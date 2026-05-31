@@ -83,9 +83,16 @@ Docker (recomendado, confinado + não-root): [docs/DOCKER.md](docs/DOCKER.md).
 ## CI / releases
 
 [`.github/workflows/daemon-release.yml`](.github/workflows/daemon-release.yml):
-em tag `daemon-v*`, build → checksum → assinatura Ed25519 → GitHub Release com
-**provenance SLSA**. Precisa do secret `THE_DUDES_SIGN_KEY` (PEM da chave
-privada cuja pública é a `signing-pub.pem`).
+em tag `daemon-v*`, build reproduzível → checksum → **SLSA provenance keyless**
+(via OIDC, sem chave privada no CI) → GitHub Release.
+
+Duas mecânicas de autenticidade, ambas verificáveis:
+
+- **Release do GitHub**: provenance SLSA —
+  `gh attestation verify daemon.cjs --repo rlisboar/the-dudes-daemon`.
+- **Bundle servido pelo orchestrator**: assinatura **Ed25519** com chave
+  **privada offline** (nunca entra no CI), verificável contra
+  [`signing-pub.pem`](signing-pub.pem) (ver seção acima).
 
 ## Licença
 
