@@ -70,8 +70,13 @@ export function isInsideRoot(candidate: string, root: string): boolean {
  *  configurado (modo legado, só FORBIDDEN_PATHS). */
 export function getWorkspaceRoot(): string | null {
   const v = process.env.THE_DUDES_WORKSPACE_ROOT;
-  if (!v || !v.trim()) return null;
-  return path.resolve(expandBasePath(v.trim()));
+  if (v && v.trim()) return path.resolve(expandBasePath(v.trim()));
+  // Fail-closed por padrão: sem a env, confina ao $HOME do usuário em vez de
+  // permitir QUALQUER diretório. Aperte definindo THE_DUDES_WORKSPACE_ROOT
+  // (pasta única) ou aponte pra um root fora do $HOME quando necessário.
+  const home = (process.env.HOME || process.env.USERPROFILE || "").trim();
+  if (home) return path.resolve(home);
+  return null; // sem HOME (raro) — modo legado (só FORBIDDEN_PATHS + warn)
 }
 
 let warnedNoWorkspaceRoot = false;
