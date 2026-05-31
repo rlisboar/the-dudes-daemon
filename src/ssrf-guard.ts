@@ -1,5 +1,6 @@
 import * as dns from "node:dns/promises";
 import * as net from "node:net";
+import { Agent, fetch as undiciFetch } from "undici";
 
 /**
  * SSRF guard local do daemon. checkOutboundUrl do server cobre fetches no
@@ -92,10 +93,12 @@ export interface SafeFetchOpts {
 }
 
 /**
- * fetch com re-checagem de SSRF em CADA redirect. O fetch nativo com
- * `redirect:"follow"` segue 30x sem revalidar o Location — uma URL que
- * passa no guard pode redirecionar pra IMDS/RFC1918/loopback. Aqui usamos
- * `redirect:"manual"` e revalidamos cada hop antes de segui-lo.
+ * fetch com re-checagem de SSRF + PIN de IP em CADA redirect.
+ * - `redirect:"manual"` + revalida cada Location (fetch nativo segue 30x sem
+ *   checar → URL aprovada poderia redirecionar pra IMDS/RFC1918/loopback).
+ * - Pina o IP resolvido no socket (undici Agent.connect.lookup) → fecha o DNS
+ *   rebinding entre o check e o connect (o check resolve, mas um fetch normal
+ *   re-resolveria e o 2o lookup poderia devolver IP privado).
  */
 export async function safeFetch(
   rawUrl: string,
@@ -107,11 +110,34 @@ export async function safeFetch(
   for (let hop = 0; hop <= maxRedirects; hop++) {
     const ssrf = await checkOutboundUrl(current, opts);
     if (ssrf) throw new Error(`SSRF bloqueado: ${ssrf}`);
-    const resp = await fetch(current, { ...init, redirect: "manual" });
+    const u = new URL(current);
+    const host = u.hostname.toLowerCase();
+    let pinned: { address: string; family: 4 | 6 };
+    if (net.isIP(host)) {
+      // IP literal já validado por checkOutboundUrl acima.
+      pinned = { address: host, family: net.isIPv6(host) ? 6 : 4 };
+    } else {
+      const records = await dns.lookup(host, { all: true });
+      const ok = records.find(
+        (r) => !isPrivateAddress(r.address) || (!!opts.allowLocalhost && /^(127\.|::1$)/i.test(r.address)),
+      );
+      if (!ok) throw new Error(`SSRF bloqueado: ${host} resolve só pra IP privado`);
+      pinned = { address: ok.address, family: ok.family === 6 ? 6 : 4 };
+    }
+    const dispatcher = new Agent({
+      connect: {
+        // Conecta no IP pinado, mas preserva o hostname (SNI/cert/Host).
+        // undici passa {all:true} → callback tem que devolver ARRAY nesse caso.
+        lookup: (_h: string, o: any, cb: (...a: any[]) => void) => {
+          if (o && o.all) cb(null, [{ address: pinned.address, family: pinned.family }]);
+          else cb(null, pinned.address, pinned.family);
+        },
+      },
+    });
+    const resp = (await undiciFetch(current, { ...init, dispatcher, redirect: "manual" } as any)) as unknown as Response;
     if (resp.status >= 300 && resp.status < 400 && resp.headers.has("location")) {
-      const loc = resp.headers.get("location") as string;
-      // Resolve Location relativo contra a URL atual; revalida no próximo loop.
-      current = new URL(loc, current).toString();
+      // Resolve Location relativo contra a URL atual; revalida + re-pina no próximo loop.
+      current = new URL(resp.headers.get("location") as string, current).toString();
       continue;
     }
     return resp;
