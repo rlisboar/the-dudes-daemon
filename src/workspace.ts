@@ -35,9 +35,30 @@ export function expandBasePath(input: string): string {
  *  resolvido (ou igual ao próprio root). Usa `path.sep` no comparador pra
  *  evitar bypass clássico "/home/u/proj" vs "/home/u/projevil" via
  *  startsWith literal. */
+/** Resolve symlinks do prefixo existente mais profundo + reanexa a cauda que
+ *  ainda não existe. Sem isto, `root/link` (link → /etc) passa no check lexical
+ *  mas escapa o confinamento na hora de operar. */
+function resolveReal(p: string): string {
+  let cur = path.resolve(p);
+  const tail: string[] = [];
+  for (;;) {
+    try {
+      const real = realpathSync(cur);
+      return tail.length ? path.join(real, ...tail.reverse()) : real;
+    } catch {
+      const parent = path.dirname(cur);
+      if (parent === cur) return path.resolve(p); // nada do caminho existe
+      tail.push(path.basename(cur));
+      cur = parent;
+    }
+  }
+}
+
 export function isInsideRoot(candidate: string, root: string): boolean {
-  const a = path.resolve(candidate);
-  const b = path.resolve(root);
+  // realpath em ambos pra bloquear escape via symlink (lexical não basta).
+  const a = resolveReal(candidate);
+  let b: string;
+  try { b = realpathSync(path.resolve(root)); } catch { b = path.resolve(root); }
   if (a === b) return true;
   return a.startsWith(b + path.sep);
 }
