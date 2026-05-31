@@ -47,13 +47,19 @@ export function initSentry() {
       },
     },
     beforeSend(event) {
-      // Mesmo redact do orchestrator — daemon vê tokens em transit.
-      if (event.request?.url) {
-        event.request.url = event.request.url.replace(
-          /(token|recovery|kek)=[^&]+/gi,
-          "$1=[REDACTED]",
-        );
-      }
+      // O daemon vê tokens + valores de credencial (get_credential) + blobs
+      // E2EE em trânsito. Scrub em URL, message, exceptions e breadcrumbs.
+      const SECRET = /\b(token|secret|api[_-]?key|password|passwd|authorization|bearer|recovery|kek)["':=\s]+\S+/gi;
+      const scrub = (s: unknown): any =>
+        typeof s === "string"
+          ? s.replace(SECRET, "$1=[REDACTED]")
+             .replace(/\be2e:[A-Za-z0-9+/=]{8,}/g, "e2e:[REDACTED]")
+             .replace(/\bsk-[a-zA-Z0-9_-]{16,}/g, "[REDACTED]")
+          : s;
+      if (event.request?.url) event.request.url = scrub(event.request.url);
+      if (event.message) event.message = scrub(event.message);
+      for (const ex of event.exception?.values ?? []) if (ex.value) ex.value = scrub(ex.value);
+      for (const b of event.breadcrumbs ?? []) if (b.message) b.message = scrub(b.message);
       return event;
     },
   });

@@ -476,7 +476,7 @@ export class AgentRunner {
         this.traceSpawn("gemini", args);
         proc = spawnDropped(this.runnerCommand("gemini"), args, {
           cwd: this.agentTmpDir(),
-          env: { ...process.env, GEMINI_CLI_TRUST_WORKSPACE: "true" },
+          env: { ...this.buildEnv(), GEMINI_CLI_TRUST_WORKSPACE: "true" },
           stdio: ["ignore", "pipe", "pipe"],
         }, this.opts.dropTo ?? null);
       } else if (runner === "codex") {
@@ -490,7 +490,7 @@ export class AgentRunner {
         this.traceSpawn("codex", args);
         proc = spawnDropped(this.runnerCommand("codex"), args, {
           cwd: this.opts.workspaceRoot,
-          env: process.env as NodeJS.ProcessEnv,
+          env: this.buildEnv(),
           stdio: ["ignore", "pipe", "pipe"],
         }, this.opts.dropTo ?? null);
       } else if (runner === "opencode") {
@@ -503,7 +503,7 @@ export class AgentRunner {
         this.traceSpawn("opencode", args);
         proc = spawnDropped("python3", ["-c", "import pty,sys; pty.spawn(sys.argv[1:])", this.runnerCommand("opencode"), ...args], {
           cwd: this.opts.workspaceRoot,
-          env: process.env as NodeJS.ProcessEnv,
+          env: this.buildEnv(),
           stdio: ["ignore", "pipe", "pipe"],
         }, this.opts.dropTo ?? null);
       } else {
@@ -514,7 +514,7 @@ export class AgentRunner {
         this.traceSpawn("claude", args);
         proc = spawnDropped(this.runnerCommand("claude"), args, {
           cwd: this.opts.workspaceRoot,
-          env: process.env as NodeJS.ProcessEnv,
+          env: this.buildEnv(),
           stdio: ["ignore", "pipe", "pipe"],
         }, this.opts.dropTo ?? null);
       }
@@ -1625,7 +1625,7 @@ export class AgentRunner {
       this.traceSpawn("claude", args);
       const proc = spawnDropped(this.runnerCommand("claude"), args, {
         cwd: this.opts.workspaceRoot,
-        env: process.env as NodeJS.ProcessEnv,
+        env: this.buildEnv(),
         stdio: ["ignore", "pipe", "pipe"],
       }, this.opts.dropTo ?? null);
       proc.stdout!.setEncoding("utf8");

@@ -1080,7 +1080,9 @@ class DaemonClient {
       return;
     }
     try {
-      const n = count ?? 20;
+      // Coerce pra inteiro positivo com clamp — `count` chega do WS e um valor
+      // string injetaria args no git (ex `--output=<file>` → escrita arbitrária).
+      const n = Math.min(Math.max(Number.parseInt(String(count ?? 20), 10) || 20, 1), 1000);
       const output = await this.gitExec(["log", `-${n}`, "--format=%H||%s||%an||%aI"]);
       const commits = output.trim().split("\n").filter(Boolean).map((line) => {
         const [hash, message, author, date] = line.split("||");
@@ -1164,7 +1166,7 @@ class DaemonClient {
       return;
     }
     try {
-      const n = count ?? 10;
+      const n = Math.min(Math.max(Number.parseInt(String(count ?? 10), 10) || 10, 1), 1000);
       const output = await this.gitExec(["log", `-${n}`, "--format=%H||%s||%an||%aI", "--", filePath]);
       const commits = output.trim().split("\n").filter(Boolean).map((line) => {
         const [hash, message, author, date] = line.split("||");

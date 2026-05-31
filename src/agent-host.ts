@@ -359,7 +359,13 @@ export class AgentHost {
       },
       onContextWarning: (used, limit) => this.send({ type: "agent:context_warning", agentId: msg.agent.id, used, limit }),
       onContextFull: () => this.send({ type: "agent:context_full", agentId: msg.agent.id }),
-      onError: (err) => this.send({ type: "agent:error", agentId: msg.agent.id, message: err }),
+      onError: (err) => {
+        // stderr do agente pode conter credencial (echo/uso). Redacta as creds
+        // conhecidas ANTES de sair do daemon (vira system message no server,
+        // server-visível por design — então redact, não cifra).
+        const message = msg.projectId ? redactCredentials(msg.projectId, String(err ?? "")) : String(err ?? "");
+        this.send({ type: "agent:error", agentId: msg.agent.id, message });
+      },
       onExit: (code) => {
         const e = this.entries.get(msg.agent.id);
         if (e) e.runner = null;
