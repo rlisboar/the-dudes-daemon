@@ -1,0 +1,73 @@
+# Release do daemon: build reproduzível → checksum → assinatura Ed25519 →
+# GitHub Release + provenance SLSA. Dispara em tag `daemon-v*`.
+#
+# Segredo necessário: THE_DUDES_SIGN_KEY (PEM da chave privada Ed25519, a mesma
+# cuja pública está em daemon/signing-pub.pem). Configure em Settings → Secrets.
+name: daemon-release
+
+on:
+  push:
+    tags:
+      - "daemon-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write        # criar Release
+  id-token: write        # provenance (OIDC)
+  attestations: write    # attest-build-provenance
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Build reproduzível: esbuild pinado (daemon/package.json), lockfile.
+      - name: Install (locked)
+        working-directory: daemon
+        run: npm ci
+
+      - name: Build
+        working-directory: daemon
+        env:
+          BUILD_SHA: ${{ github.sha }}
+        run: npm run build:legacy   # sem embed de Sentry DSN (build OSS limpo)
+
+      - name: Checksums
+        working-directory: daemon/dist
+        run: |
+          sha256sum daemon.cjs > daemon.cjs.sha256
+          sha256sum mcp-bridge.cjs > mcp-bridge.cjs.sha256
+
+      - name: Sign (Ed25519)
+        if: ${{ env.SIGN_KEY != '' }}
+        working-directory: daemon
+        env:
+          SIGN_KEY: ${{ secrets.THE_DUDES_SIGN_KEY }}
+        run: |
+          printf '%s' "$SIGN_KEY" > /tmp/sign.key
+          THE_DUDES_SIGN_KEY_FILE=/tmp/sign.key node scripts/build.mjs
+          rm -f /tmp/sign.key
+          # confere contra a pública committada (fail-closed)
+          node -e 'const{verify}=require("crypto"),fs=require("fs");const pub=fs.readFileSync("signing-pub.pem");for(const f of ["dist/daemon.cjs","dist/mcp-bridge.cjs"]){const ok=verify(null,fs.readFileSync(f),pub,Buffer.from(fs.readFileSync(f+".sig","utf8").trim(),"base64"));if(!ok){console.error("sig mismatch",f);process.exit(1)}console.log("sig ok",f)}'
+
+      - name: Provenance attestation (SLSA)
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: "daemon/dist/daemon.cjs, daemon/dist/mcp-bridge.cjs"
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            daemon/dist/daemon.cjs
+            daemon/dist/daemon.cjs.sha256
+            daemon/dist/daemon.cjs.sig
+            daemon/dist/mcp-bridge.cjs
+            daemon/dist/mcp-bridge.cjs.sha256
+            daemon/dist/mcp-bridge.cjs.sig
+            daemon/signing-pub.pem

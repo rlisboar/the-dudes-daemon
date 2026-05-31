@@ -1,0 +1,38 @@
+{
+  "name": "@the-dudes/daemon",
+  "version": "0.1.0",
+  "private": true,
+  "description": "the-dudes daemon — roda agentes CLI (claude, codex, gemini, opencode) na sua máquina sob orquestração remota, com E2EE e aprovação manual.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rlisboar/the-dudes-daemon.git"
+  },
+  "type": "module",
+  "main": "dist/main.js",
+  "bin": {
+    "the-dudes-daemon": "dist/main.js"
+  },
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "start": "node dist/daemon.cjs",
+    "build": "node scripts/build.mjs",
+    "build:legacy": "npm run build:daemon && npm run build:bridge",
+    "build:daemon": "esbuild src/main.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/daemon.cjs --banner:js=\"#!/usr/bin/env node\"",
+    "build:bridge": "esbuild src/mcp-bridge.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/mcp-bridge.cjs",
+    "lint": "eslint src"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "@sentry/node": "^10.52.0",
+    "ws": "^8.18.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.4",
+    "@types/ws": "^8.5.12",
+    "esbuild": "0.24.2",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.2"
+  }
+}

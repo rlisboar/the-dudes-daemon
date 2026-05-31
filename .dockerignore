@@ -1,0 +1,9 @@
+# Imagem não precisa do código-fonte nem do bundle — o daemon é baixado do
+# orchestrator no boot. Só o entrypoint + Dockerfile importam.
+node_modules
+dist
+src
+scripts
+tsconfig.json
+*.log
+.env*
