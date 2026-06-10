@@ -1,14 +1,19 @@
 import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { writeFileSync, mkdirSync, chmodSync } from "node:fs";
+import http from "node:http";
+import { writeFileSync, mkdirSync, chmodSync, mkdtempSync, rmSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import type { AgentInfo, AgentRuntimeState, AgentUsage, CliRunner, ImageAttachment } from "./types.js";
+import type { ContextFeatures } from "./protocol.js";
 import { spawnDropped, type DropTarget } from "./privileges.js";
 import type { ResolvedCliCommands } from "./cli-config.js";
+import { resolvePython3 } from "./cli-config.js";
 
 export const MODEL_CONTEXT_LIMITS: Record<string, number> = {
   // Claude. opusplan = Opus no plan, Sonnet na execução; janela efetiva 200k.
   opus: 200_000, opusplan: 200_000, sonnet: 200_000, haiku: 200_000,
+  // Fable 5 — Claude Code serve a variante [1m] (claude-fable-5[1m]) por padrão.
+  fable: 1_000_000, "claude-fable-5": 1_000_000,
   // Gemini
   "gemini-3-flash-preview": 1_000_000,
   "gemini-3.1-flash-lite-preview": 1_000_000,
@@ -40,6 +45,9 @@ export const MODEL_CONTEXT_LIMITS: Record<string, number> = {
 
 const CONTEXT_WARN_PCT = 0.85;
 const OPENCODE_NO_OUTPUT_TIMEOUT_MS = 120_000;
+/** Timeout do turno opencode via API do serve (POST /message é síncrono e pode
+ *  rodar tools por minutos). Generoso; o serve é morto no stop() se preciso. */
+const OPENCODE_TURN_TIMEOUT_MS = 600_000;
 
 const CONTEXT_FULL_PATTERNS = [
   /context.{0,20}(length|window|limit).{0,20}exceed/i,
@@ -88,6 +96,8 @@ export interface AgentRunnerOptions {
     url?: string;
     headers?: Record<string, string>;
   }>;
+  /** Blocos de contexto ligados (gateiam header + tools). Ausente = tudo on. */
+  features?: ContextFeatures;
   cliCommands: ResolvedCliCommands;
   verbose: boolean;
   verboseHuman: boolean;
@@ -108,17 +118,29 @@ export interface AgentRunnerOptions {
   onExit: (code: number | null) => void;
 }
 
-const SYSTEM_PROMPT_HEADER = `You are part of a multi-agent team running locally.
-
-# CRITICAL ROUTING RULE
+// Header montado por seções com gating por projeto (Fase 2). Cada bloco off
+// remove a prosa E as referências cruzadas — nunca deixa o agente lendo
+// instrução de uma tool que ele não tem. teammates/tasks/filelock/memory são
+// gateáveis; goals/webhooks/credentials/state-verify/footer ficam (ajustados).
+const HDR_ROUTING = `# CRITICAL ROUTING RULE
 - Direct text in your response is delivered ONLY to the human user.
 - To talk to ANOTHER AGENT (teammate), you MUST use the \`mcp__the-dudes__send_message\` tool — never as plain text.
 - If a message arrives prefixed with \`[from <name>]:\`, that came from a teammate. Your reply to them MUST go through \`mcp__the-dudes__send_message\` with \`to: "<name>"\`. Do NOT answer them via plain text — plain text will not reach the teammate.
 - Plain text is for the user. Tool call is for teammates. They are separate channels — pick the right one.
 - It is fine to also include a short status line as plain text (visible to user) AFTER calling \`send_message\`, but the actual answer to the teammate must be inside the tool call.
-- Respect the hierarchy from \`list_agents\`: managers coordinate their reports, leads route work inside their teams, and specialists/worker agents should escalate cross-team or priority conflicts to their manager.
+- Respect the hierarchy from \`list_agents\`: managers coordinate their reports, leads route work inside their teams, and specialists/worker agents should escalate cross-team or priority conflicts to their manager.`;
 
-# Teammate communication
+// Seção de teammate; a fallback de erro só cita o board quando tasks on.
+function teammateSection(tasks: boolean): string {
+  const blocked = tasks
+    ? `  - Use the task board to coordinate: add a task assigned to that teammate, or add a comment on a shared task.
+  - If the error says "preventive mode", direct messages are disabled project-wide — use only the task board.
+  - If the error says "limit reached" or "loop detected", the conversation was paused — escalate to the user with a summary.
+  - If the error says "hierarchy violation", you are not allowed to message this agent — use the task board or escalate to your manager.`
+    : `  - If the error says "preventive mode", direct messages are disabled project-wide — escalate to the user.
+  - If the error says "limit reached" or "loop detected", the conversation was paused — escalate to the user with a summary.
+  - If the error says "hierarchy violation", you are not allowed to message this agent — escalate to your manager or the user.`;
+  return `# Teammate communication
 - \`mcp__the-dudes__list_agents\` — list teammates, including hierarchy level, team, manager and skills.
 - \`mcp__the-dudes__send_message\` (args: {to, content}) — send a message to a teammate.
 - **Hierarchy rules**: \`send_message\` is enforced by the server. You can ONLY message:
@@ -127,58 +149,117 @@ const SYSTEM_PROMPT_HEADER = `You are part of a multi-agent team running locally
   - Same-team peers at your exact hierarchy level
   - If no hierarchy is configured, all communication is allowed
 - If \`send_message\` returns an error, the message was blocked — do NOT retry. Instead:
-  - Use the task board to coordinate: add a task assigned to that teammate, or add a comment on a shared task.
-  - If the error says "preventive mode", direct messages are disabled project-wide — use only the task board.
-  - If the error says "limit reached" or "loop detected", the conversation was paused — escalate to the user with a summary.
-  - If the error says "hierarchy violation", you are not allowed to message this agent — use the task board or escalate to your manager.
+${blocked}`;
+}
 
-# Shared task board (visible to user and all teammates)
+// Board de tasks SEM as tools de webhook (extraídas pra HDR_WEBHOOKS).
+const HDR_TASKS_CORE = `# Shared task board (visible to the user and any teammates)
 - \`mcp__the-dudes__list_tasks\` — read the current board. Shows lock status and blocker dependencies.
 - \`mcp__the-dudes__add_task\` (args: {title, description?, status?, assignee?}) — add a task. Status defaults to \`todo\`.
 - \`mcp__the-dudes__update_task\` (args: {id, status?, title?, description?, assignee?}) — change a task; use status to move it between todo/doing/done/blocked. You can also set \`blockedByTaskId\` to make it depend on another task.
 - \`mcp__the-dudes__lock_task\` (args: {id}) — **ALWAYS lock a task BEFORE starting work.** Atomic lock prevents double-work. Fails if already locked or blocked by an incomplete dependency.
 - \`mcp__the-dudes__unlock_task\` (args: {id}) — release the lock when done or if you must abandon the task.
 - \`mcp__the-dudes__add_task_comment\` (args: {taskId, content}) — add a comment to a task for documentation or questions.
-- \`mcp__the-dudes__list_task_comments\` (args: {taskId}) — read all comments on a task in chronological order.
-- \`mcp__the-dudes__send_webhook\` (args: {webhookName, message}) — send a custom message through a named outbound webhook configured in this project (Discord, Slack, etc). Use only when the operator has configured the webhook by name and asked you to notify external systems.
-- \`mcp__the-dudes__list_webhooks\` — list webhook subscriptions in this project (name, direction, enabled, events). URLs and secrets are NOT returned. Use to discover the names accepted by send_webhook.
+- \`mcp__the-dudes__list_task_comments\` (args: {taskId}) — read all comments on a task in chronological order.`;
 
-# File locking (MANDATORY when enabled)
+// Webhooks: tools ungated (sempre registradas no bridge) → seção própria.
+const HDR_WEBHOOKS = `# Webhooks
+- \`mcp__the-dudes__send_webhook\` (args: {webhookName, message}) — send a custom message through a named outbound webhook configured in this project (Discord, Slack, etc). Use only when the operator has configured the webhook by name and asked you to notify external systems.
+- \`mcp__the-dudes__list_webhooks\` — list webhook subscriptions in this project (name, direction, enabled, events). URLs and secrets are NOT returned. Use to discover the names accepted by send_webhook.`;
+
+const HDR_FILELOCK = `# File locking (MANDATORY when enabled)
 - If file locking is enabled in the project, you MUST use these tools before editing any file:
 - \`mcp__the-dudes__lock_file\` (args: {path}) — lock a file before editing. Fails if another agent already holds the lock. Lock expires after 5 minutes.
 - \`mcp__the-dudes__unlock_file\` (args: {path}) — release your lock when done editing.
 - \`mcp__the-dudes__list_file_locks\` — see which files are currently locked and by whom.
-- Do NOT edit files that are locked by another agent.
+- Do NOT edit files that are locked by another agent.`;
 
-# Goal alignment
-- \`mcp__the-dudes__list_goals\` — list project goals (mission, objectives, milestones). Shows hierarchy tree.
-- Every task can link to a goal via \`goal_id\` in \`add_task\`. Check \`list_goals\` to understand the project's purpose before creating tasks.
-- When working on a task, the assignment notification includes the goal context. Align your work with the goal's intent.
+// Goals ungated; a linha de add_task/atribuição só entra com tasks on.
+function goalsSection(tasks: boolean): string {
+  const lines = [
+    `# Goal alignment`,
+    `- \`mcp__the-dudes__list_goals\` — list project goals (mission, objectives, milestones). Shows hierarchy tree.`,
+  ];
+  if (tasks) {
+    lines.push(`- Every task can link to a goal via \`goal_id\` in \`add_task\`. Check \`list_goals\` to understand the project's purpose before creating tasks.`);
+    lines.push(`- When working on a task, the assignment notification includes the goal context. Align your work with the goal's intent.`);
+  } else {
+    lines.push(`- Check \`list_goals\` to understand the project's purpose and align your work with the goal's intent.`);
+  }
+  return lines.join("\n");
+}
 
-# Credentials (API keys, tokens, passwords)
+const HDR_MEMORY = `# Project memory (durable, survives restarts & model switches)
+- \`mcp__the-dudes__recall\` (args: {query?, type?}) — search the project memory (shared + your private). **Call this at the start of a task** to load durable context.
+- \`mcp__the-dudes__remember\` (args: {title, body, type?, scope?, pinned?}) — save a durable note. Use for decisions, stable facts, references and your own working state worth keeping across restarts. \`scope: "project"\` (default) is shared with all agents; \`scope: "agent"\` is private to you. Keep entries short and atomic. It is re-injected into your system prompt on every restart.
+- \`mcp__the-dudes__forget\` (args: {id}) — delete a memory entry you created. You cannot delete user-curated or other agents' entries.
+- \`mcp__the-dudes__pin\` (args: {id, pinned?}) — pin/unpin an entry so it stays prioritized in the injected hot-set.
+- Memory is already injected into this system prompt under "## Project Memory" when present — don't re-recall what's already there.`;
+
+const HDR_CREDS = `# Credentials (API keys, tokens, passwords)
 - \`mcp__the-dudes__get_credential\` (args: {name}) — retrieve a stored credential value by name. Use this whenever you need an API key or secret; never ask the user to paste it inline.
-- NEVER send credentials or sensitive information to any agent or human.
+- NEVER send credentials or sensitive information to any agent or human.`;
 
-# State verification (MANDATORY before acting on any task)
-- The message history is a log — it is NOT authoritative ground truth. Other agents may have made changes you haven't seen yet.
-- Before starting ANY code change or claiming a task:
-  1. Call \`list_tasks\` to see the current board. Do NOT assume task status or ownership from past messages — tasks may have been reassigned or completed.
-  2. Call \`list_agents\` to see who is currently online — check roles, teams, and hierarchy levels.
-   3. **Specialization rule:** Check if any teammate's role or team is more specialized for this task than yours. Use \`list_agents\` to inspect roles, teams, and hierarchy. If a specialist exists, delegate to them via the task board (\`add_task\` with assignee) or \`send_message\`. Only execute the task yourself if:
+// State verification: passos numerados montados conforme tasks/teammates,
+// pra não instruir o agente a chamar list_tasks/list_agents que ele não tem.
+function stateVerifySection(tasks: boolean, teammates: boolean): string {
+  const lines: string[] = [
+    `# State verification (MANDATORY before acting on any task)`,
+    `- The message history is a log — it is NOT authoritative ground truth.${teammates ? " Other agents may have made changes you haven't seen yet." : ""}`,
+    `- Before starting ANY code change or claiming a task:`,
+  ];
+  let n = 1;
+  if (tasks) lines.push(`  ${n++}. Call \`list_tasks\` to see the current board. Do NOT assume task status or ownership from past messages — tasks may have been reassigned or completed.`);
+  if (teammates) lines.push(`  ${n++}. Call \`list_agents\` to see who is currently online — check roles, teams, and hierarchy levels.`);
+  if (teammates) lines.push(`  ${n++}. **Specialization rule:** Check if any teammate's role or team is more specialized for this task than yours. Use \`list_agents\` to inspect roles, teams, and hierarchy. If a specialist exists, delegate to them via ${tasks ? "the task board (\`add_task\` with assignee) or " : ""}\`send_message\`. Only execute the task yourself if:
       - No specialist exists for this domain, OR
-      - Your own role is explicitly more suitable for the task than any available teammate.
-  4. Check actual files on disk (Read, Grep, Glob) before editing — another agent may have modified them since you last looked.
-- If a task appears duplicated or already in-progress, coordinate with the assignee — do NOT start parallel work on the same task.
-- When you discover the board or disk contradicts your understanding, update your understanding and proceed from the current state.
+      - Your own role is explicitly more suitable for the task than any available teammate.`);
+  lines.push(`  ${n++}. Check actual files on disk (Read, Grep, Glob) before editing${teammates ? " — another agent may have modified them since you last looked" : ""}.`);
+  if (tasks) lines.push(`- If a task appears duplicated or already in-progress, coordinate with the assignee — do NOT start parallel work on the same task.`);
+  lines.push(`- When you discover the ${tasks ? "board or disk" : "disk"} contradicts your understanding, update your understanding and proceed from the current state.`);
+  return lines.join("\n");
+}
 
-# Conversation discipline (anti-loop)
+const HDR_DISCIPLINE = `# Conversation discipline (anti-loop)
 - Limit back-and-forth exchanges. After 2-3 exchanges with a teammate on the same topic without progress, STOP and escalate to the user with a summary. Do NOT keep replying.
 - If you receive a message that repeats the same point you already addressed, do NOT reply with the same counterpoint — the conversation is stuck. Escalate.
 - Reply ONLY when you have new information or a decision to communicate. "Ok", "Got it", "Thanks" do NOT count as new information — skip them.
 - If you are about to reply to a teammate and no user has spoken in the last several messages, ask yourself: "Is the user aware this conversation is happening?" If not, summarize and tag the user instead.
-- Do NOT reply to system messages about conversation pauses — those are final.
+- Do NOT reply to system messages about conversation pauses — those are final.`;
 
-Use the board to coordinate work: when you start a piece of work, mark it \`doing\`; when you finish, mark it \`done\`. When you discover work for someone else, add a task assigned to that teammate. Stay in character. Be concise.`;
+// Rodapé: só cita board/atribuição quando os blocos correspondentes estão on.
+function footerSection(tasks: boolean, teammates: boolean): string {
+  const parts: string[] = [];
+  if (tasks) parts.push("Use the board to coordinate work: when you start a piece of work, mark it `doing`; when you finish, mark it `done`.");
+  if (tasks && teammates) parts.push("When you discover work for someone else, add a task assigned to that teammate.");
+  parts.push("Stay in character. Be concise.");
+  return parts.join(" ");
+}
+
+/** Monta o header gateando seção + referências cruzadas por projeto.
+ *  Ausente/undefined numa flag = ligada (compat com server antigo). */
+function buildSystemPromptHeader(features?: ContextFeatures): string {
+  const teammates = features?.teammates !== false;
+  const tasks = features?.tasks !== false;
+  const filelock = features?.filelock !== false;
+  const memory = features?.memory !== false;
+  const sections: string[] = [];
+  sections.push(teammates
+    ? `You are part of a multi-agent team running locally.`
+    : `You are an agent running locally.`);
+  if (teammates) sections.push(HDR_ROUTING);
+  if (teammates) sections.push(teammateSection(tasks));
+  if (tasks) sections.push(HDR_TASKS_CORE);
+  if (features?.webhooks !== false) sections.push(HDR_WEBHOOKS);
+  if (filelock) sections.push(HDR_FILELOCK);
+  if (features?.goals !== false) sections.push(goalsSection(tasks));
+  if (memory) sections.push(HDR_MEMORY);
+  if (features?.credentials !== false) sections.push(HDR_CREDS);
+  sections.push(stateVerifySection(tasks, teammates));
+  if (teammates) sections.push(HDR_DISCIPLINE);
+  sections.push(footerSection(tasks, teammates));
+  return sections.join("\n\n");
+}
 
 export class AgentRunner {
   readonly info: AgentInfo;
@@ -195,6 +276,9 @@ export class AgentRunner {
   private ocBusy = false;
   private ocActiveProc: ChildProcess | null = null;
   private ocFirstTurn = true;
+  /** true se a run opencode atual emitiu algum evento produtivo (text/tool/
+   *  step_finish). false no fim = falha transitória → dispara retry. */
+  private ocRunSawOutput = false;
   private stopped = false;
   /** Garante que onExit dispara no máximo uma vez. stop() é re-chamável e
    *  pode correr com um close handler em voo (ocActiveProc null →
@@ -414,8 +498,22 @@ export class AgentRunner {
       .join("\n");
   }
 
+  /** Tmpdir do agente — nome ALEATÓRIO (mkdtemp), memoizado por instância.
+   *  Antes era /tmp/the-dudes/<agentId> (path previsível): um agente irmão
+   *  same-uid sob prompt-injection fazia `cat /tmp/the-dudes/<outro>/agent.token`
+   *  e roubava o token de outro agente (cross-project). O nome aleatório sem o
+   *  agentId remove o mapeamento agentId→token — o irmão pode listar o parent
+   *  mas não sabe qual dir é de qual agente. NÃO é isolamento forte (same-uid
+   *  ainda lê qualquer arquivo do dono); isolamento real exige uid distinto/
+   *  container por agente — ver SECURITY-TODO S-05. */
+  private _tmpDir?: string;
   private agentTmpDir(): string {
-    return path.join(os.tmpdir(), "the-dudes", this.info.id);
+    if (this._tmpDir) return this._tmpDir;
+    const parent = path.join(os.tmpdir(), "the-dudes");
+    mkdirSync(parent, { recursive: true, mode: 0o700 });
+    try { chmodSync(parent, 0o700); } catch {}
+    this._tmpDir = mkdtempSync(path.join(parent, "ag-")); // 0700 por padrão
+    return this._tmpDir;
   }
 
   /** Grava agent token em arquivo mode 0o600 e retorna path. Em vez de
@@ -430,18 +528,17 @@ export class AgentRunner {
     return tokenPath;
   }
 
-  /** Garante que o tmpdir do agente (e o parent /tmp/the-dudes) existam
-   *  com mode 0700 antes de gravar arquivos que carregam o agent token.
-   *  Caso o diretório já exista com mode permissivo herdado de umask
-   *  legado, o chmodSync corrige. */
+  /** Garante o tmpdir do agente (mkdtemp já cria 0700). */
   private ensureSecureAgentTmpDir(): string {
-    const parent = path.join(os.tmpdir(), "the-dudes");
-    mkdirSync(parent, { recursive: true, mode: 0o700 });
-    try { chmodSync(parent, 0o700); } catch {}
-    const dir = this.agentTmpDir();
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
-    try { chmodSync(dir, 0o700); } catch {}
-    return dir;
+    return this.agentTmpDir();
+  }
+
+  /** Remove o tmpdir do agente (token plaintext + sessions). Best-effort,
+   *  chamado no fim de vida pra não deixar token válido em /tmp. */
+  private cleanupAgentTmpDir(): void {
+    if (!this._tmpDir) return;
+    try { rmSync(this._tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    this._tmpDir = undefined;
   }
 
   contextLimit(): number {
@@ -501,7 +598,9 @@ export class AgentRunner {
         args.push(prompt);
         this.traceCli("opencode", "argv", prompt);
         this.traceSpawn("opencode", args);
-        proc = spawnDropped("python3", ["-c", "import pty,sys; pty.spawn(sys.argv[1:])", this.runnerCommand("opencode"), ...args], {
+        const py = resolvePython3();
+        if (!py) { this.opts.onError("python3 não encontrado em path absoluto — opencode precisa do wrapper PTY"); resolve(""); return; }
+        proc = spawnDropped(py, ["-c", "import pty,sys; pty.spawn(sys.argv[1:])", this.runnerCommand("opencode"), ...args], {
           cwd: this.opts.workspaceRoot,
           env: this.buildEnv(),
           stdio: ["ignore", "pipe", "pipe"],
@@ -575,6 +674,23 @@ export class AgentRunner {
     this.pushUserMessage("[system] Context loaded. Awaiting instructions.");
   }
 
+  /** Env do mcp-bridge: lista de grupos de contexto ligados. Objeto vazio
+   *  quando não há features (bridge registra tudo). Spread nos 4 config
+   *  writers do bridge (gemini/opencode/claude/codex). */
+  private featuresEnv(): Record<string, string> {
+    const f = this.opts.features;
+    if (!f) return {};
+    const on: string[] = [];
+    if (f.teammates !== false) on.push("teammates");
+    if (f.tasks !== false) on.push("tasks");
+    if (f.filelock !== false) on.push("filelock");
+    if (f.memory !== false) on.push("memory");
+    if (f.goals !== false) on.push("goals");
+    if (f.credentials !== false) on.push("credentials");
+    if (f.webhooks !== false) on.push("webhooks");
+    return { THE_DUDES_FEATURES: on.join(",") };
+  }
+
   private writeGeminiConfig() {
     this.ensureSecureAgentTmpDir();
     const dir = path.join(this.agentTmpDir(), ".gemini");
@@ -585,6 +701,7 @@ export class AgentRunner {
       THE_DUDES_AGENT_NAME: this.info.name,
       THE_DUDES_ORCH_URL: this.opts.orchestratorUrl,
       THE_DUDES_AGENT_TOKEN_FILE: this.writeAgentTokenFile(),
+      ...this.featuresEnv(),
     };
     if (this.opts.bridgeSocketPath) env.THE_DUDES_BRIDGE_SOCKET = this.opts.bridgeSocketPath;
     // Gemini settings.json aceita `mcpServers` no mesmo shape do Claude
@@ -630,10 +747,22 @@ export class AgentRunner {
         mcp[name] = entry;
       }
     }
+    // BUG histórico: faltava `environment` → o mcp-bridge spawnado pelo serve
+    // não recebia THE_DUDES_AGENT_TOKEN_FILE → mandava Bearer vazio →
+    // /api/bridge 401 (as tools the-dudes nunca funcionaram no opencode).
+    const tdEnv: Record<string, string> = {
+      THE_DUDES_AGENT_ID: this.info.id,
+      THE_DUDES_AGENT_NAME: this.info.name,
+      THE_DUDES_ORCH_URL: this.opts.orchestratorUrl,
+      THE_DUDES_AGENT_TOKEN_FILE: this.writeAgentTokenFile(),
+      ...this.featuresEnv(),
+    };
+    if (this.opts.bridgeSocketPath) tdEnv.THE_DUDES_BRIDGE_SOCKET = this.opts.bridgeSocketPath;
     mcp["the-dudes"] = {
       type: "local",
       enabled: true,
       command: [this.opts.bridgeCommand, ...this.opts.bridgeArgs],
+      environment: tdEnv,
     };
     const config = {
       $schema: "https://opencode.ai/config.json",
@@ -802,7 +931,7 @@ export class AgentRunner {
       "--verbose",
       "--mcp-config", mcpConfig,
       "--append-system-prompt",
-      `${SYSTEM_PROMPT_HEADER}\n\n# Your role\n${this.info.role}\n\n${this.info.systemPrompt}\n\n# Workspace\n${this.workspaceInfo()}${planAddon}`,
+      `${buildSystemPromptHeader(this.opts.features)}\n\n# Your role\n${this.info.role}\n\n${this.info.systemPrompt}\n\n# Workspace\n${this.workspaceInfo()}${planAddon}`,
       "--allowed-tools",
       [...baseAllowed, ...extraAllowed].join(","),
     ];
@@ -848,6 +977,7 @@ export class AgentRunner {
       THE_DUDES_AGENT_NAME: this.info.name,
       THE_DUDES_ORCH_URL: this.opts.orchestratorUrl,
       THE_DUDES_AGENT_TOKEN_FILE: this.writeAgentTokenFile(),
+      ...this.featuresEnv(),
     };
     if (this.opts.bridgeSocketPath) env.THE_DUDES_BRIDGE_SOCKET = this.opts.bridgeSocketPath;
     // Bridge interno reservado em "the-dudes" — sempre presente. Servers
@@ -1009,13 +1139,13 @@ export class AgentRunner {
     return this.ocServerBootPromise;
   }
 
-  private runOpenCodeMessage(content: string) {
+  private runOpenCodeMessage(content: string, retry = 0) {
     if (this.stopped) return;
     if (!this.ensureRunnerAvailable("opencode")) return;
     this.setState("thinking");
 
     this.ensureOcServer().then(
-      () => this.runOpenCodeMessageAttached(content),
+      () => this.runOpenCodeMessageAttached(content, retry),
       (err) => {
         this.opts.onError(`opencode serve falhou: ${err?.message ?? err}`);
         this.ocBusy = false;
@@ -1025,101 +1155,155 @@ export class AgentRunner {
     );
   }
 
-  private runOpenCodeMessageAttached(content: string) {
-    if (this.stopped || !this.ocServerUrl) return;
+  /** Máx. de retries por mensagem quando a run volta SEM output produtivo
+   *  (sintoma de ECONNRESET do provider: o modelo começa o stream e a
+   *  conexão TLS cai no meio → opencode sai sem emitir text/step_finish).
+   *  1 retry cobre o flap intermitente (ex.: Z.AI) sem loop infinito. */
+  private static readonly OC_EMPTY_RETRIES = 1;
 
-    const args = ["run", "--attach", this.ocServerUrl, "--format", "json"];
-    if (this.opts.autoApprove) args.push("--dangerously-skip-permissions");
-    if (this.info.model) args.push("--model", this.info.model);
-    if (this.ocSessionId) args.push("-s", this.ocSessionId);
+  private async runOpenCodeMessageAttached(content: string, retry = 0) {
+    if (this.stopped || !this.ocServerUrl) return;
+    // first-turn wrapping pode ser re-aplicado no retry (capturado aqui).
+    const wasFirstTurn = this.ocFirstTurn;
+    this.ocRunSawOutput = false;
+    // provider/modelID de "providerID/modelID" (split no 1º "/").
+    const slash = (this.info.model ?? "").indexOf("/");
+    const providerID = slash > 0 ? (this.info.model as string).slice(0, slash) : "";
+    const modelID = slash > 0 ? (this.info.model as string).slice(slash + 1) : (this.info.model ?? "");
+
+    // Garante sessão no serve (POST /session). Reusa ocSessionId se já existe.
+    if (!this.ocSessionId) {
+      try {
+        const sess = await this.ocServeFetch("/session", "POST", providerID && modelID ? { model: { id: modelID, providerID } } : {});
+        if (!sess?.id) throw new Error("sessão sem id");
+        this.ocSessionId = sess.id;
+        if (this.opts.onSessionId) this.opts.onSessionId(sess.id);
+      } catch (e) {
+        this.opts.onError(`opencode: falha criando sessão no serve: ${(e as Error).message}`);
+        this.ocBusy = false; this.setState("idle"); this.drainOcQueue(); return;
+      }
+    }
 
     let message = content;
     if (this.ocFirstTurn) {
       this.ocFirstTurn = false;
       const summary = this.ocPendingSummary ? `\n\n# Previous conversation summary\n${this.ocPendingSummary}` : "";
       this.ocPendingSummary = undefined;
-      message = `${SYSTEM_PROMPT_HEADER}\n\n# Your role\n${this.info.role}\n\n${this.info.systemPrompt}\n\n# Workspace\n${this.workspaceInfo()}${summary}\n\n---\n\n${content}`;
+      message = `${buildSystemPromptHeader(this.opts.features)}\n\n# Your role\n${this.info.role}\n\n${this.info.systemPrompt}\n\n# Workspace\n${this.workspaceInfo()}${summary}\n\n---\n\n${content}`;
     }
-    args.push(message);
-    this.traceCli("opencode", "argv", message);
-    this.traceSpawn("opencode", args);
-
-    // OpenCode CLI emite text/step_finish em stdout SÓ quando é TTY. Sem
-    // pty wrapper, stdout fica vazio e daemon nunca vê resposta do modelo.
-    const proc = spawnDropped(
-      "python3",
-      ["-c", "import pty,sys; pty.spawn(sys.argv[1:])", this.runnerCommand("opencode"), ...args],
-      { cwd: this.opts.workspaceRoot, env: this.buildEnv(), stdio: ["ignore", "pipe", "pipe"] },
-      this.opts.dropTo ?? null,
-    );
-    this.ocActiveProc = proc;
-
-    let ocBuffer = "";
-    // Watchdog: opencode CLI silencia upstream errors (ex.: provider ECONNRESET)
-    // — fica vivo sem emitir step_finish nem error event. Mata processo após
-    // OPENCODE_NO_OUTPUT_TIMEOUT_MS sem nenhum chunk de stdout.
-    let lastOutputAt = Date.now();
-    const watchdog = setInterval(() => {
-      if (this.stopped || proc.killed) return;
-      if (Date.now() - lastOutputAt > OPENCODE_NO_OUTPUT_TIMEOUT_MS) {
-        this.opts.log("warn", `[cli:${this.info.id}:opencode] no stdout em ${OPENCODE_NO_OUTPUT_TIMEOUT_MS}ms — matando proc`);
-        this.opts.onError(`opencode timeout: sem output por ${Math.round(OPENCODE_NO_OUTPUT_TIMEOUT_MS / 1000)}s (provider provavelmente caiu)`);
-        try { proc.kill("SIGTERM"); } catch {}
-        setTimeout(() => { try { if (!proc.killed) proc.kill("SIGKILL"); } catch {} }, 1500);
-      }
-    }, 5000);
-
-    const processLine = (raw: string) => {
-      // strip ANSI escape sequences and carriage returns
-      const line = raw.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "").replace(/\r/g, "").trim();
-      if (!line.startsWith("{")) return;
-      try { this.handleOpenCodeEvent(JSON.parse(line)); } catch {}
-    };
-
-    proc.stdout!.setEncoding("utf8");
-    proc.stdout!.on("data", (chunk: string) => {
-      lastOutputAt = Date.now();
-      this.traceCli("opencode", "stdout", chunk);
-      ocBuffer += chunk;
-      let idx: number;
-      while ((idx = ocBuffer.indexOf("\n")) >= 0) {
-        processLine(ocBuffer.slice(0, idx));
-        ocBuffer = ocBuffer.slice(idx + 1);
-      }
-    });
-
-    proc.stderr!.on("data", (chunk: string) => {
-      lastOutputAt = Date.now();
-      const msg = chunk.trim();
-      if (msg) { this.traceCli("opencode", "stderr", msg); this.checkContextFullError(msg); this.opts.onError(msg); }
-    });
-
-    // Cleanup do watchdog precisa rodar em QUALQUER evento terminal. O pty
-    // wrapper às vezes emite "error"/"exit" sem nunca emitir "close" (ex.:
-    // terminação abnormal), e antes só "close" limpava o interval — deixando
-    // o setInterval de 5s vivo pela vida do daemon, matando um pid morto.
-    // `settled` garante que a recuperação (drain/idle/exit) roda uma só vez.
-    let settled = false;
-    const finalize = (code: number | null) => {
-      clearInterval(watchdog);
-      if (settled) return;
-      settled = true;
-      if (ocBuffer.trim()) { processLine(ocBuffer); ocBuffer = ""; }
-      this.ocActiveProc = null;
+    this.traceCli("opencode", "stdin", message);
+    // Transporte via API do serve (POST síncrono /session/:id/message) em vez
+    // de `opencode run` — cujo stdout NÃO serializa o `text` de reasoning
+    // models (ex: deepseek-v4-pro) → agente mudo. O serve retorna a message
+    // completa {info, parts:[step-start, reasoning, text, tool, step-finish]}.
+    let resp: any;
+    try {
+      resp = await this.ocServeFetch(
+        `/session/${this.ocSessionId}/message`,
+        "POST",
+        { ...(providerID && modelID ? { model: { providerID, modelID } } : {}), parts: [{ type: "text", text: message }] },
+        OPENCODE_TURN_TIMEOUT_MS,
+      );
+    } catch (e) {
       this.ocBusy = false;
-      if (this.stopped) {
-        this.emitExit(code);
+      if (this.stopped) return;
+      const emsg = (e as Error).message;
+      if (retry < AgentRunner.OC_EMPTY_RETRIES) {
+        this.opts.onError(`opencode: turno falhou (${emsg}) — retry ${retry + 1}/${AgentRunner.OC_EMPTY_RETRIES}`);
+        if (wasFirstTurn) this.ocFirstTurn = true;
+        this.ocBusy = true;
+        setTimeout(() => { if (this.stopped) { this.ocBusy = false; return; } void this.runOpenCodeMessage(content, retry + 1); }, 1200);
         return;
       }
+      this.opts.onError(`opencode: turno falhou após retry: ${emsg}`);
       this.setState("idle");
       this.drainOcQueue();
-    };
+      return;
+    }
 
-    proc.on("close", (code) => finalize(code));
-    proc.on("exit", (code) => finalize(code));
-    proc.on("error", (err) => {
-      this.opts.onError(`opencode proc error: ${(err as Error)?.message ?? err}`);
-      finalize(null);
+    // Parseia parts da resposta do serve.
+    const parts = Array.isArray(resp?.parts) ? resp.parts : [];
+    for (const p of parts) {
+      const t = p?.type;
+      if (t === "text") {
+        const text = (p.text as string | undefined)?.trim();
+        if (text) { this.ocRunSawOutput = true; this.setState("speaking"); this.opts.onAssistantText(text); }
+      } else if (t === "tool" || t === "tool-use" || t === "tool_use" || t === "tool-call" || t === "tool_call") {
+        this.ocRunSawOutput = true;
+        const toolName = p.tool ?? p.name ?? p.state?.name ?? "";
+        const input = p.state?.input ?? p.input ?? {};
+        this.opts.onToolUse(toolName, input);
+      } else if (t === "step-finish" || t === "step_finish") {
+        const tokens = p.tokens;
+        if (tokens) {
+          const delta: AgentUsage = {
+            input: Number(tokens.input ?? 0),
+            output: Number(tokens.output ?? 0),
+            cacheCreate: Number(tokens.cache?.write ?? 0),
+            cacheRead: Number(tokens.cache?.read ?? 0),
+          };
+          this.opts.onUsageDelta?.(delta);
+          this.checkContextUsage(delta);
+        }
+      }
+    }
+
+    this.ocActiveProc = null;
+    this.ocBusy = false;
+    if (this.stopped) return;
+    if (!this.ocRunSawOutput && retry < AgentRunner.OC_EMPTY_RETRIES) {
+      this.opts.onError(`opencode: resposta vazia (provável flap do provider) — retry ${retry + 1}/${AgentRunner.OC_EMPTY_RETRIES}`);
+      if (wasFirstTurn) this.ocFirstTurn = true;
+      this.ocBusy = true;
+      setTimeout(() => { if (this.stopped) { this.ocBusy = false; return; } void this.runOpenCodeMessage(content, retry + 1); }, 1200);
+      return;
+    }
+    if (!this.ocRunSawOutput) {
+      this.opts.onError(`opencode: turno terminou sem texto — o modelo "${this.info.model ?? "?"}" pode não retornar resposta. Troque o modelo.`);
+    }
+    this.setState("idle");
+    this.drainOcQueue();
+  }
+
+  /** HTTP ao opencode serve (loopback). Resolve com JSON parseado; rejeita
+   *  em status !2xx ou erro de rede/timeout. Usado pelo transporte por API
+   *  (POST /session, POST /session/:id/message). */
+  private ocServeFetch(path: string, method: string, body?: unknown, timeoutMs = 20_000): Promise<any> {
+    return new Promise((resolve, reject) => {
+      if (!this.ocServerUrl) { reject(new Error("serve não está pronto")); return; }
+      let u: URL;
+      try { u = new URL(this.ocServerUrl + path); } catch (e) { reject(e as Error); return; }
+      const data = body !== undefined ? JSON.stringify(body) : undefined;
+      const req = http.request(
+        {
+          hostname: u.hostname,
+          port: u.port,
+          path: u.pathname + u.search,
+          method,
+          headers: {
+            "Content-Type": "application/json",
+            ...(data ? { "Content-Length": Buffer.byteLength(data) } : {}),
+          },
+          timeout: timeoutMs,
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (c: Buffer) => chunks.push(c));
+          res.on("end", () => {
+            const txt = Buffer.concat(chunks).toString("utf8");
+            const sc = res.statusCode ?? 0;
+            if (sc >= 200 && sc < 300) {
+              try { resolve(txt ? JSON.parse(txt) : {}); } catch { resolve({}); }
+            } else {
+              reject(new Error(`HTTP ${sc}${txt ? ` — ${txt.slice(0, 200)}` : ""}`));
+            }
+          });
+        },
+      );
+      req.on("error", reject);
+      req.on("timeout", () => req.destroy(new Error(`timeout ${timeoutMs}ms`)));
+      if (data) req.write(data);
+      req.end();
     });
   }
 
@@ -1134,6 +1318,7 @@ export class AgentRunner {
       case "text": {
         const text = (event.part?.text as string | undefined)?.trim();
         if (text) {
+          this.ocRunSawOutput = true;
           this.setState("speaking");
           this.opts.onAssistantText(text);
         }
@@ -1141,6 +1326,7 @@ export class AgentRunner {
       }
       case "tool_use":
       case "tool_call": {
+        this.ocRunSawOutput = true;
         const toolName = event.part?.tool ?? event.part?.name ?? "";
         const input = event.part?.state?.input ?? event.part?.input ?? {};
         this.opts.onToolUse(toolName, input);
@@ -1151,6 +1337,10 @@ export class AgentRunner {
         this.setState("thinking");
         break;
       case "step_finish": {
+        // NÃO marca ocRunSawOutput aqui: um turno que só emite usage/step_finish
+        // (sem text/tool — ex.: reasoning model cujo text não serializa pro
+        // stdout) NÃO é resposta visível. Marcar aqui mascarava o mudo (sucesso
+        // falso → sem retry, sem erro). Só text/tool_use/tool_call contam.
         const tokens = event.part?.tokens;
         if (tokens) {
           const delta: AgentUsage = {
@@ -1183,7 +1373,7 @@ export class AgentRunner {
       this.ocFirstTurn = false;
       const summary = this.ocPendingSummary ? `\n\n# Previous conversation summary\n${this.ocPendingSummary}` : "";
       this.ocPendingSummary = undefined;
-      message = `${SYSTEM_PROMPT_HEADER}\n\n# Your role\n${this.info.role}\n\n${this.info.systemPrompt}\n\n# Workspace\n${this.workspaceInfo()}${summary}\n\n---\n\n${content}`;
+      message = `${buildSystemPromptHeader(this.opts.features)}\n\n# Your role\n${this.info.role}\n\n${this.info.systemPrompt}\n\n# Workspace\n${this.workspaceInfo()}${summary}\n\n---\n\n${content}`;
     }
     this.traceCli("gemini", "argv", message);
 
@@ -1315,6 +1505,7 @@ export class AgentRunner {
       THE_DUDES_AGENT_NAME: this.info.name,
       THE_DUDES_ORCH_URL: this.opts.orchestratorUrl,
       THE_DUDES_AGENT_TOKEN_FILE: this.writeAgentTokenFile(),
+      ...this.featuresEnv(),
     };
     if (this.opts.bridgeSocketPath) env.THE_DUDES_BRIDGE_SOCKET = this.opts.bridgeSocketPath;
     out.push(
@@ -1335,7 +1526,7 @@ export class AgentRunner {
       this.ocFirstTurn = false;
       const summary = this.ocPendingSummary ? `\n\n# Previous conversation summary\n${this.ocPendingSummary}` : "";
       this.ocPendingSummary = undefined;
-      message = `${SYSTEM_PROMPT_HEADER}\n\n# Your role\n${this.info.role}\n\n${this.info.systemPrompt}\n\n# Workspace\n${this.workspaceInfo()}${summary}\n\n---\n\n${content}`;
+      message = `${buildSystemPromptHeader(this.opts.features)}\n\n# Your role\n${this.info.role}\n\n${this.info.systemPrompt}\n\n# Workspace\n${this.workspaceInfo()}${summary}\n\n---\n\n${content}`;
     } else {
       this.ocFirstTurn = false;
     }
@@ -1571,9 +1762,79 @@ export class AgentRunner {
     this.opts.onError("[ctx] context cleared — next message starts new session");
   }
 
-  async compactContext(): Promise<void> {
+  async compactContext(saveMemory = true): Promise<void> {
+    // OpenCode roda via serve HTTP. O one-shot runOneShot/resetWithSummary
+    // abaixo NÃO toca a sessão do serve → "compact não faz nada". Aqui:
+    // (1) AUTO-EXTRACT de memória (Fase 3) num FORK da sessão (não polui a
+    //     conversa real) — pede MEMORY_JSON, parseia, salva via bridge;
+    // (2) compacta a sessão real com o summarize NATIVO do serve.
+    if (this.opts.cliRunner === "opencode") {
+      if (!this.ocServerUrl || !this.ocSessionId) {
+        this.opts.onError("[ctx] compact: sessão opencode ainda não ativa — manda uma mensagem primeiro");
+        return;
+      }
+      const slash = (this.info.model ?? "").indexOf("/");
+      const providerID = slash > 0 ? (this.info.model as string).slice(0, slash) : "";
+      const modelID = slash > 0 ? (this.info.model as string).slice(slash + 1) : (this.info.model ?? "");
+      if (!providerID || !modelID) { this.opts.onError("[ctx] compact: modelo inválido"); return; }
+
+      // (1) auto-extract via fork (mesmo prompt do claude) — só se pedido
+      if (saveMemory) try {
+        const existingTitles = await this.fetchExistingMemoryTitles();
+        const already = existingTitles.length > 0
+          ? ` Do NOT repeat anything already saved (skip): ${existingTitles.map((t) => `"${t}"`).join(", ")}.`
+          : "";
+        const extractPrompt =
+          "Extract NEW durable knowledge from this conversation worth keeping permanently — every explicit decision, convention, preference, architectural choice or stable fact. Be generous." + already +
+          " Respond with ONLY one line: `MEMORY_JSON:` + a single-line JSON array, each item {\"title\":\"<short>\",\"body\":\"<full>\",\"type\":\"decision\"|\"fact\"|\"reference\"|\"preference\"} in the conversation's language. Use `MEMORY_JSON: []` if nothing. No markdown.";
+        const fork = await this.ocServeFetch(`/session/${this.ocSessionId}/fork`, "POST", {});
+        const forkId = fork?.id as string | undefined;
+        if (forkId) {
+          try {
+            const resp = await this.ocServeFetch(`/session/${forkId}/message`, "POST",
+              { model: { providerID, modelID }, parts: [{ type: "text", text: extractPrompt }] }, 120_000);
+            const text = (Array.isArray(resp?.parts) ? resp.parts : [])
+              .filter((p: any) => p?.type === "text").map((p: any) => p.text ?? "").join("\n");
+            this.opts.onError(`[ctx] fork-extract respLen=${text.length} marker=${/MEMORY_JSON/.test(text)}`);
+            const { items } = this.parseAndStripMemory(text);
+            void this.saveExtractedMemory(items);
+            this.opts.onError(`[ctx] memória: ${items.length} fato(s) extraído(s) na compactação`);
+          } finally {
+            void this.ocServeFetch(`/session/${forkId}`, "DELETE").catch(() => {});
+          }
+        }
+      } catch (e) {
+        this.opts.onError(`[ctx] auto-extract falhou: ${(e as Error).message}`);
+      }
+
+      // (2) compacta a sessão real
+      try {
+        await this.ocServeFetch(`/session/${this.ocSessionId}/summarize`, "POST", { providerID, modelID }, 120_000);
+        this.opts.onError(`[ctx] contexto compactado${saveMemory ? " + memória salva" : " (sem salvar memória)"}`);
+      } catch (e) {
+        this.opts.onError(`[ctx] compact falhou: ${(e as Error).message}`);
+      }
+      return;
+    }
+
+    // Phase 3 — auto-extract durable memory on compaction. The summary
+    // one-shot already has the full plaintext context (via --resume), so
+    // we ask it to ALSO emit a MEMORY_JSON line. The daemon parses it,
+    // strips it from the continuation summary, and writes each entry via
+    // the bridge relay (which E2EE-encrypts title/body). One LLM call,
+    // no extra cost.
+    // Dedup da auto-extração: passa os títulos já em memória pro modelo
+    // não re-emitir fatos existentes (rewordings escapam do hash exato).
+    const existingTitles = await this.fetchExistingMemoryTitles();
+    const alreadyBlock = existingTitles.length > 0
+      ? ` Do NOT repeat anything already saved in memory (skip these): ${existingTitles.map((t) => `"${t}"`).join(", ")}.`
+      : "";
     const summaryPrompt =
-      "Summarize this conversation concisely. Focus on decisions made, tasks in progress, key findings, and context needed to continue. Be brief.";
+      "Two tasks. Write BOTH the summary and the memory entries in the SAME LANGUAGE as the conversation (e.g. if the conversation is in Portuguese, respond in Portuguese). Only the `MEMORY_JSON:` marker and JSON keys stay in English.\n\n" +
+      "TASK 1 — Summarize this conversation concisely (decisions made, tasks in progress, key findings, context needed to continue). Be brief.\n\n" +
+      "TASK 2 — Extract NEW durable knowledge worth keeping permanently. Include EVERY explicit decision, convention, preference, architectural choice, or stable fact stated by the user or any agent — even a single one matters. Be generous: when in doubt, include it." + alreadyBlock + " Output it on a NEW FINAL LINE as exactly `MEMORY_JSON:` followed by a single-line JSON array. Each element MUST be {\"title\": \"<short>\", \"body\": \"<the fact in full>\", \"type\": \"decision\"|\"fact\"|\"reference\"|\"preference\"} where title/body are in the conversation's language. " +
+      "Example: MEMORY_JSON: [{\"title\":\"DB engine\",\"body\":\"The project uses PostgreSQL partitioned by month\",\"type\":\"decision\"}]. " +
+      "Output `MEMORY_JSON: []` ONLY if there is no NEW durable info. No markdown, no code fences, single line.";
 
     if (this.opts.cliRunner === "claude") {
       const oldSession = this.opts.resumeSessionId ?? this.info.sessionId;
@@ -1586,14 +1847,137 @@ export class AgentRunner {
       this.info.sessionId = undefined;
       this.startClaude();
       if (summary) {
+        const { clean, items } = this.parseAndStripMemory(summary);
+        if (saveMemory) void this.saveExtractedMemory(items);
         await new Promise((r) => setTimeout(r, 600));
-        this.pushUserMessage(`# Previous conversation summary\n${summary}\n\n---\n\nContinue from here.`);
+        this.pushUserMessage(`# Previous conversation summary\n${clean}\n\n---\n\nContinue from here.`);
       }
       return;
     }
 
+    // codex/gemini: one-shot que resume a sessão (codex exec resume / gemini
+    // --resume latest) e parseia MEMORY_JSON. Diag de tamanho pra ver se o
+    // one-shot retornou texto (vazio = resume falhou ou reasoning model não
+    // serializou o agent_message).
     const summary = await this.runOneShot(summaryPrompt);
-    this.resetWithSummary(summary || undefined);
+    this.opts.onError(`[compact] ${this.opts.cliRunner} summary length=${(summary || "").length}`);
+    const { clean, items } = this.parseAndStripMemory(summary || "");
+    if (saveMemory) void this.saveExtractedMemory(items);
+    if (clean) {
+      this.resetWithSummary(clean);
+      this.opts.onError(`[ctx] contexto compactado${saveMemory ? ` (${items.length} memória(s) salvas)` : " (sem salvar memória)"}`);
+    } else {
+      this.opts.onError(`[ctx] compact: one-shot ${this.opts.cliRunner} sem resumo — sessão não compactada (resume/parsing). Mande uma mensagem e tente de novo.`);
+    }
+  }
+
+  /** Extrai o bloco `MEMORY_JSON: [...]` do output do summary one-shot,
+   *  retorna o summary limpo (sem o bloco) + os itens parseados. Tolerante
+   *  a markdown/prefixos e a JSON malformado (retorna [] nesse caso). */
+  private parseAndStripMemory(summary: string): { clean: string; items: Array<{ title: string; body: string; type: string }> } {
+    const m = summary.match(/^[ \t>*-]*MEMORY_JSON:\s*(\[[\s\S]*?\])\s*$/m);
+    if (!m) return { clean: summary.trim(), items: [] };
+    let items: Array<{ title: string; body: string; type: string }> = [];
+    try {
+      const arr = JSON.parse(m[1]);
+      if (Array.isArray(arr)) {
+        const allowed = new Set(["fact", "decision", "reference", "preference", "task_state"]);
+        // Tolerante a variações de schema do modelo: aceita item como
+        // objeto (várias keys alternativas) ou string solta.
+        const pick = (o: any, keys: string[]): string => {
+          for (const k of keys) if (typeof o?.[k] === "string" && o[k].trim()) return o[k];
+          return "";
+        };
+        items = arr
+          .map((x) => {
+            if (typeof x === "string") {
+              const s = x.trim();
+              return { title: s.slice(0, 80), body: s, type: "fact" };
+            }
+            const title = pick(x, ["title", "name", "heading", "summary"]);
+            const body = pick(x, ["body", "content", "detail", "details", "text", "value", "description"]) || title;
+            const rawType = typeof x?.type === "string" ? x.type : (typeof x?.kind === "string" ? x.kind : "fact");
+            return { title: (title || body).slice(0, 200), body: body.slice(0, 4000), type: allowed.has(rawType) ? rawType : "fact" };
+          })
+          .filter((it) => it.title && it.body)
+          .slice(0, 5);
+      }
+    } catch { /* malformed — skip extraction, keep summary */ }
+    const clean = summary.replace(m[0], "").trim();
+    return { clean, items };
+  }
+
+  /** Grava as memórias auto-extraídas via relay socket — o relay cifra
+   *  title/body com a project key (server cego). Sem relay socket, pula
+   *  pra não mandar plaintext ao server (E2EE fail-safe). */
+  private async saveExtractedMemory(items: Array<{ title: string; body: string; type: string }>): Promise<void> {
+    this.opts.onError(`[compact] memory extracted=${items.length}`);
+    if (items.length === 0) return;
+    const socket = this.opts.bridgeSocketPath;
+    if (!socket) {
+      this.opts.onError(`[compact] ${items.length} memory item(s) skipped — no bridge relay (would bypass E2EE)`);
+      return;
+    }
+    let saved = 0;
+    for (const it of items) {
+      try {
+        await this.postBridgeJson(socket, "memory_add", { title: it.title, body: it.body, type: it.type, scope: "project" });
+        saved++;
+      } catch (e) {
+        this.opts.onError(`[compact] memory save failed: ${(e as Error).message}`);
+      }
+    }
+    if (saved > 0) this.opts.onError(`[compact] auto-saved ${saved} memory entry(ies)`);
+  }
+
+  /** Títulos das memórias já existentes (project + camada agent), via relay
+   *  socket (decriptados no inbound). Usado pra dedup da auto-extração. */
+  private async fetchExistingMemoryTitles(): Promise<string[]> {
+    const socket = this.opts.bridgeSocketPath;
+    if (!socket) return [];
+    try {
+      const r = await this.postBridgeJson(socket, "memory_list", {});
+      const mems = Array.isArray(r?.memories) ? r.memories : [];
+      return mems
+        .map((m: any) => (typeof m.title === "string" ? m.title.trim() : ""))
+        .filter(Boolean)
+        .slice(0, 40);
+    } catch {
+      return [];
+    }
+  }
+
+  private postBridgeJson(socketPath: string, route: string, body: unknown): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const data = JSON.stringify(body ?? {});
+      const req = http.request(
+        {
+          socketPath,
+          method: "POST",
+          path: `/api/bridge/${this.info.id}/${route}`,
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${this.opts.agentToken}`,
+            "Content-Length": Buffer.byteLength(data),
+          },
+          timeout: 15000,
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (c: Buffer) => chunks.push(c));
+          res.on("end", () => {
+            if (res.statusCode && res.statusCode < 300) {
+              try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}")); }
+              catch { resolve({}); }
+            } else reject(new Error(`HTTP ${res.statusCode}`));
+          });
+        }
+      );
+      req.on("error", reject);
+      req.on("timeout", () => req.destroy(new Error("timeout")));
+      req.write(data);
+      req.end();
+    });
   }
 
   private async killClaudeForRestart(): Promise<void> {
@@ -1643,6 +2027,10 @@ export class AgentRunner {
   private emitExit(code: number | null) {
     if (this.exited) return;
     this.exited = true;
+    // Remove o token-file plaintext + tmpdir no fim de vida — sem isso o token
+    // (válido até o server reiniciar, que re-arma todos) ficava em /tmp pra
+    // sempre, colhível por qualquer processo same-uid futuro (#11/rodada 3).
+    this.cleanupAgentTmpDir();
     this.opts.onExit(code);
   }
 

@@ -25,9 +25,9 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
     "@sentry/node": "^10.52.0",
+    "undici": "^6.21.0",
     "ws": "^8.18.0",
-    "zod": "^3.23.8",
-    "undici": "^6.21.0"
+    "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/node": "^22.7.4",

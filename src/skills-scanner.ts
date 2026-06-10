@@ -172,6 +172,11 @@ async function scanSource(spec: SourceSpec): Promise<SkillDefinition[]> {
     const skillMd = path.join(folder, "SKILL.md");
     let raw: string;
     try {
+      // Rejeita SKILL.md que seja symlink — o realpath de isSafeChild só valida
+      // a PASTA; um SKILL.md -> /etc/passwd seria lido e injetado no system
+      // prompt (exfil de arquivo arbitrário do host). lstat não segue o link.
+      const lst = await fs.lstat(skillMd);
+      if (lst.isSymbolicLink()) continue;
       raw = await fs.readFile(skillMd, "utf8");
     } catch {
       continue;
@@ -187,7 +192,10 @@ async function scanSource(spec: SourceSpec): Promise<SkillDefinition[]> {
     // com mesmo nome canônico vindas de fontes diferentes.
     let installedFrom: { source: string; slug: string; installedAt?: string } | undefined;
     try {
-      const meta = await fs.readFile(path.join(folder, ".installed-from.json"), "utf8");
+      const metaPath = path.join(folder, ".installed-from.json");
+      const lst = await fs.lstat(metaPath);
+      if (lst.isSymbolicLink()) throw new Error("symlink");
+      const meta = await fs.readFile(metaPath, "utf8");
       const j = JSON.parse(meta);
       if (j && typeof j.source === "string" && typeof j.slug === "string") {
         installedFrom = { source: j.source, slug: j.slug, installedAt: j.installedAt };

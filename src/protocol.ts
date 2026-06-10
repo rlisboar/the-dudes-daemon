@@ -86,6 +86,43 @@ export interface AgentSpawn {
    * por enquanto (codex/gemini/opencode leem direto do filesystem do CLI).
    */
   extraMcpServers?: Record<string, MCPServerConfig>;
+  /**
+   * Hot-set of project-memory entries injected into the agent system
+   * prompt at (re)start. titleCipher/bodyCipher are E2EE blobs; the
+   * daemon decrypts each (it holds the project key) and appends a
+   * "## Project Memory" block to the already-decrypted systemPrompt.
+   * Re-sent on every spawn so durable knowledge survives model/runner
+   * switches and context compaction. Server cannot pre-concatenate this
+   * into systemPrompt because that prompt is itself cipher at rest.
+   */
+  memory?: MemoryInjectionEntry[];
+  /**
+   * Blocos de contexto ligados neste projeto. Cada flag off remove DUAS
+   * pontas: a seção correspondente do system prompt E o grupo de tools no
+   * mcp-bridge (via env THE_DUDES_FEATURES), pra não ocupar contexto à toa.
+   * Ausente = tudo ligado (compat com server/daemon antigos).
+   */
+  features?: ContextFeatures;
+}
+
+/** Grupos de contexto gateáveis por projeto. Fase 1 só desliga memory e
+ *  filelock ponta-a-ponta; teammates/tasks vêm sempre true até a Fase 2
+ *  reescrever a prosa emaranhada do header. */
+export interface ContextFeatures {
+  teammates?: boolean;
+  tasks?: boolean;
+  filelock?: boolean;
+  memory?: boolean;
+  goals?: boolean;
+  credentials?: boolean;
+  webhooks?: boolean;
+}
+
+export interface MemoryInjectionEntry {
+  type: string;
+  scope: string;
+  titleCipher: string;
+  bodyCipher: string;
 }
 
 export interface MCPServerConfig {
@@ -129,7 +166,7 @@ export interface AgentSend {
   images?: ImageAttachment[];
 }
 export interface AgentClear { type: "agent:clear"; agentId: string }
-export interface AgentCompact { type: "agent:compact"; agentId: string }
+export interface AgentCompact { type: "agent:compact"; agentId: string; saveMemory?: boolean }
 export interface AutoApproveSet { type: "auto_approve:set"; value: boolean }
 export interface WorkspaceSet {
   type: "workspace:set";
@@ -594,7 +631,30 @@ export interface MCPDeleteResult {
   error?: string;
 }
 
+/** GitLab API proxy — o server pede e o DAEMON faz o request HTTP (a partir da
+ *  rede do daemon). Necessário quando o GitLab é interno/on-prem, alcançável só
+ *  da infra do usuário e não do server público. */
+export interface GitlabApiRequest {
+  type: "gitlab:request";
+  correlationId: string;
+  method: string;
+  url: string;
+  token: string;
+  body?: string;
+}
+export interface GitlabApiResult {
+  type: "gitlab:request_result";
+  correlationId: string;
+  ok: boolean;
+  status: number;
+  statusText?: string;
+  text?: string;
+  /** Falha de transporte (DNS/conexão/timeout) — distinto de um HTTP !ok. */
+  error?: string;
+}
+
 export type FromDaemon =
+  | GitlabApiResult
   | DaemonHello | DaemonPing | DaemonChallengeResponse
   | AgentStateEv | AgentRunningEv | AgentSessionEv | AgentTokenResyncEv | AgentUsageDeltaEv
   | AgentTextEv | AgentToolUseEv | AgentThinkingEv | AgentErrorEv | AgentExitEv
@@ -625,6 +685,7 @@ export type FromOrch =
   | GitSwitchBranchRequest | GitCreateBranchRequest
   | GitShowRequest | GitFileLogRequest | GitGraphRequest
   | GitBlameRequest | GitStashListRequest | GitStashRequest | GitStashPopRequest
+  | GitlabApiRequest
   | SummarizeRequest
   | ProjectKeyForDaemon
   | WebhookDispatchRequest

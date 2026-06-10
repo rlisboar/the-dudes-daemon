@@ -1,4 +1,5 @@
 import http from "node:http";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import os from "node:os";
 import { chmodSync, chownSync, existsSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
@@ -155,6 +156,36 @@ export class BridgeRelay {
           } catch { /* not JSON or not the shape we expect; leave alone */ }
         }
       }
+      // E2EE: memory_add carrega title/body em plaintext do agente. Cifra
+      // com a project key antes de subir, igual ao `send` — server guarda
+      // só ciphertext (titleCipher/bodyCipher). Mantém a memória de agente
+      // no mesmo formato cipher que a memória criada pelo user na UI.
+      const mm = parsed.pathname.match(/^\/api\/bridge\/([^/]+)\/memory_add$/);
+      if (mm) {
+        const projectId = this.agentProjectLookup(mm[1]);
+        if (projectId) {
+          try {
+            const json = JSON.parse(body.toString("utf8"));
+            // content_hash pra dedup exato (server cego). Normalização DEVE
+            // casar com web (`e2ee.ts memoryContentHash`): trim+lowercase+
+            // colapsa whitespace, title\nbody, sha-256 hex. Calculado ANTES
+            // de cifrar (precisa do plaintext).
+            if (json && typeof json.title === "string" && typeof json.body === "string" && !json.contentHash) {
+              const norm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
+              json.contentHash = createHash("sha256").update(`${norm(json.title)}\n${norm(json.body)}`).digest("hex");
+            }
+            if (json && typeof json.title === "string" && !isE2eEncrypted(json.title)) {
+              const enc = encryptForProject(json.title, projectId);
+              if (enc) { json.titleCipher = enc; delete json.title; }
+            }
+            if (json && typeof json.body === "string" && !isE2eEncrypted(json.body)) {
+              const enc = encryptForProject(json.body, projectId);
+              if (enc) { json.bodyCipher = enc; delete json.body; }
+            }
+            body = Buffer.from(JSON.stringify(json), "utf8");
+          } catch { /* leave alone */ }
+        }
+      }
     }
     // Strip headers that don't make sense to forward (host/connection/etc).
     const fwd: Record<string, string> = {};
@@ -175,7 +206,7 @@ export class BridgeRelay {
       // plaintext. Server stores ciphertext per project; daemon holds the
       // project key and rewrites the response body in place before handing
       // it to the MCP bridge child.
-      const m2 = parsed.pathname.match(/^\/api\/bridge\/([^/]+)\/(tasks_list|tasks_comment_list|goals_list)$/);
+      const m2 = parsed.pathname.match(/^\/api\/bridge\/([^/]+)\/(tasks_list|tasks_comment_list|goals_list|memory_list)$/);
       if (m2 && this.agentProjectLookup && upstream.status === 200) {
         const agentId = m2[1];
         const op = m2[2];
@@ -200,6 +231,13 @@ export class BridgeRelay {
               for (const g of json.goals) {
                 if (g.title) g.title = dec(g.title);
                 if (g.description) g.description = dec(g.description);
+              }
+            } else if (op === "memory_list" && Array.isArray(json.memories)) {
+              for (const e of json.memories) {
+                // entrega title/body em plaintext pro agente (a tool recall
+                // filtra query/substring sobre isto). Mantém os campos cipher.
+                if (e.titleCipher) e.title = dec(e.titleCipher);
+                if (e.bodyCipher) e.body = dec(e.bodyCipher);
               }
             }
             buf = Buffer.from(JSON.stringify(json), "utf8");

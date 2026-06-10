@@ -166,31 +166,63 @@ export function repoCwd(basePath: string, repoName: string): string {
   return resolved;
 }
 
-export function isAllowedGitUrl(gitUrl: string): { ok: true } | { ok: false; reason: string } {
+/** True se o IP literal cai em range privado/loopback/link-local/CGNAT
+ *  (IPv4, IPv4-mapped e IPv6). Base do bloqueio anti-SSRF. */
+function ipInPrivateRange(ipRaw: string): boolean {
+  const s = ipRaw.toLowerCase().replace(/^\[|\]$/g, "");
+  const mapped = s.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+  const v4 = mapped ? mapped[1] : (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(s) ? s : null);
+  if (v4) {
+    const o = v4.split(".").map((x) => Number(x));
+    if (o.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return true; // malformado → bloqueia
+    if (o[0] === 0 || o[0] === 127 || o[0] === 10) return true;
+    if (o[0] === 169 && o[1] === 254) return true;            // link-local / metadata
+    if (o[0] === 172 && o[1] >= 16 && o[1] <= 31) return true; // 172.16/12
+    if (o[0] === 192 && o[1] === 168) return true;            // 192.168/16
+    if (o[0] === 100 && o[1] >= 64 && o[1] <= 127) return true; // CGNAT 100.64/10
+    return false;
+  }
+  if (s === "::1" || s === "::" || s === "0:0:0:0:0:0:0:1") return true;
+  if (s.startsWith("fe80:")) return true; // link-local
+  if (/^f[cd][0-9a-f]{2}:/.test(s) || /^f[cd]$/.test(s.slice(0, 2))) return true; // ULA fc00::/7
+  return false;
+}
+
+/** Resolve o host (DNS) e bloqueia se QUALQUER IP resolvido for privado —
+ *  cobre hostname→IP-privado e rebinding. Literal IP é checado direto.
+ *  Fail-closed: não-resolve → bloqueia. */
+async function hostIsPrivate(hostRaw: string): Promise<boolean> {
+  const h = hostRaw.toLowerCase().replace(/^\[|\]$/g, "");
+  if (!h) return true;
+  if (h === "localhost" || h.endsWith(".localhost") || h.endsWith(".local") || h.endsWith(".internal")) return true;
+  // IP literal (v4/v6)?
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h) || h.includes(":")) return ipInPrivateRange(h);
+  // hostname → resolve TODOS os endereços e checa cada um.
+  try {
+    const { lookup } = await import("node:dns/promises");
+    const addrs = await lookup(h, { all: true });
+    if (addrs.length === 0) return true;
+    return addrs.some((a) => ipInPrivateRange(a.address));
+  } catch {
+    return true; // não resolve → fail-closed
+  }
+}
+
+export async function isAllowedGitUrl(gitUrl: string): Promise<{ ok: true } | { ok: false; reason: string }> {
   if (!gitUrl || typeof gitUrl !== "string") return { ok: false, reason: "git url vazia" };
-  // Allowed forms: https://…, http://… (warn-only), ssh://…, git://…, git@host:path
-  const sshShort = /^[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+:.+$/;
-  if (sshShort.test(gitUrl)) return { ok: true };
+  // Allowed forms: https://…, http://…, ssh://…, git://…, git@host:path
+  // scp-like: ANTES retornava ok sem checar host (bypass total do anti-SSRF — MED-4).
+  const scp = /^[a-zA-Z0-9._-]+@([a-zA-Z0-9.-]+):.+$/.exec(gitUrl);
+  if (scp) {
+    if (await hostIsPrivate(scp[1])) return { ok: false, reason: `host privado bloqueado: ${scp[1]}` };
+    return { ok: true };
+  }
   let u: URL;
   try { u = new URL(gitUrl); } catch { return { ok: false, reason: "URL inválida" }; }
   const allowed = ["https:", "http:", "ssh:", "git:"];
   if (!allowed.includes(u.protocol)) return { ok: false, reason: `protocolo não permitido: ${u.protocol}` };
-  // Block private/loopback hosts to prevent SSRF / local-file inclusion.
-  const host = u.hostname.toLowerCase();
-  const blocked = [
-    /^localhost$/,
-    /^127\./,
-    /^10\./,
-    /^192\.168\./,
-    /^172\.(1[6-9]|2\d|3[01])\./,
-    /^169\.254\./,
-    /^::1$/i,
-    /^fe80:/i,
-    /^0\./,
-  ];
-  if (blocked.some((re) => re.test(host))) {
-    return { ok: false, reason: `host privado bloqueado: ${host}` };
-  }
+  // Bloqueia host privado/loopback/metadata — agora com DNS resolve + IPv6 (MED-3).
+  if (await hostIsPrivate(u.hostname)) return { ok: false, reason: `host privado bloqueado: ${u.hostname}` };
   return { ok: true };
 }
 
@@ -288,7 +320,7 @@ export interface CloneResult {
 }
 
 export async function cloneRepoIfMissing(basePath: string, repo: Repo, drop: DropTarget | null = null): Promise<CloneResult> {
-  const urlCheck = isAllowedGitUrl(repo.gitUrl);
+  const urlCheck = await isAllowedGitUrl(repo.gitUrl);
   if (!urlCheck.ok) {
     return { repoName: repo.name, ok: false, message: `git url rejeitada: ${urlCheck.reason}` };
   }

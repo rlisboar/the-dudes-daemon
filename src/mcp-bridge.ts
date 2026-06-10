@@ -105,6 +105,39 @@ async function postJSON(route: string, body: unknown): Promise<any> {
 
 const server = new McpServer({ name: "the-dudes", version: "0.1.0" });
 
+// --- Gating de contexto por projeto -------------------------------------
+// O daemon escreve THE_DUDES_FEATURES (lista CSV dos grupos ligados) no env
+// deste processo. Ausente = registra TUDO (compat com daemon antigo). Tools
+// de grupo desligado não são registradas → não ocupam contexto no agente.
+// Grupos não mapeados (goals, credential, webhooks, approve_action) são
+// sempre registrados. Monkey-patch em server.tool: gateia por NOME, sem
+// tocar nos 21 call sites abaixo.
+const _featuresRaw = process.env.THE_DUDES_FEATURES;
+const _enabledGroups = _featuresRaw === undefined
+  ? null
+  : new Set(_featuresRaw.split(",").map((s) => s.trim()).filter(Boolean));
+const TOOL_GROUP: Record<string, string> = {
+  send_message: "teammates", list_agents: "teammates",
+  list_tasks: "tasks", add_task: "tasks", update_task: "tasks",
+  lock_task: "tasks", unlock_task: "tasks",
+  add_task_comment: "tasks", list_task_comments: "tasks",
+  lock_file: "filelock", unlock_file: "filelock", list_file_locks: "filelock",
+  remember: "memory", recall: "memory", forget: "memory", pin: "memory",
+  list_goals: "goals",
+  get_credential: "credentials",
+  list_webhooks: "webhooks", send_webhook: "webhooks",
+  // approve_action permanece SEMPRE registrado (permission-prompt do claude).
+};
+const _origTool = server.tool.bind(server);
+(server as unknown as { tool: (...a: unknown[]) => unknown }).tool = (...args: unknown[]) => {
+  const name = args[0] as string;
+  const g = TOOL_GROUP[name];
+  if (g && _enabledGroups !== null && !_enabledGroups.has(g)) {
+    return undefined; // grupo desligado pra este projeto — não registra
+  }
+  return (_origTool as (...a: unknown[]) => unknown)(...args);
+};
+
 server.tool(
   "send_message",
   "Send a message to a teammate by name. Use list_agents to discover them.",
@@ -502,6 +535,84 @@ server.tool(
           },
         ],
       };
+    }
+  }
+);
+
+const MEMORY_TYPES = ["fact", "decision", "reference", "preference", "task_state"] as const;
+
+server.tool(
+  "remember",
+  "Save a durable note to the project memory. It is re-injected into your system prompt on every restart (survives model switches and context compaction) and pushed live to running agents. Keep entries short and atomic. scope 'project' is shared with all agents (default); 'agent' is private to you.",
+  {
+    title: z.string().describe("Short one-line title"),
+    body: z.string().describe("The fact/decision/reference to remember"),
+    type: z.enum(MEMORY_TYPES).optional().describe("fact (default) | decision | reference | preference | task_state"),
+    scope: z.enum(["project", "agent"]).optional().describe("project = shared (default); agent = private to you"),
+    pinned: z.boolean().optional().describe("Pin so it stays in the hot-set"),
+  },
+  async ({ title, body, type, scope, pinned }) => {
+    try {
+      const r = await postJSON("memory_add", { title, body, type, scope, pinned });
+      return { content: [{ type: "text", text: `remembered ${r.memory?.id ?? ""} [${r.memory?.type ?? type ?? "fact"}/${r.memory?.scope ?? scope ?? "project"}]` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  "recall",
+  "Search the project memory (shared + your private). Use at the start of a task to load durable context. Optional query does a substring match over title/body; optional type filters by kind.",
+  {
+    query: z.string().optional().describe("Substring to match in title/body"),
+    type: z.enum(MEMORY_TYPES).optional(),
+  },
+  async ({ query, type }) => {
+    try {
+      const r = await postJSON("memory_list", { type });
+      let entries = (r.memories ?? []) as Array<{ id: string; type: string; scope: string; agentId?: string | null; pinned?: boolean; title?: string; body?: string }>;
+      if (query) {
+        const q = query.toLowerCase();
+        entries = entries.filter((e) => `${e.title ?? ""}\n${e.body ?? ""}`.toLowerCase().includes(q));
+      }
+      if (entries.length === 0) return { content: [{ type: "text", text: "(no matching memory)" }] };
+      const text = entries
+        .map((e) => `- ${e.id} [${e.type}/${e.scope}]${e.pinned ? " 📌" : ""} ${e.title ?? "🔒"}\n    ${(e.body ?? "").replace(/\n/g, "\n    ")}`)
+        .join("\n");
+      return { content: [{ type: "text", text }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  "forget",
+  "Delete a memory entry. You can only forget entries you created (or your own private ones) — user-curated and other agents' entries are protected.",
+  { id: z.string().describe("Memory id (mem_xxxx)") },
+  async ({ id }) => {
+    try {
+      const r = await postJSON("memory_remove", { id });
+      if (r.ok) return { content: [{ type: "text", text: `forgot ${id}` }] };
+      return { content: [{ type: "text", text: r.error ?? `could not forget ${id}` }], isError: true };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  "pin",
+  "Pin or unpin a memory entry. Pinned entries are prioritized in the hot-set injected into agent system prompts.",
+  { id: z.string().describe("Memory id (mem_xxxx)"), pinned: z.boolean().optional().describe("true to pin (default), false to unpin") },
+  async ({ id, pinned }) => {
+    try {
+      const r = await postJSON("memory_pin", { id, pinned: pinned !== false });
+      if (r.memory) return { content: [{ type: "text", text: `${r.memory.pinned ? "pinned" : "unpinned"} ${id}` }] };
+      return { content: [{ type: "text", text: r.error ?? `memory ${id} not found` }], isError: true };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
     }
   }
 );

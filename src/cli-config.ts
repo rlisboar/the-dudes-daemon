@@ -98,6 +98,18 @@ function resolveOne(label: CliRunner, override?: string): ResolvedCliCommand {
   };
 }
 
+/** Resolve python3 a um path ABSOLUTO (o wrapper PTY do opencode era
+ *  spawnado por nome cru "python3", resolvido do PATH no exec — PATH hijack
+ *  rodava um python3 malicioso como o usuário dropado). Tenta paths fixos
+ *  comuns primeiro, depois o which endurecido. null se não achar (caller
+ *  deve falhar explícito em vez de cair no nome cru). */
+export function resolvePython3(): string | null {
+  for (const p of ["/usr/bin/python3", "/usr/local/bin/python3", "/opt/homebrew/bin/python3", "/bin/python3"]) {
+    if (isExecutable(p)) return p;
+  }
+  return detectOnPath("python3");
+}
+
 function detectOnPath(command: string): string | null {
   // Usa path absoluto /usr/bin/which (com fallback) e timeout pra evitar
   // PATH hijack (user com diretório attacker-writable antes em PATH).

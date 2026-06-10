@@ -245,12 +245,15 @@ export async function dispatchWebhook(args: {
     // server-side. Aqui replicamos pra fechar SSRF via daemon pivot.
     // safeFetch revalida cada redirect — fetch default segue 30x e um
     // 302 → http://169.254.169.254/ furava o guard inicial.
+    // maxRedirects:0 — safeFetch reenvia os MESMOS headers em cada hop, então
+    // seguir um 30x cross-origin vazaria a assinatura HMAC + headers de auth
+    // custom pro host de destino. Webhook não segue redirect.
     const { safeFetch } = await import("./ssrf-guard.js");
     const ctrl = new AbortController();
     const tm = setTimeout(() => ctrl.abort(), 10_000);
     let resp: Response;
     try {
-      resp = await safeFetch(args.url, { method: "POST", headers, body: payload, signal: ctrl.signal });
+      resp = await safeFetch(args.url, { method: "POST", headers, body: payload, signal: ctrl.signal }, { maxRedirects: 0 });
     } catch (e) {
       clearTimeout(tm);
       return { status: null, body: "", error: `webhook bloqueado: ${(e as Error).message}` };

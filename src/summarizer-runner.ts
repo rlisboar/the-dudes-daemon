@@ -15,6 +15,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ResolvedCliCommands } from "./cli-config.js";
+import { resolvePython3 } from "./cli-config.js";
 import { extractOneShotText } from "./agent-runner.js";
 import { spawnDropped, type DropTarget } from "./privileges.js";
 import type { CliRunner } from "./types.js";
@@ -150,7 +151,9 @@ export async function runSummarizer(args: SummarizerArgs): Promise<SummarizerRes
     const ocArgs = ["run", "--format", "json"];
     if (args.model) ocArgs.push("--model", args.model);
     ocArgs.push(fullPrompt);
-    cmd = "python3";
+    const py = resolvePython3();
+    if (!py) return { ok: false, error: "python3 não encontrado em path absoluto (wrapper PTY do opencode)" };
+    cmd = py;
     argv = ["-c", "import pty,sys; pty.spawn(sys.argv[1:])", cliCommand, ...ocArgs];
   } else {
     return { ok: false, error: `runner inválido: ${args.runner}` };

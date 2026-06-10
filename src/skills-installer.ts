@@ -196,9 +196,27 @@ export async function installSkillFromClawHub(input: InstallInput): Promise<Inst
   if (!res.ok || !res.body) throw new Error(`download HTTP ${res.status}`);
   const declaredLen = Number(res.headers.get("content-length") ?? 0);
   if (declaredLen && declaredLen > maxBytes) throw new Error(`artifact too large: ${declaredLen} bytes`);
-  const arrBuf = await res.arrayBuffer();
-  if (arrBuf.byteLength > maxBytes) throw new Error(`artifact too large: ${arrBuf.byteLength} bytes`);
-  const zip = Buffer.from(arrBuf);
+  // Lê o corpo por STREAM com teto — arrayBuffer() carregaria o corpo inteiro
+  // na RAM antes do check (host sem/mentindo Content-Length derrubava o daemon
+  // por OOM com vários GB antes da linha de validação rodar).
+  const reader = (res.body as any).getReader?.();
+  let zip: Buffer;
+  if (reader) {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.length;
+      if (total > maxBytes) { try { await reader.cancel(); } catch {} throw new Error(`artifact too large: > ${maxBytes} bytes`); }
+      chunks.push(Buffer.from(value));
+    }
+    zip = Buffer.concat(chunks);
+  } else {
+    const arrBuf = await res.arrayBuffer();
+    if (arrBuf.byteLength > maxBytes) throw new Error(`artifact too large: ${arrBuf.byteLength} bytes`);
+    zip = Buffer.from(arrBuf);
+  }
 
   // 2) parse central directory + validate manifest exists
   const entries = parseCentralDirectory(zip);

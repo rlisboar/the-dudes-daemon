@@ -83,21 +83,34 @@ export class AgentHost {
   async spawn(msg: AgentSpawn): Promise<void> {
     const existing = this.entries.get(msg.agent.id);
     if (existing?.runner) {
-      // Already running locally — re-broadcast state so the orchestrator
-      // can reconcile after a WS reconnect (server had marked the agent
-      // offline via daemonWentOffline). Without this, server stays in
-      // running=false even though the CLI proc is alive.
-      // Re-anuncia o token: server perdeu o Map agentTokens (in-memory)
-      // após restart e o processo mcp-bridge segue rodando com o token
-      // antigo — sem isto, /api/bridge devolve 401 nas próximas chamadas.
-      if (existing.agentToken) {
-        this.send({ type: "agent:token_resync", agentId: msg.agent.id, token: existing.agentToken });
+      // Distingue RECONNECT (WS reconectou; mesma config) de RECONFIG
+      // (troca de runner/model — server parou e re-spawnou). No reconfig,
+      // o spawn pode chegar ANTES do runner antigo terminar de sair (race
+      // com o fallback de 8s do server). Sem este check, o re-broadcast
+      // abaixo re-attacha no runner VELHO e o novo runner nunca sobe —
+      // agente fica mudo até reiniciar. Detecta a mudança e derruba o
+      // velho, caindo pra criação do novo abaixo.
+      const reconfig =
+        existing.info?.cliRunner !== msg.agent.cliRunner ||
+        existing.info?.model !== msg.agent.model;
+      if (!reconfig) {
+        // Reconnect puro — re-anuncia estado pro orchestrator reconciliar.
+        // Re-anuncia o token: server perdeu o Map agentTokens (in-memory)
+        // após restart e o mcp-bridge segue com o token antigo — sem isto
+        // /api/bridge devolve 401 nas próximas chamadas.
+        if (existing.agentToken) {
+          this.send({ type: "agent:token_resync", agentId: msg.agent.id, token: existing.agentToken });
+        }
+        this.send({ type: "agent:running", agentId: msg.agent.id, running: true });
+        const sid = existing.info?.sessionId ?? existing.runner.info?.sessionId;
+        if (sid) this.send({ type: "agent:session", agentId: msg.agent.id, sessionId: sid });
+        this.send({ type: "agent:state", agentId: msg.agent.id, state: existing.runner.currentRuntimeState() });
+        return;
       }
-      this.send({ type: "agent:running", agentId: msg.agent.id, running: true });
-      const sid = existing.info?.sessionId ?? existing.runner.info?.sessionId;
-      if (sid) this.send({ type: "agent:session", agentId: msg.agent.id, sessionId: sid });
-      this.send({ type: "agent:state", agentId: msg.agent.id, state: existing.runner.currentRuntimeState() });
-      return;
+      // Reconfig: derruba o runner antigo antes de criar o novo. Seu
+      // onExit tardio não vai zerar o novo (guard `e.runner === thisRunner`).
+      try { existing.runner.stop(); } catch { /* já morto */ }
+      existing.runner = null;
     }
 
     // Resolve cwd:
@@ -307,6 +320,10 @@ export class AgentHost {
       else if (cliRunner === "codex" && !isOcSession) resumeSessionId = sid;
       else if (cliRunner === "gemini") resumeSessionId = sid;
     }
+    // Identidade do runner deste spawn. Usada no onExit pra só zerar
+    // `e.runner` se ainda for ESTE runner — senão o exit tardio de um
+    // runner antigo (troca de runner) zeraria o runner novo.
+    let thisRunner: AgentRunner | null = null;
     const opts: AgentRunnerOptions = {
       bridgeCommand: bridge.command,
       bridgeArgs: bridge.args,
@@ -319,6 +336,7 @@ export class AgentHost {
       dropTo: this.dropTo,
       bridgeSocketPath: this.bridgeSocketPath,
       extraMcpServers: msg.extraMcpServers,
+      features: msg.features,
       cliCommands: this.cliCommands,
       verbose: this.verbose,
       verboseHuman: this.verboseHuman,
@@ -368,6 +386,13 @@ export class AgentHost {
       },
       onExit: (code) => {
         const e = this.entries.get(msg.agent.id);
+        // Se este runner já foi substituído (reconfig/troca de runner), seu
+        // exit tardio NÃO deve mexer no estado do agente — senão derruba o
+        // runner novo que acabou de subir. Só o runner ativo reporta exit.
+        if (e && e.runner !== thisRunner) {
+          breadcrumb("agent", "exit-superseded", { agentId: msg.agent.id, code, runner: cliRunner });
+          return;
+        }
         if (e) e.runner = null;
         this.send({ type: "agent:exit", agentId: msg.agent.id, code });
         this.send({ type: "agent:running", agentId: msg.agent.id, running: false });
@@ -385,6 +410,7 @@ export class AgentHost {
       },
     };
     const runner = new AgentRunner(msg.agent, opts);
+    thisRunner = runner;
     runner.start();
     this.entries.set(msg.agent.id, {
       info: msg.agent,
@@ -424,10 +450,10 @@ export class AgentHost {
     }
   }
 
-  async compact(agentId: string) {
+  async compact(agentId: string, saveMemory = true) {
     const e = this.entries.get(agentId);
     if (!e?.runner) return;
-    try { await e.runner.compactContext(); } catch (err) {
+    try { await e.runner.compactContext(saveMemory); } catch (err) {
       this.send({ type: "agent:error", agentId, message: `compact failed: ${(err as Error).message}` });
     }
   }

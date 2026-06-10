@@ -8,8 +8,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { WebSocket } from "ws";
 import { AgentHost } from "./agent-host.js";
-import { autoWorkspaceCwd, describeGitRoots, ensureWritableDir, expandBasePath, isInsideRoot, validateBasePath, validateGitHash, validateGitRef } from "./workspace.js";
-import { detectDropTarget, type DropTarget } from "./privileges.js";
+import { assertWorkspaceScoped, autoWorkspaceCwd, describeGitRoots, ensureWritableDir, expandBasePath, isInsideRoot, validateBasePath, validateGitHash, validateGitRef } from "./workspace.js";
+import { detectDropTarget, spawnDropped, type DropTarget } from "./privileges.js";
 import { BridgeRelay } from "./bridge-relay.js";
 import { defaultDaemonConfigPath, formatCliStatus, loadDaemonCliConfig, mergeCliConfig, resolveCliCommands, type DaemonCliConfig, type ResolvedCliCommands } from "./cli-config.js";
 import type { FromDaemon, FromOrch } from "./protocol.js";
@@ -161,6 +161,16 @@ class DaemonClient {
   async start() {
     process.on("SIGINT", () => this.shutdown());
     process.on("SIGTERM", () => this.shutdown());
+    // Sweep de tmpdirs órfãos de agentes (token plaintext em /tmp) — cobre
+    // crash anterior onde o cleanup do emitExit não rodou. No boot ainda não
+    // há runner ativo deste daemon, então limpar tudo em /tmp/the-dudes é
+    // seguro (dirs novos "ag-*" + legados por agentId). Ver SECURITY-TODO S-05.
+    try {
+      const parent = path.join(os.tmpdir(), "the-dudes");
+      for (const name of fs.readdirSync(parent)) {
+        try { fs.rmSync(path.join(parent, name), { recursive: true, force: true }); } catch { /* skip */ }
+      }
+    } catch { /* dir não existe ainda — ok */ }
     // Start the local Unix-socket relay so MCP bridges spawned by agents
     // (which run as the dropped user) can reach the orchestrator without
     // hitting an outbound firewall app.
@@ -342,7 +352,16 @@ class DaemonClient {
     const m = msg as { type: string; workspaceRoot?: string };
     const wsOverride = typeof m.workspaceRoot === "string" && m.workspaceRoot ? m.workspaceRoot : null;
     if (wsOverride && m.type.startsWith("git:")) {
-      this.activeWsOverride = wsOverride;
+      // Defense-in-depth: o workspaceRoot vem do server (semi-confiável). Só
+      // aceita se estiver dentro do THE_DUDES_WORKSPACE_ROOT (ou $HOME) — senão
+      // git rodaria em qualquer dir que o server mandasse (MED-8).
+      try {
+        this.enforceWorkspaceScope(expandBasePath(wsOverride));
+        this.activeWsOverride = wsOverride;
+      } catch (e) {
+        log("warn", `git workspaceRoot fora do root permitido — ignorado: ${(e as Error).message}`);
+        this.activeWsOverride = null;
+      }
     }
     try {
       await this.handleInner(msg);
@@ -392,6 +411,37 @@ class DaemonClient {
           if (dec !== null) spec.agent = { ...spec.agent, systemPrompt: dec };
           else log("warn", `agent ${spec.agent.id} systemPrompt is encrypted but project key not held — spawn will fail`);
         }
+        // Global project memory — decrypt each cipher entry and append a
+        // "## Project Memory" block to the (already decrypted) system
+        // prompt. Server can't pre-concatenate (the prompt is cipher at
+        // rest), so each title/body arrives as a separate cipher blob and
+        // we assemble here. Re-built on every spawn, so durable knowledge
+        // survives model/runner switches and context compaction.
+        if (msg.projectId && msg.memory && msg.memory.length > 0) {
+          // Budget token-aware: server manda candidatos ordenados (pinned >
+          // recente); aqui cortamos por tamanho decriptado (~2k tokens ≈
+          // 8000 chars) pra a memória não dominar o contexto. Server é cego
+          // a tokens (cipher), então o corte real é aqui.
+          const MEMORY_CHAR_BUDGET = 8000;
+          const entries: string[] = [];
+          let used = 0;
+          let dropped = 0;
+          for (const m of msg.memory) {
+            const title = isE2eEncrypted(m.titleCipher) ? decryptForProject(m.titleCipher, msg.projectId) : m.titleCipher;
+            const body = isE2eEncrypted(m.bodyCipher) ? decryptForProject(m.bodyCipher, msg.projectId) : m.bodyCipher;
+            if (title === null || body === null) continue; // sem chave — pula
+            const block = `### [${m.type}] ${title}\n${body}`;
+            if (used + block.length > MEMORY_CHAR_BUDGET && entries.length > 0) { dropped++; continue; }
+            entries.push(block);
+            used += block.length;
+          }
+          if (dropped > 0) log("info", `memory budget: ${entries.length} injected, ${dropped} dropped (over ${MEMORY_CHAR_BUDGET} chars) for ${spec.agent.id}`);
+          if (entries.length > 0) {
+            const block = `## Project Memory\n\nConhecimento durável do projeto (compartilhado + seu). Use como contexto de fundo; verifique antes de confiar em detalhes específicos.\n\n${entries.join("\n\n")}`;
+            spec.agent = { ...spec.agent, systemPrompt: `${spec.agent.systemPrompt}\n\n---\n\n${block}` };
+            log("info", `injected ${entries.length} memory entries into ${spec.agent.id} system prompt`);
+          }
+        }
         log("info", `spawn ${spec.agent.name} (${spec.agent.id}) cfg=${resolvedCwd} runner=${spec.agent.cliRunner ?? "claude"}`);
         this.host.spawn(spec).catch((e) => {
           log("error", `spawn failed: ${(e as Error).message}`);
@@ -440,7 +490,7 @@ class DaemonClient {
         this.host.clear(msg.agentId).catch(() => {});
         return;
       case "agent:compact":
-        this.host.compact(msg.agentId).catch(() => {});
+        this.host.compact(msg.agentId, msg.saveMemory !== false).catch(() => {});
         return;
       case "auto_approve:set":
         this.host.setAutoApprove(msg.value);
@@ -466,6 +516,10 @@ class DaemonClient {
         return;
       case "webhook:dispatch": {
         await this.handleWebhookDispatch(msg);
+        return;
+      }
+      case "gitlab:request": {
+        await this.handleGitlabRequest(msg);
         return;
       }
       case "skill:install": {
@@ -596,6 +650,7 @@ class DaemonClient {
       return;
     }
     try {
+      this.enforceWorkspaceScope(expandBasePath(root)); // server-supplied skills root no root permitido (MED-9)
       const { installSkillFromClawHub } = await import("./skills-installer.js");
       // GitHub repo zips (SkillsMP / AgentSkill) podem ser maiores que
       // ClawHub — sobe cap pra 50MB quando subPath foi fornecido. Source
@@ -637,6 +692,7 @@ class DaemonClient {
   private resolveSkillFile(rootPath: string | undefined, skillName: string, relPath: string): string {
     const skillsRoot = rootPath ?? null;
     if (!skillsRoot) throw new Error("workspaceSkillsRoot ausente na msg");
+    this.enforceWorkspaceScope(expandBasePath(skillsRoot)); // server-supplied root no root permitido (MED-6)
     if (!skillName || skillName.includes("/") || skillName.includes("..") || skillName.startsWith(".")) {
       throw new Error("skillName inválido");
     }
@@ -679,6 +735,7 @@ class DaemonClient {
     try {
       const skillsRoot = msg.workspaceSkillsRoot ?? null;
       if (!skillsRoot) throw new Error("workspaceSkillsRoot ausente na msg");
+      this.enforceWorkspaceScope(expandBasePath(skillsRoot)); // MED-9
       if (!msg.skillName || msg.skillName.includes("/") || msg.skillName.includes("..")) {
         throw new Error("skillName inválido");
       }
@@ -859,6 +916,68 @@ class DaemonClient {
     }
   }
 
+  /** Proxy de API do GitLab: o server manda método+url+token e o DAEMON faz o
+   *  request HTTP a partir da SUA rede. É o que torna GitLab interno/on-prem
+   *  (ex.: gitlab.eonf.ltd, só resolvível/alcançável na infra do usuário)
+   *  utilizável — o server público nunca alcança o host. Passa por safeFetch:
+   *  git/spawn são escopados ao workspace, mas um fetch tem alcance irrestrito;
+   *  sem o guard, server/admin comprometido pivotaria pra IMDS/RFC1918/loopback
+   *  da rede do membro e o PRIVATE-TOKEN vazaria em redirect cross-origin. */
+  private async handleGitlabRequest(msg: Extract<FromOrch, { type: "gitlab:request" }>) {
+    const send = (r: Partial<Extract<FromDaemon, { type: "gitlab:request_result" }>>) =>
+      this.send({ type: "gitlab:request_result", correlationId: msg.correlationId, ok: false, status: 0, ...r });
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 25_000);
+    try {
+      // safeFetch: bloqueia IP privado/metadata/loopback (checkOutboundUrl),
+      // pina o IP resolvido no socket (anti DNS-rebinding) e NÃO segue redirect
+      // (maxRedirects 0) — senão o PRIVATE-TOKEN vazaria pro host de destino do
+      // 30x (undici reenvia header custom cross-origin). Mesmo guard do
+      // webhook-dispatch/skills-installer.
+      const { safeFetch } = await import("./ssrf-guard.js");
+      const res = await safeFetch(
+        msg.url,
+        {
+          method: msg.method,
+          headers: { "PRIVATE-TOKEN": msg.token, "Content-Type": "application/json" },
+          body: msg.body,
+          signal: ctrl.signal,
+        },
+        { maxRedirects: 0 },
+      );
+      // Lê o corpo por stream com teto de 2MB — não materializa res.text()
+      // inteiro na RAM antes de cortar (alvo malicioso podia mandar GBs).
+      const CAP = 2 * 1024 * 1024;
+      let text = "";
+      const body = res.body;
+      if (body) {
+        const reader = (body as any).getReader?.();
+        if (reader) {
+          const dec = new TextDecoder();
+          let total = 0;
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            total += value.length;
+            text += dec.decode(value, { stream: true });
+            if (total >= CAP) { try { await reader.cancel(); } catch {} break; }
+          }
+          text += dec.decode();
+          if (text.length > CAP) text = text.slice(0, CAP);
+        } else {
+          const raw = await res.text();
+          text = raw.length > CAP ? raw.slice(0, CAP) : raw;
+        }
+      }
+      send({ ok: res.ok, status: res.status, statusText: res.statusText, text });
+    } catch (e) {
+      const reason = (e as Error).name === "AbortError" ? "timeout (25s)" : (e as Error).message;
+      send({ error: `${msg.method}: ${reason}` });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   private async handleWebhookDispatch(msg: Extract<FromOrch, { type: "webhook:dispatch" }>) {
     const eventType = String((msg.event as any)?.type ?? "unknown");
     log("info", `webhook:dispatch ${eventType} → ${msg.url} (${msg.format})`);
@@ -943,6 +1062,14 @@ class DaemonClient {
     }
   }
 
+  /** Enforça o scope do workspace SÓ quando THE_DUDES_WORKSPACE_ROOT está
+   *  explicitamente setado (hardening opt-in, alinhado ao controle documentado).
+   *  Sem a env, mantém o comportamento atual (não quebra workspace fora do
+   *  $HOME). Throw se `p` cair fora do root permitido. */
+  private enforceWorkspaceScope(p: string): void {
+    if (process.env.THE_DUDES_WORKSPACE_ROOT) assertWorkspaceScoped(p);
+  }
+
   private async handleFileList(correlationId: string, targetPath: string, override?: string) {
     if (!override) {
       this.send({ type: "file:list_result", correlationId, path: targetPath, entries: [], error: "workspaceRoot ausente na msg" });
@@ -951,6 +1078,7 @@ class DaemonClient {
     // ~ pode vir cru do DB. Expandir antes de comparar/resolver.
     const root = expandBasePath(override);
     try {
+      this.enforceWorkspaceScope(root); // server-supplied root tem que estar no root permitido (MED-7)
       const resolved = path.resolve(root, targetPath);
       if (!isInsideRoot(resolved, root)) {
         this.send({ type: "file:list_result", correlationId, path: targetPath, entries: [], error: "acesso negado" });
@@ -979,6 +1107,7 @@ class DaemonClient {
     }
     const root = expandBasePath(override);
     try {
+      this.enforceWorkspaceScope(root); // MED-7
       const resolved = path.resolve(root, targetPath);
       if (!isInsideRoot(resolved, root)) {
         this.send({ type: "file:read_result", correlationId, path: targetPath, error: "acesso negado" });
@@ -1007,6 +1136,7 @@ class DaemonClient {
     }
     const root = expandBasePath(override);
     try {
+      this.enforceWorkspaceScope(root); // MED-7
       const resolved = path.resolve(root, targetPath);
       if (!isInsideRoot(resolved, root)) {
         this.send({ type: "file:write_result", correlationId, path: targetPath, ok: false, error: "acesso negado" });
@@ -1058,14 +1188,26 @@ class DaemonClient {
   private gitExec(args: string[]): Promise<string> {
     if (!this.activeWsOverride) return Promise.reject(new Error("workspaceRoot ausente na msg git:*"));
     const fallback = autoWorkspaceCwd(this.activeWsOverride);
+    // Env enxuto + drop de privilégio (MED-8): um repo pode ter .git/config
+    // ou hooks; sem isto, secrets do daemon (THE_DUDES_DAEMON_TOKEN, etc.)
+    // vazam pro processo git e ele roda como root. Espelha runGitClone.
+    const env: NodeJS.ProcessEnv = {
+      PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
+      HOME: this.dropTo?.home ?? process.env.HOME ?? "/tmp",
+      USER: this.dropTo?.user ?? process.env.USER ?? "nobody",
+      LANG: process.env.LANG ?? "C.UTF-8",
+      GIT_TERMINAL_PROMPT: "0",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+    };
     return new Promise((resolve, reject) => {
-      const proc = spawn("git", args, { cwd: this.gitCwd() ?? fallback });
+      const proc = spawnDropped("git", args, { cwd: this.gitCwd() ?? fallback, stdio: ["ignore", "pipe", "pipe"], env }, this.dropTo);
       let stdout = "";
       let stderr = "";
-      proc.stdout.setEncoding("utf8");
-      proc.stdout.on("data", (c: string) => { stdout += c; });
-      proc.stderr.setEncoding("utf8");
-      proc.stderr.on("data", (c: string) => { stderr += c; });
+      proc.stdout!.setEncoding("utf8");
+      proc.stdout!.on("data", (c: string) => { stdout += c; });
+      proc.stderr!.setEncoding("utf8");
+      proc.stderr!.on("data", (c: string) => { stderr += c; });
       proc.on("close", (code) => {
         if (code !== 0) { reject(new Error(stderr.trim() || `git exited ${code}`)); return; }
         resolve(stdout);
@@ -1209,6 +1351,15 @@ class DaemonClient {
     this.stopPing();
     this.pingTimer = setInterval(() => {
       this.send({ type: "daemon:ping", ts: Date.now() });
+      // Re-anuncia os tokens dos agentes vivos a cada ping. Necessário porque
+      // atrás do Cloudflare o WS do daemon pode permanecer ABERTO quando o
+      // origin (server) reinicia — o daemon não detecta o restart, não dispara
+      // o resync do "open", e o server fica com o Map agentTokens vazio →
+      // /api/bridge devolve 401 pra sempre. O resync periódico restaura o
+      // mapping em <pingMs. Idempotente (server ignora token já igual).
+      for (const { id, token } of this.host.listAgentTokens()) {
+        this.send({ type: "agent:token_resync", agentId: id, token });
+      }
     }, this.args.pingMs);
   }
   private stopPing() {
