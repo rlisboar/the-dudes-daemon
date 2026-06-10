@@ -20,7 +20,8 @@
     "build:legacy": "npm run build:daemon && npm run build:bridge",
     "build:daemon": "esbuild src/main.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/daemon.cjs --banner:js=\"#!/usr/bin/env node\"",
     "build:bridge": "esbuild src/mcp-bridge.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/mcp-bridge.cjs",
-    "lint": "eslint src"
+    "lint": "eslint src",
+    "test": "node --import tsx --test \"src/**/*.test.ts\""
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
