@@ -9,6 +9,7 @@ import path from "node:path";
 import { WebSocket } from "ws";
 import { AgentHost } from "./agent-host.js";
 import { assertWorkspaceScoped, autoWorkspaceCwd, describeGitRoots, ensureWritableDir, expandBasePath, isInsideRoot, validateBasePath, validateGitHash, validateGitRef } from "./workspace.js";
+import { buildGraph, graphPath } from "./graph-indexer.js";
 import { detectDropTarget, spawnDropped, type DropTarget } from "./privileges.js";
 import { BridgeRelay } from "./bridge-relay.js";
 import { defaultDaemonConfigPath, formatCliStatus, loadDaemonCliConfig, mergeCliConfig, resolveCliCommands, type DaemonCliConfig, type ResolvedCliCommands } from "./cli-config.js";
@@ -623,6 +624,12 @@ class DaemonClient {
       case "git:graph":
         await this.handleGitOp(msg.correlationId, "graph", ["log", "--graph", "--oneline", "--all", "-20"]);
         return;
+      case "graph:build":
+        await this.handleGraphBuild(msg);
+        return;
+      case "graph:fetch":
+        await this.handleGraphFetch(msg);
+        return;
       case "git:blame":
         await this.handleGitOp(msg.correlationId, "blame", ["blame", "--", msg.path]);
         return;
@@ -1059,6 +1066,68 @@ class DaemonClient {
         ok: false,
         error: (e as Error).message,
       });
+    }
+  }
+
+  /** graph:build — reindex sob demanda do knowledge graph (graphify) pro
+   *  workspace do projeto. Roda async (não trava o event loop) e reporta
+   *  building→ready/error via graph:status. */
+  private async handleGraphBuild(msg: Extract<FromOrch, { type: "graph:build" }>): Promise<void> {
+    // NUNCA cair pro $HOME quando o server não manda workspaceRoot — senão um
+    // workspaceFor() null faria `graphify update $HOME` indexar o home inteiro.
+    if (!msg.workspaceRoot) {
+      this.send({ type: "graph:status", projectId: msg.projectId, status: "error", error: "workspace não configurado no projeto", correlationId: msg.correlationId });
+      return;
+    }
+    let root: string;
+    try {
+      const base = expandBasePath(msg.workspaceRoot);
+      validateBasePath(base);            // bloqueia /, /etc, $HOME, /usr… (server semi-confiável)
+      this.enforceWorkspaceScope(base);  // assertWorkspaceScoped quando THE_DUDES_WORKSPACE_ROOT setado
+      root = base;
+    } catch (e) {
+      this.send({ type: "graph:status", projectId: msg.projectId, status: "error", error: `workspace inválido: ${(e as Error).message}`, correlationId: msg.correlationId });
+      return;
+    }
+    const gbin = this.cliCommands.graphify;
+    if (!gbin?.available) {
+      this.send({ type: "graph:status", projectId: msg.projectId, status: "error", error: "graphify não instalado (pip install graphifyy mcp)", correlationId: msg.correlationId });
+      return;
+    }
+    this.send({ type: "graph:status", projectId: msg.projectId, status: "building", correlationId: msg.correlationId });
+    const r = await buildGraph(root, gbin.command);
+    if (!r.ok) {
+      this.send({ type: "graph:status", projectId: msg.projectId, status: "error", error: r.error, correlationId: msg.correlationId });
+      return;
+    }
+    this.send({ type: "graph:status", projectId: msg.projectId, status: "ready", nodeCount: r.nodeCount, edgeCount: r.edgeCount, correlationId: msg.correlationId });
+  }
+
+  /** graph:fetch — lê o graphify-out/graph.json do workspace pra renderizar o
+   *  mapa na UI. Scope-checked; cap 4MB. */
+  private async handleGraphFetch(msg: Extract<FromOrch, { type: "graph:fetch" }>): Promise<void> {
+    if (!msg.workspaceRoot) {
+      this.send({ type: "graph:data", projectId: msg.projectId, error: "workspace não configurado no projeto", correlationId: msg.correlationId });
+      return;
+    }
+    try {
+      const root = expandBasePath(msg.workspaceRoot);
+      validateBasePath(root);
+      this.enforceWorkspaceScope(root);
+      const gp = graphPath(root);
+      const stat = await fs.promises.stat(gp).catch(() => null);
+      if (!stat) {
+        this.send({ type: "graph:data", projectId: msg.projectId, error: "índice ainda não gerado — reindexe", correlationId: msg.correlationId });
+        return;
+      }
+      if (stat.size > 4 * 1024 * 1024) {
+        this.send({ type: "graph:data", projectId: msg.projectId, error: "grafo muito grande (> 4MB) pra renderizar", correlationId: msg.correlationId });
+        return;
+      }
+      const json = await fs.promises.readFile(gp, "utf-8");
+      this.send({ type: "graph:data", projectId: msg.projectId, json, correlationId: msg.correlationId });
+    } catch (e) {
+      this.send({ type: "graph:data", projectId: msg.projectId, error: (e as Error).message, correlationId: msg.correlationId });
     }
   }
 

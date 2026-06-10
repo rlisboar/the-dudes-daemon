@@ -116,6 +116,9 @@ export interface ContextFeatures {
   goals?: boolean;
   credentials?: boolean;
   webhooks?: boolean;
+  /** Knowledge graph (graphify) — injeta o MCP server graphify-mcp no agente
+   *  e indexa o workspace sob demanda. Off = não injeta nem indexa. */
+  graph?: boolean;
 }
 
 export interface MemoryInjectionEntry {
@@ -336,6 +339,24 @@ export interface GitFileLogRequest {
 }
 
 export interface GitGraphRequest { type: "git:graph"; correlationId: string; workspaceRoot?: string; }
+
+/** Knowledge graph (graphify) — orch pede rebuild do índice do workspace.
+ *  projectId só pra rotular o status de volta. */
+export interface GraphBuildRequest { type: "graph:build"; correlationId?: string; projectId?: string; workspaceRoot?: string; }
+/** Status do índice graphify reportado pelo daemon (durante/após build). */
+export interface GraphStatusEvent {
+  type: "graph:status";
+  projectId?: string;
+  status: "building" | "ready" | "error";
+  nodeCount?: number;
+  edgeCount?: number;
+  error?: string;
+  correlationId?: string;
+}
+/** Orch pede o graph.json do workspace pra renderizar o mapa na UI. */
+export interface GraphFetchRequest { type: "graph:fetch"; correlationId?: string; projectId?: string; workspaceRoot?: string; }
+/** graph.json (string) devolvido pelo daemon pro mapa. */
+export interface GraphDataEvent { type: "graph:data"; projectId?: string; json?: string; error?: string; correlationId?: string; }
 
 export interface GitBlameRequest {
   type: "git:blame";
@@ -672,7 +693,9 @@ export type FromDaemon =
   | SkillDeleteResult
   | MCPsScanResult
   | MCPSaveResult
-  | MCPDeleteResult;
+  | MCPDeleteResult
+  | GraphStatusEvent
+  | GraphDataEvent;
 
 export type FromOrch =
   | DaemonWelcome | DaemonPong | DaemonChallenge
@@ -696,4 +719,6 @@ export type FromOrch =
   | SkillDeleteRequest
   | MCPsRescanRequest
   | MCPSaveRequest
-  | MCPDeleteRequest;
+  | MCPDeleteRequest
+  | GraphBuildRequest
+  | GraphFetchRequest;

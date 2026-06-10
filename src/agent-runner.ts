@@ -8,6 +8,7 @@ import type { ContextFeatures } from "./protocol.js";
 import { spawnDropped, type DropTarget } from "./privileges.js";
 import type { ResolvedCliCommands } from "./cli-config.js";
 import { resolvePython3 } from "./cli-config.js";
+import { buildGraph, graphExists, graphPath } from "./graph-indexer.js";
 
 export const MODEL_CONTEXT_LIMITS: Record<string, number> = {
   // Claude. opusplan = Opus no plan, Sonnet na execução; janela efetiva 200k.
@@ -116,6 +117,10 @@ export interface AgentRunnerOptions {
   onSessionInvalid?: () => void;
   onError: (err: string) => void;
   onExit: (code: number | null) => void;
+  /** projectId (pra rotular graph:status emitido pelo auto-build do grafo). */
+  projectId?: string;
+  /** Reporta status do índice graphify durante o auto-build no spawn. */
+  onGraphStatus?: (status: "building" | "ready" | "error", info?: { nodeCount?: number; edgeCount?: number; error?: string }) => void;
 }
 
 // Header montado por seções com gating por projeto (Fase 2). Cada bloco off
@@ -646,7 +651,11 @@ export class AgentRunner {
     }
   }
 
-  start() {
+  async start() {
+    await this.prepareGraphify();
+    // prepareGraphify pode aguardar um build (até 180s); se o agente foi
+    // parado/removido nessa janela, não spawnar processo zumbi.
+    if (this.stopped) return;
     if (this.opts.cliRunner === "opencode") {
       if (!this.ensureRunnerAvailable("opencode")) return;
       this.writeOpenCodeConfig();
@@ -666,6 +675,47 @@ export class AgentRunner {
     }
     if (!this.ensureRunnerAvailable("claude")) return;
     this.startClaude();
+  }
+
+  /** Feature graph (graphify): se ligada, garante o índice do workspace
+   *  (build local se ausente) e injeta o MCP server `graphify` em
+   *  extraMcpServers — daí os 4 config writers (claude/gemini/opencode/codex)
+   *  o serializam como qualquer outro MCP. No-op se a feature está off ou o
+   *  binário graphify-mcp não está instalado. */
+  private async prepareGraphify() {
+    if (!this.opts.features?.graph) return;
+    const mcpBin = this.opts.cliCommands.graphifyMcp;
+    if (!mcpBin?.available) {
+      this.opts.log("warn", `[graph:${this.info.name}] feature ligada mas graphify-mcp não encontrado — pip install graphifyy mcp. Pulando.`);
+      return;
+    }
+    const root = this.opts.workspaceRoot;
+    if (!graphExists(root)) {
+      const gbin = this.opts.cliCommands.graphify;
+      if (!gbin?.available) {
+        this.opts.log("warn", `[graph:${this.info.name}] sem índice e graphify (build) não encontrado — pulando injeção.`);
+        return;
+      }
+      this.opts.log("info", `[graph:${this.info.name}] indexando workspace (graphify update)…`);
+      this.opts.onGraphStatus?.("building");
+      const r = await buildGraph(root, gbin.command);
+      if (!r.ok) {
+        this.opts.log("warn", `[graph:${this.info.name}] build falhou: ${r.error} — pulando injeção.`);
+        this.opts.onGraphStatus?.("error", { error: r.error });
+        return;
+      }
+      this.opts.log("info", `[graph:${this.info.name}] índice pronto: ${r.nodeCount ?? "?"} nós, ${r.edgeCount ?? "?"} arestas.`);
+      this.opts.onGraphStatus?.("ready", { nodeCount: r.nodeCount, edgeCount: r.edgeCount });
+    }
+    if (!graphExists(root)) return; // build não produziu grafo → não serve
+    this.opts.extraMcpServers = {
+      ...(this.opts.extraMcpServers ?? {}),
+      graphify: {
+        type: "stdio",
+        command: mcpBin.command,
+        args: [graphPath(root), "--transport", "stdio"],
+      },
+    };
   }
 
   private bootPerMessageRunner() {
@@ -1377,10 +1427,16 @@ export class AgentRunner {
     }
     this.traceCli("gemini", "argv", message);
 
+    // Gemini só conecta MCP servers nomeados na allowlist. Montar
+    // dinamicamente a partir de extraMcpServers (graphify + outros do
+    // workspace) — senão a feature graph fica sem efeito no gemini.
+    const allowedMcp = ["the-dudes", ...Object.keys(this.opts.extraMcpServers ?? {})]
+      .filter((n, i, a) => a.indexOf(n) === i)
+      .join(",");
     const args = [
       "--output-format", "stream-json",
       "--include-directories", this.opts.workspaceRoot,
-      "--allowed-mcp-server-names", "the-dudes",
+      "--allowed-mcp-server-names", allowedMcp,
       "--skip-trust",
       "-p", message,
     ];

@@ -10,6 +10,8 @@ export interface CliPathConfig {
   opencode?: string;
   gemini?: string;
   codex?: string;
+  graphify?: string;
+  graphifyMcp?: string;
 }
 
 export interface DaemonCliConfig {
@@ -28,6 +30,11 @@ export interface ResolvedCliCommands {
   opencode: ResolvedCliCommand;
   gemini: ResolvedCliCommand;
   codex: ResolvedCliCommand;
+  /** graphify CLI (build/index do knowledge graph) — opcional, só usado
+   *  quando a feature graph está ligada no projeto. */
+  graphify: ResolvedCliCommand;
+  /** graphify-mcp (serve o graph.json via MCP stdio). */
+  graphifyMcp: ResolvedCliCommand;
 }
 
 const DEFAULT_CONFIG_PATH = path.join(os.homedir(), ".the-dudes", "daemon-config.json");
@@ -63,7 +70,31 @@ export function resolveCliCommands(config: DaemonCliConfig = {}): ResolvedCliCom
     opencode: resolveOne("opencode", config.cliPaths?.opencode),
     gemini: resolveOne("gemini", config.cliPaths?.gemini),
     codex: resolveOne("codex", config.cliPaths?.codex),
+    // graphify/graphify-mcp costumam ser instalados via pip --user/pipx em
+    // dirs FORA do PATH herdado pelo daemon (ex: ~/Library/Python/X.Y/bin,
+    // ~/.local/bin). Além do `which`, varre esses dirs de script do pip.
+    graphify: resolveOne("graphify", config.cliPaths?.graphify, pythonBinDirs()),
+    graphifyMcp: resolveOne("graphify-mcp", config.cliPaths?.graphifyMcp, pythonBinDirs()),
   };
+}
+
+/** Dirs comuns onde pip/pipx instalam console scripts, fora do PATH padrão. */
+function pythonBinDirs(): string[] {
+  const home = os.homedir();
+  const dirs: string[] = [path.join(home, ".local", "bin"), "/opt/homebrew/bin", "/usr/local/bin"];
+  // macOS pip --user: ~/Library/Python/X.Y/bin
+  collectVersionedBins(path.join(home, "Library", "Python"), dirs);
+  // python.org framework: /Library/Frameworks/Python.framework/Versions/X.Y/bin
+  collectVersionedBins("/Library/Frameworks/Python.framework/Versions", dirs);
+  return dirs;
+}
+
+function collectVersionedBins(base: string, out: string[]): void {
+  try {
+    for (const v of fs.readdirSync(base)) out.push(path.join(base, v, "bin"));
+  } catch {
+    /* dir não existe — ignora */
+  }
 }
 
 export function formatCliStatus(label: CliRunner, resolved: ResolvedCliCommand): string {
@@ -72,7 +103,7 @@ export function formatCliStatus(label: CliRunner, resolved: ResolvedCliCommand):
   return `${label}: ${resolved.command} [${state}, ${source}]`;
 }
 
-function resolveOne(label: CliRunner, override?: string): ResolvedCliCommand {
+function resolveOne(label: CliRunner | string, override?: string, extraDirs?: string[]): ResolvedCliCommand {
   const manual = normalizePath(override);
   if (manual) {
     return {
@@ -90,6 +121,13 @@ function resolveOne(label: CliRunner, override?: string): ResolvedCliCommand {
       available: true,
       resolvedPath: detected,
     };
+  }
+  // Fallback: varre dirs extras (ex: dirs de script do pip fora do PATH).
+  for (const dir of extraDirs ?? []) {
+    const cand = path.join(dir, label);
+    if (isExecutable(cand)) {
+      return { command: cand, source: "detected", available: true, resolvedPath: cand };
+    }
   }
   return {
     command: label,
@@ -153,6 +191,8 @@ function sanitizeCliConfig(cfg: DaemonCliConfig): DaemonCliConfig {
       opencode: normalizePath(cliPaths.opencode),
       gemini: normalizePath(cliPaths.gemini),
       codex: normalizePath(cliPaths.codex),
+      graphify: normalizePath(cliPaths.graphify),
+      graphifyMcp: normalizePath(cliPaths.graphifyMcp),
     },
   };
 }

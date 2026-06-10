@@ -377,6 +377,8 @@ export class AgentHost {
       },
       onContextWarning: (used, limit) => this.send({ type: "agent:context_warning", agentId: msg.agent.id, used, limit }),
       onContextFull: () => this.send({ type: "agent:context_full", agentId: msg.agent.id }),
+      projectId: msg.projectId,
+      onGraphStatus: (status, info) => this.send({ type: "graph:status", projectId: msg.projectId, status, nodeCount: info?.nodeCount, edgeCount: info?.edgeCount, error: info?.error }),
       onError: (err) => {
         // stderr do agente pode conter credencial (echo/uso). Redacta as creds
         // conhecidas ANTES de sair do daemon (vira system message no server,
@@ -411,7 +413,7 @@ export class AgentHost {
     };
     const runner = new AgentRunner(msg.agent, opts);
     thisRunner = runner;
-    runner.start();
+    runner.start().catch((e) => this.log("error", `agent ${msg.agent.id} start failed: ${(e as Error).message}`));
     this.entries.set(msg.agent.id, {
       info: msg.agent,
       runner,
