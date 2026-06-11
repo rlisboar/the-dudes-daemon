@@ -18,33 +18,21 @@ import { sign as edSign, createPrivateKey } from "node:crypto";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = resolve(__dirname, "..");
 
-function loadDsn() {
-  if (process.env.SENTRY_DSN_DAEMON_BUILD) return process.env.SENTRY_DSN_DAEMON_BUILD;
-  // tenta .env.local local
-  try {
-    const env = readFileSync(resolve(root, ".env.local"), "utf8");
-    const m = env.match(/^SENTRY_DSN_DAEMON\s*=\s*(.+)$/m);
-    if (m) return m[1].trim().replace(/^"|"$/g, "");
-  } catch {
-    /* arquivo não existe — OK */
-  }
-  // tenta server .env (workspace root)
-  try {
-    const env = readFileSync(resolve(root, "..", "server", ".env.local"), "utf8");
-    const m = env.match(/^SENTRY_DSN\s*=\s*(.+)$/m);
-    if (m) return m[1].trim().replace(/^"|"$/g, "");
-  } catch {
-    /* idem */
-  }
-  return "";
-}
-
-const dsn = loadDsn();
-const buildSha = process.env.BUILD_SHA || process.env.COMMIT_SHA || "unknown";
+// BUILD REPRODUZÍVEL: o bundle distribuído NÃO embute DSN nem BUILD_SHA por
+// padrão — assim `npm run build` num clone do repo público (que tem git
+// history própria) produz bytes IDÊNTICOS ao binário publicado em /install.
+// Telemetria é OPT-IN: defina SENTRY_DSN_DAEMON_BUILD pra embutir a DSN (e
+// BUILD_SHA pra carimbar o sha) — esses builds deixam de ser reproduzíveis,
+// por isso NÃO são o que distribuímos. Default = sem phone-home (melhor p/
+// confiança) + reproduzível.
+const dsn = process.env.SENTRY_DSN_DAEMON_BUILD || "";
+const buildSha = process.env.BUILD_SHA || "";
 const env = process.env.SENTRY_ENV || process.env.NODE_ENV || "production";
 
-console.log(`[build] sentry dsn: ${dsn ? "embedded" : "(absent — telemetry off)"}`);
-console.log(`[build] build sha:  ${buildSha}`);
+const repro = !dsn && !buildSha;
+console.log(`[build] sentry dsn: ${dsn ? "embedded (opt-in, NÃO reproduzível)" : "(absent — telemetry off)"}`);
+console.log(`[build] build sha:  ${buildSha || "(none)"}`);
+console.log(`[build] reproducible: ${repro ? "yes (default distribuível)" : "no (DSN/SHA embutidos)"}`);
 
 const common = {
   bundle: true,
