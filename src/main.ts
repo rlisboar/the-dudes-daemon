@@ -1094,13 +1094,23 @@ class DaemonClient {
       this.send({ type: "graph:status", projectId: msg.projectId, status: "error", error: "graphify não instalado (pip install graphifyy mcp)", correlationId: msg.correlationId });
       return;
     }
+    // modo semântico (docs/.md/.yaml via LLM). Backend claude-cli exige o
+    // `claude` CLI; outros backends leem a API key do env do daemon.
+    const claude = this.cliCommands.claude;
+    const backend = msg.backend || "claude-cli";
+    if (msg.semantic && backend === "claude-cli" && !claude?.available) {
+      this.send({ type: "graph:status", projectId: msg.projectId, status: "error", error: "backend claude-cli exige o claude CLI instalado (ou escolha outro backend)", correlationId: msg.correlationId });
+      return;
+    }
     this.send({ type: "graph:status", projectId: msg.projectId, status: "building", correlationId: msg.correlationId });
-    const r = await buildGraph(root, gbin.command);
+    const r = await buildGraph(root, gbin.command, msg.semantic
+      ? { semantic: true, backend, model: msg.model, claudeCmd: claude?.command }
+      : {});
     if (!r.ok) {
       this.send({ type: "graph:status", projectId: msg.projectId, status: "error", error: r.error, correlationId: msg.correlationId });
       return;
     }
-    this.send({ type: "graph:status", projectId: msg.projectId, status: "ready", nodeCount: r.nodeCount, edgeCount: r.edgeCount, correlationId: msg.correlationId });
+    this.send({ type: "graph:status", projectId: msg.projectId, status: "ready", nodeCount: r.nodeCount, edgeCount: r.edgeCount, inputTokens: r.inputTokens, outputTokens: r.outputTokens, correlationId: msg.correlationId });
   }
 
   /** graph:fetch — lê o graphify-out/graph.json do workspace pra renderizar o
