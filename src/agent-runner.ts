@@ -690,24 +690,28 @@ export class AgentRunner {
       return;
     }
     const root = this.opts.workspaceRoot;
-    if (!graphExists(root)) {
-      const gbin = this.opts.cliCommands.graphify;
-      if (!gbin?.available) {
-        this.opts.log("warn", `[graph:${this.info.name}] sem índice e graphify (build) não encontrado — pulando injeção.`);
-        return;
-      }
-      this.opts.log("info", `[graph:${this.info.name}] indexando workspace (graphify update)…`);
-      this.opts.onGraphStatus?.("building");
+    const gbin = this.opts.cliCommands.graphify;
+    const hadIndex = graphExists(root);
+    if (gbin?.available) {
+      // Rebuild incremental do código a CADA spawn (cache SHA256 = barato; sem
+      // LLM). Mantém o grafo fresco pros agentes sem reindex manual. A 1ª vez
+      // (sem índice) emite status pra UI; refreshes seguintes são silenciosos.
+      if (!hadIndex) this.opts.onGraphStatus?.("building");
+      this.opts.log("info", `[graph:${this.info.name}] ${hadIndex ? "atualizando" : "indexando"} workspace (graphify update)…`);
       const r = await buildGraph(root, gbin.command);
-      if (!r.ok) {
-        this.opts.log("warn", `[graph:${this.info.name}] build falhou: ${r.error} — pulando injeção.`);
-        this.opts.onGraphStatus?.("error", { error: r.error });
-        return;
+      if (r.ok) {
+        this.opts.log("info", `[graph:${this.info.name}] índice ${hadIndex ? "atualizado" : "pronto"}: ${r.nodeCount ?? "?"} nós, ${r.edgeCount ?? "?"} arestas.`);
+        if (!hadIndex) this.opts.onGraphStatus?.("ready", { nodeCount: r.nodeCount, edgeCount: r.edgeCount });
+      } else {
+        this.opts.log("warn", `[graph:${this.info.name}] build falhou: ${r.error}`);
+        if (!hadIndex) { this.opts.onGraphStatus?.("error", { error: r.error }); return; }
+        // tinha índice antigo → segue servindo o que existe
       }
-      this.opts.log("info", `[graph:${this.info.name}] índice pronto: ${r.nodeCount ?? "?"} nós, ${r.edgeCount ?? "?"} arestas.`);
-      this.opts.onGraphStatus?.("ready", { nodeCount: r.nodeCount, edgeCount: r.edgeCount });
+    } else if (!hadIndex) {
+      this.opts.log("warn", `[graph:${this.info.name}] sem índice e graphify (build) não encontrado — pulando injeção.`);
+      return;
     }
-    if (!graphExists(root)) return; // build não produziu grafo → não serve
+    if (!graphExists(root)) return; // sem grafo → não serve
     this.opts.extraMcpServers = {
       ...(this.opts.extraMcpServers ?? {}),
       graphify: {
