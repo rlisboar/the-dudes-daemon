@@ -523,10 +523,6 @@ class DaemonClient {
         await this.handleGitlabRequest(msg);
         return;
       }
-      case "skill:install": {
-        await this.handleSkillInstall(msg);
-        return;
-      }
       case "skills:rescan": {
         await this.reportSkillsScan(msg.workspaceSkillsRoot).catch((e) =>
           log("warn", `manual rescan failed: ${(e as Error).message}`)
@@ -645,54 +641,6 @@ class DaemonClient {
     }
   }
 
-  private async handleSkillInstall(msg: Extract<FromOrch, { type: "skill:install" }>) {
-    const root = msg.workspaceSkillsRoot ?? null;
-    if (!root) {
-      this.send({
-        type: "skill:install_result",
-        correlationId: msg.correlationId,
-        ok: false,
-        error: "workspace não definido — abra o projeto antes de instalar skills",
-      });
-      return;
-    }
-    try {
-      this.enforceWorkspaceScope(expandBasePath(root)); // server-supplied skills root no root permitido (MED-9)
-      const { installSkillFromClawHub } = await import("./skills-installer.js");
-      // GitHub repo zips (SkillsMP / AgentSkill) podem ser maiores que
-      // ClawHub — sobe cap pra 50MB quando subPath foi fornecido. Source
-      // de origem chega via msg (orch resolve do cmd do client).
-      const isGithub = !!msg.subPath || msg.downloadUrl.includes("codeload.github.com");
-      const result = await installSkillFromClawHub({
-        downloadUrl: msg.downloadUrl,
-        slug: msg.slug,
-        workspaceSkillsRoot: root,
-        subPath: msg.subPath,
-        maxBytes: isGithub ? 50 * 1024 * 1024 : undefined,
-        source: msg.source ?? (isGithub ? "github" : "clawhub"),
-      });
-      this.send({
-        type: "skill:install_result",
-        correlationId: msg.correlationId,
-        ok: true,
-        name: result.name,
-        installedAt: result.installedAt,
-      });
-      log("info", `skill installed: ${result.name} → ${result.installedAt}`);
-      // Re-scan pra propagar a skill nova pro orch — usa o mesmo root
-      // pra refletir o projeto correto.
-      await this.reportSkillsScan(root);
-    } catch (err) {
-      const error = (err as Error).message;
-      this.send({
-        type: "skill:install_result",
-        correlationId: msg.correlationId,
-        ok: false,
-        error,
-      });
-      log("warn", `skill install failed (${msg.slug}): ${error}`);
-    }
-  }
 
   /** Resolve um path relativo dentro de `<root>/<name>/` com guard contra
    *  traversal. `root` é `<projectBase>/skills` quando vem do server. */

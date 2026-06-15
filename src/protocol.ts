@@ -497,42 +497,6 @@ export interface SkillsScanResult {
   ts: number;
 }
 
-/* ---------- AgentSkills install ---------- */
-
-export interface SkillInstallRequest {
-  type: "skill:install";
-  /** Slug ClawHub (ex: "obsidian-notes"). */
-  slug: string;
-  /** Versão específica ou "latest". */
-  version?: string;
-  /** URL signed do artefato — daemon baixa direto, sem proxy server. */
-  downloadUrl: string;
-  /** Nome canônico (opcional — daemon usa SKILL.md.frontmatter.name). */
-  name?: string;
-  /** Path absoluto onde extrair (`<basePath>/skills`). Server resolve do
-   *  projeto ativo do client. Se omitido, daemon usa `this.workspacePath
-   *  + "/skills"` como fallback (compat com daemons antigos). */
-  workspaceSkillsRoot?: string;
-  /** Path dentro do ZIP a ser extraído (resto é descartado). Usado pra
-   *  GitHub repo zips onde a skill mora num subdir. */
-  subPath?: string;
-  /** Registry de origem — gravado em `.installed-from.json` pro UI
-   *  reconciliar matches por (source, slug). */
-  source?: string;
-  /** Correlation pra resposta voltar pro client certo. */
-  correlationId: string;
-}
-
-export interface SkillInstallResult {
-  type: "skill:install_result";
-  correlationId: string;
-  ok: boolean;
-  /** Path final onde a skill foi escrita, se ok. */
-  installedAt?: string;
-  /** Nome canônico extraído do SKILL.md. */
-  name?: string;
-  error?: string;
-}
 
 /** Pede pro daemon re-escanear sources e re-emitir snapshot. */
 export interface SkillsRescanRequest {
@@ -689,7 +653,6 @@ export type FromDaemon =
   | SummarizeResult
   | WebhookDeliveryResult
   | SkillsScanResult
-  | SkillInstallResult
   | SkillReadFileResult
   | SkillSaveFileResult
   | SkillDeleteResult
@@ -714,7 +677,6 @@ export type FromOrch =
   | SummarizeRequest
   | ProjectKeyForDaemon
   | WebhookDispatchRequest
-  | SkillInstallRequest
   | SkillsRescanRequest
   | SkillReadFileRequest
   | SkillSaveFileRequest
