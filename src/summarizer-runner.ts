@@ -139,6 +139,7 @@ export async function runSummarizer(args: SummarizerArgs): Promise<SummarizerRes
     // Use json output format so we can extract real usage tokens.
     argv = ["-p", fullPrompt, "--output-format", "json"];
     if (args.model) argv.push("--model", args.model);
+    if (args.effort) argv.push("--effort", args.effort);
   } else if (args.runner === "codex") {
     argv = ["exec", "--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox"];
     if (args.model) argv.push("-m", args.model);
@@ -149,7 +150,11 @@ export async function runSummarizer(args: SummarizerArgs): Promise<SummarizerRes
     if (args.model) argv.push("--model", args.model);
   } else if (args.runner === "opencode") {
     const ocArgs = ["run", "--format", "json"];
-    if (args.model) ocArgs.push("--model", args.model);
+    // Remove sufixo de reasoning legado (ex glm-5.2:high) — o opencode espera o
+    // modelID sem ele. reasoning_effort NÃO é aplicável: bloco provider no
+    // opencode.json corrompe o zai-coding-plan (run mudo). Roda no default.
+    const ocModel = args.model?.replace(/:(off|minimal|none|low|medium|high|xhigh|max)$/, "");
+    if (ocModel) ocArgs.push("--model", ocModel);
     ocArgs.push(fullPrompt);
     const py = resolvePython3();
     if (!py) return { ok: false, error: "python3 não encontrado em path absoluto (wrapper PTY do opencode)" };

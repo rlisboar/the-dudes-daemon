@@ -62,6 +62,12 @@ const MISSING_SESSION_PATTERNS = [
   /no conversation found with session id/i,
 ];
 
+// Banner de rate-limit do provider que o claude CLI emite como TEXTO do assistant
+// (não como erro). Sem isto o server trata como output real, cifra (E2EE), e o
+// auto-retry nunca dispara — pior, zera o contador. Roteamos como erro.
+// Ex: "API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited"
+const RATE_LIMIT_TEXT_RE = /temporarily limiting requests|·\s*rate limited|\brate.?limited\b|overloaded|too many requests|\b429\b|\b529\b/i;
+
 export interface AgentRunnerOptions {
   bridgeCommand: string;
   bridgeArgs: string[];
@@ -277,6 +283,13 @@ export class AgentRunner {
 
   // OpenCode / Gemini per-message model
   private ocSessionId: string | undefined;
+  /** IDs de parts já processadas (dedup entre turnos). O POST /message só
+   *  retorna a ÚLTIMA mensagem do assistant; tool calls ficam em mensagens
+   *  intermediárias do loop → buscamos TODAS as msgs e processamos as novas. */
+  private ocSeenPartIds = new Set<string>();
+  /** Sessão veio de resume → primeira drain deve "marcar como visto" o histórico
+   *  sem reemitir (senão tool calls/textos antigos reapareceriam nos RUNS). */
+  private ocNeedsPrime = false;
   private ocQueue: Array<{ content: string; images?: ImageAttachment[] }> = [];
   private ocBusy = false;
   private ocActiveProc: ChildProcess | null = null;
@@ -298,6 +311,9 @@ export class AgentRunner {
   private ocServerProc: ChildProcess | null = null;
   private ocServerUrl: string | undefined;
   private ocServerBootPromise: Promise<void> | null = null;
+  /** SSE /event do serve — só ativo com auto-approve OFF, p/ receber os
+   *  pedidos de permissão (permission.asked) e resolver via orquestrador. */
+  private ocEventReq: import("node:http").ClientRequest | null = null;
 
   // Context tracking
   private lastInputTokens = 0;
@@ -315,6 +331,7 @@ export class AgentRunner {
     this.info = info;
     if ((opts.cliRunner === "opencode" || opts.cliRunner === "codex") && opts.resumeSessionId) {
       this.ocSessionId = opts.resumeSessionId;
+      if (opts.cliRunner === "opencode") this.ocNeedsPrime = true;
     }
   }
 
@@ -552,6 +569,8 @@ export class AgentRunner {
 
   resetWithSummary(summary?: string): void {
     this.ocSessionId = undefined;
+    this.ocSeenPartIds.clear();
+    this.ocNeedsPrime = false;
     this.ocFirstTurn = true;
     this.contextWarned = false;
     this.lastInputTokens = 0;
@@ -818,10 +837,23 @@ export class AgentRunner {
       command: [this.opts.bridgeCommand, ...this.opts.bridgeArgs],
       environment: tdEnv,
     };
-    const config = {
+    const config: Record<string, unknown> = {
       $schema: "https://opencode.ai/config.json",
       mcp,
+      // auto-approve: ON = libera tudo; OFF = pede aprovação nas tools de risco
+      // (shell/edição/rede/fora-do-workspace). As demais (read/grep/glob/list +
+      // MCP the-dudes, que são seguras) ficam no default (allow). Os "ask" são
+      // resolvidos pelo daemon via evento SSE → política do orquestrador (mesma
+      // UI do claude). Sem isto o opencode rodava com default=allow, ignorando
+      // o toggle.
+      permission: this.opts.autoApprove
+        ? "allow"
+        : { edit: "ask", bash: "ask", webfetch: "ask", external_directory: "ask" },
     };
+    // NÃO escrever bloco `provider.*` aqui: qualquer override de provider no
+    // opencode.json (mesmo `options:{}` vazio) corrompe o zai-coding-plan
+    // (provider some no run → agente mudo). reasoning_effort/thinking não são
+    // configuráveis por aqui; o modelo roda no default dele.
     try {
       // mode 0o600: arquivo fica em workspaceRoot, então pode acabar em git
       // se .gitignore não cobrir. Mode restrito reduz blast-radius em
@@ -1126,6 +1158,15 @@ export class AgentRunner {
       if (textParts.length) {
         const text = textParts.join("\n").trim();
         if (text) {
+          // Banner de rate-limit vem como texto do assistant (não é output real):
+          // roteia como erro p/ o server disparar auto-retry e não zerar contador.
+          // Exige contexto "API Error" (o banner do claude CLI sempre tem) p/ não
+          // confundir com prosa normal do agente que cite "rate limit"/"overloaded".
+          if (/API Error/i.test(text) && RATE_LIMIT_TEXT_RE.test(text)) {
+            this.setState("idle");
+            this.opts.onError(text);
+            return;
+          }
           this.setState("speaking");
           this.opts.onAssistantText(text);
         }
@@ -1139,6 +1180,12 @@ export class AgentRunner {
     }
     if (event.type === "result") {
       this.setState("idle");
+      // Resultado de erro (ex rate limit) que não veio como texto do assistant:
+      // surfacia como erro p/ auto-retry. result/error pode estar em vários campos.
+      if (event.is_error || event.subtype === "error_during_execution" || event.subtype === "error_max_turns") {
+        const r = String(event.result ?? event.error ?? event.message ?? "");
+        if (r && RATE_LIMIT_TEXT_RE.test(r)) this.opts.onError(r);
+      }
       return;
     }
   }
@@ -1169,6 +1216,7 @@ export class AgentRunner {
           resolved = true;
           this.ocServerUrl = m[0];
           this.opts.log("info", `[cli:${this.info.id}:opencode] serve ready ${this.ocServerUrl}`);
+          this.ocStartEventStream(); // permission.asked listener (auto-approve OFF)
           resolve();
         }
       };
@@ -1191,6 +1239,19 @@ export class AgentRunner {
       }, 10_000);
     });
     return this.ocServerBootPromise;
+  }
+
+  /** Quebra o model do opencode em provider/modelID. Tolera um sufixo legado
+   *  ":<effort>" no model (ex glm-5.2:high) — só removido, NÃO aplicado: o
+   *  reasoning_effort NÃO é configurável via opencode.json no provider
+   *  zai-coding-plan (qualquer bloco `provider.<id>` corrompe o provider →
+   *  agente mudo). O GLM-5.2 roda no default dele (reasoning_effort=max). */
+  private ocModelParts(): { providerID: string; modelID: string } {
+    const raw = (this.info.model ?? "").replace(/:(off|minimal|none|low|medium|high|xhigh|max)$/, "");
+    const slash = raw.indexOf("/");
+    const providerID = slash > 0 ? raw.slice(0, slash) : "";
+    const modelID = slash > 0 ? raw.slice(slash + 1) : raw;
+    return { providerID, modelID };
   }
 
   private runOpenCodeMessage(content: string, retry = 0) {
@@ -1220,10 +1281,8 @@ export class AgentRunner {
     // first-turn wrapping pode ser re-aplicado no retry (capturado aqui).
     const wasFirstTurn = this.ocFirstTurn;
     this.ocRunSawOutput = false;
-    // provider/modelID de "providerID/modelID" (split no 1º "/").
-    const slash = (this.info.model ?? "").indexOf("/");
-    const providerID = slash > 0 ? (this.info.model as string).slice(0, slash) : "";
-    const modelID = slash > 0 ? (this.info.model as string).slice(slash + 1) : (this.info.model ?? "");
+    // provider/modelID + reasoning effort (sufixo ":high"/":max" ou effort do agente).
+    const { providerID, modelID } = this.ocModelParts();
 
     // Garante sessão no serve (POST /session). Reusa ocSessionId se já existe.
     if (!this.ocSessionId) {
@@ -1236,6 +1295,16 @@ export class AgentRunner {
         this.opts.onError(`opencode: falha criando sessão no serve: ${(e as Error).message}`);
         this.ocBusy = false; this.setState("idle"); this.drainOcQueue(); return;
       }
+    }
+
+    // Resume: marca o histórico da sessão como já visto antes do 1º turno —
+    // senão a drain por GET reemitiria tool calls/textos antigos nos RUNS.
+    if (this.ocNeedsPrime) {
+      this.ocNeedsPrime = false;
+      try {
+        const hist = await this.ocServeFetch(`/session/${this.ocSessionId}/message`, "GET");
+        if (Array.isArray(hist)) for (const m of hist) for (const p of (m?.parts ?? [])) { if (p?.id) this.ocSeenPartIds.add(p.id); }
+      } catch { /* best-effort */ }
     }
 
     let message = content;
@@ -1275,32 +1344,11 @@ export class AgentRunner {
       return;
     }
 
-    // Parseia parts da resposta do serve.
-    const parts = Array.isArray(resp?.parts) ? resp.parts : [];
-    for (const p of parts) {
-      const t = p?.type;
-      if (t === "text") {
-        const text = (p.text as string | undefined)?.trim();
-        if (text) { this.ocRunSawOutput = true; this.setState("speaking"); this.opts.onAssistantText(text); }
-      } else if (t === "tool" || t === "tool-use" || t === "tool_use" || t === "tool-call" || t === "tool_call") {
-        this.ocRunSawOutput = true;
-        const toolName = p.tool ?? p.name ?? p.state?.name ?? "";
-        const input = p.state?.input ?? p.input ?? {};
-        this.opts.onToolUse(toolName, input);
-      } else if (t === "step-finish" || t === "step_finish") {
-        const tokens = p.tokens;
-        if (tokens) {
-          const delta: AgentUsage = {
-            input: Number(tokens.input ?? 0),
-            output: Number(tokens.output ?? 0),
-            cacheCreate: Number(tokens.cache?.write ?? 0),
-            cacheRead: Number(tokens.cache?.read ?? 0),
-          };
-          this.opts.onUsageDelta?.(delta);
-          this.checkContextUsage(delta);
-        }
-      }
-    }
+    // O POST /message só retorna a ÚLTIMA mensagem do assistant; as tool calls
+    // ficam em mensagens INTERMEDIÁRIAS do loop (uma msg por step). Busca TODAS
+    // as msgs da sessão e processa só as parts novas (dedup por id) — senão os
+    // RUNS (tool executions) nunca apareciam no opencode.
+    await this.ocProcessNewParts(resp);
 
     this.ocActiveProc = null;
     this.ocBusy = false;
@@ -1359,6 +1407,168 @@ export class AgentRunner {
       if (data) req.write(data);
       req.end();
     });
+  }
+
+  /* ---------- OpenCode permission (auto-approve OFF) ---------- */
+
+  /** Abre o stream SSE /event do serve p/ receber `permission.asked`. Só roda
+   *  com auto-approve OFF (com ON o config já libera tudo, nenhum ask é emitido).
+   *  Reabre se a conexão cair (serve vivo = sessão do agente viva). */
+  private ocStartEventStream(): void {
+    if (this.opts.autoApprove) return;
+    if (!this.ocServerUrl || this.ocEventReq || this.stopped) return;
+    let u: URL;
+    try { u = new URL(this.ocServerUrl + "/event"); } catch { return; }
+    const req = http.request(
+      { hostname: u.hostname, port: u.port, path: "/event", method: "GET", headers: { Accept: "text/event-stream" } },
+      (res) => {
+        res.setEncoding("utf8");
+        let buf = "";
+        res.on("data", (chunk: string) => {
+          buf += chunk;
+          let idx: number;
+          while ((idx = buf.indexOf("\n")) >= 0) {
+            const line = buf.slice(0, idx); buf = buf.slice(idx + 1);
+            if (!line.startsWith("data:")) continue;
+            const js = line.slice(5).trim();
+            if (!js) continue;
+            try {
+              const ev = JSON.parse(js);
+              if (ev?.type === "permission.asked") void this.ocHandlePermissionAsked(ev.properties ?? {});
+            } catch { /* linha SSE não-JSON (keep-alive etc) */ }
+          }
+        });
+        res.on("end", () => { this.ocEventReq = null; this.ocReopenEvents(); });
+        res.on("error", () => { this.ocEventReq = null; this.ocReopenEvents(); });
+      },
+    );
+    req.on("error", () => { this.ocEventReq = null; this.ocReopenEvents(); });
+    req.end();
+    this.ocEventReq = req;
+  }
+
+  private ocReopenEvents(): void {
+    if (this.stopped || this.opts.autoApprove || !this.ocServerUrl) return;
+    setTimeout(() => { if (!this.stopped && this.ocServerUrl) this.ocStartEventStream(); }, 1000);
+  }
+
+  /** Resolve um permission.asked: consulta a política do orquestrador (mesma do
+   *  approve_action do claude) e responde ao serve (once = libera / reject = nega). */
+  private async ocHandlePermissionAsked(props: any): Promise<void> {
+    const permId = props?.id as string | undefined;
+    const sessionID = props?.sessionID as string | undefined;
+    const tool = String(props?.permission ?? "");
+    if (!permId || !sessionID) return;
+    // input p/ exibir na UI: metadata (ex bash {command, description}) + patterns
+    const input = { ...(props?.metadata ?? {}), patterns: props?.patterns };
+    let allow = false;
+    try {
+      const r = await this.bridgePost("permission", { tool, input });
+      allow = !!r?.allow;
+    } catch (e) {
+      // fail-closed: nega se a política não respondeu (igual approve_action)
+      this.opts.log("warn", `[cli:${this.info.id}:opencode] permission '${tool}' negada (erro política): ${(e as Error).message}`);
+    }
+    try {
+      await this.ocServeFetch(`/session/${sessionID}/permissions/${permId}`, "POST", { response: allow ? "once" : "reject" });
+    } catch (e) {
+      this.opts.log("warn", `[cli:${this.info.id}:opencode] falha respondendo permission: ${(e as Error).message}`);
+    }
+  }
+
+  /** POST ao orquestrador /api/bridge/<agentId>/<route> (via socket se houver,
+   *  senão HTTP). Bearer = agentToken. Timeout longo: aprovação humana pode
+   *  demorar (waiter do server expira em 5min). */
+  private bridgePost(route: string, body: unknown): Promise<any> {
+    const data = JSON.stringify(body);
+    const path = `/api/bridge/${this.info.id}/${route}`;
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "Content-Length": String(Buffer.byteLength(data)),
+      "Authorization": `Bearer ${this.opts.agentToken}`,
+    };
+    const timeoutMs = 6 * 60_000;
+    return new Promise((resolve, reject) => {
+      let opts: import("node:http").RequestOptions;
+      if (this.opts.bridgeSocketPath) {
+        opts = { socketPath: this.opts.bridgeSocketPath, path, method: "POST", headers, timeout: timeoutMs };
+      } else {
+        let u: URL;
+        try { u = new URL(this.opts.orchestratorUrl + path); } catch (e) { reject(e as Error); return; }
+        opts = { hostname: u.hostname, port: u.port, path: u.pathname, method: "POST", headers, timeout: timeoutMs };
+      }
+      const req = http.request(opts, (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (c: Buffer) => chunks.push(c));
+        res.on("end", () => {
+          const txt = Buffer.concat(chunks).toString("utf8");
+          const sc = res.statusCode ?? 0;
+          if (sc >= 200 && sc < 300) { try { resolve(txt ? JSON.parse(txt) : {}); } catch { resolve({}); } }
+          else reject(new Error(`HTTP ${sc}${txt ? ` — ${txt.slice(0, 120)}` : ""}`));
+        });
+      });
+      req.on("error", reject);
+      req.on("timeout", () => req.destroy(new Error(`timeout ${timeoutMs}ms`)));
+      req.write(data);
+      req.end();
+    });
+  }
+
+  /** Lê TODAS as mensagens da sessão e processa as parts ainda não vistas.
+   *  Cobre tool calls que vivem em mensagens intermediárias (o POST /message
+   *  só devolve a última). Fallback p/ resp.parts se o GET falhar. */
+  private async ocProcessNewParts(resp: any): Promise<void> {
+    let messages: any[] | null = null;
+    try {
+      const r = await this.ocServeFetch(`/session/${this.ocSessionId}/message`, "GET");
+      if (Array.isArray(r)) messages = r;
+    } catch { /* cai pro fallback abaixo */ }
+
+    const groups: any[][] = messages
+      ? messages
+          .filter((m) => (m?.info?.role ?? m?.role) === "assistant")
+          .map((m) => (Array.isArray(m?.parts) ? m.parts : []))
+      : [Array.isArray(resp?.parts) ? resp.parts : []];
+
+    for (const parts of groups) {
+      for (const p of parts) {
+        const id = p?.id;
+        if (id) {
+          if (this.ocSeenPartIds.has(id)) continue;
+          this.ocSeenPartIds.add(id);
+        }
+        this.ocDispatchPart(p);
+      }
+    }
+  }
+
+  /** Despacha uma part da resposta opencode (text/tool/step-finish). */
+  private ocDispatchPart(p: any): void {
+    const t = p?.type;
+    if (t === "text") {
+      const text = (p.text as string | undefined)?.trim();
+      if (text) { this.ocRunSawOutput = true; this.setState("speaking"); this.opts.onAssistantText(text); }
+    } else if (t === "tool" || t === "tool-use" || t === "tool_use" || t === "tool-call" || t === "tool_call") {
+      // só conta tool já resolvida (completed/error) — evita emitir pending sem input
+      const status = p.state?.status;
+      if (status && status !== "completed" && status !== "error") return;
+      this.ocRunSawOutput = true;
+      const toolName = p.tool ?? p.name ?? p.state?.name ?? "";
+      const input = p.state?.input ?? p.input ?? {};
+      this.opts.onToolUse(toolName, input);
+    } else if (t === "step-finish" || t === "step_finish") {
+      const tokens = p.tokens;
+      if (tokens) {
+        const delta: AgentUsage = {
+          input: Number(tokens.input ?? 0),
+          output: Number(tokens.output ?? 0),
+          cacheCreate: Number(tokens.cache?.write ?? 0),
+          cacheRead: Number(tokens.cache?.read ?? 0),
+        };
+        this.opts.onUsageDelta?.(delta);
+        this.checkContextUsage(delta);
+      }
+    }
   }
 
   private handleOpenCodeEvent(event: any) {
@@ -1771,6 +1981,7 @@ export class AgentRunner {
     // stop). Cleanup explicit pra GC.
     this.pendingMessages = [];
     this.ocQueue = [];
+    if (this.ocEventReq) { try { this.ocEventReq.destroy(); } catch { /* noop */ } this.ocEventReq = null; }
     if (this.opts.cliRunner === "opencode" || this.opts.cliRunner === "gemini" || this.opts.cliRunner === "codex") {
       if (this.ocServerProc && !this.ocServerProc.killed) {
         try { this.ocServerProc.kill("SIGTERM"); } catch {}
