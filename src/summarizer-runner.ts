@@ -11,11 +11,11 @@
  * speaking the original (un-summarized) text on error.
  */
 
+import http from "node:http";
 import { mkdtempSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ResolvedCliCommands } from "./cli-config.js";
-import { resolvePython3 } from "./cli-config.js";
 import { extractOneShotText } from "./agent-runner.js";
 import { spawnDropped, type DropTarget } from "./privileges.js";
 import type { CliRunner } from "./types.js";
@@ -99,6 +99,114 @@ function expandHome(p: string): string {
   return p;
 }
 
+/** HTTP loopback ao opencode serve. Resolve com JSON; rejeita em !2xx/timeout. */
+function ocFetch(baseUrl: string, path: string, method: string, body: unknown, timeoutMs: number): Promise<any> {
+  return new Promise((resolve, reject) => {
+    let u: URL;
+    try { u = new URL(baseUrl + path); } catch (e) { reject(e as Error); return; }
+    const data = body !== undefined ? JSON.stringify(body) : undefined;
+    const req = http.request(
+      {
+        hostname: u.hostname, port: u.port, path: u.pathname + u.search, method,
+        headers: { "Content-Type": "application/json", ...(data ? { "Content-Length": Buffer.byteLength(data) } : {}) },
+        timeout: timeoutMs,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (c: Buffer) => chunks.push(c));
+        res.on("end", () => {
+          const txt = Buffer.concat(chunks).toString("utf8");
+          const sc = res.statusCode ?? 0;
+          if (sc >= 200 && sc < 300) { try { resolve(txt ? JSON.parse(txt) : {}); } catch { resolve({}); } }
+          else reject(new Error(`HTTP ${sc}${txt ? ` — ${txt.slice(0, 150)}` : ""}`));
+        });
+      },
+    );
+    req.on("error", reject);
+    req.on("timeout", () => req.destroy(new Error(`timeout ${timeoutMs}ms`)));
+    if (data) req.write(data);
+    req.end();
+  });
+}
+
+/**
+ * Summarize via opencode usando o MESMO transporte dos agentes: sobe um
+ * `opencode serve` efêmero, POST /session + POST /message, depois GET de TODAS
+ * as mensagens (o POST só devolve a última; texto/tool ficam em msgs do loop).
+ * `opencode run --format json` falhava aqui (reasoning models não serializam
+ * texto no stdout). cwd limpo = sem opencode.json = provider zai-coding-plan ok.
+ */
+async function runOpenCodeSummarizer(args: SummarizerArgs, fullPrompt: string, cwd: string, env: NodeJS.ProcessEnv): Promise<SummarizerResult> {
+  const cliCommand = args.cliCommands.opencode!.command;
+  // strip do sufixo legado de effort (glm-5.2:high) — não é configurável aqui
+  const raw = (args.model ?? "").replace(/:(off|minimal|none|low|medium|high|xhigh|max)$/, "");
+  const slash = raw.indexOf("/");
+  const providerID = slash > 0 ? raw.slice(0, slash) : "";
+  const modelID = slash > 0 ? raw.slice(slash + 1) : raw;
+
+  let proc;
+  try {
+    proc = spawnDropped(cliCommand, ["serve", "--port", "0", "--hostname", "127.0.0.1"], { cwd, env, stdio: ["ignore", "pipe", "pipe"] }, args.dropTo ?? null);
+  } catch (e) {
+    try { rmSync(cwd, { recursive: true, force: true }); } catch { /* ignore */ }
+    return { ok: false, error: `opencode serve spawn falhou: ${(e as Error).message}` };
+  }
+  const cleanup = () => {
+    try { proc.kill("SIGKILL"); } catch { /* ignore */ }
+    try { rmSync(cwd, { recursive: true, force: true }); } catch { /* ignore */ }
+  };
+
+  try {
+    const serveUrl = await new Promise<string>((resolve, reject) => {
+      let buf = "";
+      const onData = (c: string) => { buf += c; const m = buf.match(/https?:\/\/[\w.:-]+:\d+/); if (m) resolve(m[0]); };
+      proc.stdout?.setEncoding("utf8");
+      proc.stderr?.setEncoding("utf8");
+      proc.stdout?.on("data", onData);
+      proc.stderr?.on("data", onData);
+      proc.on("exit", (code) => reject(new Error(`serve saiu antes de subir (code ${code})`)));
+      setTimeout(() => reject(new Error("serve boot timeout (10s)")), 10_000);
+    });
+
+    const sess = await ocFetch(serveUrl, "/session", "POST", providerID && modelID ? { model: { id: modelID, providerID } } : {}, 15_000);
+    const sid = sess?.id;
+    if (!sid) throw new Error("sessão sem id");
+
+    await ocFetch(
+      serveUrl, `/session/${sid}/message`, "POST",
+      { ...(providerID && modelID ? { model: { providerID, modelID } } : {}), parts: [{ type: "text", text: fullPrompt }] },
+      Math.max(20_000, MAX_TIMEOUT_MS - 12_000),
+    );
+
+    const msgs = await ocFetch(serveUrl, `/session/${sid}/message`, "GET", undefined, 15_000);
+    let summary = "";
+    let input = 0, output = 0;
+    if (Array.isArray(msgs)) {
+      for (const m of msgs) {
+        if ((m?.info?.role ?? m?.role) !== "assistant") continue;
+        for (const p of (m?.parts ?? [])) {
+          if (p?.type === "text" && p.text) summary += (summary ? "\n" : "") + String(p.text).trim();
+          if ((p?.type === "step-finish" || p?.type === "step_finish") && p.tokens) {
+            input += Number(p.tokens.input ?? 0);
+            output += Number(p.tokens.output ?? 0);
+          }
+        }
+      }
+    }
+    summary = summary.trim();
+    cleanup();
+    if (!summary) return { ok: false, error: "opencode: turno terminou sem texto" };
+    if (!input && !output) {
+      input = Math.ceil(((args.systemPrompt ?? "").length + args.text.length) / 4);
+      output = Math.ceil(summary.length / 4);
+    }
+    return { ok: true, summary, usage: { input, output } };
+  } catch (e) {
+    cleanup();
+    return { ok: false, error: `opencode: ${(e as Error).message}` };
+  }
+}
+
 export async function runSummarizer(args: SummarizerArgs): Promise<SummarizerResult> {
   const status = args.cliCommands[args.runner];
   if (!status?.available) {
@@ -132,6 +240,11 @@ export async function runSummarizer(args: SummarizerArgs): Promise<SummarizerRes
     env.GEMINI_CLI_TRUST_WORKSPACE = "true";
   }
 
+  // opencode usa o transporte serve (igual aos agentes), não `opencode run`.
+  if (args.runner === "opencode") {
+    return runOpenCodeSummarizer(args, fullPrompt, cwd, env);
+  }
+
   let cmd = cliCommand;
   let argv: string[];
 
@@ -148,18 +261,6 @@ export async function runSummarizer(args: SummarizerArgs): Promise<SummarizerRes
   } else if (args.runner === "gemini") {
     argv = ["--output-format", "json", "--skip-trust", "--yolo", "-p", fullPrompt];
     if (args.model) argv.push("--model", args.model);
-  } else if (args.runner === "opencode") {
-    const ocArgs = ["run", "--format", "json"];
-    // Remove sufixo de reasoning legado (ex glm-5.2:high) — o opencode espera o
-    // modelID sem ele. reasoning_effort NÃO é aplicável: bloco provider no
-    // opencode.json corrompe o zai-coding-plan (run mudo). Roda no default.
-    const ocModel = args.model?.replace(/:(off|minimal|none|low|medium|high|xhigh|max)$/, "");
-    if (ocModel) ocArgs.push("--model", ocModel);
-    ocArgs.push(fullPrompt);
-    const py = resolvePython3();
-    if (!py) return { ok: false, error: "python3 não encontrado em path absoluto (wrapper PTY do opencode)" };
-    cmd = py;
-    argv = ["-c", "import pty,sys; pty.spawn(sys.argv[1:])", cliCommand, ...ocArgs];
   } else {
     return { ok: false, error: `runner inválido: ${args.runner}` };
   }
