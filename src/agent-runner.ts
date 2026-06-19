@@ -68,6 +68,14 @@ const MISSING_SESSION_PATTERNS = [
 // Ex: "API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited"
 const RATE_LIMIT_TEXT_RE = /temporarily limiting requests|·\s*rate limited|\brate.?limited\b|overloaded|too many requests|\b429\b|\b529\b/i;
 
+const MIME_EXT: Record<string, string> = {
+  "image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg",
+  "image/gif": "gif", "image/webp": "webp", "image/bmp": "bmp", "image/svg+xml": "svg",
+};
+function mimeToExt(mime: string): string {
+  return MIME_EXT[mime?.toLowerCase()] ?? "bin";
+}
+
 export interface AgentRunnerOptions {
   bridgeCommand: string;
   bridgeArgs: string[];
@@ -1254,13 +1262,13 @@ export class AgentRunner {
     return { providerID, modelID };
   }
 
-  private runOpenCodeMessage(content: string, retry = 0) {
+  private runOpenCodeMessage(content: string, images?: ImageAttachment[], retry = 0) {
     if (this.stopped) return;
     if (!this.ensureRunnerAvailable("opencode")) return;
     this.setState("thinking");
 
     this.ensureOcServer().then(
-      () => this.runOpenCodeMessageAttached(content, retry),
+      () => this.runOpenCodeMessageAttached(content, images, retry),
       (err) => {
         this.opts.onError(`opencode serve falhou: ${err?.message ?? err}`);
         this.ocBusy = false;
@@ -1276,7 +1284,7 @@ export class AgentRunner {
    *  1 retry cobre o flap intermitente (ex.: Z.AI) sem loop infinito. */
   private static readonly OC_EMPTY_RETRIES = 1;
 
-  private async runOpenCodeMessageAttached(content: string, retry = 0) {
+  private async runOpenCodeMessageAttached(content: string, images?: ImageAttachment[], retry = 0) {
     if (this.stopped || !this.ocServerUrl) return;
     // first-turn wrapping pode ser re-aplicado no retry (capturado aqui).
     const wasFirstTurn = this.ocFirstTurn;
@@ -1319,12 +1327,19 @@ export class AgentRunner {
     // de `opencode run` — cujo stdout NÃO serializa o `text` de reasoning
     // models (ex: deepseek-v4-pro) → agente mudo. O serve retorna a message
     // completa {info, parts:[step-start, reasoning, text, tool, step-finish]}.
+    // Imagens viram FilePartInput com data-URL (opencode aceita inline; sem temp).
+    const parts: any[] = [{ type: "text", text: message }];
+    if (images && images.length) {
+      for (const img of images) {
+        parts.push({ type: "file", mime: img.mimeType, url: `data:${img.mimeType};base64,${img.base64}` });
+      }
+    }
     let resp: any;
     try {
       resp = await this.ocServeFetch(
         `/session/${this.ocSessionId}/message`,
         "POST",
-        { ...(providerID && modelID ? { model: { providerID, modelID } } : {}), parts: [{ type: "text", text: message }] },
+        { ...(providerID && modelID ? { model: { providerID, modelID } } : {}), parts },
         OPENCODE_TURN_TIMEOUT_MS,
       );
     } catch (e) {
@@ -1335,7 +1350,7 @@ export class AgentRunner {
         this.opts.onError(`opencode: turno falhou (${emsg}) — retry ${retry + 1}/${AgentRunner.OC_EMPTY_RETRIES}`);
         if (wasFirstTurn) this.ocFirstTurn = true;
         this.ocBusy = true;
-        setTimeout(() => { if (this.stopped) { this.ocBusy = false; return; } void this.runOpenCodeMessage(content, retry + 1); }, 1200);
+        setTimeout(() => { if (this.stopped) { this.ocBusy = false; return; } void this.runOpenCodeMessage(content, images, retry + 1); }, 1200);
         return;
       }
       this.opts.onError(`opencode: turno falhou após retry: ${emsg}`);
@@ -1357,7 +1372,7 @@ export class AgentRunner {
       this.opts.onError(`opencode: resposta vazia (provável flap do provider) — retry ${retry + 1}/${AgentRunner.OC_EMPTY_RETRIES}`);
       if (wasFirstTurn) this.ocFirstTurn = true;
       this.ocBusy = true;
-      setTimeout(() => { if (this.stopped) { this.ocBusy = false; return; } void this.runOpenCodeMessage(content, retry + 1); }, 1200);
+      setTimeout(() => { if (this.stopped) { this.ocBusy = false; return; } void this.runOpenCodeMessage(content, images, retry + 1); }, 1200);
       return;
     }
     if (!this.ocRunSawOutput) {
@@ -1623,7 +1638,7 @@ export class AgentRunner {
 
   /* ---------- Gemini per-message model ---------- */
 
-  private runGeminiMessage(content: string) {
+  private runGeminiMessage(content: string, images?: ImageAttachment[]) {
     if (this.stopped) return;
     if (!this.ensureRunnerAvailable("gemini")) return;
     this.setState("thinking");
@@ -1638,6 +1653,13 @@ export class AgentRunner {
       const summary = this.ocPendingSummary ? `\n\n# Previous conversation summary\n${this.ocPendingSummary}` : "";
       this.ocPendingSummary = undefined;
       message = `${buildSystemPromptHeader(this.opts.features)}\n\n# Your role\n${this.info.role}\n\n${this.info.systemPrompt}\n\n# Workspace\n${this.workspaceInfo()}${summary}\n\n---\n\n${content}`;
+    }
+    // Imagens: gemini lê arquivos referenciados por @<path> no prompt.
+    let imgCleanup = () => {};
+    if (images && images.length) {
+      const { paths, cleanup } = this.writeImageTempFiles(images);
+      imgCleanup = cleanup;
+      if (paths.length) message += `\n\n${paths.map((p) => `@${p}`).join(" ")}`;
     }
     this.traceCli("gemini", "argv", message);
 
@@ -1725,6 +1747,7 @@ export class AgentRunner {
 
     proc.on("close", (code) => {
       flush();
+      imgCleanup();
       this.ocActiveProc = null;
       this.ocBusy = false;
       if (this.stopped) { this.emitExit(code); return; }
@@ -1786,7 +1809,7 @@ export class AgentRunner {
     return out;
   }
 
-  private runCodexMessage(content: string) {
+  private runCodexMessage(content: string, images?: ImageAttachment[]) {
     if (this.stopped) return;
     if (!this.ensureRunnerAvailable("codex")) return;
     this.setState("thinking");
@@ -1814,9 +1837,18 @@ export class AgentRunner {
       ...(this.info.effort ? ["-c", `model_reasoning_effort="${codexEffort(this.info.effort)}"`] : []),
     ];
 
+    // Imagens: codex aceita `-i <FILE>` (repetido). Grava temp e anexa.
+    let imgCleanup = () => {};
+    let imageArgs: string[] = [];
+    if (images && images.length) {
+      const { paths, cleanup } = this.writeImageTempFiles(images);
+      imgCleanup = cleanup;
+      imageArgs = paths.flatMap((p) => ["-i", p]);
+    }
+
     const args = this.ocSessionId
-      ? ["exec", "resume", ...commonFlags, this.ocSessionId, message]
-      : ["exec", ...commonFlags, message];
+      ? ["exec", "resume", ...commonFlags, this.ocSessionId, ...imageArgs, message]
+      : ["exec", ...commonFlags, ...imageArgs, message];
 
     this.traceSpawn("codex", args);
     const proc = spawnDropped(this.runnerCommand("codex"), args, {
@@ -1854,6 +1886,7 @@ export class AgentRunner {
       if (buf.trim().startsWith("{")) {
         try { this.handleCodexEvent(JSON.parse(buf.trim())); } catch {}
       }
+      imgCleanup();
       this.ocActiveProc = null;
       this.ocBusy = false;
       if (this.stopped) { this.emitExit(code); return; }
@@ -1909,16 +1942,31 @@ export class AgentRunner {
     }
   }
 
+  /** Grava imagens (base64) em arquivos temp no tmpdir do agente — pros runners
+   *  per-message que aceitam imagem por caminho de arquivo (codex `-i`, gemini
+   *  `@path`). Retorna paths + cleanup. opencode usa data-URL inline (não temp). */
+  private writeImageTempFiles(images: ImageAttachment[]): { paths: string[]; cleanup: () => void } {
+    const dir = this.agentTmpDir();
+    mkdirSync(dir, { recursive: true });
+    const paths: string[] = [];
+    images.forEach((img, i) => {
+      const p = path.join(dir, `img-${Date.now()}-${i}.${mimeToExt(img.mimeType)}`);
+      try { writeFileSync(p, Buffer.from(img.base64, "base64"), { mode: 0o600 }); paths.push(p); }
+      catch (e) { this.opts.log("warn", `[cli:${this.info.id}] falha gravando imagem temp: ${(e as Error).message}`); }
+    });
+    return { paths, cleanup: () => { for (const p of paths) { try { rmSync(p, { force: true }); } catch { /* noop */ } } } };
+  }
+
   private drainOcQueue() {
     if (this.ocBusy || this.ocQueue.length === 0 || this.stopped) return;
     this.ocBusy = true;
-    const { content } = this.ocQueue.shift()!;
+    const { content, images } = this.ocQueue.shift()!;
     if (this.opts.cliRunner === "gemini") {
-      this.runGeminiMessage(content);
+      this.runGeminiMessage(content, images);
     } else if (this.opts.cliRunner === "codex") {
-      this.runCodexMessage(content);
+      this.runCodexMessage(content, images);
     } else {
-      this.runOpenCodeMessage(content);
+      this.runOpenCodeMessage(content, images);
     }
   }
 

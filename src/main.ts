@@ -1078,8 +1078,8 @@ class DaemonClient {
         this.send({ type: "graph:data", projectId: msg.projectId, error: "índice ainda não gerado — reindexe", correlationId: msg.correlationId });
         return;
       }
-      if (stat.size > 4 * 1024 * 1024) {
-        this.send({ type: "graph:data", projectId: msg.projectId, error: "grafo muito grande (> 4MB) pra renderizar", correlationId: msg.correlationId });
+      if (stat.size > 16 * 1024 * 1024) {
+        this.send({ type: "graph:data", projectId: msg.projectId, error: "grafo muito grande (> 16MB) pra renderizar", correlationId: msg.correlationId });
         return;
       }
       const json = await fs.promises.readFile(gp, "utf-8");
