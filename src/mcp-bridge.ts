@@ -117,7 +117,7 @@ const _enabledGroups = _featuresRaw === undefined
   ? null
   : new Set(_featuresRaw.split(",").map((s) => s.trim()).filter(Boolean));
 const TOOL_GROUP: Record<string, string> = {
-  send_message: "teammates", list_agents: "teammates",
+  send_message: "teammates", list_agents: "teammates", delegate: "teammates",
   list_tasks: "tasks", add_task: "tasks", update_task: "tasks",
   lock_task: "tasks", unlock_task: "tasks",
   add_task_comment: "tasks", list_task_comments: "tasks",
@@ -157,6 +157,24 @@ server.tool(
         content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }],
         isError: true,
       };
+    }
+  }
+);
+
+server.tool(
+  "delegate",
+  "Spawn an EPHEMERAL sub-agent to handle ONE focused sub-task in the background, then it self-terminates. Returns a task id immediately (async). The sub-agent does the work and sends its result back to you via a message when done — you don't block. Use for parallel research/implementation you'd otherwise do yourself. Keep goals narrow and self-contained.",
+  {
+    goal: z.string().describe("The focused task for the sub-agent (self-contained — it has no prior context)."),
+    context: z.string().optional().describe("Optional background/inputs the sub-agent needs (paths, constraints, prior findings)."),
+  },
+  async ({ goal, context }) => {
+    try {
+      const r = await postJSON("delegate", { goal, context: context ?? "" });
+      if (r.error) return { content: [{ type: "text", text: `delegate falhou: ${r.error}` }], isError: true };
+      return { content: [{ type: "text", text: `subagente "${r.subagentName}" criado (task ${r.taskId}). Ele te manda o resultado por mensagem quando terminar.` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
     }
   }
 );
