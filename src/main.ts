@@ -484,6 +484,7 @@ class DaemonClient {
           if (msg.systemPrefix) content = msg.systemPrefix + content;
           if (msg.systemSuffix) content = content + msg.systemSuffix;
         }
+        if (msg.telegram !== undefined) this.host.setTelegramMirror(msg.agentId, msg.telegram);
         this.host.send_message(msg.agentId, content, msg.images);
         return;
       }

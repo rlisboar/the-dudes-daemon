@@ -51,6 +51,9 @@ interface Entry {
    *  Map agentTokens (in-memory) mas o processo mcp-bridge segue
    *  rodando com o token antigo. Daemon devolve no resync. */
   agentToken?: string;
+  /** Espelho Telegram: chat vinculado pra onde TODA saída do agente é
+   *  encaminhada (texto em claro). Setado via agent:send.telegram. */
+  telegramMirror?: { botToken: string; chatId: string };
 }
 
 export class AgentHost {
@@ -74,6 +77,27 @@ export class AgentHost {
    *  another daemon — bridge relay falls back to passing through). */
   getAgentProjectId(agentId: string): string | null {
     return this.entries.get(agentId)?.projectId ?? null;
+  }
+
+  /** Vincula/desvincula o agente a um chat do Telegram (espelho de saída). */
+  setTelegramMirror(agentId: string, mirror: { botToken: string; chatId: string } | null): void {
+    const e = this.entries.get(agentId);
+    if (!e) return;
+    e.telegramMirror = mirror ?? undefined;
+  }
+
+  /** Encaminha um texto pro chat do Telegram via Bot API (egress local, SSRF
+   *  guard). Best-effort: falha não derruba o turno do agente. */
+  private async mirrorToTelegram(mirror: { botToken: string; chatId: string }, text: string): Promise<void> {
+    try {
+      const { safeFetch } = await import("./ssrf-guard.js");
+      const url = `https://api.telegram.org/bot${mirror.botToken}/sendMessage`;
+      // Telegram corta em 4096 chars/mensagem.
+      const body = JSON.stringify({ chat_id: mirror.chatId, text: text.slice(0, 4096), disable_web_page_preview: true });
+      await safeFetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body }, { maxRedirects: 0 });
+    } catch (e) {
+      this.log("warn", `[telegram-mirror] falha enviando pro chat ${mirror.chatId}: ${(e as Error).message}`);
+    }
   }
 
   setAutoApprove(value: boolean) {
@@ -352,6 +376,10 @@ export class AgentHost {
         const red = msg.projectId ? redactCredentials(msg.projectId, text) : text;
         const enc = msg.projectId ? encryptForProject(red, msg.projectId) : null;
         this.send({ type: "agent:text", agentId: msg.agent.id, text: enc ?? red });
+        // Espelho Telegram: encaminha a MESMA resposta (em claro, já redatada)
+        // pro chat vinculado. Server é E2EE-cego, por isso o mirror é aqui.
+        const mirror = this.entries.get(msg.agent.id)?.telegramMirror;
+        if (mirror && red.trim()) void this.mirrorToTelegram(mirror, red);
       },
       onToolUse: (toolName, input) => this.send({
         type: "agent:tool_use",

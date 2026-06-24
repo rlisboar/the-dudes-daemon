@@ -167,6 +167,10 @@ export interface AgentSend {
   /** Project the message belongs to — required for E2EE decrypt. */
   projectId?: string;
   images?: ImageAttachment[];
+  /** Espelho Telegram: quando presente, vincula este agente a um chat do
+   *  Telegram. O daemon passa a encaminhar TODA saída do agente (texto em
+   *  claro, pré-E2EE) pra esse chat via sendMessage. null desvincula. */
+  telegram?: { botToken: string; chatId: string } | null;
 }
 export interface AgentClear { type: "agent:clear"; agentId: string }
 export interface AgentCompact { type: "agent:compact"; agentId: string; saveMemory?: boolean }
