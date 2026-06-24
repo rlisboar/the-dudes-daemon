@@ -1,4 +1,5 @@
 import path from "node:path";
+import { homedir } from "node:os";
 import { statSync, readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { spawn } from "node:child_process";
 
@@ -16,7 +17,50 @@ export interface BuildOpts {
   /** modelo dentro do backend (ex haiku/sonnet/opus, gpt-4.1-mini,
    *  gemini-3-flash-preview, qwen2.5-coder:7b). graphify lê via env por backend. */
   model?: string;
+  /** API key (já decifrada) + env var do backend (ex GEMINI_API_KEY). Injetada
+   *  no env do graphify pros backends que leem key do ambiente. */
+  apiKeyEnv?: string;
+  apiKey?: string;
   timeoutMs?: number;
+}
+
+// O graphify roda `claude -p` SEM CLAUDE_CONFIG_DIR → claude usa o default
+// (~/.claude), que pode não estar autenticado (a auth pode estar em
+// ~/.config/claude, ~/.claude-eonf, ou no env). Descobrimos qual dir autentica
+// (probe rápido, cache por processo) e passamos pro graphify. Resolve o exit 1
+// silencioso (401 que o claude joga no stdout JSON e o graphify descarta).
+let _authedClaudeCfg: string | null | undefined; // undefined=não testado, null=nenhum, string=dir
+function probeClaudeAuth(claudeCmd: string, cfgDir: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    let out = ""; let settled = false;
+    const fin = (v: boolean) => { if (!settled) { settled = true; resolve(v); } };
+    let pr: ReturnType<typeof spawn>;
+    try {
+      pr = spawn(claudeCmd, ["-p", "--output-format", "json", "ok"], { env: { ...process.env, CLAUDE_CONFIG_DIR: cfgDir } });
+    } catch { fin(false); return; }
+    const t = setTimeout(() => { try { pr.kill("SIGKILL"); } catch { /* noop */ } fin(false); }, 30_000);
+    pr.stdout?.on("data", (c: Buffer) => { out += c.toString(); });
+    pr.on("error", () => { clearTimeout(t); fin(false); });
+    pr.on("close", (code) => {
+      clearTimeout(t);
+      if (code !== 0) return fin(false);
+      try { fin(JSON.parse(out)?.is_error !== true); } catch { fin(false); }
+    });
+  });
+}
+async function resolveAuthedClaudeConfigDir(claudeCmd: string): Promise<string | undefined> {
+  if (_authedClaudeCfg !== undefined) return _authedClaudeCfg ?? undefined;
+  const home = homedir();
+  const cands = [process.env.CLAUDE_CONFIG_DIR, path.join(home, ".claude-eonf"), path.join(home, ".config", "claude"), path.join(home, ".claude")]
+    .filter((d): d is string => !!d && existsSync(d));
+  const seen = new Set<string>();
+  for (const dir of cands) {
+    if (seen.has(dir)) continue;
+    seen.add(dir);
+    if (await probeClaudeAuth(claudeCmd, dir)) { _authedClaudeCfg = dir; return dir; }
+  }
+  _authedClaudeCfg = null;
+  return undefined;
 }
 
 /** env var de modelo por backend do graphify (ver llm.py model_env_key). */
@@ -147,13 +191,19 @@ export function buildGraph(
   return p;
 }
 
-function runBuild(
+async function runBuild(
   workspaceRoot: string,
   graphifyBin: string,
   opts: BuildOpts,
 ): Promise<GraphBuildResult> {
   // semântico é mais lento (LLM sequencial via claude-cli) → timeout maior.
   const timeoutMs = opts.timeoutMs ?? (opts.semantic ? 900_000 : 180_000);
+  // Descobre o CLAUDE_CONFIG_DIR autenticado (probe + cache) p/ o claude-cli do
+  // graphify não cair no default ~/.claude desautenticado (401 → exit 1).
+  let claudeCfgDir: string | undefined;
+  if (opts.semantic && (opts.backend || "claude-cli") === "claude-cli" && opts.claudeCmd) {
+    claudeCfgDir = await resolveAuthedClaudeConfigDir(opts.claudeCmd);
+  }
   return new Promise((resolve) => {
     let out = "";
     let settled = false;
@@ -170,11 +220,14 @@ function runBuild(
         const env: NodeJS.ProcessEnv = { ...process.env };
         if (backend === "claude-cli" && opts.claudeCmd) {
           env.PATH = `${path.dirname(opts.claudeCmd)}:${process.env.PATH ?? ""}`;
+          if (claudeCfgDir) env.CLAUDE_CONFIG_DIR = claudeCfgDir; // dir autenticado
         }
         if (opts.model && backend !== "auto") {
           const mEnv = MODEL_ENV[backend];
           if (mEnv) env[mEnv] = opts.model;
         }
+        // API key do backend (do vault, já decifrada) → env var do backend.
+        if (opts.apiKeyEnv && opts.apiKey) env[opts.apiKeyEnv] = opts.apiKey;
         const args = ["extract", workspaceRoot];
         if (backend !== "auto") args.push("--backend", backend);
         proc = spawn(graphifyBin, args, { cwd: workspaceRoot, env });
@@ -208,8 +261,32 @@ function runBuild(
           }
           return;
         }
-        const tail = out.trim().split("\n").slice(-3).join(" | ").slice(0, 400);
-        done({ ok: false, error: `graphify update exit ${code}: ${tail}` });
+        // Prioriza linhas que parecem o ERRO real (claude-cli/python) em vez do
+        // tail de progresso — senão a msg mostra "...semantic extraction..." e
+        // esconde a causa. Cap maior pra a causa caber.
+        const lines = out.trim().split("\n").filter(Boolean);
+        const errRe = /error|exception|traceback|failed|rate.?limit|unauthorized|forbidden|not found|timeout|denied|invalid|quota|\b4\d\d\b|\b5\d\d\b/i;
+        const errLines = lines.filter((l) => errRe.test(l) && !/\[graphify extract\]\s+(AST|semantic) extraction/i.test(l));
+        const picked = (errLines.length ? errLines : lines).slice(-4).join(" | ").slice(0, 800);
+        const cmd = opts.semantic ? "extract" : "update";
+        // Hint p/ o caso comum: todos os chunks do claude-cli falham (exit 1,
+        // stderr vazio) = o claude retornou erro no stdout JSON (que o graphify
+        // descarta) — quase sempre rate/usage limit do Claude no lote de N
+        // arquivos. Single call funciona; o lote (chunks ~paralelos) estoura.
+        let hint = "";
+        if (/semantic chunk.*failed|all semantic chunks failed|claude -p exited/i.test(out)) {
+          if (opts.semantic && (opts.backend || "claude-cli") === "claude-cli") {
+            const cfgNote = _authedClaudeCfg
+              ? `config dir testado: ${_authedClaudeCfg}`
+              : "nenhum CLAUDE_CONFIG_DIR autenticado encontrado — rode 'claude' e faça login";
+            hint =
+              ` — claude-cli falhou (${cfgNote}). Pode ser auth (401, erro vai no stdout JSON que o graphify descarta)` +
+              " ou rate-limit. Tente outro backend (Gemini/DeepSeek/Ollama) ou reduza o escopo (.graphifyignore).";
+          } else {
+            hint = " — verifique a API key do backend (credencial no vault) e o escopo (.graphifyignore).";
+          }
+        }
+        done({ ok: false, error: `graphify ${cmd} exit ${code}: ${picked}${hint}` });
         return;
       }
       ensureGitignored(workspaceRoot);

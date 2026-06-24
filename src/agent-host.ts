@@ -96,7 +96,9 @@ export class AgentHost {
       const body = JSON.stringify({ chat_id: mirror.chatId, text: text.slice(0, 4096), disable_web_page_preview: true });
       await safeFetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body }, { maxRedirects: 0 });
     } catch (e) {
-      this.log("warn", `[telegram-mirror] falha enviando pro chat ${mirror.chatId}: ${(e as Error).message}`);
+      // Redact o token do bot caso o erro (undici/cause) ecoe a URL.
+      const safe = ((e as Error).message ?? "").replace(/bot\d+:[\w-]+/g, "bot***");
+      this.log("warn", `[telegram-mirror] falha enviando pro chat ${mirror.chatId}: ${safe}`);
     }
   }
 

@@ -436,7 +436,12 @@ class DaemonClient {
             entries.push(block);
             used += block.length;
           }
-          if (dropped > 0) log("info", `memory budget: ${entries.length} injected, ${dropped} dropped (over ${MEMORY_CHAR_BUDGET} chars) for ${spec.agent.id}`);
+          if (dropped > 0) {
+            log("info", `memory budget: ${entries.length} injected, ${dropped} dropped (over ${MEMORY_CHAR_BUDGET} chars) for ${spec.agent.id}`);
+            // Overflow visível: avisa o agente que a memória foi truncada pra ele
+            // usar `recall` em vez de assumir que o injetado é tudo.
+            entries.push(`### [system] memória truncada\n${dropped} memória(s) mais antiga(s) omitida(s) por limite de contexto. Use a tool \`recall\` pra buscar conhecimento que não esteja aqui.`);
+          }
           if (entries.length > 0) {
             const block = `## Project Memory\n\nConhecimento durável do projeto (compartilhado + seu). Use como contexto de fundo; verifique antes de confiar em detalhes específicos.\n\n${entries.join("\n\n")}`;
             spec.agent = { ...spec.agent, systemPrompt: `${spec.agent.systemPrompt}\n\n---\n\n${block}` };
@@ -936,7 +941,10 @@ class DaemonClient {
 
   private async handleWebhookDispatch(msg: Extract<FromOrch, { type: "webhook:dispatch" }>) {
     const eventType = String((msg.event as any)?.type ?? "unknown");
-    log("info", `webhook:dispatch ${eventType} → ${msg.url} (${msg.format})`);
+    // NÃO logar a URL inteira: webhooks carregam segredo no path (telegram
+    // .../bot<TOKEN>/..., discord/slack incoming-webhook tokens). Loga só o host.
+    const host = (() => { try { return new URL(msg.url).host; } catch { return "?"; } })();
+    log("info", `webhook:dispatch ${eventType} → ${host} (${msg.format})`);
     try {
       const result = await dispatchWebhook({
         event: msg.event,
@@ -1051,9 +1059,16 @@ class DaemonClient {
       this.send({ type: "graph:status", projectId: msg.projectId, status: "error", error: "backend claude-cli exige o claude CLI instalado (ou escolha outro backend)", correlationId: msg.correlationId });
       return;
     }
+    // API key do backend não-claude: server manda o cipher do vault; daemon
+    // decifra (project key) e injeta como env var do backend.
+    let apiKey: string | undefined;
+    if (msg.semantic && msg.apiKeyEnv && msg.apiKeyCipher && msg.projectId) {
+      const dec = isE2eEncrypted(msg.apiKeyCipher) ? decryptForProject(msg.apiKeyCipher, msg.projectId) : msg.apiKeyCipher;
+      if (dec) apiKey = dec;
+    }
     this.send({ type: "graph:status", projectId: msg.projectId, status: "building", correlationId: msg.correlationId });
     const r = await buildGraph(root, gbin.command, msg.semantic
-      ? { semantic: true, backend, model: msg.model, claudeCmd: claude?.command }
+      ? { semantic: true, backend, model: msg.model, claudeCmd: claude?.command, apiKeyEnv: msg.apiKeyEnv, apiKey }
       : {});
     if (!r.ok) {
       this.send({ type: "graph:status", projectId: msg.projectId, status: "error", error: r.error, correlationId: msg.correlationId });

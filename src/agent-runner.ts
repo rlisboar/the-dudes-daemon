@@ -2100,13 +2100,11 @@ export class AgentRunner {
 
       // (1) auto-extract via fork (mesmo prompt do claude) — só se pedido
       if (saveMemory) try {
-        const existingTitles = await this.fetchExistingMemoryTitles();
-        const already = existingTitles.length > 0
-          ? ` Do NOT repeat anything already saved (skip): ${existingTitles.map((t) => `"${t}"`).join(", ")}.`
-          : "";
+        const existing = await this.fetchExistingMemories();
+        const already = this.memoryAlreadyBlock(existing);
         const extractPrompt =
           "Extract NEW durable knowledge from this conversation worth keeping permanently — every explicit decision, convention, preference, architectural choice or stable fact. Be generous." + already +
-          " Respond with ONLY one line: `MEMORY_JSON:` + a single-line JSON array, each item {\"title\":\"<short>\",\"body\":\"<full>\",\"type\":\"decision\"|\"fact\"|\"reference\"|\"preference\"} in the conversation's language. Use `MEMORY_JSON: []` if nothing. No markdown.";
+          " Respond with ONLY one line: `MEMORY_JSON:` + a single-line JSON array, each item {\"title\":\"<short>\",\"body\":\"<full>\",\"type\":\"decision\"|\"fact\"|\"reference\"|\"preference\",\"supersedes\":[\"<id>\"]?} in the conversation's language. Use `MEMORY_JSON: []` if nothing. No markdown.";
         const fork = await this.ocServeFetch(`/session/${this.ocSessionId}/fork`, "POST", {});
         const forkId = fork?.id as string | undefined;
         if (forkId) {
@@ -2117,7 +2115,7 @@ export class AgentRunner {
               .filter((p: any) => p?.type === "text").map((p: any) => p.text ?? "").join("\n");
             this.opts.onError(`[ctx] fork-extract respLen=${text.length} marker=${/MEMORY_JSON/.test(text)}`);
             const { items } = this.parseAndStripMemory(text);
-            void this.saveExtractedMemory(items);
+            void this.saveExtractedMemory(items, existing);
             this.opts.onError(`[ctx] memória: ${items.length} fato(s) extraído(s) na compactação`);
           } finally {
             void this.ocServeFetch(`/session/${forkId}`, "DELETE").catch(() => {});
@@ -2145,14 +2143,12 @@ export class AgentRunner {
     // no extra cost.
     // Dedup da auto-extração: passa os títulos já em memória pro modelo
     // não re-emitir fatos existentes (rewordings escapam do hash exato).
-    const existingTitles = await this.fetchExistingMemoryTitles();
-    const alreadyBlock = existingTitles.length > 0
-      ? ` Do NOT repeat anything already saved in memory (skip these): ${existingTitles.map((t) => `"${t}"`).join(", ")}.`
-      : "";
+    const existing = await this.fetchExistingMemories();
+    const alreadyBlock = this.memoryAlreadyBlock(existing);
     const summaryPrompt =
       "Two tasks. Write BOTH the summary and the memory entries in the SAME LANGUAGE as the conversation (e.g. if the conversation is in Portuguese, respond in Portuguese). Only the `MEMORY_JSON:` marker and JSON keys stay in English.\n\n" +
       "TASK 1 — Summarize this conversation concisely (decisions made, tasks in progress, key findings, context needed to continue). Be brief.\n\n" +
-      "TASK 2 — Extract NEW durable knowledge worth keeping permanently. Include EVERY explicit decision, convention, preference, architectural choice, or stable fact stated by the user or any agent — even a single one matters. Be generous: when in doubt, include it." + alreadyBlock + " Output it on a NEW FINAL LINE as exactly `MEMORY_JSON:` followed by a single-line JSON array. Each element MUST be {\"title\": \"<short>\", \"body\": \"<the fact in full>\", \"type\": \"decision\"|\"fact\"|\"reference\"|\"preference\"} where title/body are in the conversation's language. " +
+      "TASK 2 — Extract NEW durable knowledge worth keeping permanently. Include EVERY explicit decision, convention, preference, architectural choice, or stable fact stated by the user or any agent — even a single one matters. Be generous: when in doubt, include it." + alreadyBlock + " Output it on a NEW FINAL LINE as exactly `MEMORY_JSON:` followed by a single-line JSON array. Each element MUST be {\"title\": \"<short>\", \"body\": \"<the fact in full>\", \"type\": \"decision\"|\"fact\"|\"reference\"|\"preference\", \"supersedes\": [\"<id>\"]?} where title/body are in the conversation's language. " +
       "Example: MEMORY_JSON: [{\"title\":\"DB engine\",\"body\":\"The project uses PostgreSQL partitioned by month\",\"type\":\"decision\"}]. " +
       "Output `MEMORY_JSON: []` ONLY if there is no NEW durable info. No markdown, no code fences, single line.";
 
@@ -2168,7 +2164,7 @@ export class AgentRunner {
       this.startClaude();
       if (summary) {
         const { clean, items } = this.parseAndStripMemory(summary);
-        if (saveMemory) void this.saveExtractedMemory(items);
+        if (saveMemory) void this.saveExtractedMemory(items, existing);
         await new Promise((r) => setTimeout(r, 600));
         this.pushUserMessage(`# Previous conversation summary\n${clean}\n\n---\n\nContinue from here.`);
       }
@@ -2182,7 +2178,7 @@ export class AgentRunner {
     const summary = await this.runOneShot(summaryPrompt);
     this.opts.onError(`[compact] ${this.opts.cliRunner} summary length=${(summary || "").length}`);
     const { clean, items } = this.parseAndStripMemory(summary || "");
-    if (saveMemory) void this.saveExtractedMemory(items);
+    if (saveMemory) void this.saveExtractedMemory(items, existing);
     if (clean) {
       this.resetWithSummary(clean);
       this.opts.onError(`[ctx] contexto compactado${saveMemory ? ` (${items.length} memória(s) salvas)` : " (sem salvar memória)"}`);
@@ -2194,10 +2190,10 @@ export class AgentRunner {
   /** Extrai o bloco `MEMORY_JSON: [...]` do output do summary one-shot,
    *  retorna o summary limpo (sem o bloco) + os itens parseados. Tolerante
    *  a markdown/prefixos e a JSON malformado (retorna [] nesse caso). */
-  private parseAndStripMemory(summary: string): { clean: string; items: Array<{ title: string; body: string; type: string }> } {
+  private parseAndStripMemory(summary: string): { clean: string; items: Array<{ title: string; body: string; type: string; supersedes: string[] }> } {
     const m = summary.match(/^[ \t>*-]*MEMORY_JSON:\s*(\[[\s\S]*?\])\s*$/m);
     if (!m) return { clean: summary.trim(), items: [] };
-    let items: Array<{ title: string; body: string; type: string }> = [];
+    let items: Array<{ title: string; body: string; type: string; supersedes: string[] }> = [];
     try {
       const arr = JSON.parse(m[1]);
       if (Array.isArray(arr)) {
@@ -2212,12 +2208,16 @@ export class AgentRunner {
           .map((x) => {
             if (typeof x === "string") {
               const s = x.trim();
-              return { title: s.slice(0, 80), body: s, type: "fact" };
+              return { title: s.slice(0, 80), body: s, type: "fact", supersedes: [] as string[] };
             }
             const title = pick(x, ["title", "name", "heading", "summary"]);
             const body = pick(x, ["body", "content", "detail", "details", "text", "value", "description"]) || title;
             const rawType = typeof x?.type === "string" ? x.type : (typeof x?.kind === "string" ? x.kind : "fact");
-            return { title: (title || body).slice(0, 200), body: body.slice(0, 4000), type: allowed.has(rawType) ? rawType : "fact" };
+            // supersedes: ids que esta entrada substitui. Filtra ao formato
+            // mem_xxxx (anti-alucinação); validação final é contra a lista real.
+            const supRaw = Array.isArray(x?.supersedes) ? x.supersedes : (Array.isArray(x?.replaces) ? x.replaces : []);
+            const supersedes = supRaw.filter((s: unknown) => typeof s === "string" && /^mem_[a-z0-9]+$/i.test(s)).slice(0, 5) as string[];
+            return { title: (title || body).slice(0, 200), body: body.slice(0, 4000), type: allowed.has(rawType) ? rawType : "fact", supersedes };
           })
           .filter((it) => it.title && it.body)
           .slice(0, 5);
@@ -2229,8 +2229,12 @@ export class AgentRunner {
 
   /** Grava as memórias auto-extraídas via relay socket — o relay cifra
    *  title/body com a project key (server cego). Sem relay socket, pula
-   *  pra não mandar plaintext ao server (E2EE fail-safe). */
-  private async saveExtractedMemory(items: Array<{ title: string; body: string; type: string }>): Promise<void> {
+   *  pra não mandar plaintext ao server (E2EE fail-safe). Merge: quando o
+   *  modelo marca `supersedes`, remove as memórias antigas que a nova
+   *  consolida (só ids reais da lista existente; só se o add criou entry NOVA,
+   *  não dedup-hit). Add ANTES, remove DEPOIS (sem transação — duplicata
+   *  benigna é preferível a perda). */
+  private async saveExtractedMemory(items: Array<{ title: string; body: string; type: string; supersedes: string[] }>, existing: Array<{ id: string; title: string; body: string }> = []): Promise<void> {
     this.opts.onError(`[compact] memory extracted=${items.length}`);
     if (items.length === 0) return;
     const socket = this.opts.bridgeSocketPath;
@@ -2238,33 +2242,63 @@ export class AgentRunner {
       this.opts.onError(`[compact] ${items.length} memory item(s) skipped — no bridge relay (would bypass E2EE)`);
       return;
     }
-    let saved = 0;
+    const existingIds = new Set(existing.map((e) => e.id));
+    let saved = 0, merged = 0;
     for (const it of items) {
       try {
-        await this.postBridgeJson(socket, "memory_add", { title: it.title, body: it.body, type: it.type, scope: "project" });
+        const r = await this.postBridgeJson(socket, "memory_add", { title: it.title, body: it.body, type: it.type, scope: "project" });
         saved++;
+        const newId = r?.memory?.id as string | undefined;
+        // Só faz merge se o add criou entry NOVA (id não estava na lista) —
+        // senão foi dedup-hit e remover a "antiga" perderia o dado.
+        const isNew = !!newId && !existingIds.has(newId);
+        if (isNew) {
+          for (const oldId of it.supersedes) {
+            if (!existingIds.has(oldId) || oldId === newId) continue; // só ids reais existentes
+            try {
+              await this.postBridgeJson(socket, "memory_remove", { id: oldId });
+              merged++;
+            } catch { /* 403 = não foi o agente que criou → mantém viva. ok. */ }
+          }
+        }
       } catch (e) {
         this.opts.onError(`[compact] memory save failed: ${(e as Error).message}`);
       }
     }
-    if (saved > 0) this.opts.onError(`[compact] auto-saved ${saved} memory entry(ies)`);
+    if (saved > 0) this.opts.onError(`[compact] auto-saved ${saved} memory entry(ies)${merged > 0 ? `, consolidou ${merged} antiga(s)` : ""}`);
   }
 
-  /** Títulos das memórias já existentes (project + camada agent), via relay
-   *  socket (decriptados no inbound). Usado pra dedup da auto-extração. */
-  private async fetchExistingMemoryTitles(): Promise<string[]> {
+  /** Memórias já existentes (project + camada agent) com id/title/body, via
+   *  relay socket (decriptados no inbound). Usado pra dedup E pro merge
+   *  (consolidação) da auto-extração. */
+  private async fetchExistingMemories(): Promise<Array<{ id: string; title: string; body: string }>> {
     const socket = this.opts.bridgeSocketPath;
     if (!socket) return [];
     try {
       const r = await this.postBridgeJson(socket, "memory_list", {});
       const mems = Array.isArray(r?.memories) ? r.memories : [];
       return mems
-        .map((m: any) => (typeof m.title === "string" ? m.title.trim() : ""))
-        .filter(Boolean)
+        .map((m: any) => ({
+          id: typeof m.id === "string" ? m.id : "",
+          title: typeof m.title === "string" ? m.title.trim() : "",
+          body: typeof m.body === "string" ? m.body.trim() : "",
+        }))
+        .filter((m: { id: string; title: string }) => m.id && m.title)
         .slice(0, 40);
     } catch {
       return [];
     }
+  }
+
+  /** Bloco de prompt: lista as memórias existentes indexadas por id e instrui o
+   *  modelo a marcar `supersedes` quando a nova entrada atualiza/substitui uma. */
+  private memoryAlreadyBlock(existing: Array<{ id: string; title: string; body: string }>): string {
+    if (existing.length === 0) return "";
+    const list = existing
+      .map((m) => `[id=${m.id}] ${m.title}${m.body ? ` — ${m.body.slice(0, 160)}` : ""}`)
+      .join("\n");
+    return `\n\nEXISTING MEMORY (a new entry may UPDATE/REPLACE one of these):\n${list}\n` +
+      `If your new entry is a better/updated version of an existing one, add "supersedes": ["<id>"] with its id(s) from the list above — ONLY when it is genuinely the same fact updated, not merely related. Otherwise omit "supersedes". Do NOT repeat an existing entry unchanged.`;
   }
 
   private postBridgeJson(socketPath: string, route: string, body: unknown): Promise<any> {

@@ -346,7 +346,7 @@ export interface GitGraphRequest { type: "git:graph"; correlationId: string; wor
 
 /** Knowledge graph (graphify) — orch pede rebuild do índice do workspace.
  *  projectId só pra rotular o status de volta. */
-export interface GraphBuildRequest { type: "graph:build"; correlationId?: string; projectId?: string; workspaceRoot?: string; semantic?: boolean; backend?: string; model?: string; }
+export interface GraphBuildRequest { type: "graph:build"; correlationId?: string; projectId?: string; workspaceRoot?: string; semantic?: boolean; backend?: string; model?: string; apiKeyEnv?: string; apiKeyCipher?: string; }
 /** Status do índice graphify reportado pelo daemon (durante/após build). */
 export interface GraphStatusEvent {
   type: "graph:status";
