@@ -1059,6 +1059,14 @@ class DaemonClient {
       this.send({ type: "graph:status", projectId: msg.projectId, status: "error", error: "backend claude-cli exige o claude CLI instalado (ou escolha outro backend)", correlationId: msg.correlationId });
       return;
     }
+    // Backends *-cli (opencode/codex/gemini via shim OpenAI-compat) exigem o
+    // respectivo CLI instalado no daemon.
+    const SHIM_CLI: Record<string, "opencode" | "codex" | "gemini"> = { "opencode-cli": "opencode", "codex-cli": "codex", "gemini-cli": "gemini" };
+    const shimCli = SHIM_CLI[backend];
+    if (msg.semantic && shimCli && !this.cliCommands[shimCli]?.available) {
+      this.send({ type: "graph:status", projectId: msg.projectId, status: "error", error: `backend ${backend} exige o CLI ${shimCli} instalado no daemon`, correlationId: msg.correlationId });
+      return;
+    }
     // API key do backend não-claude: server manda o cipher do vault; daemon
     // decifra (project key) e injeta como env var do backend.
     let apiKey: string | undefined;
@@ -1068,7 +1076,7 @@ class DaemonClient {
     }
     this.send({ type: "graph:status", projectId: msg.projectId, status: "building", correlationId: msg.correlationId });
     const r = await buildGraph(root, gbin.command, msg.semantic
-      ? { semantic: true, backend, model: msg.model, claudeCmd: claude?.command, apiKeyEnv: msg.apiKeyEnv, apiKey }
+      ? { semantic: true, backend, model: msg.model, claudeCmd: claude?.command, apiKeyEnv: msg.apiKeyEnv, apiKey, cliCommands: this.cliCommands, dropTo: this.dropTo, log }
       : {});
     if (!r.ok) {
       this.send({ type: "graph:status", projectId: msg.projectId, status: "error", error: r.error, correlationId: msg.correlationId });

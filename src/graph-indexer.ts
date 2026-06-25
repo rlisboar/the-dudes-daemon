@@ -2,14 +2,19 @@ import path from "node:path";
 import { homedir } from "node:os";
 import { statSync, readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { spawn } from "node:child_process";
+import type { ResolvedCliCommands } from "./cli-config.js";
+import type { DropTarget } from "./privileges.js";
+import type { CliRunner } from "./types.js";
+import { startCliShim, type CliShim } from "./graph-llm-shim.js";
 
 export interface BuildOpts {
   /** true = `graphify extract` (AST + semântico via LLM, indexa docs/.md/.yaml
    *  além de código). false/undefined = `graphify update` (code-only, local). */
   semantic?: boolean;
   /** backend LLM do graphify: claude-cli (usa o claude Code, sem key) |
-   *  gemini | openai | anthropic | deepseek | ollama | kimi | "auto".
-   *  Não-claude-cli leem a API key do ENV do daemon. Vazio = claude-cli. */
+   *  gemini | openai | anthropic | deepseek | ollama | kimi | "auto" |
+   *  opencode-cli | codex-cli | gemini-cli (CLIs via shim OpenAI-compat).
+   *  Não-claude-cli/HTTP leem a API key do ENV do daemon. Vazio = claude-cli. */
   backend?: string;
   /** path absoluto do `claude` CLI — necessário p/ backend claude-cli
    *  (graphify resolve `claude` via PATH, então injetamos o dir). */
@@ -21,8 +26,22 @@ export interface BuildOpts {
    *  no env do graphify pros backends que leem key do ambiente. */
   apiKeyEnv?: string;
   apiKey?: string;
+  /** CLIs resolvidos do daemon — necessário pros backends *-cli (shim). */
+  cliCommands?: ResolvedCliCommands;
+  /** drop de privilégios pros CLIs do shim (igual aos agentes). */
+  dropTo?: DropTarget | null;
+  /** logger do daemon (status do shim). */
+  log?: (level: "info" | "warn" | "error", msg: string) => void;
   timeoutMs?: number;
 }
+
+/** Backends *-cli → runner do shim OpenAI-compat. claude tem backend nativo
+ *  (claude-cli), então não passa pelo shim. */
+const CLI_SHIM_RUNNER: Record<string, CliRunner> = {
+  "opencode-cli": "opencode",
+  "codex-cli": "codex",
+  "gemini-cli": "gemini",
+};
 
 // O graphify roda `claude -p` SEM CLAUDE_CONFIG_DIR → claude usa o default
 // (~/.claude), que pode não estar autenticado (a auth pode estar em
@@ -204,10 +223,34 @@ async function runBuild(
   if (opts.semantic && (opts.backend || "claude-cli") === "claude-cli" && opts.claudeCmd) {
     claudeCfgDir = await resolveAuthedClaudeConfigDir(opts.claudeCmd);
   }
+  // Backend *-cli: sobe o shim OpenAI-compat ANTES do graphify (precisa do
+  // baseUrl/token). O graphify roda como `--backend openai` apontando pro shim.
+  const reqBackend = opts.backend || "claude-cli";
+  const shimRunner: CliRunner | undefined = opts.semantic ? CLI_SHIM_RUNNER[reqBackend] : undefined;
+  let shim: CliShim | undefined;
+  if (shimRunner) {
+    if (!opts.cliCommands?.[shimRunner]?.available) {
+      return { ok: false, error: `backend ${reqBackend} exige o CLI '${shimRunner}' instalado no daemon` };
+    }
+    try {
+      shim = await startCliShim({
+        runner: shimRunner,
+        model: opts.model,
+        cliCommands: opts.cliCommands,
+        dropTo: opts.dropTo,
+        claudeConfigDir: claudeCfgDir,
+        log: opts.log,
+      });
+    } catch (e) {
+      return { ok: false, error: `falha ao subir o shim ${shimRunner}: ${(e as Error).message}` };
+    }
+  }
   return new Promise((resolve) => {
     let out = "";
     let settled = false;
-    const done = (r: GraphBuildResult) => { if (!settled) { settled = true; resolve(r); } };
+    const done = (r: GraphBuildResult) => {
+      if (!settled) { settled = true; try { shim?.stop(); } catch { /* noop */ } resolve(r); }
+    };
     ensureGraphifyignore(workspaceRoot); // .gitignore `*` esconderia tudo do graphify
     let proc: ReturnType<typeof spawn>;
     try {
@@ -216,18 +259,29 @@ async function runBuild(
         // claude-cli usa o claude Code local (sem key) — graphify resolve
         // `claude` via PATH, então injetamos o dir. Outros backends leem a API
         // key do env do daemon. Herda o resto do env (HOME etc).
-        const backend = opts.backend || "claude-cli";
+        let backend = reqBackend;
         const env: NodeJS.ProcessEnv = { ...process.env };
-        if (backend === "claude-cli" && opts.claudeCmd) {
-          env.PATH = `${path.dirname(opts.claudeCmd)}:${process.env.PATH ?? ""}`;
-          if (claudeCfgDir) env.CLAUDE_CONFIG_DIR = claudeCfgDir; // dir autenticado
+        if (shim) {
+          // Backend *-cli: graphify fala OpenAI-compat com o shim local.
+          backend = "openai";
+          env.OPENAI_BASE_URL = shim.baseUrl;
+          env.OPENAI_API_KEY = shim.token;
+          // label (o modelo real é forçado pelo CLI); seta as duas env vars que
+          // versões diferentes do graphify leem.
+          env.OPENAI_MODEL = shim.model;
+          env.GRAPHIFY_OPENAI_MODEL = shim.model;
+        } else {
+          if (backend === "claude-cli" && opts.claudeCmd) {
+            env.PATH = `${path.dirname(opts.claudeCmd)}:${process.env.PATH ?? ""}`;
+            if (claudeCfgDir) env.CLAUDE_CONFIG_DIR = claudeCfgDir; // dir autenticado
+          }
+          if (opts.model && backend !== "auto") {
+            const mEnv = MODEL_ENV[backend];
+            if (mEnv) env[mEnv] = opts.model;
+          }
+          // API key do backend (do vault, já decifrada) → env var do backend.
+          if (opts.apiKeyEnv && opts.apiKey) env[opts.apiKeyEnv] = opts.apiKey;
         }
-        if (opts.model && backend !== "auto") {
-          const mEnv = MODEL_ENV[backend];
-          if (mEnv) env[mEnv] = opts.model;
-        }
-        // API key do backend (do vault, já decifrada) → env var do backend.
-        if (opts.apiKeyEnv && opts.apiKey) env[opts.apiKeyEnv] = opts.apiKey;
         const args = ["extract", workspaceRoot];
         if (backend !== "auto") args.push("--backend", backend);
         proc = spawn(graphifyBin, args, { cwd: workspaceRoot, env });
@@ -275,7 +329,9 @@ async function runBuild(
         // arquivos. Single call funciona; o lote (chunks ~paralelos) estoura.
         let hint = "";
         if (/semantic chunk.*failed|all semantic chunks failed|claude -p exited/i.test(out)) {
-          if (opts.semantic && (opts.backend || "claude-cli") === "claude-cli") {
+          if (shimRunner) {
+            hint = ` — o CLI '${shimRunner}' falhou via shim (login/modelo do '${shimRunner}'?). Veja o log do daemon ([graph-shim]) ou tente outro backend.`;
+          } else if (opts.semantic && reqBackend === "claude-cli") {
             const cfgNote = _authedClaudeCfg
               ? `config dir testado: ${_authedClaudeCfg}`
               : "nenhum CLAUDE_CONFIG_DIR autenticado encontrado — rode 'claude' e faça login";
