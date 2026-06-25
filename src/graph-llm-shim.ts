@@ -118,9 +118,10 @@ export async function startCliShim(opts: CliShimOpts): Promise<CliShim> {
 
   const handle = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
     const url = req.url || "";
-    // Auth: só o graphify local (com o token) pode gastar o CLI.
-    const auth = req.headers.authorization || "";
-    if (auth !== `Bearer ${token}`) { sendJson(res, 401, { error: { message: "unauthorized" } }); return; }
+    // Auth: só o graphify local (com o token) pode gastar o CLI. Aceita o token
+    // com ou sem prefixo "Bearer " (clientes OpenAI-compat variam).
+    const auth = (req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
+    if (auth !== token) { sendJson(res, 401, { error: { message: "unauthorized" } }); return; }
     // GET /models (alguns SDKs sondam).
     if (req.method === "GET" && /\/models\/?$/.test(url)) {
       sendJson(res, 200, { object: "list", data: [{ id: modelLabel, object: "model", owned_by: "the-dudes" }] });
