@@ -11,10 +11,23 @@ import { resolvePython3 } from "./cli-config.js";
 import { buildGraph, graphExists, graphPath } from "./graph-indexer.js";
 
 export const MODEL_CONTEXT_LIMITS: Record<string, number> = {
-  // Claude. opusplan = Opus no plan, Sonnet na execução; janela efetiva 200k.
-  opus: 200_000, opusplan: 200_000, sonnet: 200_000, haiku: 200_000,
-  // Fable 5 — Claude Code serve a variante [1m] (claude-fable-5[1m]) por padrão.
+  // Claude — aliases (CLI atualizado): opus→Opus 4.8, sonnet→Sonnet 5,
+  // opusplan→Opus no plan + Sonnet na execução — todos 1M. haiku (4.5) = 200k.
+  // CLIs antigos resolvem os aliases pra gerações de 200k; isso é coberto pelo
+  // resolvedModel (init event) + IDs completos abaixo.
+  opus: 1_000_000, opusplan: 1_000_000, haiku: 200_000,
+  sonnet: 1_000_000, "claude-sonnet-5": 1_000_000,
   fable: 1_000_000, "claude-fable-5": 1_000_000,
+  // IDs completos — batem com o model resolvido que o CLI reporta no init.
+  // Variantes "[1m]" não precisam de chave: contextLimitFor trata o sufixo.
+  "claude-opus-4-8": 1_000_000, "claude-opus-4-7": 1_000_000, "claude-opus-4-6": 1_000_000,
+  "claude-opus-4-5": 200_000,
+  "claude-sonnet-4-6": 1_000_000, "claude-sonnet-4-5": 200_000,
+  "claude-haiku-4-5": 200_000,
+  // Gerações mais antigas (CLIs bem desatualizados) — todas 200k. IDs datados
+  // caem nessas chaves via DATED_MODEL_ID_RE (claude-sonnet-4-20250514 → claude-sonnet-4).
+  "claude-opus-4-1": 200_000, "claude-opus-4": 200_000, "claude-sonnet-4": 200_000,
+  "claude-3-7-sonnet": 200_000, "claude-3-5-sonnet": 200_000, "claude-3-5-haiku": 200_000,
   // Gemini
   "gemini-3-flash-preview": 1_000_000,
   "gemini-3.1-flash-lite-preview": 1_000_000,
@@ -39,12 +52,79 @@ export const MODEL_CONTEXT_LIMITS: Record<string, number> = {
   "zai-coding-plan/glm-4.5-air": 128_000,
   "zai-coding-plan/glm-5-turbo": 128_000,
   "zai-coding-plan/glm-5.1": 128_000,
-  // OpenCode / DeepSeek
+  // OpenCode / DeepSeek. deepseek-chat é alias do chat model corrente —
+  // 128k é o piso histórico da linha (conservador).
   "deepseek/deepseek-v4-pro": 200_000,
   "deepseek/deepseek-v4-flash": 200_000,
+  "deepseek/deepseek-chat": 128_000,
 };
 
+/** Piso conservador pra modelo ausente ou fora do mapa: o default real do CLI
+ *  varia por runner, conta e versão instalada no cliente — assumir 1M mataria
+ *  a compaction proativa de modelos com janela de 128k–400k. */
+export const DEFAULT_CONTEXT_LIMIT = 200_000;
+
+/** Sufixo legado ":<effort>" aceito no campo model (ex glm-5.2:high).
+ *  Compartilhado entre contextLimitFor e ocModelParts — divergência aqui já
+ *  causou lookup errado de janela. */
+const EFFORT_SUFFIX_RE = /:(off|minimal|none|low|medium|high|xhigh|max)$/;
+/** IDs datados que o CLI reporta no init (ex claude-sonnet-4-5-20250929). */
+const DATED_MODEL_ID_RE = /-\d{8}$/;
+
+/** Lookup estrito: janela conhecida ou undefined (sem piso).
+ *  - Object.hasOwn: model vem de campo livre da UI — "constructor"/"toString"
+ *    não podem acertar chave herdada de Object.prototype;
+ *  - tolera o sufixo legado ":<effort>" (ver ocModelParts);
+ *  - sufixo "[1m]" do Claude Code é opt-in explícito da janela de 1M;
+ *  - ID datado cai pra chave sem data (claude-sonnet-4-5-20250929 →
+ *    claude-sonnet-4-5). */
+export function lookupContextLimit(model: string | undefined): number | undefined {
+  const raw = model?.trim();
+  if (!raw) return undefined;
+  const base = raw.replace(EFFORT_SUFFIX_RE, "");
+  if (base.endsWith("[1m]")) return 1_000_000;
+  if (Object.hasOwn(MODEL_CONTEXT_LIMITS, base)) return MODEL_CONTEXT_LIMITS[base];
+  const undated = base.replace(DATED_MODEL_ID_RE, "");
+  if (undated !== base && Object.hasOwn(MODEL_CONTEXT_LIMITS, undated)) return MODEL_CONTEXT_LIMITS[undated];
+  // opencode usa "provider/model" e a janela é do MODEL, não do provider —
+  // sem chave exata (deepseek/, zai-coding-plan/ têm), tenta a parte pós-"/"
+  // (anthropic/claude-sonnet-5 → claude-sonnet-5 = 1M).
+  const slash = base.indexOf("/");
+  if (slash > 0) return lookupContextLimit(base.slice(slash + 1));
+  return undefined;
+}
+
+/** Janela de contexto com piso conservador pra desconhecido/ausente. */
+export function contextLimitFor(model: string | undefined): number {
+  return lookupContextLimit(model) ?? DEFAULT_CONTEXT_LIMIT;
+}
+
+/** Semântica do delta de usage por runner:
+ *  - "anthropic" (claude): `input` EXCLUI cache — total = input + cacheCreate
+ *    + cacheRead;
+ *  - "inclusive" (codex/gemini): `input` já INCLUI o cache lido;
+ *  - "auto" (opencode): o formato segue o provider — decide pela relação
+ *    entre as parcelas (cache ⊆ input ⇒ inclusivo, senão soma). */
+export type UsageSemantics = "anthropic" | "inclusive" | "auto";
+
+export function contextTokensOf(delta: AgentUsage, semantics: UsageSemantics): number {
+  if (semantics === "anthropic") return delta.input + delta.cacheCreate + delta.cacheRead;
+  if (semantics === "inclusive") return delta.input;
+  return delta.cacheCreate + delta.cacheRead <= delta.input
+    ? delta.input
+    : delta.input + delta.cacheCreate + delta.cacheRead;
+}
+
 const CONTEXT_WARN_PCT = 0.85;
+/** Cooldown do onContextFull: segura rajadas (N eventos acima do limite no
+ *  mesmo turno → N compactions concorrentes) mas REARMA sozinho — um latch
+ *  permanente mataria a auto-compaction após uma falha transiente do compact. */
+const CONTEXT_FULL_COOLDOWN_MS = 120_000;
+/** Timeout dos one-shots de resumo (compact). Sem isso, um CLI travado
+ *  segura o guard `compacting` pra sempre e o agente fica sem processo. */
+const ONE_SHOT_TIMEOUT_MS = 300_000;
+/** Falhas consecutivas de compact antes de suspender a auto-compaction. */
+const MAX_COMPACT_FAIL_STREAK = 3;
 const OPENCODE_NO_OUTPUT_TIMEOUT_MS = 120_000;
 /** Timeout do turno opencode via API do serve (POST /message é síncrono e pode
  *  rodar tools por minutos). Generoso; o serve é morto no stop() se preciso. */
@@ -326,7 +406,17 @@ export class AgentRunner {
 
   // Context tracking
   private lastInputTokens = 0;
+  /** Model efetivamente resolvido pelo CLI (evento init do claude). Vence
+   *  this.info.model no contextLimit(): alias→ID depende da versão do CLI. */
+  private resolvedModel?: string;
   private contextWarned = false;
+  /** Última emissão de onContextFull (cooldown — ver CONTEXT_FULL_COOLDOWN_MS). */
+  private lastContextFullAt = 0;
+  /** Falhas consecutivas de compact — teto contra loop infinito de retry
+   *  quando a falha é determinística (sessão acima do hard cap da API). */
+  private compactFailStreak = 0;
+  /** Guard de reentrância do compactContext. */
+  private compacting = false;
   private sessionInvalid = false;
   private restarting = false;
   private lastVerboseIoBody = "";
@@ -573,7 +663,17 @@ export class AgentRunner {
   }
 
   contextLimit(): number {
-    return MODEL_CONTEXT_LIMITS[this.info.model ?? "sonnet"] ?? 200_000;
+    // `||` (não `??`): "" é ausente, igual aos demais usos de info.model.
+    const configured = (this.info.model || "").trim().replace(EFFORT_SUFFIX_RE, "");
+    // "[1m]" no config é opt-in explícito do usuário pela janela de 1M —
+    // vence o resolvedModel, que reporta o ID resolvido SEM o marcador.
+    if (configured.endsWith("[1m]")) return 1_000_000;
+    // resolvedModel (init do CLI) corrige alias resolvido por CLI antigo ou
+    // default da conta — mas só quando o ID reportado é CONHECIDO: um ID novo
+    // fora do mapa não pode rebaixar pro piso um config que resolve pra 1M.
+    const fromResolved = lookupContextLimit(this.resolvedModel);
+    if (fromResolved !== undefined) return fromResolved;
+    return contextLimitFor(configured);
   }
 
   resetWithSummary(summary?: string): void {
@@ -581,9 +681,18 @@ export class AgentRunner {
     this.ocSeenPartIds.clear();
     this.ocNeedsPrime = false;
     this.ocFirstTurn = true;
-    this.contextWarned = false;
-    this.lastInputTokens = 0;
+    this.resetContextAccounting();
     this.ocPendingSummary = summary;
+  }
+
+  /** Zera a contabilidade de contexto (warning, cooldown de full, contador).
+   *  Chamar em TODO caminho que troca/compacta a sessão — sem isso o warning
+   *  de 85% vira one-shot por vida do runner e o onContextFull fica em cooldown. */
+  private resetContextAccounting(): void {
+    this.contextWarned = false;
+    this.lastContextFullAt = 0;
+    this.lastInputTokens = 0;
+    this.compactFailStreak = 0;
   }
 
   async runOneShot(prompt: string): Promise<string> {
@@ -654,28 +763,62 @@ export class AgentRunner {
       proc.stdout!.setEncoding("utf8");
       proc.stderr!.setEncoding("utf8");
       let out = "";
+      // CLI travado não pode segurar o await do compact pra sempre (guard
+      // `compacting` ficaria preso e o agente sem processo). O killer resolve
+      // a promise DIRETO: "close" não é garantido pós-SIGKILL se um processo
+      // neto herdou os pipes de stdio (Node só emite close com streams fechados).
+      let settled = false;
+      const settle = (v: string) => { if (!settled) { settled = true; resolve(v); } };
+      const killer = setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} settle(""); }, ONE_SHOT_TIMEOUT_MS);
       proc.stdout!.on("data", (c: string) => { this.traceCli(runner, "stdout", c); out += c; });
       proc.stderr!.on("data", (c: string) => { this.traceCli(runner, "stderr", c); });
-      proc.on("close", () => resolve(extractOneShotText(out, runner)));
-      proc.on("error", () => resolve(""));
+      proc.on("close", () => { clearTimeout(killer); settle(extractOneShotText(out, runner)); });
+      proc.on("error", () => { clearTimeout(killer); settle(""); });
     });
   }
 
-  private checkContextUsage(delta: AgentUsage): void {
-    if (delta.input > 0) this.lastInputTokens = delta.input;
+  private checkContextUsage(delta: AgentUsage, semantics: UsageSemantics): void {
+    const total = contextTokensOf(delta, semantics);
+    if (total > 0) this.lastInputTokens = total;
     const limit = this.contextLimit();
     const pct = this.lastInputTokens / limit;
     if (pct >= 1.0) {
-      this.opts.onContextFull?.();
+      this.notifyContextFull();
     } else if (pct >= CONTEXT_WARN_PCT && !this.contextWarned) {
       this.contextWarned = true;
       this.opts.onContextWarning?.(this.lastInputTokens, limit);
     }
   }
 
+  /** Dispara onContextFull no máximo uma vez por janela de cooldown. Sem
+   *  isso, N eventos acima do limite no mesmo turno viram N compactContext
+   *  concorrentes (processo claude órfão + resumo duplicado). Cooldown em vez
+   *  de latch: se o compact falhar (provider flaky, timeout), o próximo sinal
+   *  de contexto cheio re-dispara a compaction em vez de silenciar pra sempre. */
+  private notifyContextFull(): void {
+    // Teto de retries: falha determinística de compact (sessão acima do hard
+    // cap) entraria em loop kill→one-shot→restart eterno via cooldown.
+    if (this.compactFailStreak >= MAX_COMPACT_FAIL_STREAK) return;
+    const now = Date.now();
+    if (now - this.lastContextFullAt < CONTEXT_FULL_COOLDOWN_MS) return;
+    this.lastContextFullAt = now;
+    this.opts.onContextFull?.();
+  }
+
+  /** Registra falha de compact; ao atingir o teto, suspende a auto-compaction
+   *  (rearmada por sucesso de compact ou clear, via resetContextAccounting). */
+  private registerCompactFailure(): void {
+    this.compactFailStreak++;
+    if (this.compactFailStreak >= MAX_COMPACT_FAIL_STREAK) {
+      this.opts.onError(`[ctx] compact falhou ${this.compactFailStreak}x seguidas — auto-compaction suspensa; limpe o contexto manualmente`);
+    } else {
+      this.opts.onError("[ctx] compact: sem resumo utilizável — sessão antiga preservada; tente de novo ou limpe o contexto");
+    }
+  }
+
   private checkContextFullError(msg: string): void {
     if (CONTEXT_FULL_PATTERNS.some((p) => p.test(msg))) {
-      this.opts.onContextFull?.();
+      this.notifyContextFull();
     }
   }
 
@@ -927,6 +1070,8 @@ export class AgentRunner {
         this.opts.resumeSessionId = undefined;
         if (!this.stopped) {
           this.proc = null;
+          // sessão nova e vazia — contadores da antiga não podem sobrar
+          this.resetContextAccounting();
           this.startClaude();
           return;
         }
@@ -1126,6 +1271,8 @@ export class AgentRunner {
       this.opts.onSessionId(event.session_id);
     }
     if (event.type === "system" && event.subtype === "init") {
+      // CLI reporta o model realmente resolvido (alias→ID, default da conta).
+      if (typeof event.model === "string" && event.model) this.resolvedModel = event.model;
       this.setState("idle");
       return;
     }
@@ -1140,7 +1287,10 @@ export class AgentRunner {
           cacheRead: Number(usage.cache_read_input_tokens ?? 0),
         };
         this.opts.onUsageDelta?.(delta);
-        this.checkContextUsage(delta);
+        // Sidechains (subagentes Task) reportam o contexto do SUBAGENTE:
+        // contam pro billing (onUsageDelta acima), mas não podem sobrescrever
+        // a ocupação do thread principal — mascarariam um contexto a 95%.
+        if (!event.parent_tool_use_id) this.checkContextUsage(delta, "anthropic");
       }
       const textParts: string[] = [];
       let hasToolUse = false;
@@ -1171,10 +1321,29 @@ export class AgentRunner {
           // roteia como erro p/ o server disparar auto-retry e não zerar contador.
           // Exige contexto "API Error" (o banner do claude CLI sempre tem) p/ não
           // confundir com prosa normal do agente que cite "rate limit"/"overloaded".
-          if (/API Error/i.test(text) && RATE_LIMIT_TEXT_RE.test(text)) {
-            this.setState("idle");
-            this.opts.onError(text);
-            return;
+          if (/API Error/i.test(text)) {
+            if (RATE_LIMIT_TEXT_RE.test(text)) {
+              this.setState("idle");
+              this.opts.onError(text);
+              return;
+            }
+            // Contexto estourado também chega como texto do assistant ("API
+            // Error: 400 ... prompt is too long") — sem rotear pro
+            // onContextFull, o agente publica o erro como fala e trava pra
+            // sempre (todos os turnos seguintes falham igual). Restrições
+            // anti-falso-positivo: o banner real é uma linha curta que COMEÇA
+            // com "API Error" (prosa do agente citando um erro não pode
+            // suprimir a fala nem compactar sessão saudável), e banner de
+            // SIDECHAIN (subagente Task estourando o próprio contexto) não
+            // pode compactar o thread principal.
+            if (!event.parent_tool_use_id && text.length < 600 &&
+                /^\s*API Error/i.test(text) &&
+                CONTEXT_FULL_PATTERNS.some((p) => p.test(text))) {
+              this.setState("idle");
+              this.opts.onError(text);
+              this.notifyContextFull();
+              return;
+            }
           }
           this.setState("speaking");
           this.opts.onAssistantText(text);
@@ -1193,7 +1362,10 @@ export class AgentRunner {
       // surfacia como erro p/ auto-retry. result/error pode estar em vários campos.
       if (event.is_error || event.subtype === "error_during_execution" || event.subtype === "error_max_turns") {
         const r = String(event.result ?? event.error ?? event.message ?? "");
-        if (r && RATE_LIMIT_TEXT_RE.test(r)) this.opts.onError(r);
+        if (r) {
+          if (RATE_LIMIT_TEXT_RE.test(r)) this.opts.onError(r);
+          this.checkContextFullError(r);
+        }
       }
       return;
     }
@@ -1256,11 +1428,22 @@ export class AgentRunner {
    *  zai-coding-plan (qualquer bloco `provider.<id>` corrompe o provider →
    *  agente mudo). O GLM-5.2 roda no default dele (reasoning_effort=max). */
   private ocModelParts(): { providerID: string; modelID: string } {
-    const raw = (this.info.model ?? "").replace(/:(off|minimal|none|low|medium|high|xhigh|max)$/, "");
+    const raw = (this.info.model ?? "").replace(EFFORT_SUFFIX_RE, "");
     const slash = raw.indexOf("/");
     const providerID = slash > 0 ? raw.slice(0, slash) : "";
     const modelID = slash > 0 ? raw.slice(slash + 1) : raw;
     return { providerID, modelID };
+  }
+
+  /** Semântica do usage do opencode segue o PROVIDER, não a forma do delta:
+   *  Anthropic reporta `input` EXCLUINDO cache (total = soma das parcelas);
+   *  os demais (deepseek/zai/openai/google) incluem o cache lido no input.
+   *  A heurística "auto" fica só pro provider desconhecido — ela subconta
+   *  turnos Anthropic em que o input não-cacheado excede as parcelas de
+   *  cache (tool result gigante ainda não cacheado). */
+  private ocUsageSemantics(): UsageSemantics {
+    const { providerID } = this.ocModelParts();
+    return providerID.startsWith("anthropic") ? "anthropic" : "auto";
   }
 
   private runOpenCodeMessage(content: string, images?: ImageAttachment[], retry = 0) {
@@ -1582,7 +1765,7 @@ export class AgentRunner {
           cacheRead: Number(tokens.cache?.read ?? 0),
         };
         this.opts.onUsageDelta?.(delta);
-        this.checkContextUsage(delta);
+        this.checkContextUsage(delta, this.ocUsageSemantics());
       }
     }
   }
@@ -1630,7 +1813,7 @@ export class AgentRunner {
             cacheRead: Number(tokens.cache?.read ?? 0),
           };
           this.opts.onUsageDelta?.(delta);
-          this.checkContextUsage(delta);
+          this.checkContextUsage(delta, this.ocUsageSemantics());
         }
         break;
       }
@@ -1735,7 +1918,7 @@ export class AgentRunner {
               cacheRead: Number(s.cached ?? 0),
             };
             this.opts.onUsageDelta?.(delta);
-            this.checkContextUsage(delta);
+            this.checkContextUsage(delta, "inclusive");
           }
         } catch {}
       }
@@ -1936,7 +2119,7 @@ export class AgentRunner {
             cacheRead: Number(u.cached_input_tokens ?? 0),
           };
           this.opts.onUsageDelta?.(delta);
-          this.checkContextUsage(delta);
+          this.checkContextUsage(delta, "inclusive");
         }
         break;
       }
@@ -2058,11 +2241,19 @@ export class AgentRunner {
   }
 
   async clearContext(): Promise<void> {
+    // Clear no meio de um compact faria killClaudeForRestart+startClaude em
+    // paralelo com o compact → processo claude órfão (mesma corrida que o
+    // guard `compacting` fecha no compactContext).
+    if (this.compacting) {
+      this.opts.onError("[ctx] clear ignorado — compact em andamento, aguarde terminar");
+      return;
+    }
     if (this.opts.cliRunner === "claude") {
       await this.killClaudeForRestart();
       this.opts.resumeSessionId = undefined;
       this.info.sessionId = undefined;
       if (this.opts.onSessionId) this.opts.onSessionId("");
+      this.resetContextAccounting();
       this.startClaude();
       this.opts.onError("[ctx] context cleared — claude restarted with new session");
       return;
@@ -2083,6 +2274,22 @@ export class AgentRunner {
   }
 
   async compactContext(saveMemory = true): Promise<void> {
+    // Guard de reentrância: compactContexts concorrentes (context_full em
+    // rajada, clique duplo) fariam killClaudeForRestart + startClaude em
+    // paralelo → processo claude órfão + resumo duplicado na conversa.
+    if (this.compacting) {
+      this.opts.onError("[ctx] compact já em andamento — ignorado");
+      return;
+    }
+    this.compacting = true;
+    try {
+      await this.compactContextInner(saveMemory);
+    } finally {
+      this.compacting = false;
+    }
+  }
+
+  private async compactContextInner(saveMemory: boolean): Promise<void> {
     // OpenCode roda via serve HTTP. O one-shot runOneShot/resetWithSummary
     // abaixo NÃO toca a sessão do serve → "compact não faz nada". Aqui:
     // (1) AUTO-EXTRACT de memória (Fase 3) num FORK da sessão (não polui a
@@ -2093,9 +2300,9 @@ export class AgentRunner {
         this.opts.onError("[ctx] compact: sessão opencode ainda não ativa — manda uma mensagem primeiro");
         return;
       }
-      const slash = (this.info.model ?? "").indexOf("/");
-      const providerID = slash > 0 ? (this.info.model as string).slice(0, slash) : "";
-      const modelID = slash > 0 ? (this.info.model as string).slice(slash + 1) : (this.info.model ?? "");
+      // ocModelParts remove o sufixo legado ":<effort>" — split inline aqui
+      // mandava "deepseek-v4-pro:max" pro serve e o compact falhava sempre.
+      const { providerID, modelID } = this.ocModelParts();
       if (!providerID || !modelID) { this.opts.onError("[ctx] compact: modelo inválido"); return; }
 
       // (1) auto-extract via fork (mesmo prompt do claude) — só se pedido
@@ -2128,8 +2335,23 @@ export class AgentRunner {
       // (2) compacta a sessão real
       try {
         await this.ocServeFetch(`/session/${this.ocSessionId}/summarize`, "POST", { providerID, modelID }, 120_000);
+        // O summarize cria uma mensagem nova na sessão (resumo + step-finish
+        // com tokens do contexto PRÉ-compactação). Prime IMEDIATO marca essas
+        // parts como vistas — a flag ocNeedsPrime só seria consumida no início
+        // do próximo turno, e um turno em voo drenaria o step-finish antes,
+        // re-disparando context_full logo após o reset (resumo-do-resumo).
+        try {
+          const hist = await this.ocServeFetch(`/session/${this.ocSessionId}/message`, "GET");
+          if (Array.isArray(hist)) for (const m of hist) for (const p of (m?.parts ?? [])) { if (p?.id) this.ocSeenPartIds.add(p.id); }
+        } catch { this.ocNeedsPrime = true; /* fallback: prime no próximo turno */ }
+        this.resetContextAccounting();
         this.opts.onError(`[ctx] contexto compactado${saveMemory ? " + memória salva" : " (sem salvar memória)"}`);
       } catch (e) {
+        // Timeout do cliente não desfaz o summarize no serve: se ele concluir
+        // depois, as parts do resumo precisam de prime mesmo assim — senão o
+        // próximo turno re-despacha o resumo como fala + context_full espúrio.
+        this.ocNeedsPrime = true;
+        this.registerCompactFailure();
         this.opts.onError(`[ctx] compact falhou: ${(e as Error).message}`);
       }
       return;
@@ -2159,8 +2381,27 @@ export class AgentRunner {
       this.opts.onError(`[compact] running summary one-shot…`);
       const summary = oldSession ? await this.runOneShotWithSession(summaryPrompt, oldSession) : "";
       this.opts.onError(`[compact] summary length=${summary.length}`);
+      // stop()/reconfig durante o one-shot longo: não spawnar processo zumbi —
+      // mas fecha o ciclo de vida (emitExit é idempotente): sem isso a UI fica
+      // com o agente "running" pra sempre e o token-file sobra em /tmp.
+      if (this.stopped) { this.emitExit(null); return; }
+      // O one-shot herda a sessão antiga — se ela falhou (contexto estourado,
+      // 401/500, billing...), o stdout é vazio ou é SÓ o banner de erro, que
+      // sempre COMEÇA com "API Error". A âncora importa nos dois sentidos:
+      // banner de qualquer erro é lixo, mas um resumo legítimo que MENCIONE
+      // "API Error" no meio do texto (conversa sobre debugging) é válido.
+      // NÃO descartar a conversa com base em resumo-lixo: preserva a sessão
+      // antiga e deixa o retry (cooldown) ou o usuário decidir.
+      const summaryIsError = /^\s*API Error/i.test(summary);
+      if (oldSession && (!summary || summaryIsError)) {
+        this.registerCompactFailure();
+        this.opts.resumeSessionId = oldSession;
+        this.startClaude();
+        return;
+      }
       this.opts.resumeSessionId = undefined;
       this.info.sessionId = undefined;
+      this.resetContextAccounting();
       this.startClaude();
       if (summary) {
         const { clean, items } = this.parseAndStripMemory(summary);
@@ -2369,10 +2610,15 @@ export class AgentRunner {
       proc.stdout!.setEncoding("utf8");
       proc.stderr!.setEncoding("utf8");
       let out = "";
+      // Mesmo timeout/settle do runOneShot — killer resolve direto porque
+      // "close" não é garantido pós-SIGKILL (pipes herdados por processo neto).
+      let settled = false;
+      const settle = (v: string) => { if (!settled) { settled = true; resolve(v); } };
+      const killer = setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} settle(""); }, ONE_SHOT_TIMEOUT_MS);
       proc.stdout!.on("data", (c: string) => { this.traceCli("claude", "stdout", c); out += c; });
       proc.stderr!.on("data", (c: string) => { this.traceCli("claude", "stderr", c); });
-      proc.on("close", () => resolve(out.trim()));
-      proc.on("error", () => resolve(""));
+      proc.on("close", () => { clearTimeout(killer); settle(out.trim()); });
+      proc.on("error", () => { clearTimeout(killer); settle(""); });
     });
   }
 
