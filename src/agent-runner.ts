@@ -28,8 +28,13 @@ export const MODEL_CONTEXT_LIMITS: Record<string, number> = {
   // caem nessas chaves via DATED_MODEL_ID_RE (claude-sonnet-4-20250514 → claude-sonnet-4).
   "claude-opus-4-1": 200_000, "claude-opus-4": 200_000, "claude-sonnet-4": 200_000,
   "claude-3-7-sonnet": 200_000, "claude-3-5-sonnet": 200_000, "claude-3-5-haiku": 200_000,
-  // Gemini
+  // Gemini — inclui as variantes GA (sem "-preview"): fora do mapa cairiam no
+  // piso de 200k e compactariam a cada ~20% da janela real de 1M.
+  "gemini-3-pro": 1_000_000,
+  "gemini-3-pro-preview": 1_000_000,
+  "gemini-3-flash": 1_000_000,
   "gemini-3-flash-preview": 1_000_000,
+  "gemini-3.1-flash-lite": 1_000_000,
   "gemini-3.1-flash-lite-preview": 1_000_000,
   "gemini-2.5-flash": 1_000_000,
   "gemini-2.5-flash-lite": 1_000_000,
@@ -52,6 +57,11 @@ export const MODEL_CONTEXT_LIMITS: Record<string, number> = {
   "zai-coding-plan/glm-4.5-air": 128_000,
   "zai-coding-plan/glm-5-turbo": 128_000,
   "zai-coding-plan/glm-5.1": 128_000,
+  // glm-5.2 é o modelo ATIVO do plano — sem a chave, o piso de 200k fica acima
+  // da janela real de 128k e a compaction proativa nunca dispara. A chave sem
+  // prefixo cobre outros providers via fallback pós-"/".
+  "zai-coding-plan/glm-5.2": 128_000,
+  "glm-5.2": 128_000,
   // OpenCode / DeepSeek. deepseek-chat é alias do chat model corrente —
   // 128k é o piso histórico da linha (conservador).
   "deepseek/deepseek-v4-pro": 200_000,
@@ -130,8 +140,12 @@ const OPENCODE_NO_OUTPUT_TIMEOUT_MS = 120_000;
  *  rodar tools por minutos). Generoso; o serve é morto no stop() se preciso. */
 const OPENCODE_TURN_TIMEOUT_MS = 600_000;
 
-const CONTEXT_FULL_PATTERNS = [
+export const CONTEXT_FULL_PATTERNS = [
   /context.{0,20}(length|window|limit).{0,20}exceed/i,
+  // Ordem inversa (exceed ANTES de context) — as duas variantes mais comuns:
+  // Anthropic "input length and `max_tokens` exceed context limit: ..." e
+  // codex "Your input exceeds the context window of this model".
+  /exceed\w*.{0,40}context.{0,20}(window|limit|length)/i,
   /maximum.{0,20}(context|token)/i,
   /too many tokens/i,
   /prompt is too long/i,
@@ -417,6 +431,17 @@ export class AgentRunner {
   private compactFailStreak = 0;
   /** Guard de reentrância do compactContext. */
   private compacting = false;
+  /** Guard de reentrância do clearContext — simétrico ao `compacting`: sem
+   *  ele, clear durante clear (ou compact durante clear) roda dois
+   *  killClaudeForRestart+startClaude em paralelo → processo claude órfão. */
+  private clearing = false;
+  /** One-shot de resumo em voo (compact codex/gemini/opencode) — precisa de
+   *  kill no stop(), senão roda órfão por até ONE_SHOT_TIMEOUT_MS. */
+  private oneShotProc: ChildProcess | null = null;
+  /** Base acumulada dos stats do gemini (uiTelemetryService acumula por
+   *  processo E re-hidrata o histórico no --resume): billing por turno é o
+   *  delta contra a base, nunca o valor bruto. */
+  private gemStatsBase = { input: 0, output: 0, cached: 0 };
   private sessionInvalid = false;
   private restarting = false;
   private lastVerboseIoBody = "";
@@ -681,6 +706,9 @@ export class AgentRunner {
     this.ocSeenPartIds.clear();
     this.ocNeedsPrime = false;
     this.ocFirstTurn = true;
+    // Sessão nova nasce sem --resume (gemini) → stats do CLI voltam a zero;
+    // manter a base antiga zeraria o billing dos primeiros turnos via clamp.
+    this.gemStatsBase = { input: 0, output: 0, cached: 0 };
     this.resetContextAccounting();
     this.ocPendingSummary = summary;
   }
@@ -762,13 +790,20 @@ export class AgentRunner {
 
       proc.stdout!.setEncoding("utf8");
       proc.stderr!.setEncoding("utf8");
+      this.oneShotProc = proc; // stop() precisa alcançar o one-shot (senão roda órfão até o timeout)
       let out = "";
       // CLI travado não pode segurar o await do compact pra sempre (guard
       // `compacting` ficaria preso e o agente sem processo). O killer resolve
       // a promise DIRETO: "close" não é garantido pós-SIGKILL se um processo
       // neto herdou os pipes de stdio (Node só emite close com streams fechados).
       let settled = false;
-      const settle = (v: string) => { if (!settled) { settled = true; resolve(v); } };
+      const settle = (v: string) => {
+        if (!settled) {
+          settled = true;
+          if (this.oneShotProc === proc) this.oneShotProc = null;
+          resolve(v);
+        }
+      };
       const killer = setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} settle(""); }, ONE_SHOT_TIMEOUT_MS);
       proc.stdout!.on("data", (c: string) => { this.traceCli(runner, "stdout", c); out += c; });
       proc.stderr!.on("data", (c: string) => { this.traceCli(runner, "stderr", c); });
@@ -1031,9 +1066,17 @@ export class AgentRunner {
       env,
       stdio: ["pipe", "pipe", "pipe"],
     }, this.opts.dropTo ?? null) as ChildProcessWithoutNullStreams;
+    // Fragmento de linha (sem \n) deixado pelo processo anterior SIGKILLado
+    // se colaria à primeira linha do novo → JSON.parse falha e o init
+    // (resolvedModel + idle) é perdido silenciosamente.
+    this.buffer = "";
+    // Identidade capturada: chunks/exit tardios do processo antigo (entregues
+    // entre exit e close, ou de um órfão) não podem re-emitir session_id/usage
+    // da sessão descartada nem clobberar o processo novo.
+    const proc = this.proc;
 
-    this.proc.stdout.setEncoding("utf8");
-    this.proc.stderr.setEncoding("utf8");
+    proc.stdout.setEncoding("utf8");
+    proc.stderr.setEncoding("utf8");
 
     // Flush mensagens bufferadas durante restart. Pequeno delay pra
     // Claude inicializar; CLI bufferará stdin entretanto.
@@ -1045,11 +1088,13 @@ export class AgentRunner {
       }, 300);
     }
 
-    this.proc.stdout.on("data", (chunk: string) => {
+    proc.stdout.on("data", (chunk: string) => {
+      if (this.proc !== proc) return; // chunk tardio de processo substituído
       this.traceCli("claude", "stdout", chunk);
       this.handleStdout(chunk);
     });
-    this.proc.stderr.on("data", (chunk: string) => {
+    proc.stderr.on("data", (chunk: string) => {
+      if (this.proc !== proc) return;
       const msg = chunk.trim();
       if (!msg) return;
       this.traceCli("claude", "stderr", msg);
@@ -1064,7 +1109,11 @@ export class AgentRunner {
       this.checkContextFullError(msg);
       this.opts.onError(msg);
     });
-    this.proc.on("exit", (code) => {
+    proc.on("exit", (code) => {
+      // Exit de um órfão já substituído (kill pulado numa corrida de restart):
+      // sem o guard, ele anularia this.proc do processo NOVO e chamaria
+      // emitExit — agente marcado como morto com o processo vivo.
+      if (this.proc !== proc) return;
       if (this.sessionInvalid) {
         this.sessionInvalid = false;
         this.opts.resumeSessionId = undefined;
@@ -1406,15 +1455,27 @@ export class AgentRunner {
       proc.stdout!.on("data", onData);
       proc.stderr!.on("data", onData);
       proc.on("exit", (code) => {
-        this.ocServerProc = null;
-        this.ocServerUrl = undefined;
-        this.ocServerBootPromise = null;
-        if (!resolved) reject(new Error(`opencode serve exited before listening (code ${code})`));
+        // Guard de identidade: exit tardio de um serve descartado no boot
+        // timeout não pode limpar o estado de um boot NOVO já em andamento.
+        if (this.ocServerProc === proc) {
+          this.ocServerProc = null;
+          this.ocServerUrl = undefined;
+          this.ocServerBootPromise = null;
+        }
+        if (!resolved) { resolved = true; reject(new Error(`opencode serve exited before listening (code ${code})`)); }
         else this.opts.log("warn", `[cli:${this.info.id}:opencode] serve exited (code ${code})`);
       });
       setTimeout(() => {
         if (!resolved) {
+          // resolved=true: URL impressa DEPOIS do timeout não pode armar
+          // ocServerUrl num processo que está morrendo (fast-path reportaria
+          // o serve como pronto e todo turno falharia até o exit).
+          resolved = true;
           try { proc.kill("SIGTERM"); } catch {}
+          setTimeout(() => { if (procAlive(proc)) { try { proc.kill("SIGKILL"); } catch {} } }, 1500);
+          // Um serve wedged que ignore SIGTERM sem nunca ter dado exit não
+          // pode deixar a bootPromise REJEITADA cacheada pra sempre.
+          if (this.ocServerProc === proc) { this.ocServerProc = null; this.ocServerBootPromise = null; }
           reject(new Error("opencode serve boot timeout (10s)"));
         }
       }, 10_000);
@@ -1428,7 +1489,10 @@ export class AgentRunner {
    *  zai-coding-plan (qualquer bloco `provider.<id>` corrompe o provider →
    *  agente mudo). O GLM-5.2 roda no default dele (reasoning_effort=max). */
   private ocModelParts(): { providerID: string; modelID: string } {
-    const raw = (this.info.model ?? "").replace(EFFORT_SUFFIX_RE, "");
+    // trim ANTES do sufixo (regex ancorada em $) e igual ao lookupContextLimit:
+    // model vem de campo livre da UI — whitespace colado no providerID quebra
+    // o startsWith("anthropic") do ocUsageSemantics (subcontagem documentada lá).
+    const raw = (this.info.model ?? "").trim().replace(EFFORT_SUFFIX_RE, "");
     const slash = raw.indexOf("/");
     const providerID = slash > 0 ? raw.slice(0, slash) : "";
     const modelID = slash > 0 ? raw.slice(slash + 1) : raw;
@@ -1489,6 +1553,12 @@ export class AgentRunner {
       }
     }
 
+    // Sessão deste turno: clear no meio do POST síncrono troca ocSessionId —
+    // o resultado do turno antigo tem que ser descartado quando resolver
+    // (texto velho "falando" pós-clear + usage da sessão cheia envenenando a
+    // contabilidade recém-zerada).
+    const turnSession = this.ocSessionId;
+
     // Resume: marca o histórico da sessão como já visto antes do 1º turno —
     // senão a drain por GET reemitiria tool calls/textos antigos nos RUNS.
     if (this.ocNeedsPrime) {
@@ -1529,6 +1599,7 @@ export class AgentRunner {
     } catch (e) {
       this.ocBusy = false;
       if (this.stopped) return;
+      if (this.ocSessionId !== turnSession) { this.setState("idle"); this.drainOcQueue(); return; } // clear trocou a sessão — descarta sem retry
       const emsg = (e as Error).message;
       if (retry < AgentRunner.OC_EMPTY_RETRIES) {
         this.opts.onError(`opencode: turno falhou (${emsg}) — retry ${retry + 1}/${AgentRunner.OC_EMPTY_RETRIES}`);
@@ -1538,11 +1609,31 @@ export class AgentRunner {
         return;
       }
       this.opts.onError(`opencode: turno falhou após retry: ${emsg}`);
+      // Estouro de janela chega como reject do POST (HTTP 4xx com o banner do
+      // provider no corpo) — única rota reativa do transporte via serve; sem
+      // isso o agente trava repetindo o mesmo erro até clear manual.
+      this.checkContextFullError(emsg);
       this.setState("idle");
       this.drainOcQueue();
       return;
     }
 
+    // Clear durante o POST: resultado pertence à sessão descartada.
+    if (this.ocSessionId !== turnSession) {
+      this.ocActiveProc = null;
+      this.ocBusy = false;
+      if (this.stopped) return;
+      this.setState("idle");
+      this.drainOcQueue();
+      return;
+    }
+    // Serve pode responder 200 com o erro do provider embutido em info.error
+    // (nunca passa pelas parts) — cobre a variante que o reject do POST não vê.
+    const infoErr = resp?.info?.error;
+    if (infoErr) {
+      const im = typeof infoErr === "string" ? infoErr : String(infoErr?.data?.message ?? infoErr?.message ?? JSON.stringify(infoErr));
+      this.checkContextFullError(im);
+    }
     // O POST /message só retorna a ÚLTIMA mensagem do assistant; as tool calls
     // ficam em mensagens INTERMEDIÁRIAS do loop (uma msg por step). Busca TODAS
     // as msgs da sessão e processa só as parts novas (dedup por id) — senão os
@@ -1599,6 +1690,10 @@ export class AgentRunner {
               reject(new Error(`HTTP ${sc}${txt ? ` — ${txt.slice(0, 200)}` : ""}`));
             }
           });
+          // Conexão caindo DEPOIS dos headers emite 'error' no RES (não no
+          // req): sem este handler a promise pendura pra sempre (guards
+          // compacting/ocBusy presos) e o 'error' vira uncaughtException.
+          res.on("error", (e) => reject(new Error(`resposta interrompida: ${e.message}`)));
         },
       );
       req.on("error", reject);
@@ -1705,6 +1800,7 @@ export class AgentRunner {
           if (sc >= 200 && sc < 300) { try { resolve(txt ? JSON.parse(txt) : {}); } catch { resolve({}); } }
           else reject(new Error(`HTTP ${sc}${txt ? ` — ${txt.slice(0, 120)}` : ""}`));
         });
+        res.on("error", (e) => reject(new Error(`resposta interrompida: ${e.message}`))); // mesmo hang do ocServeFetch
       });
       req.on("error", reject);
       req.on("timeout", () => req.destroy(new Error(`timeout ${timeoutMs}ms`)));
@@ -1832,7 +1928,8 @@ export class AgentRunner {
     this.writeGeminiConfig();
 
     let message = content;
-    if (this.ocFirstTurn) {
+    const firstTurn = this.ocFirstTurn;
+    if (firstTurn) {
       this.ocFirstTurn = false;
       const summary = this.ocPendingSummary ? `\n\n# Previous conversation summary\n${this.ocPendingSummary}` : "";
       this.ocPendingSummary = undefined;
@@ -1862,8 +1959,13 @@ export class AgentRunner {
     ];
     if (this.info.model) args.push("--model", this.info.model);
     if (this.opts.autoApprove) args.push("--yolo");
-    // Resume previous session if one exists for this agent dir
-    args.push("--resume", "latest");
+    // Resume SÓ quando não é primeiro turno: o storage do gemini é indexado
+    // pelo cwd (agentTmpDir, nunca rotacionado) — `--resume latest`
+    // incondicional re-abria a sessão CHEIA depois de clear/compact
+    // (resetWithSummary não a apaga), tornando os dois no-ops e o compact um
+    // loop infinito (resumo appendado na própria sessão que estourou).
+    // Sem o resume, o processo novo cria sessão limpa que vira a "latest".
+    if (!firstTurn) args.push("--resume", "latest");
 
     const env = {
       ...this.buildEnv(),
@@ -1910,15 +2012,26 @@ export class AgentRunner {
             this.setState("thinking");
           } else if (ev.type === "result") {
             flush();
+            // stats do gemini-cli são ACUMULADOS (uiTelemetryService soma o
+            // prompt de TODAS as requests do turno e o hydrate do --resume
+            // pré-carrega o histórico inteiro): input_tokens ≈ Σ requests,
+            // não a ocupação da janela. Billing = delta contra a base
+            // persistida (base zera junto com a sessão no resetWithSummary);
+            // ocupação NÃO é derivável daqui — contexto cheio do gemini é
+            // detectado pela rota reativa (banner no stderr →
+            // checkContextFullError), nunca por estes stats.
             const s = ev.stats ?? {};
+            const rawInput = Number(s.input_tokens ?? s.input ?? 0);
+            const rawOutput = Number(s.output_tokens ?? 0);
+            const rawCached = Number(s.cached ?? 0);
             const delta: AgentUsage = {
-              input: Number(s.input_tokens ?? s.input ?? 0),
-              output: Number(s.output_tokens ?? 0),
+              input: Math.max(0, rawInput - this.gemStatsBase.input),
+              output: Math.max(0, rawOutput - this.gemStatsBase.output),
               cacheCreate: 0,
-              cacheRead: Number(s.cached ?? 0),
+              cacheRead: Math.max(0, rawCached - this.gemStatsBase.cached),
             };
+            this.gemStatsBase = { input: rawInput, output: rawOutput, cached: rawCached };
             this.opts.onUsageDelta?.(delta);
-            this.checkContextUsage(delta, "inclusive");
           }
         } catch {}
       }
@@ -2060,8 +2173,12 @@ export class AgentRunner {
 
     proc.stderr!.on("data", (chunk: string) => {
       const msg = chunk.trim();
-      if (msg) this.traceCli("codex", "stderr", msg);
-      if (msg && msg.includes(" ERROR ") && !msg.includes("failed to record rollout items")) {
+      if (!msg) return;
+      this.traceCli("codex", "stderr", msg);
+      // Único runner cujo stderr não passava pelos CONTEXT_FULL_PATTERNS
+      // (claude e gemini passam) — estouro reportado só no stderr era mudo.
+      this.checkContextFullError(msg);
+      if (msg.includes(" ERROR ") && !msg.includes("failed to record rollout items")) {
         this.opts.onError(msg);
       }
     });
@@ -2082,6 +2199,11 @@ export class AgentRunner {
   private handleCodexEvent(event: any) {
     switch (event.type) {
       case "thread.started": {
+        // Durante compact, o thread.started de um turno em voo chegando
+        // DEPOIS do resetWithSummary ressuscitaria a sessão ANTIGA
+        // (ocSessionId=undefined → tid) — o próximo exec resume injetaria o
+        // summary em cima da thread cheia e o compact viraria no-op.
+        if (this.compacting) break;
         const tid = event.thread_id as string | undefined;
         if (tid && tid !== this.ocSessionId) {
           this.ocSessionId = tid;
@@ -2123,6 +2245,24 @@ export class AgentRunner {
         }
         break;
       }
+      // Estouro de janela do codex chega por aqui (turn.failed com
+      // error.message "Your input exceeds the context window...") e encerra
+      // SEM turn.completed — descartar esses eventos deixava o agente mudo e
+      // permanentemente quebrado (todo exec resume falha igual).
+      case "turn.failed": {
+        const emsg = String(event.error?.message ?? event.error ?? "turn failed");
+        this.checkContextFullError(emsg);
+        this.opts.onError(`codex: ${emsg}`);
+        break;
+      }
+      case "error": {
+        const emsg = String(event.message ?? event.error?.message ?? "");
+        if (emsg) {
+          this.checkContextFullError(emsg);
+          this.opts.onError(`codex: ${emsg}`);
+        }
+        break;
+      }
     }
   }
 
@@ -2142,7 +2282,11 @@ export class AgentRunner {
   }
 
   private drainOcQueue() {
-    if (this.ocBusy || this.ocQueue.length === 0 || this.stopped) return;
+    // `compacting` pausa a fila: turno iniciado no meio do compact roda em
+    // paralelo com o one-shot/summarize na MESMA sessão (prime engoliria a
+    // resposta dele; thread.started ressuscitaria a sessão pós-reset).
+    // Re-drenada no finally do compactContext.
+    if (this.ocBusy || this.compacting || this.ocQueue.length === 0 || this.stopped) return;
     this.ocBusy = true;
     const { content, images } = this.ocQueue.shift()!;
     if (this.opts.cliRunner === "gemini") {
@@ -2214,63 +2358,76 @@ export class AgentRunner {
     this.pendingMessages = [];
     this.ocQueue = [];
     if (this.ocEventReq) { try { this.ocEventReq.destroy(); } catch { /* noop */ } this.ocEventReq = null; }
+    // One-shot de resumo em voo (compact): sem kill, roda órfão por até
+    // ONE_SHOT_TIMEOUT_MS consumindo API — e o emitExit abaixo apaga o tmpdir
+    // (cwd + session store do gemini) debaixo dele.
+    if (this.oneShotProc) { try { this.oneShotProc.kill("SIGKILL"); } catch {} this.oneShotProc = null; }
     if (this.opts.cliRunner === "opencode" || this.opts.cliRunner === "gemini" || this.opts.cliRunner === "codex") {
-      if (this.ocServerProc && !this.ocServerProc.killed) {
-        try { this.ocServerProc.kill("SIGTERM"); } catch {}
+      if (procAlive(this.ocServerProc)) {
+        try { this.ocServerProc!.kill("SIGTERM"); } catch {}
         setTimeout(() => {
-          if (this.ocServerProc && !this.ocServerProc.killed) { try { this.ocServerProc.kill("SIGKILL"); } catch {} }
+          if (procAlive(this.ocServerProc)) { try { this.ocServerProc!.kill("SIGKILL"); } catch {} }
         }, 1500);
       }
-      if (this.ocActiveProc && !this.ocActiveProc.killed) {
-        this.ocActiveProc.kill("SIGTERM");
+      if (procAlive(this.ocActiveProc)) {
+        this.ocActiveProc!.kill("SIGTERM");
         setTimeout(() => {
-          if (this.ocActiveProc && !this.ocActiveProc.killed) this.ocActiveProc.kill("SIGKILL");
+          if (procAlive(this.ocActiveProc)) this.ocActiveProc!.kill("SIGKILL");
         }, 1500);
       } else {
         this.emitExit(0);
       }
       return;
     }
-    if (this.proc && !this.proc.killed) {
-      try { this.proc.stdin.end(); } catch {}
-      this.proc.kill("SIGTERM");
+    if (procAlive(this.proc)) {
+      try { this.proc!.stdin.end(); } catch {}
+      this.proc!.kill("SIGTERM");
       setTimeout(() => {
-        if (this.proc && !this.proc.killed) this.proc.kill("SIGKILL");
+        if (procAlive(this.proc)) this.proc!.kill("SIGKILL");
       }, 1500);
     }
   }
 
   async clearContext(): Promise<void> {
-    // Clear no meio de um compact faria killClaudeForRestart+startClaude em
-    // paralelo com o compact → processo claude órfão (mesma corrida que o
-    // guard `compacting` fecha no compactContext).
+    // Exclusão mútua BIDIRECIONAL com o compact (e consigo mesmo): clear no
+    // meio de um compact (ou de outro clear) faria killClaudeForRestart+
+    // startClaude em paralelo → dois processos claude vivos na mesma sessão.
     if (this.compacting) {
       this.opts.onError("[ctx] clear ignorado — compact em andamento, aguarde terminar");
       return;
     }
-    if (this.opts.cliRunner === "claude") {
-      await this.killClaudeForRestart();
-      this.opts.resumeSessionId = undefined;
-      this.info.sessionId = undefined;
-      if (this.opts.onSessionId) this.opts.onSessionId("");
-      this.resetContextAccounting();
-      this.startClaude();
-      this.opts.onError("[ctx] context cleared — claude restarted with new session");
+    if (this.clearing) {
+      this.opts.onError("[ctx] clear já em andamento — ignorado");
       return;
     }
-    if (this.ocActiveProc && !this.ocActiveProc.killed) {
-      try { this.ocActiveProc.kill("SIGTERM"); } catch {}
-      setTimeout(() => {
-        if (this.ocActiveProc && !this.ocActiveProc.killed) try { this.ocActiveProc.kill("SIGKILL"); } catch {}
-      }, 1500);
+    this.clearing = true;
+    try {
+      if (this.opts.cliRunner === "claude") {
+        await this.killClaudeForRestart();
+        this.opts.resumeSessionId = undefined;
+        this.info.sessionId = undefined;
+        if (this.opts.onSessionId) this.opts.onSessionId("");
+        this.resetContextAccounting();
+        this.startClaude();
+        this.opts.onError("[ctx] context cleared — claude restarted with new session");
+        return;
+      }
+      if (procAlive(this.ocActiveProc)) {
+        try { this.ocActiveProc!.kill("SIGTERM"); } catch {}
+        setTimeout(() => {
+          if (procAlive(this.ocActiveProc)) try { this.ocActiveProc!.kill("SIGKILL"); } catch {}
+        }, 1500);
+      }
+      this.ocQueue = [];
+      this.ocBusy = false;
+      this.resetWithSummary(undefined);
+      this.info.sessionId = undefined;
+      if (this.opts.onSessionId) this.opts.onSessionId("");
+      this.setState("idle");
+      this.opts.onError("[ctx] context cleared — next message starts new session");
+    } finally {
+      this.clearing = false;
     }
-    this.ocQueue = [];
-    this.ocBusy = false;
-    this.resetWithSummary(undefined);
-    this.info.sessionId = undefined;
-    if (this.opts.onSessionId) this.opts.onSessionId("");
-    this.setState("idle");
-    this.opts.onError("[ctx] context cleared — next message starts new session");
   }
 
   async compactContext(saveMemory = true): Promise<void> {
@@ -2281,11 +2438,22 @@ export class AgentRunner {
       this.opts.onError("[ctx] compact já em andamento — ignorado");
       return;
     }
+    // Simétrico ao check de `compacting` no clearContext: compact entrando na
+    // janela do kill de um clear capturaria a sessão antiga e subiria um
+    // segundo processo (o early-return do killClaudeForRestart via proc.killed
+    // era o buraco; o guard fecha a porta pelo outro lado também).
+    if (this.clearing) {
+      this.opts.onError("[ctx] compact ignorado — clear em andamento");
+      return;
+    }
     this.compacting = true;
     try {
       await this.compactContextInner(saveMemory);
     } finally {
       this.compacting = false;
+      // A fila oc fica pausada durante o compact (drainOcQueue checa
+      // `compacting`) — mensagens chegadas no meio precisam drenar agora.
+      if (this.opts.cliRunner !== "claude") this.drainOcQueue();
     }
   }
 
@@ -2304,6 +2472,14 @@ export class AgentRunner {
       // mandava "deepseek-v4-pro:max" pro serve e o compact falhava sempre.
       const { providerID, modelID } = this.ocModelParts();
       if (!providerID || !modelID) { this.opts.onError("[ctx] compact: modelo inválido"); return; }
+      // Turno em voo compartilha a sessão do serve: o prime pós-summarize
+      // marcaria as parts dele como vistas (resposta engolida + retry
+      // re-executa tools com side effect). A fila está pausada pelo guard
+      // `compacting` — só falta o em-voo terminar.
+      if (!(await this.waitOcIdle())) {
+        if (!this.stopped) this.opts.onError("[ctx] compact: turno em andamento não terminou a tempo — tente de novo quando o agente estiver idle");
+        return;
+      }
 
       // (1) auto-extract via fork (mesmo prompt do claude) — só se pedido
       if (saveMemory) try {
@@ -2351,8 +2527,12 @@ export class AgentRunner {
         // depois, as parts do resumo precisam de prime mesmo assim — senão o
         // próximo turno re-despacha o resumo como fala + context_full espúrio.
         this.ocNeedsPrime = true;
-        this.registerCompactFailure();
-        this.opts.onError(`[ctx] compact falhou: ${(e as Error).message}`);
+        const emsg = (e as Error).message;
+        // Timeout ≠ falha: o summarize pode ter CONCLUÍDO no serve (provider
+        // lento). Contar no streak suspenderia a auto-compaction após 3
+        // compactions que na verdade funcionaram.
+        if (!/^timeout /.test(emsg)) this.registerCompactFailure();
+        this.opts.onError(`[ctx] compact falhou: ${emsg}`);
       }
       return;
     }
@@ -2416,7 +2596,16 @@ export class AgentRunner {
     // --resume latest) e parseia MEMORY_JSON. Diag de tamanho pra ver se o
     // one-shot retornou texto (vazio = resume falhou ou reasoning model não
     // serializou o agent_message).
+    // Turno em voo primeiro: o one-shot escreveria na MESMA sessão (gemini)
+    // ou o thread.started/turn.completed dele brigaria com o reset (codex).
+    if (!(await this.waitOcIdle())) {
+      if (!this.stopped) this.opts.onError("[ctx] compact: turno em andamento não terminou a tempo — tente de novo quando o agente estiver idle");
+      return;
+    }
     const summary = await this.runOneShot(summaryPrompt);
+    // stop() durante o one-shot: emitExit já rodou e o tmpdir já era — não
+    // tocar estado nem anunciar compact num agente finalizado.
+    if (this.stopped) return;
     this.opts.onError(`[compact] ${this.opts.cliRunner} summary length=${(summary || "").length}`);
     const { clean, items } = this.parseAndStripMemory(summary || "");
     if (saveMemory) void this.saveExtractedMemory(items, existing);
@@ -2424,8 +2613,23 @@ export class AgentRunner {
       this.resetWithSummary(clean);
       this.opts.onError(`[ctx] contexto compactado${saveMemory ? ` (${items.length} memória(s) salvas)` : " (sem salvar memória)"}`);
     } else {
-      this.opts.onError(`[ctx] compact: one-shot ${this.opts.cliRunner} sem resumo — sessão não compactada (resume/parsing). Mande uma mensagem e tente de novo.`);
+      // Sem resumo utilizável = falha de compact: precisa contar no streak —
+      // senão o teto de MAX_COMPACT_FAIL_STREAK nunca engata nos runners
+      // codex/gemini (falha determinística vira loop eterno de one-shots
+      // caros a cada janela de cooldown).
+      this.registerCompactFailure();
     }
+  }
+
+  /** Espera o turno oc em voo terminar (a fila fica pausada pelo guard
+   *  `compacting`). true = idle; false = desistiu (turno mais longo que o
+   *  teto) ou stop() no meio. */
+  private async waitOcIdle(maxMs = 120_000): Promise<boolean> {
+    const step = 250;
+    for (let waited = 0; this.ocBusy && !this.stopped && waited < maxMs; waited += step) {
+      await new Promise((r) => setTimeout(r, step));
+    }
+    return !this.ocBusy && !this.stopped;
   }
 
   /** Extrai o bloco `MEMORY_JSON: [...]` do output do summary one-shot,
@@ -2566,6 +2770,7 @@ export class AgentRunner {
               catch { resolve({}); }
             } else reject(new Error(`HTTP ${res.statusCode}`));
           });
+          res.on("error", (e) => reject(new Error(`resposta interrompida: ${e.message}`))); // mesmo hang do ocServeFetch
         }
       );
       req.on("error", reject);
@@ -2576,17 +2781,21 @@ export class AgentRunner {
   }
 
   private async killClaudeForRestart(): Promise<void> {
-    if (!this.proc || this.proc.killed) return;
+    // Teste de vida por exitCode/signalCode, NÃO por .killed: kill() marca
+    // killed=true no ENVIO do sinal — early-return por .killed pulava a espera
+    // quando outro caminho já tinha sinalizado (processo ainda vivo) e a
+    // escalação SIGKILL nunca disparava (código morto).
+    const proc = this.proc;
+    if (!procAlive(proc)) return;
     this.restarting = true;
     await new Promise<void>((resolve) => {
-      const proc = this.proc!;
       let settled = false;
       const done = () => { if (!settled) { settled = true; resolve(); } };
-      proc.once("exit", done);
-      try { proc.stdin.end(); } catch {}
-      proc.kill("SIGTERM");
+      proc!.once("exit", done);
+      try { proc!.stdin.end(); } catch {}
+      try { proc!.kill("SIGTERM"); } catch {}
       setTimeout(() => {
-        if (proc && !proc.killed) proc.kill("SIGKILL");
+        if (procAlive(proc)) { try { proc!.kill("SIGKILL"); } catch {} }
       }, 1500);
       setTimeout(done, 3000);
     });
@@ -2609,11 +2818,18 @@ export class AgentRunner {
       }, this.opts.dropTo ?? null);
       proc.stdout!.setEncoding("utf8");
       proc.stderr!.setEncoding("utf8");
+      this.oneShotProc = proc; // stop() precisa alcançar o one-shot
       let out = "";
       // Mesmo timeout/settle do runOneShot — killer resolve direto porque
       // "close" não é garantido pós-SIGKILL (pipes herdados por processo neto).
       let settled = false;
-      const settle = (v: string) => { if (!settled) { settled = true; resolve(v); } };
+      const settle = (v: string) => {
+        if (!settled) {
+          settled = true;
+          if (this.oneShotProc === proc) this.oneShotProc = null;
+          resolve(v);
+        }
+      };
       const killer = setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} settle(""); }, ONE_SHOT_TIMEOUT_MS);
       proc.stdout!.on("data", (c: string) => { this.traceCli("claude", "stdout", c); out += c; });
       proc.stderr!.on("data", (c: string) => { this.traceCli("claude", "stderr", c); });
@@ -2654,6 +2870,13 @@ function codexEffort(level: string): string {
 
 function isMissingSessionMessage(msg: string): boolean {
   return MISSING_SESSION_PATTERNS.some((p) => p.test(msg));
+}
+
+/** Processo ainda vivo? `.killed` só diz que um sinal foi ENVIADO (vira true
+ *  no próprio kill(), antes do exit) — como teste de vida em timeouts de
+ *  escalação, `!p.killed` é sempre false e o SIGKILL nunca sai. */
+function procAlive(p: ChildProcess | null | undefined): boolean {
+  return !!p && p.exitCode === null && p.signalCode === null;
 }
 
 export function extractOneShotText(out: string, runner: CliRunner): string {

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   MODEL_CONTEXT_LIMITS,
   DEFAULT_CONTEXT_LIMIT,
+  CONTEXT_FULL_PATTERNS,
   contextLimitFor,
   lookupContextLimit,
   contextTokensOf,
@@ -74,6 +75,23 @@ test("sufixo legado :<effort> é removido antes do lookup", () => {
   assert.equal(contextLimitFor("deepseek/deepseek-v4-pro:max"), 200_000);
 });
 
+test("modelos ativos fora do mapa antigo: glm-5.2 = 128k, gemini-3 GA = 1M", () => {
+  // rodada 5 #3: glm-5.2 caía no piso de 200k > janela real de 128k —
+  // warning/full ficavam inalcançáveis antes do hard cap do provider.
+  assert.equal(contextLimitFor("zai-coding-plan/glm-5.2"), 128_000);
+  assert.equal(contextLimitFor("zai-coding-plan/glm-5.2:high"), 128_000);
+  assert.equal(contextLimitFor("glm-5.2"), 128_000);
+  assert.equal(contextLimitFor("outro-provider/glm-5.2"), 128_000);
+  // rodada 5 #9: variantes GA da geração 3 caíam no piso (200k numa janela 1M).
+  assert.equal(contextLimitFor("gemini-3-pro"), 1_000_000);
+  assert.equal(contextLimitFor("gemini-3-pro-preview"), 1_000_000);
+  assert.equal(contextLimitFor("gemini-3-flash"), 1_000_000);
+});
+
+test("[1m] com prefixo de provider resolve pra 1M direto", () => {
+  assert.equal(contextLimitFor("anthropic/claude-sonnet-5[1m]"), 1_000_000);
+});
+
 test("model ausente, vazio ou desconhecido cai no piso conservador", () => {
   assert.equal(contextLimitFor(undefined), DEFAULT_CONTEXT_LIMIT);
   assert.equal(contextLimitFor(""), DEFAULT_CONTEXT_LIMIT);
@@ -127,4 +145,25 @@ test("auto: cache subconjunto do input ⇒ inclusivo; cache maior ⇒ soma", () 
 test("delta zerado não move o contador", () => {
   assert.equal(contextTokensOf(usage(0, 0, 0), "anthropic"), 0);
   assert.equal(contextTokensOf(usage(0, 0, 0), "auto"), 0);
+});
+
+/* ---------- CONTEXT_FULL_PATTERNS ---------- */
+
+const matchesFull = (msg: string) => CONTEXT_FULL_PATTERNS.some((p) => p.test(msg));
+
+test("banners reais de contexto cheio casam (inclusive ordem exceed→context)", () => {
+  // Anthropic — a variante MAIS comum (input + max_tokens > janela):
+  assert.ok(matchesFull("input length and `max_tokens` exceed context limit: 190510 + 21333 > 204698, decrease input length or max_tokens"));
+  // codex:
+  assert.ok(matchesFull("Your input exceeds the context window of this model. Please adjust your input and try again."));
+  // Anthropic prompt sozinho acima do limite:
+  assert.ok(matchesFull("prompt is too long: 210000 tokens > 200000 maximum"));
+  // OpenAI-style (deepseek/zai via opencode serve):
+  assert.ok(matchesFull("This model's maximum context length is 131072 tokens. However, you requested 140000 tokens. Please reduce the length of the messages."));
+});
+
+test("prosa comum não casa os padrões de contexto cheio", () => {
+  assert.ok(!matchesFull("vou revisar a função de contexto do runner"));
+  assert.ok(!matchesFull("o limite de contexto desse modelo é grande"));
+  assert.ok(!matchesFull("deploy concluído com sucesso"));
 });
