@@ -4,6 +4,7 @@ import {
   MODEL_CONTEXT_LIMITS,
   DEFAULT_CONTEXT_LIMIT,
   CONTEXT_FULL_PATTERNS,
+  RATE_LIMIT_TEXT_RE,
   contextLimitFor,
   lookupContextLimit,
   contextTokensOf,
@@ -166,4 +167,22 @@ test("prosa comum não casa os padrões de contexto cheio", () => {
   assert.ok(!matchesFull("vou revisar a função de contexto do runner"));
   assert.ok(!matchesFull("o limite de contexto desse modelo é grande"));
   assert.ok(!matchesFull("deploy concluído com sucesso"));
+});
+
+test("precedência rate-limit: 429 TPM da Anthropic é rate limit, não contexto cheio", () => {
+  // rodada 6: esse banner casa /maximum.{0,20}token/ — sem o pré-filtro de
+  // RATE_LIMIT_TEXT_RE no checkContextFullError, rajada de 429 compactava
+  // sessão saudável e 3 rajadas suspendiam a auto-compaction.
+  const tpm429 = "This request would exceed your organization's rate limit of 80000 input tokens per minute. Please reduce the prompt length or the maximum tokens requested, or try again later.";
+  assert.ok(RATE_LIMIT_TEXT_RE.test(tpm429), "429 TPM tem que casar como rate limit");
+  assert.ok(matchesFull(tpm429), "sanidade: sem o pré-filtro ele casaria como contexto cheio");
+  // Banners REAIS de contexto cheio não podem ser engolidos pelo pré-filtro:
+  for (const banner of [
+    "input length and `max_tokens` exceed context limit: 190510 + 21333 > 204698",
+    "Your input exceeds the context window of this model.",
+    "prompt is too long: 210000 tokens > 200000 maximum",
+    "This model's maximum context length is 131072 tokens. Please reduce the length of the messages.",
+  ]) {
+    assert.ok(!RATE_LIMIT_TEXT_RE.test(banner), `banner de contexto não pode casar rate limit: ${banner.slice(0, 50)}`);
+  }
 });

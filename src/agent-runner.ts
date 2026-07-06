@@ -160,7 +160,7 @@ const MISSING_SESSION_PATTERNS = [
 // (não como erro). Sem isto o server trata como output real, cifra (E2EE), e o
 // auto-retry nunca dispara — pior, zera o contador. Roteamos como erro.
 // Ex: "API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited"
-const RATE_LIMIT_TEXT_RE = /temporarily limiting requests|·\s*rate limited|\brate.?limited\b|overloaded|too many requests|\b429\b|\b529\b/i;
+export const RATE_LIMIT_TEXT_RE = /temporarily limiting requests|·\s*rate limited|\brate.?limit\w*\b|overloaded|too many requests|\b429\b|\b529\b/i;
 
 const MIME_EXT: Record<string, string> = {
   "image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg",
@@ -442,6 +442,12 @@ export class AgentRunner {
    *  processo E re-hidrata o histórico no --resume): billing por turno é o
    *  delta contra a base, nunca o valor bruto. */
   private gemStatsBase = { input: 0, output: 0, cached: 0 };
+  /** Geração da sessão oc — incrementada em todo resetWithSummary. Eventos de
+   *  um turno spawnado num epoch anterior (proc morto pelo clear drenando
+   *  stdout, thread.started tardio do codex) são descartados por comparação
+   *  de epoch — descartar por `compacting` engolia eventos LEGÍTIMOS do turno
+   *  em voo durante a fase de waitOcIdle. */
+  private ocEpoch = 0;
   private sessionInvalid = false;
   private restarting = false;
   private lastVerboseIoBody = "";
@@ -702,6 +708,7 @@ export class AgentRunner {
   }
 
   resetWithSummary(summary?: string): void {
+    this.ocEpoch++;
     this.ocSessionId = undefined;
     this.ocSeenPartIds.clear();
     this.ocNeedsPrime = false;
@@ -725,6 +732,9 @@ export class AgentRunner {
 
   async runOneShot(prompt: string): Promise<string> {
     return new Promise((resolve) => {
+      // stop() antes do spawn: sem o check, o one-shot nasce DEPOIS do
+      // emitExit (que apagou o tmpdir) e roda órfão consumindo API.
+      if (this.stopped) { resolve(""); return; }
       if (!this.ensureRunnerAvailable(this.opts.cliRunner)) {
         resolve("");
         return;
@@ -852,6 +862,13 @@ export class AgentRunner {
   }
 
   private checkContextFullError(msg: string): void {
+    // Rate limit tem PRECEDÊNCIA (mesmo pré-filtro da rota de texto do
+    // claude): o 429 TPM da Anthropic ("...rate limit of N input tokens per
+    // minute... reduce the prompt length or the maximum tokens requested...")
+    // casa /maximum.{0,20}token/ — sem o filtro, rajada de rate limit
+    // compacta uma sessão saudável (lossy) e 3 rajadas suspendem a
+    // auto-compaction via streak.
+    if (RATE_LIMIT_TEXT_RE.test(msg)) return;
     if (CONTEXT_FULL_PATTERNS.some((p) => p.test(msg))) {
       this.notifyContextFull();
     }
@@ -1597,15 +1614,27 @@ export class AgentRunner {
         OPENCODE_TURN_TIMEOUT_MS,
       );
     } catch (e) {
+      if (this.stopped) { this.ocBusy = false; return; }
+      // Clear trocou a sessão durante o POST: este turno NÃO é mais dono de
+      // ocBusy/estado — o clear já zerou a flag e um turno NOVO pode tê-la
+      // re-armado. Zerar/drenar aqui clobberaria o dono (waitOcIdle veria
+      // falso-idle e o compact rodaria em paralelo com o turno novo).
+      if (this.ocSessionId !== turnSession) return;
       this.ocBusy = false;
-      if (this.stopped) return;
-      if (this.ocSessionId !== turnSession) { this.setState("idle"); this.drainOcQueue(); return; } // clear trocou a sessão — descarta sem retry
       const emsg = (e as Error).message;
       if (retry < AgentRunner.OC_EMPTY_RETRIES) {
         this.opts.onError(`opencode: turno falhou (${emsg}) — retry ${retry + 1}/${AgentRunner.OC_EMPTY_RETRIES}`);
         if (wasFirstTurn) this.ocFirstTurn = true;
         this.ocBusy = true;
-        setTimeout(() => { if (this.stopped) { this.ocBusy = false; return; } void this.runOpenCodeMessage(content, images, retry + 1); }, 1200);
+        setTimeout(() => {
+          if (this.stopped) { this.ocBusy = false; return; }
+          // Clear na janela de 1,2s descartou a mensagem — re-postá-la numa
+          // sessão nova ressuscitaria o conteúdo que o usuário abortou (com
+          // side effects de tools). Não toca ocBusy: o clear já zerou e um
+          // turno novo pode ser o dono agora.
+          if (this.ocSessionId !== turnSession) return;
+          void this.runOpenCodeMessage(content, images, retry + 1);
+        }, 1200);
         return;
       }
       this.opts.onError(`opencode: turno falhou após retry: ${emsg}`);
@@ -1618,15 +1647,10 @@ export class AgentRunner {
       return;
     }
 
-    // Clear durante o POST: resultado pertence à sessão descartada.
-    if (this.ocSessionId !== turnSession) {
-      this.ocActiveProc = null;
-      this.ocBusy = false;
-      if (this.stopped) return;
-      this.setState("idle");
-      this.drainOcQueue();
-      return;
-    }
+    // Clear durante o POST: resultado pertence à sessão descartada. Retorna
+    // SEM tocar ocBusy/estado/fila — este turno não é mais o dono (ver catch).
+    if (this.stopped) { this.ocBusy = false; return; }
+    if (this.ocSessionId !== turnSession) return;
     // Serve pode responder 200 com o erro do provider embutido em info.error
     // (nunca passa pelas parts) — cobre a variante que o reject do POST não vê.
     const infoErr = resp?.info?.error;
@@ -1638,16 +1662,22 @@ export class AgentRunner {
     // ficam em mensagens INTERMEDIÁRIAS do loop (uma msg por step). Busca TODAS
     // as msgs da sessão e processa só as parts novas (dedup por id) — senão os
     // RUNS (tool executions) nunca apareciam no opencode.
-    await this.ocProcessNewParts(resp);
+    await this.ocProcessNewParts(resp, turnSession);
 
+    // Clear durante o GET do ocProcessNewParts: mesma regra de posse.
+    if (this.stopped) { this.ocBusy = false; return; }
+    if (this.ocSessionId !== turnSession) return;
     this.ocActiveProc = null;
     this.ocBusy = false;
-    if (this.stopped) return;
     if (!this.ocRunSawOutput && retry < AgentRunner.OC_EMPTY_RETRIES) {
       this.opts.onError(`opencode: resposta vazia (provável flap do provider) — retry ${retry + 1}/${AgentRunner.OC_EMPTY_RETRIES}`);
       if (wasFirstTurn) this.ocFirstTurn = true;
       this.ocBusy = true;
-      setTimeout(() => { if (this.stopped) { this.ocBusy = false; return; } void this.runOpenCodeMessage(content, images, retry + 1); }, 1200);
+      setTimeout(() => {
+        if (this.stopped) { this.ocBusy = false; return; }
+        if (this.ocSessionId !== turnSession) return; // clear descartou a mensagem (ver retry do catch)
+        void this.runOpenCodeMessage(content, images, retry + 1);
+      }, 1200);
       return;
     }
     if (!this.ocRunSawOutput) {
@@ -1811,13 +1841,20 @@ export class AgentRunner {
 
   /** Lê TODAS as mensagens da sessão e processa as parts ainda não vistas.
    *  Cobre tool calls que vivem em mensagens intermediárias (o POST /message
-   *  só devolve a última). Fallback p/ resp.parts se o GET falhar. */
-  private async ocProcessNewParts(resp: any): Promise<void> {
+   *  só devolve a última). Fallback p/ resp.parts se o GET falhar.
+   *  `sessionId` é a sessão DO TURNO (capturada antes do POST) — usar
+   *  this.ocSessionId aqui abriria janela pro clear no meio: GET em
+   *  /session/undefined + dispatch de histórico velho pós-reset. */
+  private async ocProcessNewParts(resp: any, sessionId?: string): Promise<void> {
+    const sid = sessionId ?? this.ocSessionId;
     let messages: any[] | null = null;
     try {
-      const r = await this.ocServeFetch(`/session/${this.ocSessionId}/message`, "GET");
+      const r = await this.ocServeFetch(`/session/${sid}/message`, "GET");
       if (Array.isArray(r)) messages = r;
     } catch { /* cai pro fallback abaixo */ }
+    // Clear durante o GET: não despachar parts da sessão descartada (texto
+    // velho "falando" pós-clear + step-finish envenenando a contabilidade).
+    if (sessionId && this.ocSessionId !== sessionId) return;
 
     const groups: any[][] = messages
       ? messages
@@ -1929,6 +1966,12 @@ export class AgentRunner {
 
     let message = content;
     const firstTurn = this.ocFirstTurn;
+    // Preservados pra restaurar se o turno morrer sem completar: com o
+    // --resume condicional, perder o firstTurn num turno falho mudaria QUAL
+    // sessão o agente usa dali em diante (re-resume da sessão que o
+    // clear/compact descartou) — e o resumo pendente seria perdido junto.
+    const pendingSummary = this.ocPendingSummary;
+    const epoch = this.ocEpoch;
     if (firstTurn) {
       this.ocFirstTurn = false;
       const summary = this.ocPendingSummary ? `\n\n# Previous conversation summary\n${this.ocPendingSummary}` : "";
@@ -1982,8 +2025,12 @@ export class AgentRunner {
 
     let buf = "";
     let pendingText = "";
+    let sawResult = false;
 
     const flush = () => {
+      // Epoch trocado (clear/compact durante o turno): texto da sessão
+      // descartada não pode "falar" pós-reset.
+      if (epoch !== this.ocEpoch) { pendingText = ""; return; }
       const t = pendingText.trim();
       if (t) {
         this.setState("speaking");
@@ -2002,6 +2049,10 @@ export class AgentRunner {
         const line = buf.slice(0, idx).trim();
         buf = buf.slice(idx + 1);
         if (!line.startsWith("{")) continue;
+        // Eventos de um turno pré-reset (proc morto pelo clear ainda drenando
+        // stdout): result tardio envenenaria a gemStatsBase recém-zerada
+        // (double-billing) e texto/tool velhos vazariam pós-clear.
+        if (epoch !== this.ocEpoch) continue;
         try {
           const ev = JSON.parse(line);
           if (ev.type === "message" && ev.role === "assistant" && typeof ev.content === "string") {
@@ -2011,6 +2062,7 @@ export class AgentRunner {
             this.opts.onToolUse(ev.name ?? "", ev.args ?? {});
             this.setState("thinking");
           } else if (ev.type === "result") {
+            sawResult = true;
             flush();
             // stats do gemini-cli são ACUMULADOS (uiTelemetryService soma o
             // prompt de TODAS as requests do turno e o hydrate do --resume
@@ -2048,6 +2100,16 @@ export class AgentRunner {
       this.ocActiveProc = null;
       this.ocBusy = false;
       if (this.stopped) { this.emitExit(code); return; }
+      // Primeiro turno que morreu sem completar (sem evento result — OAuth
+      // expirado, 429 de quota, --model inválido: falhas antes do CLI gravar
+      // a sessão nova): restaurar firstTurn/summary. Sem isso o próximo turno
+      // roda `--resume latest` e reabre a sessão que o clear/compact
+      // descartou — e o delta contra gemStatsBase=0 re-fatura o histórico
+      // inteiro. Só restaura no MESMO epoch (reset no meio já re-armou tudo).
+      if (firstTurn && !sawResult && epoch === this.ocEpoch && !this.ocFirstTurn) {
+        this.ocFirstTurn = true;
+        if (this.ocPendingSummary === undefined) this.ocPendingSummary = pendingSummary;
+      }
       this.setState("idle");
       this.drainOcQueue();
     });
@@ -2154,6 +2216,9 @@ export class AgentRunner {
       stdio: ["ignore", "pipe", "pipe"],
     }, this.opts.dropTo ?? null);
     this.ocActiveProc = proc;
+    // Epoch do spawn: eventos deste turno só valem enquanto a sessão não foi
+    // resetada (clear/compact) — ver handleCodexEvent.
+    const epoch = this.ocEpoch;
 
     let buf = "";
 
@@ -2167,7 +2232,7 @@ export class AgentRunner {
         const line = buf.slice(0, idx).trim();
         buf = buf.slice(idx + 1);
         if (!line.startsWith("{")) continue;
-        try { this.handleCodexEvent(JSON.parse(line)); } catch {}
+        try { this.handleCodexEvent(JSON.parse(line), epoch); } catch {}
       }
     });
 
@@ -2185,7 +2250,7 @@ export class AgentRunner {
 
     proc.on("close", (code) => {
       if (buf.trim().startsWith("{")) {
-        try { this.handleCodexEvent(JSON.parse(buf.trim())); } catch {}
+        try { this.handleCodexEvent(JSON.parse(buf.trim()), epoch); } catch {}
       }
       imgCleanup();
       this.ocActiveProc = null;
@@ -2196,14 +2261,16 @@ export class AgentRunner {
     });
   }
 
-  private handleCodexEvent(event: any) {
+  private handleCodexEvent(event: any, epoch: number) {
+    // Turno spawnado num epoch anterior: clear/compact já resetou a sessão —
+    // TODO evento dele é da conversa descartada (thread.started ressuscitaria
+    // a sessão antiga pós-reset; turn.completed envenenaria a contabilidade
+    // nova). Comparar epoch (e não `compacting`) preserva os eventos LEGÍTIMOS
+    // do turno em voo durante o waitOcIdle — descartar thread.started nessa
+    // fase deixava o primeiro turno órfão e o one-shot resumia thread vazia.
+    if (epoch !== this.ocEpoch) return;
     switch (event.type) {
       case "thread.started": {
-        // Durante compact, o thread.started de um turno em voo chegando
-        // DEPOIS do resetWithSummary ressuscitaria a sessão ANTIGA
-        // (ocSessionId=undefined → tid) — o próximo exec resume injetaria o
-        // summary em cima da thread cheia e o compact viraria no-op.
-        if (this.compacting) break;
         const tid = event.thread_id as string | undefined;
         if (tid && tid !== this.ocSessionId) {
           this.ocSessionId = tid;
@@ -2508,9 +2575,12 @@ export class AgentRunner {
         this.opts.onError(`[ctx] auto-extract falhou: ${(e as Error).message}`);
       }
 
-      // (2) compacta a sessão real
+      // (2) compacta a sessão real. Timeout 300s (= ONE_SHOT_TIMEOUT_MS):
+      // com 120s, providers lentos (deepseek) estouravam DETERMINISTICAMENTE
+      // em sessão grande — e como timeout não contava no streak, virava loop
+      // infinito de compacts caros a cada cooldown.
       try {
-        await this.ocServeFetch(`/session/${this.ocSessionId}/summarize`, "POST", { providerID, modelID }, 120_000);
+        await this.ocServeFetch(`/session/${this.ocSessionId}/summarize`, "POST", { providerID, modelID }, ONE_SHOT_TIMEOUT_MS);
         // O summarize cria uma mensagem nova na sessão (resumo + step-finish
         // com tokens do contexto PRÉ-compactação). Prime IMEDIATO marca essas
         // parts como vistas — a flag ocNeedsPrime só seria consumida no início
@@ -2527,12 +2597,12 @@ export class AgentRunner {
         // depois, as parts do resumo precisam de prime mesmo assim — senão o
         // próximo turno re-despacha o resumo como fala + context_full espúrio.
         this.ocNeedsPrime = true;
-        const emsg = (e as Error).message;
-        // Timeout ≠ falha: o summarize pode ter CONCLUÍDO no serve (provider
-        // lento). Contar no streak suspenderia a auto-compaction após 3
-        // compactions que na verdade funcionaram.
-        if (!/^timeout /.test(emsg)) this.registerCompactFailure();
-        this.opts.onError(`[ctx] compact falhou: ${emsg}`);
+        // Timeout CONTA no streak: isentá-lo reabria o loop infinito quando o
+        // timeout é determinístico (o teto de 3 existe exatamente pra isso).
+        // O falso positivo (summarize concluiu no serve após o timeout) fica
+        // raro com 300s, e o prime + próximo compact bem-sucedido rearmam.
+        this.registerCompactFailure();
+        this.opts.onError(`[ctx] compact falhou: ${(e as Error).message}`);
       }
       return;
     }
@@ -2596,6 +2666,15 @@ export class AgentRunner {
     // --resume latest) e parseia MEMORY_JSON. Diag de tamanho pra ver se o
     // one-shot retornou texto (vazio = resume falhou ou reasoning model não
     // serializou o agent_message).
+    // Sem sessão ativa NESTE epoch não há o que resumir — e o one-shot do
+    // gemini (--resume latest incondicional) ressuscitaria a sessão que um
+    // clear acabou de descartar (a "latest" no storage do tmpdir ainda é
+    // ela); no codex, exec sem sid "resumiria" uma thread nova vazia.
+    // Espelha os guards do claude (oldSession) e do opencode (ocSessionId).
+    if (this.ocFirstTurn || (this.opts.cliRunner === "codex" && !this.ocSessionId)) {
+      this.opts.onError("[ctx] compact: sessão ainda não ativa — manda uma mensagem primeiro");
+      return;
+    }
     // Turno em voo primeiro: o one-shot escreveria na MESMA sessão (gemini)
     // ou o thread.started/turn.completed dele brigaria com o reset (codex).
     if (!(await this.waitOcIdle())) {
@@ -2804,6 +2883,7 @@ export class AgentRunner {
 
   private async runOneShotWithSession(prompt: string, sessionId: string): Promise<string> {
     return new Promise((resolve) => {
+      if (this.stopped) { resolve(""); return; } // mesmo guard do runOneShot
       if (!this.ensureRunnerAvailable("claude")) {
         resolve("");
         return;
