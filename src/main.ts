@@ -54,6 +54,8 @@ function parseCli(): Args {
       "opencode-path": { type: "string" },
       "gemini-path": { type: "string" },
       "codex-path": { type: "string" },
+      "crush-path": { type: "string" },
+      "grok-path": { type: "string" },
       verbose: { type: "boolean", short: "v" },
       "verbose-human": { type: "boolean" },
       "verbose-human-io": { type: "boolean" },
@@ -74,6 +76,8 @@ function parseCli(): Args {
     opencode: values["opencode-path"] ?? process.env.THE_DUDES_OPENCODE_PATH,
     gemini: values["gemini-path"] ?? process.env.THE_DUDES_GEMINI_PATH,
     codex: values["codex-path"] ?? process.env.THE_DUDES_CODEX_PATH,
+    crush: values["crush-path"] ?? process.env.THE_DUDES_CRUSH_PATH,
+    grok: values["grok-path"] ?? process.env.THE_DUDES_GROK_PATH,
   };
   if (!orch) { console.error("error: --orch required (or THE_DUDES_ORCHenv)"); printHelp(); process.exit(1); }
   if (!token) { console.error("error: --token required (or THE_DUDES_DAEMON_TOKEN env)"); printHelp(); process.exit(1); }
@@ -104,7 +108,7 @@ Options:
   -vhio
              Alias for -vh
   --cli-config  Local JSON file with cliPaths overrides (default: ~/.the-dudes/daemon-config.json)
-  --claude-path / --opencode-path / --gemini-path / --codex-path
+  --claude-path / --opencode-path / --gemini-path / --codex-path / --crush-path / --grok-path
              Manual executable overrides for each CLI
   -h, --help Show this help`);
 }
@@ -183,7 +187,7 @@ class DaemonClient {
     } catch (e) {
       log("warn", `bridge relay failed to start (${(e as Error).message}) — agents will fetch orch directly`);
     }
-    (["claude", "opencode", "gemini", "codex"] as const).forEach((runner) => {
+    (["claude", "opencode", "gemini", "codex", "crush", "grok"] as const).forEach((runner) => {
       const status = this.cliCommands[runner];
       log(status.available ? "info" : "warn", formatCliStatus(runner, status));
     });
@@ -443,7 +447,7 @@ class DaemonClient {
             entries.push(`### [system] memória truncada\n${dropped} memória(s) mais antiga(s) omitida(s) por limite de contexto. Use a tool \`recall\` pra buscar conhecimento que não esteja aqui.`);
           }
           if (entries.length > 0) {
-            const block = `## Project Memory\n\nConhecimento durável do projeto (compartilhado + seu). Use como contexto de fundo; verifique antes de confiar em detalhes específicos.\n\n${entries.join("\n\n")}`;
+            const block = `## Project Memory\n\nNotas duráveis **deste agente** (não são copiadas para os outros). Catálogo do projeto: use a tool \`recall\`. Verifique antes de confiar em detalhes específicos.\n\n${entries.join("\n\n")}`;
             spec.agent = { ...spec.agent, systemPrompt: `${spec.agent.systemPrompt}\n\n---\n\n${block}` };
             log("info", `injected ${entries.length} memory entries into ${spec.agent.id} system prompt`);
           }

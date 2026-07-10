@@ -561,18 +561,18 @@ const MEMORY_TYPES = ["fact", "decision", "reference", "preference", "task_state
 
 server.tool(
   "remember",
-  "Save a durable note to the project memory. It is re-injected into your system prompt on every restart (survives model switches and context compaction) and pushed live to running agents. Keep entries short and atomic. scope 'project' is shared with all agents (default); 'agent' is private to you.",
+  "Save a durable note to YOUR agent memory (default). It is re-injected into YOUR system prompt on every restart and pushed live only to you — not duplicated into other agents. Keep entries short and atomic. Use scope 'project' only for catalog facts that others may recall (not auto-injected into every agent).",
   {
     title: z.string().describe("Short one-line title"),
     body: z.string().describe("The fact/decision/reference to remember"),
     type: z.enum(MEMORY_TYPES).optional().describe("fact (default) | decision | reference | preference | task_state"),
-    scope: z.enum(["project", "agent"]).optional().describe("project = shared (default); agent = private to you"),
-    pinned: z.boolean().optional().describe("Pin so it stays in the hot-set"),
+    scope: z.enum(["project", "agent"]).optional().describe("agent = yours only (default, injected); project = shared catalog (recall only, not injected into all)"),
+    pinned: z.boolean().optional().describe("Pin so it stays in your hot-set"),
   },
   async ({ title, body, type, scope, pinned }) => {
     try {
-      const r = await postJSON("memory_add", { title, body, type, scope, pinned });
-      return { content: [{ type: "text", text: `remembered ${r.memory?.id ?? ""} [${r.memory?.type ?? type ?? "fact"}/${r.memory?.scope ?? scope ?? "project"}]` }] };
+      const r = await postJSON("memory_add", { title, body, type, scope: scope ?? "agent", pinned });
+      return { content: [{ type: "text", text: `remembered ${r.memory?.id ?? ""} [${r.memory?.type ?? type ?? "fact"}/${r.memory?.scope ?? scope ?? "agent"}]` }] };
     } catch (e) {
       return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
     }
@@ -581,7 +581,7 @@ server.tool(
 
 server.tool(
   "recall",
-  "Search the project memory (shared + your private). Use at the start of a task to load durable context. Optional query does a substring match over title/body; optional type filters by kind.",
+  "Search memory visible to you: your private agent entries + project catalog. Your agent hot-set is already in the system prompt; use recall for project-shared catalog or older notes not injected. Optional query substring-matches title/body; optional type filters by kind.",
   {
     query: z.string().optional().describe("Substring to match in title/body"),
     type: z.enum(MEMORY_TYPES).optional(),

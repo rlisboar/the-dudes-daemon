@@ -8,8 +8,12 @@ import {
   contextLimitFor,
   lookupContextLimit,
   contextTokensOf,
+  parseGrokContextSignals,
+  grokSignalsPath,
+  normalizeGrokCwd,
 } from "../agent-runner.js";
 import type { AgentUsage } from "../types.js";
+import path from "node:path";
 
 /* ---------- contextLimitFor ---------- */
 
@@ -185,4 +189,60 @@ test("precedência rate-limit: 429 TPM da Anthropic é rate limit, não contexto
   ]) {
     assert.ok(!RATE_LIMIT_TEXT_RE.test(banner), `banner de contexto não pode casar rate limit: ${banner.slice(0, 50)}`);
   }
+});
+
+/* ---------- Grok signals.json (ocupação real da janela) ---------- */
+
+test("parseGrokContextSignals: extrai used/limit/pct do signals.json", () => {
+  const s = parseGrokContextSignals({
+    contextTokensUsed: 351681,
+    contextWindowTokens: 500000,
+    contextWindowUsage: 70,
+  });
+  assert.deepEqual(s, {
+    contextTokensUsed: 351681,
+    contextWindowTokens: 500000,
+    contextWindowUsage: 70,
+  });
+});
+
+test("parseGrokContextSignals: rejeita inválido / incompleto", () => {
+  assert.equal(parseGrokContextSignals(null), null);
+  assert.equal(parseGrokContextSignals({}), null);
+  assert.equal(parseGrokContextSignals({ contextTokensUsed: 100 }), null); // sem limit
+  assert.equal(parseGrokContextSignals({ contextTokensUsed: -1, contextWindowTokens: 500000 }), null);
+  // used=0 com limit válido é sessão vazia — aceita
+  assert.deepEqual(
+    parseGrokContextSignals({ contextTokensUsed: 0, contextWindowTokens: 500000 }),
+    { contextTokensUsed: 0, contextWindowTokens: 500000, contextWindowUsage: 0 },
+  );
+});
+
+test("grokSignalsPath: cwd encodeURIComponent + sessionId", () => {
+  const cwd = "/Users/lisboa/Documents/eonf/projects/claudinhos";
+  const p = grokSignalsPath("/home/u/.grok", cwd, "019f4807-25d0-7f11-b7b0-0dc73f5dcfef");
+  assert.equal(
+    p,
+    path.join(
+      "/home/u/.grok",
+      "sessions",
+      encodeURIComponent(cwd),
+      "019f4807-25d0-7f11-b7b0-0dc73f5dcfef",
+      "signals.json",
+    ),
+  );
+  assert.ok(p.includes("%2FUsers%2F"));
+});
+
+test("grokSignalsPath: remove trailing slash (cwdOverride da UI)", () => {
+  const a = grokSignalsPath("/home/u/.grok", "/Users/lisboa/Documents/eonf/claudinho/", "sid");
+  const b = grokSignalsPath("/home/u/.grok", "/Users/lisboa/Documents/eonf/claudinho", "sid");
+  assert.equal(a, b);
+  assert.ok(!a.includes("claudinho%2F/"), a);
+  assert.ok(a.includes(encodeURIComponent(normalizeGrokCwd("/Users/lisboa/Documents/eonf/claudinho"))));
+});
+
+test("normalizeGrokCwd: sem barra final", () => {
+  assert.equal(normalizeGrokCwd("/Users/foo/bar/"), normalizeGrokCwd("/Users/foo/bar"));
+  assert.ok(!normalizeGrokCwd("/Users/foo/bar/").endsWith("/"));
 });

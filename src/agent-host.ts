@@ -344,6 +344,11 @@ export class AgentHost {
       if (cliRunner === "opencode" && isOcSession) resumeSessionId = sid;
       else if (cliRunner === "claude" && !isOcSession && /^[0-9a-f-]{36}$/i.test(sid)) resumeSessionId = sid;
       else if (cliRunner === "codex" && !isOcSession) resumeSessionId = sid;
+      // crush resume exige o UUID da sessão (o id curto de 16 hex não funciona
+      // no --session do run) — id em formato errado faria todo turno falhar.
+      else if (cliRunner === "crush" && /^[0-9a-f-]{36}$/i.test(sid)) resumeSessionId = sid;
+      // grok headless emite sessionId UUID no evento end / JSON final
+      else if (cliRunner === "grok" && /^[0-9a-f-]{36}$/i.test(sid)) resumeSessionId = sid;
       else if (cliRunner === "gemini") resumeSessionId = sid;
     }
     // Identidade do runner deste spawn. Usada no onExit pra só zerar
@@ -405,6 +410,7 @@ export class AgentHost {
           message: "[ctx] sessão anterior não encontrada — iniciando sessão nova",
         });
       },
+      onContextUsage: (used, limit) => this.send({ type: "agent:context", agentId: msg.agent.id, used, limit }),
       onContextWarning: (used, limit) => this.send({ type: "agent:context_warning", agentId: msg.agent.id, used, limit }),
       onContextFull: () => this.send({ type: "agent:context_full", agentId: msg.agent.id }),
       projectId: msg.projectId,

@@ -78,6 +78,8 @@ function extractUsage(out: string, runner: CliRunner, promptLen: number, outputL
         }
       } catch { /* skip */ }
     }
+  } else if (runner === "grok") {
+    // Grok json/stream não expõe usage confiável — heurística por chars abaixo.
   }
   if (input === 0 && output === 0) {
     // Heuristic: ~4 chars per token. Input = prompt; output = response text.
@@ -283,6 +285,13 @@ export async function runCliText(prompt: string, args: CliTextArgs): Promise<Cli
   if (args.runner === "gemini") {
     env.GEMINI_CLI_TRUST_WORKSPACE = "true";
   }
+  if (args.runner === "grok") {
+    // Auth/sessões no home real do user — nunca no tmpdir efêmero do summarizer.
+    const home = args.dropTo?.home ?? process.env.HOME ?? homedir();
+    env.HOME = home;
+    env.GROK_HOME = join(home, ".grok");
+    env.GROK_DISABLE_AUTOUPDATER = "1";
+  }
 
   // opencode usa o transporte serve (igual aos agentes), não `opencode run`.
   if (args.runner === "opencode") {
@@ -305,6 +314,28 @@ export async function runCliText(prompt: string, args: CliTextArgs): Promise<Cli
   } else if (args.runner === "gemini") {
     argv = ["--output-format", "json", "--skip-trust", "--yolo", "-p", promptText];
     if (args.model) argv.push("--model", args.model);
+  } else if (args.runner === "crush") {
+    // crush run é texto puro no stdout (sem JSON) — extractOneShotText cai no
+    // raw e extractUsage na heurística de chars. Data dir no tmpdir efêmero
+    // pra sessão descartável não poluir o data dir global do usuário.
+    argv = ["run", "--quiet", "--data-dir", join(cwd, ".crush")];
+    if (args.model) argv.push("-m", args.model);
+    argv.push(promptText);
+  } else if (args.runner === "grok") {
+    // Grok Build headless (docs: 14-headless-mode.md): -p + json + always-approve.
+    // GROK_HOME explícito pro auth do user (não o tmpdir efêmero do summarizer).
+    argv = [
+      "-p", promptText,
+      "--output-format", "json",
+      "--always-approve",
+      "--no-auto-update",
+      "--no-subagents",
+      "--no-memory",
+      "--max-turns", "4",
+      "--cwd", cwd,
+    ];
+    if (args.model) argv.push("-m", args.model);
+    if (args.effort) argv.push("--effort", args.effort);
   } else {
     return { ok: false, error: `runner inválido: ${args.runner}` };
   }

@@ -41,6 +41,8 @@ const CLI_SHIM_RUNNER: Record<string, CliRunner> = {
   "opencode-cli": "opencode",
   "codex-cli": "codex",
   "gemini-cli": "gemini",
+  "crush-cli": "crush",
+  "grok-cli": "grok",
 };
 
 // O graphify roda `claude -p` SEM CLAUDE_CONFIG_DIR → claude usa o default

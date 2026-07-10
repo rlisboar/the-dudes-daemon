@@ -196,6 +196,8 @@ export interface AgentErrorEv { type: "agent:error"; agentId: string; message: s
 export interface AgentExitEv { type: "agent:exit"; agentId: string; code: number | null }
 export interface AgentContextWarningEv { type: "agent:context_warning"; agentId: string; used: number; limit: number }
 export interface AgentContextFullEv { type: "agent:context_full"; agentId: string }
+/** Ocupação atual da janela (runtime) — atualiza a cada turno quando o runner sabe. */
+export interface AgentContextEv { type: "agent:context"; agentId: string; used: number; limit: number }
 
 export interface WorkspaceResult {
   type: "workspace:result";
@@ -443,7 +445,7 @@ export interface GitResult {
 export interface SummarizeRequest {
   type: "summarize:request";
   correlationId: string;
-  runner: "claude" | "codex" | "opencode" | "gemini";
+  runner: "claude" | "codex" | "opencode" | "gemini" | "crush" | "grok";
   model?: string;
   effort?: string;
   systemPrompt?: string;
@@ -649,7 +651,7 @@ export type FromDaemon =
   | DaemonHello | DaemonPing | DaemonChallengeResponse
   | AgentStateEv | AgentRunningEv | AgentSessionEv | AgentTokenResyncEv | AgentUsageDeltaEv
   | AgentTextEv | AgentToolUseEv | AgentThinkingEv | AgentErrorEv | AgentExitEv
-  | AgentContextWarningEv | AgentContextFullEv
+  | AgentContextWarningEv | AgentContextFullEv | AgentContextEv
   | WorkspaceResult
   | FileListResult | FileReadResult | FileWriteResult
   | GitLogResult | GitStatusResult | GitDiffResult

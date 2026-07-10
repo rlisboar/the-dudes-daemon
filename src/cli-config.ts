@@ -10,6 +10,8 @@ export interface CliPathConfig {
   opencode?: string;
   gemini?: string;
   codex?: string;
+  crush?: string;
+  grok?: string;
   graphify?: string;
   graphifyMcp?: string;
 }
@@ -30,6 +32,9 @@ export interface ResolvedCliCommands {
   opencode: ResolvedCliCommand;
   gemini: ResolvedCliCommand;
   codex: ResolvedCliCommand;
+  crush: ResolvedCliCommand;
+  /** Grok Build CLI (xAI) — headless `grok -p` / resume. */
+  grok: ResolvedCliCommand;
   /** graphify CLI (build/index do knowledge graph) — opcional, só usado
    *  quando a feature graph está ligada no projeto. */
   graphify: ResolvedCliCommand;
@@ -70,6 +75,12 @@ export function resolveCliCommands(config: DaemonCliConfig = {}): ResolvedCliCom
     opencode: resolveOne("opencode", config.cliPaths?.opencode),
     gemini: resolveOne("gemini", config.cliPaths?.gemini),
     codex: resolveOne("codex", config.cliPaths?.codex),
+    // crush (charmbracelet) instala via brew/go install em ~/.local/bin ou
+    // /opt/homebrew/bin — dirs que o PATH herdado pelo daemon nem sempre tem.
+    crush: resolveOne("crush", config.cliPaths?.crush, pythonBinDirs()),
+    // grok (xAI Grok Build) instala em ~/.grok/bin (installer oficial) e às
+    // vezes em ~/.local/bin / homebrew — fora do PATH do daemon.
+    grok: resolveOne("grok", config.cliPaths?.grok, grokBinDirs()),
     // graphify/graphify-mcp costumam ser instalados via pip --user/pipx em
     // dirs FORA do PATH herdado pelo daemon (ex: ~/Library/Python/X.Y/bin,
     // ~/.local/bin). Além do `which`, varre esses dirs de script do pip.
@@ -87,6 +98,17 @@ function pythonBinDirs(): string[] {
   // python.org framework: /Library/Frameworks/Python.framework/Versions/X.Y/bin
   collectVersionedBins("/Library/Frameworks/Python.framework/Versions", dirs);
   return dirs;
+}
+
+/** Dirs onde o installer oficial do Grok Build coloca o binário. */
+function grokBinDirs(): string[] {
+  const home = os.homedir();
+  return [
+    path.join(home, ".grok", "bin"),
+    path.join(home, ".local", "bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+  ];
 }
 
 function collectVersionedBins(base: string, out: string[]): void {
@@ -191,6 +213,8 @@ function sanitizeCliConfig(cfg: DaemonCliConfig): DaemonCliConfig {
       opencode: normalizePath(cliPaths.opencode),
       gemini: normalizePath(cliPaths.gemini),
       codex: normalizePath(cliPaths.codex),
+      crush: normalizePath(cliPaths.crush),
+      grok: normalizePath(cliPaths.grok),
       graphify: normalizePath(cliPaths.graphify),
       graphifyMcp: normalizePath(cliPaths.graphifyMcp),
     },

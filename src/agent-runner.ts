@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import http from "node:http";
-import { writeFileSync, mkdirSync, chmodSync, mkdtempSync, rmSync } from "node:fs";
+import { writeFileSync, readFileSync, readdirSync, realpathSync, mkdirSync, chmodSync, mkdtempSync, rmSync, existsSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import type { AgentInfo, AgentRuntimeState, AgentUsage, CliRunner, ImageAttachment } from "./types.js";
@@ -67,6 +67,11 @@ export const MODEL_CONTEXT_LIMITS: Record<string, number> = {
   "deepseek/deepseek-v4-pro": 200_000,
   "deepseek/deepseek-v4-flash": 200_000,
   "deepseek/deepseek-chat": 128_000,
+  // Grok Build (xAI) — janela observada no CLI (~500k). grok-build é alias
+  // legado; grok-4.5 é o default atual; composer-fast é variante leve.
+  "grok-4.5": 500_000,
+  "grok-build": 500_000,
+  "grok-composer-2.5-fast": 500_000,
 };
 
 /** Piso conservador pra modelo ausente ou fora do mapa: o default real do CLI
@@ -123,6 +128,50 @@ export function contextTokensOf(delta: AgentUsage, semantics: UsageSemantics): n
   return delta.cacheCreate + delta.cacheRead <= delta.input
     ? delta.input
     : delta.input + delta.cacheCreate + delta.cacheRead;
+}
+
+/** Snapshot de ocupação da janela do Grok Build (`signals.json` da sessão). */
+export interface GrokContextSignals {
+  contextTokensUsed: number;
+  contextWindowTokens: number;
+  contextWindowUsage: number;
+}
+
+/** Parse best-effort do `signals.json` do Grok. Retorna null se inválido. */
+export function parseGrokContextSignals(raw: unknown): GrokContextSignals | null {
+  if (!raw || typeof raw !== "object") return null;
+  const o = raw as Record<string, unknown>;
+  const used = Number(o.contextTokensUsed ?? 0);
+  const limit = Number(o.contextWindowTokens ?? 0);
+  const pct = Number(o.contextWindowUsage ?? 0);
+  if (!Number.isFinite(used) || used < 0) return null;
+  if (!Number.isFinite(limit) || limit <= 0) return null;
+  return {
+    contextTokensUsed: Math.floor(used),
+    contextWindowTokens: Math.floor(limit),
+    contextWindowUsage: Number.isFinite(pct) ? pct : Math.round((used / limit) * 100),
+  };
+}
+
+/**
+ * Cwd que o Grok usa na pasta de sessão: absoluto, sem barra final, e
+ * realpath quando possível (`/tmp` → `/private/tmp` no macOS).
+ */
+export function normalizeGrokCwd(cwd: string): string {
+  const resolved = path.resolve(cwd || ".");
+  try {
+    return realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+/**
+ * Path do `signals.json` de uma sessão Grok.
+ * O CLI grava em `sessions/<encodeURIComponent(cwd)>/<sessionId>/`.
+ */
+export function grokSignalsPath(grokHome: string, cwd: string, sessionId: string): string {
+  return path.join(grokHome, "sessions", encodeURIComponent(normalizeGrokCwd(cwd)), sessionId, "signals.json");
 }
 
 const CONTEXT_WARN_PCT = 0.85;
@@ -220,6 +269,8 @@ export interface AgentRunnerOptions {
   onThinkingText?: (text: string, opts?: { redacted?: boolean }) => void;
   onSessionId?: (sessionId: string) => void;
   onUsageDelta?: (delta: AgentUsage) => void;
+  /** Ocupação absoluta da janela (não delta de billing). Emitido a cada update. */
+  onContextUsage?: (used: number, limit: number) => void;
   onContextWarning?: (used: number, limit: number) => void;
   onContextFull?: () => void;
   onSessionInvalid?: () => void;
@@ -303,12 +354,13 @@ function goalsSection(tasks: boolean): string {
   return lines.join("\n");
 }
 
-const HDR_MEMORY = `# Project memory (durable, survives restarts & model switches)
-- \`mcp__the-dudes__recall\` (args: {query?, type?}) — search the project memory (shared + your private). **Call this at the start of a task** to load durable context.
-- \`mcp__the-dudes__remember\` (args: {title, body, type?, scope?, pinned?}) — save a durable note. Use for decisions, stable facts, references and your own working state worth keeping across restarts. \`scope: "project"\` (default) is shared with all agents; \`scope: "agent"\` is private to you. Keep entries short and atomic. It is re-injected into your system prompt on every restart.
+const HDR_MEMORY = `# Agent memory (durable, survives restarts & model switches)
+- Your hot-set is **agent-scoped only** — it is NOT shared into other agents' prompts (avoids duplicating the same context N times).
+- \`mcp__the-dudes__recall\` (args: {query?, type?}) — search your private notes + the project catalog. **Call at the start of a task** if you need shared/project facts not already below.
+- \`mcp__the-dudes__remember\` (args: {title, body, type?, scope?, pinned?}) — save a durable note. **Default scope is \`agent\`** (yours only, re-injected on restart + live-pushed to you). Use \`scope: "project"\` only for catalog facts others may \`recall\` (not auto-injected into every agent). Keep entries short and atomic.
 - \`mcp__the-dudes__forget\` (args: {id}) — delete a memory entry you created. You cannot delete user-curated or other agents' entries.
-- \`mcp__the-dudes__pin\` (args: {id, pinned?}) — pin/unpin an entry so it stays prioritized in the injected hot-set.
-- Memory is already injected into this system prompt under "## Project Memory" when present — don't re-recall what's already there.`;
+- \`mcp__the-dudes__pin\` (args: {id, pinned?}) — pin/unpin so it stays prioritized in **your** hot-set.
+- When present, injected notes appear under "## Project Memory" below — don't re-recall what's already there.`;
 
 const HDR_CREDS = `# Credentials (API keys, tokens, passwords)
 - \`mcp__the-dudes__get_credential\` (args: {name}) — retrieve a stored credential value by name. Use this whenever you need an API key or secret; never ask the user to paste it inline.
@@ -442,6 +494,12 @@ export class AgentRunner {
    *  processo E re-hidrata o histórico no --resume): billing por turno é o
    *  delta contra a base, nunca o valor bruto. */
   private gemStatsBase = { input: 0, output: 0, cached: 0 };
+  /** Base acumulada do crush (session show --json reporta prompt/completion
+   *  tokens CUMULATIVOS da sessão): billing por turno = delta contra a base.
+   *  null = ainda não primed — sessão RESUMIDA precisa ler o meta atual antes
+   *  do primeiro turno, senão o primeiro delta re-fatura o histórico inteiro
+   *  (mesmo bug que o gemini teve com gemStatsBase=0 no resume). */
+  private crushStatsBase: { prompt: number; completion: number } | null = null;
   /** Geração da sessão oc — incrementada em todo resetWithSummary. Eventos de
    *  um turno spawnado num epoch anterior (proc morto pelo clear drenando
    *  stdout, thread.started tardio do codex) são descartados por comparação
@@ -459,9 +517,12 @@ export class AgentRunner {
 
   constructor(info: AgentInfo, private opts: AgentRunnerOptions) {
     this.info = info;
-    if ((opts.cliRunner === "opencode" || opts.cliRunner === "codex") && opts.resumeSessionId) {
+    if ((opts.cliRunner === "opencode" || opts.cliRunner === "codex" || opts.cliRunner === "crush" || opts.cliRunner === "grok") && opts.resumeSessionId) {
       this.ocSessionId = opts.resumeSessionId;
       if (opts.cliRunner === "opencode") this.ocNeedsPrime = true;
+      // crush: crushStatsBase fica null → primeiro finishCrushTurn faz prime
+      // do meta cumulativo antes de faturar (sessão resumida ≠ base zero).
+      // grok: sessionId UUID no evento end / JSON; resume via --resume.
     }
   }
 
@@ -716,6 +777,8 @@ export class AgentRunner {
     // Sessão nova nasce sem --resume (gemini) → stats do CLI voltam a zero;
     // manter a base antiga zeraria o billing dos primeiros turnos via clamp.
     this.gemStatsBase = { input: 0, output: 0, cached: 0 };
+    // crush: sessão nova = meta cumulativo novo começa do zero.
+    this.crushStatsBase = { prompt: 0, completion: 0 };
     this.resetContextAccounting();
     this.ocPendingSummary = summary;
   }
@@ -728,6 +791,8 @@ export class AgentRunner {
     this.lastContextFullAt = 0;
     this.lastInputTokens = 0;
     this.compactFailStreak = 0;
+    // UI: barra de janela volta a 0 após clear/compact.
+    this.opts.onContextUsage?.(0, this.contextLimit());
   }
 
   async runOneShot(prompt: string): Promise<string> {
@@ -768,6 +833,33 @@ export class AgentRunner {
         proc = spawnDropped(this.runnerCommand("codex"), args, {
           cwd: this.opts.workspaceRoot,
           env: this.buildEnv(),
+          stdio: ["ignore", "pipe", "pipe"],
+        }, this.opts.dropTo ?? null);
+      } else if (runner === "crush") {
+        const args = ["run", "--quiet", "--data-dir", this.crushDataDir()];
+        if (this.info.model) args.push("-m", this.info.model);
+        if (sid) args.push("--session", sid);
+        args.push(prompt);
+        this.traceCli("crush", "argv", prompt);
+        this.traceSpawn("crush", args);
+        proc = spawnDropped(this.runnerCommand("crush"), args, {
+          cwd: this.opts.workspaceRoot,
+          env: this.crushTurnEnv(),
+          stdio: ["ignore", "pipe", "pipe"],
+        }, this.opts.dropTo ?? null);
+      } else if (runner === "grok") {
+        // Headless one-shot: plain text (compact/summarize). Session resume
+        // via --resume; --always-approve = non-interactive tool approval.
+        const args = this.buildGrokHeadlessArgs(prompt, {
+          resume: sid,
+          outputFormat: "json",
+          forCompact: true,
+        });
+        this.traceCli("grok", "argv", prompt);
+        this.traceSpawn("grok", args);
+        proc = spawnDropped(this.runnerCommand("grok"), args, {
+          cwd: this.opts.workspaceRoot,
+          env: this.grokTurnEnv(),
           stdio: ["ignore", "pipe", "pipe"],
         }, this.opts.dropTo ?? null);
       } else if (runner === "opencode") {
@@ -824,8 +916,26 @@ export class AgentRunner {
 
   private checkContextUsage(delta: AgentUsage, semantics: UsageSemantics): void {
     const total = contextTokensOf(delta, semantics);
-    if (total > 0) this.lastInputTokens = total;
-    const limit = this.contextLimit();
+    if (total > 0) this.reportContextOccupancy(total);
+  }
+
+  /**
+   * Ocupação absoluta da janela (não delta de billing).
+   * `limitHint` opcional: quando o CLI reporta a janela real (ex. Grok
+   * `contextWindowTokens`), usa esse teto se for maior que o mapa estático
+   * — evita false-full quando o mapa está desatualizado.
+   * `used === 0` é válido (pós-clear); só warning/full com used > 0.
+   */
+  private reportContextOccupancy(used: number, limitHint?: number): void {
+    if (!Number.isFinite(used) || used < 0) return;
+    this.lastInputTokens = Math.floor(used);
+    const mapped = this.contextLimit();
+    const limit =
+      limitHint && Number.isFinite(limitHint) && limitHint > 0
+        ? Math.max(mapped, Math.floor(limitHint))
+        : mapped;
+    this.opts.onContextUsage?.(this.lastInputTokens, limit);
+    if (this.lastInputTokens <= 0) return;
     const pct = this.lastInputTokens / limit;
     if (pct >= 1.0) {
       this.notifyContextFull();
@@ -833,6 +943,102 @@ export class AgentRunner {
       this.contextWarned = true;
       this.opts.onContextWarning?.(this.lastInputTokens, limit);
     }
+  }
+
+  /** Paths candidatos do signals.json (cwd canônico + raw + realpath variants). */
+  private grokSignalsCandidates(sessionId: string): string[] {
+    const home = this.grokUserHome();
+    const cwd = this.opts.workspaceRoot;
+    const out = new Set<string>();
+    out.add(grokSignalsPath(home, cwd, sessionId));
+    out.add(path.join(home, "sessions", encodeURIComponent(cwd), sessionId, "signals.json"));
+    out.add(path.join(home, "sessions", encodeURIComponent(path.resolve(cwd || ".")), sessionId, "signals.json"));
+    try {
+      out.add(path.join(home, "sessions", encodeURIComponent(realpathSync(path.resolve(cwd || "."))), sessionId, "signals.json"));
+    } catch { /* noop */ }
+    return [...out];
+  }
+
+  /** Lê `signals.json` da sessão Grok (ocupação real da janela). */
+  private readGrokContextSignals(sessionId: string): GrokContextSignals | null {
+    for (const p of this.grokSignalsCandidates(sessionId)) {
+      try {
+        if (!existsSync(p)) continue;
+        const sig = parseGrokContextSignals(JSON.parse(readFileSync(p, "utf8")) as unknown);
+        if (sig) return sig;
+      } catch { /* tenta próximo */ }
+    }
+    // Fallback: scan por sessionId (cwd do CLI pode divergir por symlink).
+    try {
+      const sessionsRoot = path.join(this.grokUserHome(), "sessions");
+      if (!existsSync(sessionsRoot)) return null;
+      for (const enc of readdirSync(sessionsRoot)) {
+        const p = path.join(sessionsRoot, enc, sessionId, "signals.json");
+        if (!existsSync(p)) continue;
+        const sig = parseGrokContextSignals(JSON.parse(readFileSync(p, "utf8")) as unknown);
+        if (sig) return sig;
+      }
+    } catch { /* best-effort */ }
+    return null;
+  }
+
+  /** Max `totalTokens` visto no updates.jsonl da sessão (às vezes > signals). */
+  private readGrokUpdatesMaxTokens(sessionId: string): number {
+    const tryFiles: string[] = [];
+    for (const sigPath of this.grokSignalsCandidates(sessionId)) {
+      tryFiles.push(path.join(path.dirname(sigPath), "updates.jsonl"));
+    }
+    try {
+      const sessionsRoot = path.join(this.grokUserHome(), "sessions");
+      if (existsSync(sessionsRoot)) {
+        for (const enc of readdirSync(sessionsRoot)) {
+          tryFiles.push(path.join(sessionsRoot, enc, sessionId, "updates.jsonl"));
+        }
+      }
+    } catch { /* noop */ }
+    let max = 0;
+    const seen = new Set<string>();
+    for (const p of tryFiles) {
+      if (seen.has(p) || !existsSync(p)) continue;
+      seen.add(p);
+      try {
+        const text = readFileSync(p, "utf8");
+        // updates.jsonl pode ser grande — só varre totalTokens
+        for (const m of text.matchAll(/"totalTokens"\s*:\s*(\d+)/g)) {
+          const n = Number(m[1]);
+          if (n > max) max = n;
+        }
+      } catch { /* next */ }
+    }
+    return max;
+  }
+
+  /**
+   * Poll pós-turno: o Grok às vezes flusha signals.json um pouco depois do
+   * exit do processo. Nunca devolve "forçar 0" — null se ainda não souber.
+   */
+  private async pollGrokContextOccupancy(sessionId: string): Promise<GrokContextSignals | null> {
+    let best: GrokContextSignals | null = null;
+    for (let i = 0; i < 6; i++) {
+      if (i > 0) await new Promise((r) => setTimeout(r, 200));
+      if (this.stopped) return best;
+      const sig = this.readGrokContextSignals(sessionId);
+      if (sig) {
+        best = sig;
+        if (sig.contextTokensUsed > 0) break;
+      }
+    }
+    const fromUpdates = this.readGrokUpdatesMaxTokens(sessionId);
+    const limit = best?.contextWindowTokens && best.contextWindowTokens > 0
+      ? best.contextWindowTokens
+      : this.contextLimit();
+    const used = Math.max(best?.contextTokensUsed ?? 0, fromUpdates);
+    if (used <= 0 && !best) return null;
+    return {
+      contextTokensUsed: used,
+      contextWindowTokens: limit,
+      contextWindowUsage: Math.round((used / limit) * 100),
+    };
   }
 
   /** Dispara onContextFull no máximo uma vez por janela de cooldown. Sem
@@ -879,6 +1085,8 @@ export class AgentRunner {
     // prepareGraphify pode aguardar um build (até 180s); se o agente foi
     // parado/removido nessa janela, não spawnar processo zumbi.
     if (this.stopped) return;
+    // Baseline na UI: barra aparece em 0% com o limit do model (antes do 1º turno).
+    this.reportContextOccupancy(0);
     if (this.opts.cliRunner === "opencode") {
       if (!this.ensureRunnerAvailable("opencode")) return;
       this.writeOpenCodeConfig();
@@ -893,6 +1101,18 @@ export class AgentRunner {
     }
     if (this.opts.cliRunner === "codex") {
       if (!this.ensureRunnerAvailable("codex")) return;
+      this.bootPerMessageRunner();
+      return;
+    }
+    if (this.opts.cliRunner === "crush") {
+      if (!this.ensureRunnerAvailable("crush")) return;
+      this.writeCrushConfig();
+      this.bootPerMessageRunner();
+      return;
+    }
+    if (this.opts.cliRunner === "grok") {
+      if (!this.ensureRunnerAvailable("grok")) return;
+      this.writeGrokConfig();
       this.bootPerMessageRunner();
       return;
     }
@@ -2333,6 +2553,753 @@ export class AgentRunner {
     }
   }
 
+  /* ---------- Grok Build (xAI) per-message model ---------- */
+
+  /**
+   * Args oficiais do headless mode (docs/user-guide/14-headless-mode.md):
+   *   grok -p PROMPT --output-format streaming-json|json --always-approve
+   *        [-m MODEL] [--effort LEVEL] [--resume SID] [--cwd PATH]
+   *        [--system-prompt-override …] [--no-auto-update]
+   *
+   * Streaming-json: NDJSON com type=text|thought|end|error (sessionId no end).
+   * JSON final: { text, stopReason, sessionId, requestId, thought? }.
+   */
+  private buildGrokHeadlessArgs(
+    prompt: string,
+    opts: { resume?: string; outputFormat: "streaming-json" | "json" | "plain"; forCompact?: boolean },
+  ): string[] {
+    const args: string[] = [
+      "-p", prompt,
+      "--output-format", opts.outputFormat,
+      "--no-auto-update",
+      "--cwd", this.opts.workspaceRoot,
+    ];
+    if (this.info.model) args.push("-m", this.info.model);
+    // Effort: níveis canônicos do Grok Build (docs headless).
+    // collectThinking pede reasoning visível → sobe pro mínimo "high" se
+    // estiver baixo/ausente (mesma ideia do Claude).
+    let effort = this.info.effort;
+    if (!opts.forCompact && this.info.collectThinking && (!effort || effort === "none" || effort === "minimal" || effort === "low" || effort === "medium")) {
+      effort = "high";
+    }
+    if (effort) args.push("--effort", effort);
+    if (opts.resume) args.push("--resume", opts.resume);
+    // Plan mode: permission-mode plan + allowlist de tools de leitura.
+    // NÃO combinar com --always-approve (anularia o plan).
+    if (this.info.planMode && !opts.forCompact) {
+      args.push("--permission-mode", "plan");
+      // Tool IDs internos do Grok (docs 14-headless-mode § Tool Filtering).
+      args.push("--tools", "read_file,grep,list_dir,web_search,web_fetch");
+    } else {
+      // Non-interactive: sem TUI não há como aprovar tools (equiv. codex/crush).
+      args.push("--always-approve");
+    }
+    // Compact/one-shot: sem subagents e sem memória pra resposta curta.
+    // max-turns generoso: o resumo pode precisar de 1–2 tool reads.
+    if (opts.forCompact) {
+      args.push("--no-subagents", "--no-memory", "--max-turns", "8");
+    }
+    return args;
+  }
+
+  /** Project MCP config `.grok/config.toml` (docs: project-scoped MCP).
+   *  Valores por agente via `${VAR}`. Auth NÃO mora aqui — ver grokUserHome().
+   *  Nunca criar auth.json/sessions aqui (poluiria se GROK_HOME errasse). */
+  private writeGrokConfig() {
+    const dir = path.join(this.opts.workspaceRoot, ".grok");
+    mkdirSync(dir, { recursive: true });
+    // Evita commitar config gerada + lixo de home acidental.
+    const gi = path.join(dir, ".gitignore");
+    try {
+      if (!existsSync(gi)) {
+        writeFileSync(
+          gi,
+          // keep only project MCP config shareable if user force-adds it
+          ["*", "!.gitignore", "!config.toml"].join("\n") + "\n",
+          { mode: 0o644 },
+        );
+      }
+    } catch { /* best-effort */ }
+    // Se um spawn anterior (GROK_HOME errado) deixou auth/sessions no
+    // project .grok, remove pra não competir com ~/.grok real.
+    for (const junk of ["auth.json", "auth.json.lock", "sessions", "models_cache.json", "active_sessions.json", "active_sessions.lock"]) {
+      try { rmSync(path.join(dir, junk), { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+
+    const lines: string[] = [
+      "# Managed by the-dudes — MCP bridge for Grok Build agents.",
+      "# Per-agent values are expanded from the process environment (${VAR}).",
+      "",
+    ];
+
+    const emitStdio = (name: string, command: string, args?: string[], env?: Record<string, string>) => {
+      // MCP server names: letters, numbers, hyphens, underscores only.
+      const safe = name.replace(/[^A-Za-z0-9_-]/g, "-");
+      lines.push(`[mcp_servers.${safe}]`);
+      lines.push(`command = ${tomlQuote(command)}`);
+      lines.push("enabled = true");
+      if (args && args.length > 0) {
+        lines.push(`args = [${args.map(tomlQuote).join(", ")}]`);
+      }
+      lines.push("");
+      if (env && Object.keys(env).length > 0) {
+        lines.push(`[mcp_servers.${safe}.env]`);
+        for (const [k, v] of Object.entries(env)) {
+          lines.push(`${k} = ${tomlQuote(v)}`);
+        }
+        lines.push("");
+      }
+    };
+
+    const emitRemote = (name: string, type: "http" | "sse", url: string, headers?: Record<string, string>) => {
+      const safe = name.replace(/[^A-Za-z0-9_-]/g, "-");
+      lines.push(`[mcp_servers.${safe}]`);
+      lines.push(`url = ${tomlQuote(url)}`);
+      lines.push("enabled = true");
+      lines.push("");
+      if (headers && Object.keys(headers).length > 0) {
+        lines.push(`[mcp_servers.${safe}.headers]`);
+        for (const [k, v] of Object.entries(headers)) {
+          lines.push(`${tomlQuote(k)} = ${tomlQuote(v)}`);
+        }
+        lines.push("");
+      }
+      void type; // Grok infere http/sse pela URL; type reservado p/ futuros campos
+    };
+
+    if (this.opts.extraMcpServers) {
+      for (const [name, cfg] of Object.entries(this.opts.extraMcpServers)) {
+        if (name === "the-dudes") continue;
+        const type = cfg.type ?? "stdio";
+        if (type === "stdio") {
+          if (!cfg.command) continue;
+          emitStdio(name, cfg.command, cfg.args, cfg.env);
+        } else if ((type === "http" || type === "sse") && cfg.url) {
+          emitRemote(name, type, cfg.url, cfg.headers);
+        } else {
+          this.opts.log("warn", `[grok:${this.info.name}] skipping MCP "${name}" — transporte "${type}" sem command/url`);
+        }
+      }
+    }
+
+    // Bridge the-dudes — env por expansão ${VAR} (multi-agente no mesmo cwd).
+    const bridgeEnv: Record<string, string> = {
+      THE_DUDES_AGENT_ID: "${THE_DUDES_AGENT_ID}",
+      THE_DUDES_AGENT_NAME: "${THE_DUDES_AGENT_NAME}",
+      THE_DUDES_ORCH_URL: "${THE_DUDES_ORCH_URL}",
+      THE_DUDES_AGENT_TOKEN_FILE: "${THE_DUDES_AGENT_TOKEN_FILE}",
+    };
+    if (this.opts.bridgeSocketPath) {
+      bridgeEnv.THE_DUDES_BRIDGE_SOCKET = "${THE_DUDES_BRIDGE_SOCKET}";
+    }
+    for (const k of Object.keys(this.featuresEnv())) {
+      bridgeEnv[k] = `\${${k}}`;
+    }
+    emitStdio(
+      "the-dudes",
+      this.opts.bridgeCommand,
+      this.opts.bridgeArgs.length > 0 ? this.opts.bridgeArgs : undefined,
+      bridgeEnv,
+    );
+
+    try {
+      writeFileSync(path.join(dir, "config.toml"), lines.join("\n"), { mode: 0o600 });
+    } catch (e) {
+      this.opts.log("warn", `[grok:${this.info.name}] failed to write .grok/config.toml: ${(e as Error).message}`);
+    }
+  }
+
+  /**
+   * HOME canônico do Grok Build (auth.json, sessions). Nunca usar o
+   * `.grok/` do workspace — esse path é só project-config (MCP); se o CLI
+   * confundir com GROK_HOME, headless cai em 401 (sem credenciais).
+   */
+  private grokUserHome(): string {
+    const home = this.opts.dropTo?.home ?? process.env.HOME ?? os.homedir();
+    return path.join(home, ".grok");
+  }
+
+  private grokTurnEnv(): NodeJS.ProcessEnv {
+    const env = this.buildEnv();
+    // Garante HOME do usuário dropado (sudo) — sem isso auth cai em /var/root/.grok.
+    if (this.opts.dropTo?.home) {
+      env.HOME = this.opts.dropTo.home;
+      env.USER = this.opts.dropTo.user;
+      env.LOGNAME = this.opts.dropTo.user;
+      if (this.opts.dropTo.path) env.PATH = this.opts.dropTo.path;
+    }
+    return {
+      ...env,
+      THE_DUDES_AGENT_TOKEN_FILE: this.writeAgentTokenFile(),
+      ...this.featuresEnv(),
+      // Auth/sessões SEMPRE em ~/.grok do user — isolado do project config.
+      GROK_HOME: this.grokUserHome(),
+      // Evita spam de update check no stderr em headless.
+      GROK_DISABLE_AUTOUPDATER: "1",
+    };
+  }
+
+  private async runGrokMessage(content: string, images?: ImageAttachment[]) {
+    if (this.stopped) { this.ocBusy = false; return; }
+    if (!this.ensureRunnerAvailable("grok")) { this.ocBusy = false; return; }
+    this.setState("thinking");
+    this.writeGrokConfig();
+
+    let message = content;
+    const firstTurn = this.ocFirstTurn;
+    const pendingSummary = this.ocPendingSummary;
+    const epoch = this.ocEpoch;
+    if (firstTurn) {
+      this.ocFirstTurn = false;
+      const summary = this.ocPendingSummary ? `\n\n# Previous conversation summary\n${this.ocPendingSummary}` : "";
+      this.ocPendingSummary = undefined;
+      message = `${buildSystemPromptHeader(this.opts.features)}\n\n# Your role\n${this.info.role}\n\n${this.info.systemPrompt}\n\n# Workspace\n${this.workspaceInfo()}${summary}\n\n---\n\n${content}`;
+    }
+
+    // Imagens: grava temp e referencia por path (tool read_file do Grok).
+    let imgCleanup = () => {};
+    if (images && images.length) {
+      const { paths, cleanup } = this.writeImageTempFiles(images);
+      imgCleanup = cleanup;
+      if (paths.length) {
+        message += `\n\nAttached image file(s) — open with your file reader tool:\n${paths.join("\n")}`;
+      }
+    }
+
+    const args = this.buildGrokHeadlessArgs(message, {
+      resume: this.ocSessionId,
+      outputFormat: "streaming-json",
+    });
+    this.traceCli("grok", "argv", message);
+    this.traceSpawn("grok", args);
+
+    let proc: ChildProcess;
+    try {
+      proc = spawnDropped(this.runnerCommand("grok"), args, {
+        cwd: this.opts.workspaceRoot,
+        env: this.grokTurnEnv(),
+        stdio: ["ignore", "pipe", "pipe"],
+      }, this.opts.dropTo ?? null);
+    } catch (e) {
+      imgCleanup();
+      this.ocBusy = false;
+      this.opts.onError(`grok spawn falhou: ${(e as Error).message}`);
+      this.setState("idle");
+      return;
+    }
+    this.ocActiveProc = proc;
+
+    // Acumula o turno inteiro e emite UMA vez no final.
+    // onAssistantText no orch cria uma mensagem por chamada — flush por
+    // chunk/newline virava dezenas de balões "PM → Você" (UI quebrada).
+    let buf = "";
+    let fullText = "";
+    let fullThought = "";
+    let sawEnd = false;
+    let endSessionId: string | undefined;
+    let errOut = "";
+    let errFromJson = "";
+    let emittedAny = false;
+
+    const ingestLine = (line: string) => {
+      if (!line.startsWith("{") || epoch !== this.ocEpoch) return;
+      try {
+        const ev = JSON.parse(line) as {
+          type?: string;
+          data?: string;
+          message?: string;
+          text?: string;
+          sessionId?: string;
+          stopReason?: string;
+        };
+        if (ev.type === "text" && typeof ev.data === "string") {
+          fullText += ev.data;
+          // Só sinaliza "speaking" sem emitir mensagem — UI fica viva.
+          if (fullText.length > 0) this.setState("speaking");
+        } else if (ev.type === "thought" && typeof ev.data === "string") {
+          fullThought += ev.data;
+        } else if (ev.type === "end") {
+          sawEnd = true;
+          if (typeof ev.sessionId === "string" && ev.sessionId) {
+            endSessionId = ev.sessionId;
+          }
+        } else if (ev.type === "error") {
+          const msg = String(ev.message ?? ev.data ?? "grok error");
+          errFromJson = msg;
+          this.checkContextFullError(msg);
+        } else if (typeof ev.text === "string" && !ev.type) {
+          // --output-format json: objeto final { text, sessionId, ... }
+          fullText += ev.text;
+          if (typeof ev.sessionId === "string" && ev.sessionId) endSessionId = ev.sessionId;
+          sawEnd = true;
+        }
+      } catch { /* linha incompleta / ruído */ }
+    };
+
+    /** Emite no máximo 1 agent_to_user por turno. */
+    const emitOnce = () => {
+      if (epoch !== this.ocEpoch || emittedAny) return;
+      if (fullThought && this.info.collectThinking && this.opts.onThinkingText) {
+        this.opts.onThinkingText(fullThought);
+      }
+      const t = fullText.trim();
+      if (t) {
+        this.setState("speaking");
+        this.opts.onAssistantText(t);
+        emittedAny = true;
+      }
+      // Billing: headless não emite usage — estima por chars (~4 chars/token).
+      // Ocupação da janela NÃO usa essa heurística: finishGrokTurn lê
+      // signals.json (contextTokensUsed real) após o turno.
+      if (epoch === this.ocEpoch && (message.length > 0 || t.length > 0)) {
+        const estIn = Math.max(1, Math.ceil(message.length / 4));
+        const estOut = Math.max(0, Math.ceil(t.length / 4));
+        this.opts.onUsageDelta?.({
+          input: estIn,
+          output: estOut,
+          cacheCreate: 0,
+          cacheRead: 0,
+        });
+      }
+    };
+
+    proc.stdout!.setEncoding("utf8");
+    proc.stderr!.setEncoding("utf8");
+    proc.stdout!.on("data", (chunk: string) => {
+      this.traceCli("grok", "stdout", chunk);
+      buf += chunk;
+      let idx: number;
+      while ((idx = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, idx).trim();
+        buf = buf.slice(idx + 1);
+        ingestLine(line);
+      }
+    });
+    proc.stderr!.on("data", (chunk: string) => {
+      const msg = chunk.trim();
+      if (!msg) return;
+      this.traceCli("grok", "stderr", msg);
+      errOut += chunk;
+      this.checkContextFullError(msg);
+    });
+
+    proc.on("close", (code) => {
+      // Resto de buffer sem newline final (json single-object ou última linha).
+      if (buf.trim()) ingestLine(buf.trim());
+      emitOnce();
+      if (errFromJson && !emittedAny) {
+        this.opts.onError(`grok: ${errFromJson.slice(0, 500)}`);
+      }
+      imgCleanup();
+      this.ocActiveProc = null;
+      if (this.stopped) { this.ocBusy = false; this.emitExit(code); return; }
+      void this.finishGrokTurn({
+        code, epoch, firstTurn, pendingSummary, content, images,
+        sawEnd, endSessionId, errOut, errFromJson, emittedAny,
+      });
+    });
+  }
+
+  private async finishGrokTurn(t: {
+    code: number | null;
+    epoch: number;
+    firstTurn: boolean;
+    pendingSummary: string | undefined;
+    content: string;
+    images?: ImageAttachment[];
+    sawEnd: boolean;
+    endSessionId?: string;
+    errOut: string;
+    errFromJson: string;
+    emittedAny: boolean;
+  }): Promise<void> {
+    try {
+      if (t.epoch !== this.ocEpoch) return;
+
+      const failed = (t.code ?? 1) !== 0 && !t.emittedAny && !t.sawEnd;
+      const combinedErr = `${t.errOut}\n${t.errFromJson}`;
+
+      // Resume de sessão inexistente / expurgada.
+      if (failed && this.ocSessionId && /session not found|couldn't (start|load|resume) session|no such session|404 not found/i.test(combinedErr)) {
+        this.opts.onError(`[grok] sessão ${this.ocSessionId} não existe mais — recomeçando sessão nova`);
+        this.ocSessionId = undefined;
+        this.ocFirstTurn = true;
+        this.ocPendingSummary = t.pendingSummary;
+        this.info.sessionId = undefined;
+        if (this.opts.onSessionId) this.opts.onSessionId("");
+        this.ocQueue.unshift({ content: t.content, images: t.images });
+        return;
+      }
+
+      if (failed) {
+        if (t.firstTurn && !this.ocFirstTurn) {
+          this.ocFirstTurn = true;
+          if (this.ocPendingSummary === undefined) this.ocPendingSummary = t.pendingSummary;
+        }
+        const err = combinedErr.trim() || `grok exit ${t.code ?? "?"} sem output`;
+        this.checkContextFullError(err);
+        // 401 / credenciais: mensagem acionável (login OAuth do CLI, não do the-dudes).
+        if (/401|unauthoriz|invalid (or expired )?credentials|failed to authenticate|no auth context|auth_kind=bearer/i.test(err)) {
+          const home = this.grokUserHome();
+          this.opts.onError(
+            `[grok] autenticação falhou (401). Rode \`grok login\` no mesmo user do daemon ` +
+            `(auth em ${home}/auth.json). Se usou XAI_API_KEY inválida, remova do env. ` +
+            `Detalhe: ${err.slice(0, 300)}`,
+          );
+          return;
+        }
+        this.opts.onError(`grok: ${err.slice(0, 500)}`);
+        return;
+      }
+
+      if (t.errOut.trim() && !t.emittedAny) {
+        // stderr sem texto útil no stdout (auth/rate limit).
+        this.opts.onError(t.errOut.trim().slice(0, 500));
+      }
+
+      // Captura sessionId do evento end (ou já tinha de resume).
+      const sid = t.endSessionId ?? this.ocSessionId;
+      if (sid && sid !== this.ocSessionId) {
+        this.ocSessionId = sid;
+        if (this.opts.onSessionId) this.opts.onSessionId(sid);
+      } else if (sid && !this.info.sessionId && this.opts.onSessionId) {
+        this.opts.onSessionId(sid);
+      }
+
+      // Ocupação real da janela: signals.json / updates.jsonl (igual /context).
+      // NÃO re-emitir 0 se a leitura falhar — isso apagava a barra (e em
+      // dual-daemon um processo "cego" zerava o valor do outro).
+      if (sid) {
+        const sig = await this.pollGrokContextOccupancy(sid);
+        if (sig && sig.contextTokensUsed > 0) {
+          this.opts.log(
+            "info",
+            `[grok] context window ${sig.contextTokensUsed}/${sig.contextWindowTokens} (${sig.contextWindowUsage}%) session=${sid.slice(0, 8)}…`,
+          );
+          this.reportContextOccupancy(sig.contextTokensUsed, sig.contextWindowTokens);
+        } else if (sig) {
+          // sessão nova ainda com used=0 — só reporta se ainda não temos valor
+          if (this.lastInputTokens <= 0) {
+            this.reportContextOccupancy(0, sig.contextWindowTokens);
+          }
+        }
+      }
+    } finally {
+      this.ocBusy = false;
+      if (!this.stopped) {
+        this.setState("idle");
+        this.drainOcQueue();
+      }
+    }
+  }
+
+  /* ---------- Crush per-message model ---------- */
+
+  /** Data dir do crush POR AGENTE, estável entre restarts do daemon (o
+   *  sessionId persiste no DB do server → o resume precisa achar o crush.db
+   *  de novo; agentTmpDir é mkdtemp e morre com o runner). Fica dentro do
+   *  .crush do workspace (que o próprio crush já cobre com .gitignore "*"),
+   *  segregado por agentId — sessões de agentes irmãos não colidem e o
+   *  `session last` pós-turno é confiável (só vê as sessões DESTE agente). */
+  private crushDataDir(): string {
+    const dir = path.join(this.opts.workspaceRoot, ".crush", "agents", this.info.id);
+    mkdirSync(dir, { recursive: true });
+    // Defensivo: se .crush nasceu pelo nosso mkdir (não pelo crush), garante o
+    // .gitignore que o crush criaria — senão o crush.db entra no git do user.
+    const gi = path.join(this.opts.workspaceRoot, ".crush", ".gitignore");
+    try { if (!existsSync(gi)) writeFileSync(gi, "*\n", { mode: 0o644 }); } catch { /* best-effort */ }
+    return dir;
+  }
+
+  /** Config de projeto do crush (`.crush.json` no workspaceRoot — prioridade
+   *  máxima na cadeia de descoberta; o crush não tem flag de config path).
+   *  MCPs extras + bridge the-dudes. Multi-agente no mesmo workspace: o
+   *  arquivo é IDÊNTICO entre agentes porque os valores por agente entram por
+   *  expansão shell-style `$VAR` (suportada em command/args/env do config) e
+   *  são resolvidos do env do PROCESSO crush (buildEnv injeta por spawn). */
+  private writeCrushConfig() {
+    const configPath = path.join(this.opts.workspaceRoot, ".crush.json");
+    const mcp: Record<string, unknown> = {};
+    if (this.opts.extraMcpServers) {
+      for (const [name, cfg] of Object.entries(this.opts.extraMcpServers)) {
+        if (name === "the-dudes") continue;
+        const type = cfg.type ?? "stdio";
+        if (type === "stdio") {
+          if (!cfg.command) continue;
+          const entry: Record<string, unknown> = { type: "stdio", command: cfg.command };
+          if (cfg.args && cfg.args.length > 0) entry.args = cfg.args;
+          if (cfg.env && Object.keys(cfg.env).length > 0) entry.env = cfg.env;
+          mcp[name] = entry;
+        } else if ((type === "http" || type === "sse") && cfg.url) {
+          // crush suporta http/sse nativos (diferente de opencode/codex).
+          const entry: Record<string, unknown> = { type, url: cfg.url };
+          if (cfg.headers && Object.keys(cfg.headers).length > 0) entry.headers = cfg.headers;
+          mcp[name] = entry;
+        } else {
+          this.opts.log("warn", `[crush:${this.info.name}] skipping MCP "${name}" — transporte "${type}" sem command/url`);
+        }
+      }
+    }
+    // Bridge the-dudes: os valores POR AGENTE (id/name/token-file) via $VAR —
+    // o token file path não é secreto (o conteúdo é, mode 0600) e o env do
+    // processo crush já carrega tudo (buildEnv + crushTurnEnv).
+    mcp["the-dudes"] = {
+      type: "stdio",
+      command: this.opts.bridgeCommand,
+      ...(this.opts.bridgeArgs.length > 0 ? { args: this.opts.bridgeArgs } : {}),
+      env: {
+        THE_DUDES_AGENT_ID: "$THE_DUDES_AGENT_ID",
+        THE_DUDES_AGENT_NAME: "$THE_DUDES_AGENT_NAME",
+        THE_DUDES_ORCH_URL: "$THE_DUDES_ORCH_URL",
+        THE_DUDES_AGENT_TOKEN_FILE: "$THE_DUDES_AGENT_TOKEN_FILE",
+        ...(this.opts.bridgeSocketPath ? { THE_DUDES_BRIDGE_SOCKET: "$THE_DUDES_BRIDGE_SOCKET" } : {}),
+        ...Object.fromEntries(Object.keys(this.featuresEnv()).map((k) => [k, `$${k}`])),
+      },
+    };
+    const config: Record<string, unknown> = {
+      $schema: "https://charm.land/crush.json",
+      mcp,
+      // Sem bloco `providers`/`models`: o crush usa o estado global do usuário
+      // (~/.local/share/crush) — mesma filosofia do opencode (auth do host).
+      // `crush run` non-interactive auto-aprova as tools (sem TUI não há como
+      // promptar) — equivalente ao bypass incondicional do codex.
+    };
+    try {
+      writeFileSync(configPath, JSON.stringify(config, null, 2), { mode: 0o600 });
+    } catch (e) {
+      this.opts.log("warn", `[crush:${this.info.name}] failed to write .crush.json: ${(e as Error).message}`);
+    }
+  }
+
+  /** Env por turno do crush: buildEnv + os valores que o `.crush.json`
+   *  compartilhado referencia por `$VAR` (token file é por agente). */
+  private crushTurnEnv(): NodeJS.ProcessEnv {
+    return {
+      ...this.buildEnv(),
+      THE_DUDES_AGENT_TOKEN_FILE: this.writeAgentTokenFile(),
+      ...this.featuresEnv(),
+    };
+  }
+
+  /** Roda um subcomando `crush session ...` e devolve o JSON parseado (null em
+   *  erro/timeout). Usado pra capturar o uuid da sessão criada pelo run e o
+   *  meta cumulativo de tokens (o `crush run` não emite nada disso no stdout). */
+  private crushSessionJson(argv: string[]): Promise<any> {
+    return new Promise((resolve) => {
+      if (!this.opts.cliCommands.crush.available) { resolve(null); return; }
+      let proc: ChildProcess;
+      try {
+        proc = spawnDropped(this.runnerCommand("crush"), [...argv, "--json", "--data-dir", this.crushDataDir()], {
+          cwd: this.opts.workspaceRoot,
+          env: this.buildEnv(),
+          stdio: ["ignore", "pipe", "pipe"],
+        }, this.opts.dropTo ?? null);
+      } catch { resolve(null); return; }
+      let out = "";
+      let settled = false;
+      const settle = (v: any) => { if (!settled) { settled = true; resolve(v); } };
+      const killer = setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} settle(null); }, 15_000);
+      proc.stdout!.setEncoding("utf8");
+      proc.stdout!.on("data", (c: string) => { out += c; });
+      proc.on("close", () => {
+        clearTimeout(killer);
+        try { settle(JSON.parse(out.trim())); } catch { settle(null); }
+      });
+      proc.on("error", () => { clearTimeout(killer); settle(null); });
+    });
+  }
+
+  private async runCrushMessage(content: string, images?: ImageAttachment[]) {
+    if (this.stopped) { this.ocBusy = false; return; }
+    if (!this.ensureRunnerAvailable("crush")) { this.ocBusy = false; return; }
+    this.setState("thinking");
+    this.writeCrushConfig();
+
+    let message = content;
+    const firstTurn = this.ocFirstTurn;
+    // Preservados pra restaurar se o turno morrer sem output (mesma lógica do
+    // gemini): perder o firstTurn num turno falho descartaria system prompt e
+    // resumo pendente pra sempre.
+    const pendingSummary = this.ocPendingSummary;
+    const epoch = this.ocEpoch;
+    if (firstTurn) {
+      this.ocFirstTurn = false;
+      const summary = this.ocPendingSummary ? `\n\n# Previous conversation summary\n${this.ocPendingSummary}` : "";
+      this.ocPendingSummary = undefined;
+      message = `${buildSystemPromptHeader(this.opts.features)}\n\n# Your role\n${this.info.role}\n\n${this.info.systemPrompt}\n\n# Workspace\n${this.workspaceInfo()}${summary}\n\n---\n\n${content}`;
+    }
+    // Imagens: crush run não tem flag de attachment — grava temp e referencia
+    // por path no prompt (a tool `view` do crush lê imagem do disco).
+    let imgCleanup = () => {};
+    if (images && images.length) {
+      const { paths, cleanup } = this.writeImageTempFiles(images);
+      imgCleanup = cleanup;
+      if (paths.length) message += `\n\nAttached image file(s) — open with your file viewer tool:\n${paths.join("\n")}`;
+    }
+    this.traceCli("crush", "argv", message);
+
+    // Sessão RESUMIDA (daemon restart): prime da base de billing ANTES do
+    // turno — o meta é cumulativo e a base zero re-faturaria o histórico.
+    if (this.ocSessionId && this.crushStatsBase === null) {
+      const meta = await this.crushSessionJson(["session", "show", this.ocSessionId]);
+      const m = meta?.meta ?? meta;
+      this.crushStatsBase = {
+        prompt: Number(m?.prompt_tokens ?? 0),
+        completion: Number(m?.completion_tokens ?? 0),
+      };
+      if (this.stopped) { this.ocBusy = false; return; }
+    }
+    if (this.crushStatsBase === null) this.crushStatsBase = { prompt: 0, completion: 0 };
+
+    const args = ["run", "--quiet", "--data-dir", this.crushDataDir()];
+    if (this.info.model) args.push("-m", this.info.model);
+    // Resume por UUID (campo `uuid` do session list — o `id` curto NÃO
+    // funciona no --session do run, testado na v0.82.0).
+    if (this.ocSessionId) args.push("--session", this.ocSessionId);
+    args.push(message);
+
+    this.traceSpawn("crush", args);
+    let proc: ChildProcess;
+    try {
+      proc = spawnDropped(this.runnerCommand("crush"), args, {
+        cwd: this.opts.workspaceRoot,
+        env: this.crushTurnEnv(),
+        stdio: ["ignore", "pipe", "pipe"],
+      }, this.opts.dropTo ?? null);
+    } catch (e) {
+      imgCleanup();
+      this.ocBusy = false;
+      this.opts.onError(`crush spawn falhou: ${(e as Error).message}`);
+      this.setState("idle");
+      return;
+    }
+    this.ocActiveProc = proc;
+
+    let out = "";
+    let errOut = "";
+
+    proc.stdout!.setEncoding("utf8");
+    proc.stderr!.setEncoding("utf8");
+    proc.stdout!.on("data", (chunk: string) => {
+      this.traceCli("crush", "stdout", chunk);
+      out += chunk;
+    });
+    proc.stderr!.on("data", (chunk: string) => {
+      const msg = chunk.trim();
+      if (!msg) return;
+      this.traceCli("crush", "stderr", msg);
+      errOut += chunk;
+      this.checkContextFullError(msg);
+    });
+
+    proc.on("close", (code) => {
+      imgCleanup();
+      this.ocActiveProc = null;
+      if (this.stopped) { this.ocBusy = false; this.emitExit(code); return; }
+      void this.finishCrushTurn({ out, errOut, code, epoch, firstTurn, pendingSummary, content, images });
+    });
+  }
+
+  /** Pós-turno do crush: emite o texto, captura o uuid da sessão nova, fatura
+   *  o delta de tokens e trata falha de resume (sessão sumida do crush.db).
+   *  Só libera a fila (ocBusy) DEPOIS da captura de sessão — um segundo turno
+   *  spawnado antes criaria OUTRA sessão e a conversa se partiria em duas. */
+  private async finishCrushTurn(t: {
+    out: string; errOut: string; code: number | null; epoch: number;
+    firstTurn: boolean; pendingSummary: string | undefined;
+    content: string; images?: ImageAttachment[];
+  }): Promise<void> {
+    try {
+      // Epoch trocado (clear/compact no meio do turno): nada deste turno pode
+      // falar/faturar/ressuscitar sessão pós-reset.
+      if (t.epoch !== this.ocEpoch) return;
+
+      const text = t.out.trim();
+      const failed = (t.code ?? 1) !== 0 && !text;
+
+      // Resume apontando pra sessão que sumiu do crush.db (reboot limpou o
+      // data dir, delete manual): "session not found". Larga o id e re-tenta
+      // o turno UMA vez como sessão nova (a mensagem não pode se perder).
+      if (failed && this.ocSessionId && /session not found/i.test(t.errOut)) {
+        this.opts.onError(`[crush] sessão ${this.ocSessionId} não existe mais — recomeçando sessão nova`);
+        this.ocSessionId = undefined;
+        this.crushStatsBase = { prompt: 0, completion: 0 };
+        this.ocFirstTurn = true;
+        this.ocPendingSummary = t.pendingSummary;
+        this.info.sessionId = undefined;
+        if (this.opts.onSessionId) this.opts.onSessionId("");
+        this.ocQueue.unshift({ content: t.content, images: t.images });
+        return; // finally libera ocBusy e drena — o retry roda como turno novo
+      }
+
+      if (failed) {
+        // Primeiro turno que morreu sem output (key inválida, modelo errado,
+        // provider fora): restaurar firstTurn/summary pro retry não perder o
+        // system prompt (mesma proteção do gemini).
+        if (t.firstTurn && !this.ocFirstTurn) {
+          this.ocFirstTurn = true;
+          if (this.ocPendingSummary === undefined) this.ocPendingSummary = t.pendingSummary;
+        }
+        const err = t.errOut.trim() || `crush exit ${t.code ?? "?"} sem output`;
+        this.checkContextFullError(err);
+        this.opts.onError(`crush: ${err.slice(0, 500)}`);
+        return;
+      }
+
+      if (text) {
+        this.setState("speaking");
+        this.opts.onAssistantText(text);
+      }
+      if (t.errOut.trim()) this.opts.onError(t.errOut.trim().slice(0, 500));
+
+      // Captura da sessão criada pelo run (o stdout não traz o id): com o
+      // data dir POR AGENTE, a mais recente é necessariamente a deste turno.
+      if (!this.ocSessionId) {
+        const last = await this.crushSessionJson(["session", "last"]);
+        // `session last --json` retorna {meta:{uuid,...},messages:[...]} —
+        // o uuid mora em .meta (o shape raiz {uuid} é só do `session list`).
+        const lm = last?.meta ?? last;
+        const uuid = typeof lm?.uuid === "string" ? lm.uuid : undefined;
+        if (t.epoch !== this.ocEpoch) return; // reset durante a captura
+        if (uuid) {
+          this.ocSessionId = uuid;
+          if (this.opts.onSessionId) this.opts.onSessionId(uuid);
+        } else {
+          this.opts.log("warn", `[crush:${this.info.name}] não consegui capturar o uuid da sessão — próximo turno cria sessão nova`);
+        }
+      }
+
+      // Billing: meta cumulativo → delta contra a base. Ocupação de janela NÃO
+      // é derivável daqui (turno com N tool-calls soma N prompts) — contexto
+      // cheio do crush é detectado pela rota reativa (checkContextFullError no
+      // stderr), igual ao gemini.
+      if (this.ocSessionId) {
+        const show = await this.crushSessionJson(["session", "show", this.ocSessionId]);
+        if (t.epoch !== this.ocEpoch) return;
+        const m = show?.meta ?? show;
+        const prompt = Number(m?.prompt_tokens ?? 0);
+        const completion = Number(m?.completion_tokens ?? 0);
+        const base = this.crushStatsBase ?? { prompt: 0, completion: 0 };
+        if (prompt > 0 || completion > 0) {
+          const delta: AgentUsage = {
+            input: Math.max(0, prompt - base.prompt),
+            output: Math.max(0, completion - base.completion),
+            cacheCreate: 0,
+            cacheRead: 0,
+          };
+          this.crushStatsBase = { prompt, completion };
+          if (delta.input > 0 || delta.output > 0) this.opts.onUsageDelta?.(delta);
+        }
+      }
+    } finally {
+      this.ocBusy = false;
+      if (!this.stopped) {
+        this.setState("idle");
+        this.drainOcQueue();
+      }
+    }
+  }
+
   /** Grava imagens (base64) em arquivos temp no tmpdir do agente — pros runners
    *  per-message que aceitam imagem por caminho de arquivo (codex `-i`, gemini
    *  `@path`). Retorna paths + cleanup. opencode usa data-URL inline (não temp). */
@@ -2360,6 +3327,10 @@ export class AgentRunner {
       this.runGeminiMessage(content, images);
     } else if (this.opts.cliRunner === "codex") {
       this.runCodexMessage(content, images);
+    } else if (this.opts.cliRunner === "crush") {
+      void this.runCrushMessage(content, images);
+    } else if (this.opts.cliRunner === "grok") {
+      void this.runGrokMessage(content, images);
     } else {
       this.runOpenCodeMessage(content, images);
     }
@@ -2368,13 +3339,25 @@ export class AgentRunner {
   /* ---------- public API ---------- */
 
   // Cap defensivo nas filas: server malicioso (token roubado) ou bug
-  // em restart loop podia floodar agent:send → memory unbounded. 100
-  // mensagens cobre fluxo legítimo de retomada após restart longo
-  // (compact_context, etc); ataque vê erro logado e drop silencioso.
-  private static readonly MAX_BUFFERED_MESSAGES = 100;
+  // em restart/a2a loop podia floodar agent:send → memory unbounded.
+  // 20 cobre retomada legítima; loop agent↔agent com Grok enchia 100 e
+  // queimava tokens por horas.
+  private static readonly MAX_BUFFERED_MESSAGES = 20;
+
+  /** Stop de loop / anti-loop do server — esvazia backlog pra não processar
+   *  dezenas de a2a enfileirados depois do pause. */
+  private static readonly LOOP_STOP_RE =
+    /\[loop-stop\]|Conversation paused|loop detected|agent message limit reached|preventive mode active/i;
 
   pushUserMessage(content: string, images?: ImageAttachment[]) {
-    if (this.opts.cliRunner === "opencode" || this.opts.cliRunner === "gemini" || this.opts.cliRunner === "codex") {
+    if (AgentRunner.LOOP_STOP_RE.test(content)) {
+      const dropped = this.ocQueue.length;
+      this.ocQueue = [];
+      if (dropped > 0) {
+        this.opts.log("warn", `[cli:${this.info.id}:${this.opts.cliRunner}] loop-stop — limpou ${dropped} msg(s) da fila`);
+      }
+    }
+    if (this.opts.cliRunner === "opencode" || this.opts.cliRunner === "gemini" || this.opts.cliRunner === "codex" || this.opts.cliRunner === "crush" || this.opts.cliRunner === "grok") {
       if (this.ocQueue.length >= AgentRunner.MAX_BUFFERED_MESSAGES) {
         this.opts.log("warn", `[cli:${this.info.id}:${this.opts.cliRunner}] ocQueue cheia (${this.ocQueue.length}) — drop mensagem`);
         return;
@@ -2429,7 +3412,7 @@ export class AgentRunner {
     // ONE_SHOT_TIMEOUT_MS consumindo API — e o emitExit abaixo apaga o tmpdir
     // (cwd + session store do gemini) debaixo dele.
     if (this.oneShotProc) { try { this.oneShotProc.kill("SIGKILL"); } catch {} this.oneShotProc = null; }
-    if (this.opts.cliRunner === "opencode" || this.opts.cliRunner === "gemini" || this.opts.cliRunner === "codex") {
+    if (this.opts.cliRunner === "opencode" || this.opts.cliRunner === "gemini" || this.opts.cliRunner === "codex" || this.opts.cliRunner === "crush" || this.opts.cliRunner === "grok") {
       if (procAlive(this.ocServerProc)) {
         try { this.ocServerProc!.kill("SIGTERM"); } catch {}
         setTimeout(() => {
@@ -2479,6 +3462,8 @@ export class AgentRunner {
         this.opts.onError("[ctx] context cleared — claude restarted with new session");
         return;
       }
+      // Mata turno em voo E one-shot de compact (simétrico a stop()).
+      if (this.oneShotProc) { try { this.oneShotProc.kill("SIGKILL"); } catch {} this.oneShotProc = null; }
       if (procAlive(this.ocActiveProc)) {
         try { this.ocActiveProc!.kill("SIGTERM"); } catch {}
         setTimeout(() => {
@@ -2671,7 +3656,7 @@ export class AgentRunner {
     // clear acabou de descartar (a "latest" no storage do tmpdir ainda é
     // ela); no codex, exec sem sid "resumiria" uma thread nova vazia.
     // Espelha os guards do claude (oldSession) e do opencode (ocSessionId).
-    if (this.ocFirstTurn || (this.opts.cliRunner === "codex" && !this.ocSessionId)) {
+    if (this.ocFirstTurn || ((this.opts.cliRunner === "codex" || this.opts.cliRunner === "crush" || this.opts.cliRunner === "grok") && !this.ocSessionId)) {
       this.opts.onError("[ctx] compact: sessão ainda não ativa — manda uma mensagem primeiro");
       return;
     }
@@ -2690,6 +3675,10 @@ export class AgentRunner {
     if (saveMemory) void this.saveExtractedMemory(items, existing);
     if (clean) {
       this.resetWithSummary(clean);
+      // Notifica o server de que o sessionId antigo morreu (próximo end grava
+      // o novo). Sem isso o DB guarda o UUID antigo até o próximo turno.
+      this.info.sessionId = undefined;
+      if (this.opts.onSessionId) this.opts.onSessionId("");
       this.opts.onError(`[ctx] contexto compactado${saveMemory ? ` (${items.length} memória(s) salvas)` : " (sem salvar memória)"}`);
     } else {
       // Sem resumo utilizável = falha de compact: precisa contar no streak —
@@ -2770,7 +3759,9 @@ export class AgentRunner {
     let saved = 0, merged = 0;
     for (const it of items) {
       try {
-        const r = await this.postBridgeJson(socket, "memory_add", { title: it.title, body: it.body, type: it.type, scope: "project" });
+        // Agent-scoped: compact extrai fatos da SESSÃO deste agente — não
+        // deve poluir o prompt de todos os irmãos.
+        const r = await this.postBridgeJson(socket, "memory_add", { title: it.title, body: it.body, type: it.type, scope: "agent" });
         saved++;
         const newId = r?.memory?.id as string | undefined;
         // Só faz merge se o add criou entry NOVA (id não estava na lista) —
@@ -2992,5 +3983,37 @@ export function extractOneShotText(out: string, runner: CliRunner): string {
     }
     return texts.join("\n").trim();
   }
+  if (runner === "grok") {
+    // --output-format json: objeto único (pode ser pretty-printed multi-linha
+    // com "text"/"thought"/"sessionId"). Antes exigíamos single-line e o
+    // pretty-print caía no return bruto → TTS falava o JSON inteiro.
+    const trimmed = out.trim();
+    if (trimmed.startsWith("{")) {
+      try {
+        const ev = JSON.parse(trimmed);
+        if (typeof ev?.text === "string" && ev.text.trim()) return ev.text.trim();
+        // error object: { type:"error", message:"..." }
+        if (ev?.type === "error" && typeof ev.message === "string") return "";
+      } catch { /* fall through to NDJSON */ }
+    }
+    // --output-format streaming-json: NDJSON type=text chunks
+    const texts: string[] = [];
+    for (const line of out.split("\n")) {
+      const s = line.trim();
+      if (!s.startsWith("{")) continue;
+      try {
+        const ev = JSON.parse(s);
+        if (ev.type === "text" && typeof ev.data === "string") texts.push(ev.data);
+        else if (typeof ev.text === "string") texts.push(ev.text);
+      } catch { /* skip */ }
+    }
+    if (texts.length) return texts.join("").trim();
+    return "";
+  }
   return out.trim();
+}
+
+/** TOML double-quoted string (usado em `.grok/config.toml` gerado). */
+function tomlQuote(s: string): string {
+  return `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
