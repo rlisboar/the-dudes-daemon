@@ -188,6 +188,10 @@ const OPENCODE_NO_OUTPUT_TIMEOUT_MS = 120_000;
 /** Timeout do turno opencode via API do serve (POST /message é síncrono e pode
  *  rodar tools por minutos). Generoso; o serve é morto no stop() se preciso. */
 const OPENCODE_TURN_TIMEOUT_MS = 600_000;
+/** Timeout do turno headless Grok (`grok -p …`). Sem isso, um resume + system
+ *  prompt gigante (skills) deixa o processo zumbi por horas com ocBusy=true e
+ *  a fila enche (`ocQueue cheia`). 12 min cobre turnos longos com tools. */
+const GROK_TURN_TIMEOUT_MS = 12 * 60_000;
 
 export const CONTEXT_FULL_PATTERNS = [
   /context.{0,20}(length|window|limit).{0,20}exceed/i,
@@ -517,12 +521,17 @@ export class AgentRunner {
 
   constructor(info: AgentInfo, private opts: AgentRunnerOptions) {
     this.info = info;
-    if ((opts.cliRunner === "opencode" || opts.cliRunner === "codex" || opts.cliRunner === "crush" || opts.cliRunner === "grok") && opts.resumeSessionId) {
+    if ((opts.cliRunner === "opencode" || opts.cliRunner === "codex" || opts.cliRunner === "crush" || opts.cliRunner === "grok" || opts.cliRunner === "gemini") && opts.resumeSessionId) {
       this.ocSessionId = opts.resumeSessionId;
       if (opts.cliRunner === "opencode") this.ocNeedsPrime = true;
       // crush: crushStatsBase fica null → primeiro finishCrushTurn faz prime
       // do meta cumulativo antes de faturar (sessão resumida ≠ base zero).
-      // grok: sessionId UUID no evento end / JSON; resume via --resume.
+      // grok/codex/crush/gemini: a sessão JÁ tem o system prompt. Re-injetar
+      // no first turn com --resume (system + skills + histórico) é o que
+      // travava o gitlab/grok por horas (ocBusy preso, fila em 100).
+      if (opts.cliRunner === "grok" || opts.cliRunner === "codex" || opts.cliRunner === "crush" || opts.cliRunner === "gemini") {
+        this.ocFirstTurn = false;
+      }
     }
   }
 
@@ -1166,9 +1175,29 @@ export class AgentRunner {
   }
 
   private bootPerMessageRunner() {
-    // Trigger first-turn prompt injection without requiring user input.
-    // Empty content → only the system prompt is sent, agent awaits next message.
-    this.pushUserMessage("[system] Context loaded. Awaiting instructions.");
+    // NÃO dispara turno no start. Gastar tokens só pra "hello" é desperdício
+    // (agentes iniciados em lote e nunca usados).
+    //
+    // - Resume (sessionId): sessão no disco já tem system+histórico.
+    //   Próxima msg real usa --resume / -s / etc.
+    // - Cold start: ocFirstTurn permanece true → o 1º user/a2a message
+    //   real injeta system+role+skills na hora do turno (runGrokMessage etc).
+    //
+    // Antes: pushUserMessage("[system] Context loaded…") forçava um call
+    // ao CLI em todo start (cold e, pior, com re-injeção + resume).
+    this.setState("idle");
+    if (this.ocSessionId) {
+      this.ocFirstTurn = false;
+      this.opts.log(
+        "info",
+        `[cli:${this.info.id}:${this.opts.cliRunner}] resume session=${this.ocSessionId.slice(0, 8)}… — idle, aguardando input`,
+      );
+    } else {
+      this.opts.log(
+        "info",
+        `[cli:${this.info.id}:${this.opts.cliRunner}] cold start — idle, system prompt no 1º input real`,
+      );
+    }
   }
 
   /** Env do mcp-bridge: lista de grupos de contexto ligados. Objeto vazio
@@ -2742,6 +2771,17 @@ export class AgentRunner {
   private async runGrokMessage(content: string, images?: ImageAttachment[]) {
     if (this.stopped) { this.ocBusy = false; return; }
     if (!this.ensureRunnerAvailable("grok")) { this.ocBusy = false; return; }
+    // Nunca manda ciphertext pro CLI — hang/resposta lixo. Decryption falhou
+    // no spawn (sem project key): aborta o turno em vez de travar o runner.
+    if (typeof this.info.systemPrompt === "string" && this.info.systemPrompt.startsWith("e2e:")) {
+      this.ocBusy = false;
+      this.opts.onError(
+        `[grok] systemPrompt ainda cifrado (sem project key no daemon) — abra o projeto no browser pra re-share da chave E2EE e reinicie o agente`,
+      );
+      this.setState("idle");
+      this.drainOcQueue();
+      return;
+    }
     this.setState("thinking");
     this.writeGrokConfig();
 
@@ -2749,11 +2789,15 @@ export class AgentRunner {
     const firstTurn = this.ocFirstTurn;
     const pendingSummary = this.ocPendingSummary;
     const epoch = this.ocEpoch;
-    if (firstTurn) {
+    // Resume: NÃO re-injeta system+skills (já na sessão). Só first-turn cold.
+    if (firstTurn && !this.ocSessionId) {
       this.ocFirstTurn = false;
       const summary = this.ocPendingSummary ? `\n\n# Previous conversation summary\n${this.ocPendingSummary}` : "";
       this.ocPendingSummary = undefined;
       message = `${buildSystemPromptHeader(this.opts.features)}\n\n# Your role\n${this.info.role}\n\n${this.info.systemPrompt}\n\n# Workspace\n${this.workspaceInfo()}${summary}\n\n---\n\n${content}`;
+    } else if (firstTurn) {
+      // Tinha resumeSessionId mas ocFirstTurn ainda true (legado) — só avança flag.
+      this.ocFirstTurn = false;
     }
 
     // Imagens: grava temp e referencia por path (tool read_file do Grok).
@@ -2785,9 +2829,19 @@ export class AgentRunner {
       this.ocBusy = false;
       this.opts.onError(`grok spawn falhou: ${(e as Error).message}`);
       this.setState("idle");
+      this.drainOcQueue();
       return;
     }
     this.ocActiveProc = proc;
+
+    // Watchdog: se o CLI não sair em GROK_TURN_TIMEOUT_MS, mata e libera
+    // a fila (sintoma real: resume + prompt enorme fica em 0% CPU por horas).
+    const turnKiller = setTimeout(() => {
+      if (!procAlive(proc) || epoch !== this.ocEpoch) return;
+      this.opts.log("warn", `[grok:${this.info.name}] turno excedeu ${GROK_TURN_TIMEOUT_MS / 1000}s — SIGKILL (session=${this.ocSessionId?.slice(0, 8) ?? "nova"})`);
+      try { proc.kill("SIGKILL"); } catch { /* ignore */ }
+    }, GROK_TURN_TIMEOUT_MS);
+    proc.on("close", () => clearTimeout(turnKiller));
 
     // Acumula o turno inteiro e emite UMA vez no final.
     // onAssistantText no orch cria uma mensagem por chamada — flush por
@@ -2922,6 +2976,21 @@ export class AgentRunner {
       // Resume de sessão inexistente / expurgada.
       if (failed && this.ocSessionId && /session not found|couldn't (start|load|resume) session|no such session|404 not found/i.test(combinedErr)) {
         this.opts.onError(`[grok] sessão ${this.ocSessionId} não existe mais — recomeçando sessão nova`);
+        this.ocSessionId = undefined;
+        this.ocFirstTurn = true;
+        this.ocPendingSummary = t.pendingSummary;
+        this.info.sessionId = undefined;
+        if (this.opts.onSessionId) this.opts.onSessionId("");
+        this.ocQueue.unshift({ content: t.content, images: t.images });
+        return;
+      }
+
+      // Timeout / kill sem output em resume: descarta sessão e tenta 1x cold.
+      // Evita loop infinito de hang no mesmo sessionId.
+      if (failed && this.ocSessionId && !t.emittedAny && (t.code === null || t.code === 137 || t.code === 143 || /SIGKILL|SIGTERM|timed? ?out/i.test(combinedErr))) {
+        this.opts.onError(
+          `[grok] turno abortado sem output (code=${t.code ?? "?"}) — limpando sessão ${this.ocSessionId.slice(0, 8)}… e recomeçando`,
+        );
         this.ocSessionId = undefined;
         this.ocFirstTurn = true;
         this.ocPendingSummary = t.pendingSummary;

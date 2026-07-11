@@ -15,7 +15,7 @@ import { BridgeRelay } from "./bridge-relay.js";
 import { defaultDaemonConfigPath, formatCliStatus, loadDaemonCliConfig, mergeCliConfig, resolveCliCommands, type DaemonCliConfig, type ResolvedCliCommands } from "./cli-config.js";
 import type { FromDaemon, FromOrch } from "./protocol.js";
 import { runSummarizer } from "./summarizer-runner.js";
-import { decryptForProject, encryptForProject, forgetAllProjectKeys, getDaemonPublicKey, isE2eEncrypted, rememberProjectKey } from "./daemon-crypto.js";
+import { decryptForProject, encryptForProject, forgetAllProjectKeys, getDaemonPublicKey, hasProjectKey, isE2eEncrypted, rememberProjectKey } from "./daemon-crypto.js";
 import { dispatchWebhook } from "./webhook-dispatch.js";
 
 const VERSION = "0.1.0";
@@ -149,6 +149,11 @@ class DaemonClient {
   private cliCommands: ResolvedCliCommands;
   // Workspace é per-request (cada msg do server traz workspaceRoot do
   // projeto ATIVO). Sem state global pra evitar last-write-wins.
+  /** Spawns adiados esperando project key E2EE (race: spawn chega antes do wrap). */
+  private pendingSpawns = new Map<string, FromOrch[]>(); // projectId → agent:spawn msgs
+  /** agentIds que já esperaram SPAWN_KEY_WAIT_MS — evita loop infinito de adiar. */
+  private spawnKeyWaited = new Set<string>();
+  private static readonly SPAWN_KEY_WAIT_MS = 8_000;
 
   constructor(args: Args, cliCommands: ResolvedCliCommands) {
     this.args = args;
@@ -408,13 +413,70 @@ class DaemonClient {
           resolvedCwd = msg.basePath;
         }
         // E2EE: decrypt agent.systemPrompt before passing to the host so
-        // the CLI receives plaintext. If no project key is held the value
-        // pass-throughs untouched (legacy / not-yet-encrypted projects).
+        // the CLI receives plaintext. Legacy plain pass-through.
         const spec: import("./protocol.js").AgentSpawn = { ...msg, orchUrl: this.orchUrl };
         if (msg.projectId && isE2eEncrypted(spec.agent.systemPrompt)) {
-          const dec = decryptForProject(spec.agent.systemPrompt, msg.projectId);
-          if (dec !== null) spec.agent = { ...spec.agent, systemPrompt: dec };
-          else log("warn", `agent ${spec.agent.id} systemPrompt is encrypted but project key not held — spawn will fail`);
+          // Server pode ter appendado skills DEPOIS do blob e2e: (plaintext tail).
+          // Separa antes do decrypt — o base64 decoder ignora o tail, e sem
+          // isso as skills somem no path de sucesso.
+          const rawSpFull = spec.agent.systemPrompt;
+          const skillsMark = "\n\n---\n\n## Available skills";
+          const skillsIdxFull = typeof rawSpFull === "string" ? rawSpFull.indexOf(skillsMark) : -1;
+          const e2eOnly = skillsIdxFull >= 0 ? rawSpFull.slice(0, skillsIdxFull) : rawSpFull;
+          const skillsTailFromServer = skillsIdxFull >= 0 ? rawSpFull.slice(skillsIdxFull) : "";
+          const dec = decryptForProject(e2eOnly, msg.projectId);
+          if (dec !== null) {
+            this.spawnKeyWaited.delete(spec.agent.id);
+            spec.agent = { ...spec.agent, systemPrompt: dec + skillsTailFromServer };
+          } else if (!hasProjectKey(msg.projectId) && !this.spawnKeyWaited.has(spec.agent.id)) {
+            // Race: agent:spawn chega ANTES de project_key:for_daemon.
+            const pid = msg.projectId;
+            const list = this.pendingSpawns.get(pid) ?? [];
+            if (!list.some((m) => (m as { agent?: { id?: string } }).agent?.id === spec.agent.id)) {
+              list.push(msg);
+              this.pendingSpawns.set(pid, list);
+            }
+            this.spawnKeyWaited.add(spec.agent.id);
+            log("info", `agent ${spec.agent.id} aguardando project key E2EE de ${pid} (spawn adiado ${DaemonClient.SPAWN_KEY_WAIT_MS}ms)`);
+            setTimeout(() => {
+              const still = this.pendingSpawns.get(pid);
+              if (!still?.length) return;
+              const left = still.filter((m) => (m as { agent?: { id?: string } }).agent?.id !== spec.agent.id);
+              if (left.length) this.pendingSpawns.set(pid, left);
+              else this.pendingSpawns.delete(pid);
+              void this.handleInner(msg);
+            }, DaemonClient.SPAWN_KEY_WAIT_MS);
+            return;
+          } else {
+            // Sem key após espera, OU key presente mas ciphertext de outra rotação.
+            // NÃO passa e2e: pro CLI (hang). Fallback role-only — agente sobe.
+            // CRÍTICO: limpa sessionId. Sessões antigas podem ter sido
+            // envenenadas com o blob e2e: literal no histórico (bug pré-fix),
+            // e --resume re-trava o runner (0% CPU por horas). Cold start
+            // com role-only é recuperável; resume da sessão podre não.
+            this.spawnKeyWaited.delete(spec.agent.id);
+            const why = hasProjectKey(msg.projectId)
+              ? "ciphertext não bate com a key atual (rotação?)"
+              : "project key não chegou ao daemon a tempo";
+            // Cipher não decripta; tail de skills (se o server appendou) sobrevive.
+            log("error", `agent ${spec.agent.id}: systemPrompt E2EE falhou (${why}) — spawn com role-only + sem resume${skillsTailFromServer ? " + skills plaintext" : ""}; re-salve o system prompt no browser`);
+            this.send({
+              type: "agent:error",
+              agentId: spec.agent.id,
+              message: `systemPrompt E2EE não decripta (${why}). Agente sobe com role-only (sessão limpa) — abra o projeto no browser e re-salve o system prompt do agente.`,
+            });
+            // Notifica orch pra zerar session_id no DB (evita re-resume no próximo auto-spawn).
+            this.send({ type: "agent:session", agentId: spec.agent.id, sessionId: "" });
+            spec.agent = {
+              ...spec.agent,
+              sessionId: undefined,
+              systemPrompt:
+                `[E2EE] system prompt could not be decrypted (${why}). ` +
+                `Re-save this agent's system prompt in the UI to re-encrypt with the current project key.\n\n` +
+                `# Role\n${spec.agent.role || "agent"}` +
+                skillsTailFromServer,
+            };
+          }
         }
         // Global project memory — decrypt each cipher entry and append a
         // "## Project Memory" block to the (already decrypted) system
@@ -521,10 +583,22 @@ class DaemonClient {
       case "summarize:request":
         await this.handleSummarize(msg);
         return;
-      case "project_key:for_daemon":
-        rememberProjectKey(msg.projectId, msg.wrappedProjectKey);
+      case "project_key:for_daemon": {
+        const ok = rememberProjectKey(msg.projectId, msg.wrappedProjectKey);
+        if (!ok) {
+          log("warn", `E2EE project key wrap rejeitado para ${msg.projectId} (RSA unwrap falhou)`);
+          return;
+        }
         log("info", `received E2EE project key for ${msg.projectId}`);
+        // Flush spawns que esperavam a key.
+        const pending = this.pendingSpawns.get(msg.projectId);
+        if (pending?.length) {
+          this.pendingSpawns.delete(msg.projectId);
+          log("info", `retomando ${pending.length} spawn(s) adiado(s) de ${msg.projectId}`);
+          for (const m of pending) void this.handleInner(m);
+        }
         return;
+      }
       case "webhook:dispatch": {
         await this.handleWebhookDispatch(msg);
         return;

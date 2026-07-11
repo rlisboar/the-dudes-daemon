@@ -123,16 +123,19 @@ export function decryptWithDaemonKey(wrappedB64: string): Buffer {
 
 const projectKeys = new Map<string, Buffer>(); // projectId → 32-byte raw key
 
-export function rememberProjectKey(projectId: string, wrappedB64: string): void {
+/** @returns true se a key foi unwrapada e cacheada com sucesso. */
+export function rememberProjectKey(projectId: string, wrappedB64: string): boolean {
   try {
     const raw = decryptWithDaemonKey(wrappedB64);
     if (raw.length !== 32) {
       console.warn(`[the-dudes] unexpected project key length ${raw.length} for ${projectId}`);
-      return;
+      return false;
     }
     projectKeys.set(projectId, raw);
+    return true;
   } catch (e) {
     console.warn(`[the-dudes] failed to unwrap project key for ${projectId}:`, (e as Error).message);
+    return false;
   }
 }
 
@@ -235,9 +238,19 @@ export function decryptForProject(stored: string, projectId: string): string | n
     decipher.setAuthTag(tag);
     return Buffer.concat([decipher.update(ct), decipher.final()]).toString("utf8");
   } catch (e) {
+    // AES-GCM auth fail = ESTE blob não bate com a key em memória.
+    // Causa comum: system prompt/memory cifrado com key antiga (rotação)
+    // enquanto a key atual é válida para o resto do projeto. NÃO apagar a
+    // project key — um único blob stale mataria decrypt de TODOS os
+    // agentes/mensagens do projeto. A key só se atualiza via
+    // project_key:for_daemon (rememberProjectKey).
     console.warn(`[the-dudes] decrypt failed for ${projectId}:`, (e as Error).message);
     return null;
   }
+}
+
+export function hasProjectKey(projectId: string): boolean {
+  return projectKeys.has(projectId);
 }
 
 export function isE2eEncrypted(value: string | null | undefined): boolean {

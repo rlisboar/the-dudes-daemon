@@ -8,7 +8,7 @@ import { randomBytes, publicEncrypt, createPublicKey, constants } from "node:cry
 // módulo) — não polui ~/.the-dudes nem o CI.
 process.env.THE_DUDES_DAEMON_KEY_PATH = path.join(os.tmpdir(), `td-test-key-${process.pid}-${Date.now()}.pem`);
 const {
-  getDaemonPublicKey, rememberProjectKey, getProjectKey, forgetProjectKey,
+  getDaemonPublicKey, rememberProjectKey, getProjectKey, forgetProjectKey, hasProjectKey,
   encryptForProject, decryptForProject, isE2eEncrypted,
   rememberCredentialPlaintext, redactCredentials, redactCredentialsDeep,
 } = await import("../daemon-crypto.js");
@@ -63,6 +63,10 @@ test("decryptForProject: ciphertext adulterado falha (tag GCM) → null", () => 
   const mid = Math.floor(body.length / 2);
   const flipped = "e2e:" + body.slice(0, mid) + (body[mid] === "A" ? "B" : "A") + body.slice(mid + 1);
   assert.equal(decryptForProject(flipped, "proj-tamper"), null);
+  // Key DEVE sobreviver a um blob stale — senão um system prompt antigo
+  // derruba decrypt de todos os runners do projeto.
+  assert.ok(hasProjectKey("proj-tamper"), "key não deve ser apagada em decrypt fail");
+  assert.equal(decryptForProject(ct, "proj-tamper"), "original");
   forgetProjectKey("proj-tamper");
 });
 
