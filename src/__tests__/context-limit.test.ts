@@ -63,7 +63,7 @@ test("prefixo de provider do opencode cai pro model puro quando não há chave e
   assert.equal(contextLimitFor("anthropic/claude-haiku-4-5"), 200_000);
   assert.equal(contextLimitFor("google/gemini-2.5-pro"), 1_000_000);
   // chave exata com prefixo vence o fallback
-  assert.equal(contextLimitFor("zai-coding-plan/glm-5.1"), 128_000);
+  assert.equal(contextLimitFor("zai-coding-plan/glm-5.1"), 200_000);
   assert.equal(contextLimitFor("deepseek/deepseek-chat"), 128_000);
 });
 
@@ -76,21 +76,29 @@ test("gerações pré-4-5 reportadas por CLIs antigos ficam em 200k", () => {
 
 test("sufixo legado :<effort> é removido antes do lookup", () => {
   assert.equal(contextLimitFor("sonnet:high"), 1_000_000);
-  assert.equal(contextLimitFor("zai-coding-plan/glm-5.1:xhigh"), 128_000);
+  assert.equal(contextLimitFor("zai-coding-plan/glm-5.1:xhigh"), 200_000);
   assert.equal(contextLimitFor("deepseek/deepseek-v4-pro:max"), 200_000);
 });
 
-test("modelos ativos fora do mapa antigo: glm-5.2 = 128k, gemini-3 GA = 1M", () => {
-  // rodada 5 #3: glm-5.2 caía no piso de 200k > janela real de 128k —
-  // warning/full ficavam inalcançáveis antes do hard cap do provider.
-  assert.equal(contextLimitFor("zai-coding-plan/glm-5.2"), 128_000);
-  assert.equal(contextLimitFor("zai-coding-plan/glm-5.2:high"), 128_000);
-  assert.equal(contextLimitFor("glm-5.2"), 128_000);
-  assert.equal(contextLimitFor("outro-provider/glm-5.2"), 128_000);
+test("modelos ativos fora do mapa antigo: glm-5.2 = 1M, gemini-3 GA = 1M", () => {
+  // glm-5.2 lançou com 128k e depois ganhou 1M (models.dev/catálogo do
+  // opencode) — o mapa acompanha; a fonte primária em runtime é o serve.
+  assert.equal(contextLimitFor("zai-coding-plan/glm-5.2"), 1_000_000);
+  assert.equal(contextLimitFor("zai-coding-plan/glm-5.2:high"), 1_000_000);
+  assert.equal(contextLimitFor("glm-5.2"), 1_000_000);
+  assert.equal(contextLimitFor("outro-provider/glm-5.2"), 1_000_000);
   // rodada 5 #9: variantes GA da geração 3 caíam no piso (200k numa janela 1M).
   assert.equal(contextLimitFor("gemini-3-pro"), 1_000_000);
   assert.equal(contextLimitFor("gemini-3-pro-preview"), 1_000_000);
   assert.equal(contextLimitFor("gemini-3-flash"), 1_000_000);
+});
+
+test("GLM via fireworks (modelID com barras internas) resolve pós-provider", () => {
+  // "fireworks-ai/accounts/fireworks/routers/glm-5p2-fast": o fallback corta
+  // no PRIMEIRO "/" e o resto é a chave exata do catálogo fireworks.
+  assert.equal(contextLimitFor("fireworks-ai/accounts/fireworks/routers/glm-5p2-fast"), 1_048_575);
+  assert.equal(contextLimitFor("fireworks-ai/accounts/fireworks/models/glm-5p2"), 1_048_575);
+  assert.equal(contextLimitFor("fireworks-ai/accounts/fireworks/routers/glm-5p2-fast:high"), 1_048_575);
 });
 
 test("[1m] com prefixo de provider resolve pra 1M direto", () => {

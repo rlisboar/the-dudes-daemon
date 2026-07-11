@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import http from "node:http";
-import { writeFileSync, readFileSync, readdirSync, realpathSync, mkdirSync, chmodSync, mkdtempSync, rmSync, existsSync } from "node:fs";
+import { writeFileSync, readFileSync, readdirSync, realpathSync, mkdirSync, chmodSync, mkdtempSync, rmSync, existsSync, statSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import type { AgentInfo, AgentRuntimeState, AgentUsage, CliRunner, ImageAttachment } from "./types.js";
@@ -52,16 +52,20 @@ export const MODEL_CONTEXT_LIMITS: Record<string, number> = {
   "gpt-5": 400_000,
   "o4-mini": 200_000, "o3": 200_000,
   "gpt-4.1": 1_000_000,
-  // OpenCode / ZAI
-  "zai-coding-plan/glm-4.7": 128_000,
-  "zai-coding-plan/glm-4.5-air": 128_000,
-  "zai-coding-plan/glm-5-turbo": 128_000,
-  "zai-coding-plan/glm-5.1": 128_000,
-  // glm-5.2 é o modelo ATIVO do plano — sem a chave, o piso de 200k fica acima
-  // da janela real de 128k e a compaction proativa nunca dispara. A chave sem
-  // prefixo cobre outros providers via fallback pós-"/".
-  "zai-coding-plan/glm-5.2": 128_000,
-  "glm-5.2": 128_000,
+  // OpenCode / ZAI — janelas conforme models.dev (catálogo que o opencode
+  // usa), snapshot 2026-07. Isto é FALLBACK: o runner opencode busca a janela
+  // real do serve (/config/providers) em runtime — mapa estático envelhece
+  // (glm-5.2 lançou com 128k e depois ganhou 1M; fireworks nem existia aqui).
+  "zai-coding-plan/glm-4.7": 204_800,
+  "zai-coding-plan/glm-4.5-air": 131_072,
+  "zai-coding-plan/glm-5-turbo": 200_000,
+  "zai-coding-plan/glm-5.1": 200_000,
+  // A chave sem prefixo cobre outros providers via fallback pós-"/".
+  "zai-coding-plan/glm-5.2": 1_000_000,
+  "glm-5.2": 1_000_000,
+  // Fireworks (GLM via router) — modelID completo vem depois de "fireworks-ai/".
+  "accounts/fireworks/routers/glm-5p2-fast": 1_048_575,
+  "accounts/fireworks/models/glm-5p2": 1_048_575,
   // OpenCode / DeepSeek. deepseek-chat é alias do chat model corrente —
   // 128k é o piso histórico da linha (conservador).
   "deepseek/deepseek-v4-pro": 200_000,
@@ -163,6 +167,39 @@ export function normalizeGrokCwd(cwd: string): string {
     return realpathSync(resolved);
   } catch {
     return resolved;
+  }
+}
+
+/** Tool call registrada no chat_history.jsonl de uma sessão Grok. */
+export interface GrokChatToolCall { id: string; name: string; input: unknown }
+
+/**
+ * Extrai tool_calls de UMA linha do chat_history.jsonl do Grok. O CLI não
+ * emite eventos de tool no streaming-json; o histórico é a única fonte:
+ * `{type:"assistant", tool_calls:[{id, name, arguments:"<json-string>"}]}`.
+ * `arguments` vem como string JSON (parse best-effort; se inválido, embrulha
+ * em {raw}). Linha que não é assistant/tool_calls → [].
+ */
+export function parseGrokChatToolCalls(line: string): GrokChatToolCall[] {
+  if (!line.includes('"tool_calls"')) return [];
+  try {
+    const e = JSON.parse(line) as { type?: string; tool_calls?: { id?: string; name?: string; arguments?: unknown }[] };
+    if (e.type !== "assistant" || !Array.isArray(e.tool_calls)) return [];
+    const out: GrokChatToolCall[] = [];
+    for (const c of e.tool_calls) {
+      const id = typeof c?.id === "string" ? c.id : "";
+      if (!id) continue;
+      let input: unknown = {};
+      if (typeof c.arguments === "string") {
+        try { input = JSON.parse(c.arguments); } catch { input = { raw: c.arguments }; }
+      } else if (c.arguments && typeof c.arguments === "object") {
+        input = c.arguments;
+      }
+      out.push({ id, name: typeof c.name === "string" ? c.name : "", input });
+    }
+    return out;
+  } catch {
+    return [];
   }
 }
 
@@ -769,6 +806,10 @@ export class AgentRunner {
     // "[1m]" no config é opt-in explícito do usuário pela janela de 1M —
     // vence o resolvedModel, que reporta o ID resolvido SEM o marcador.
     if (configured.endsWith("[1m]")) return 1_000_000;
+    // opencode: janela do catálogo do serve (/config/providers) — é a que o
+    // próprio CLI aplica; vence o mapa estático, que envelhece (glm-5.2
+    // 128k→1M; "fireworks-ai/accounts/.../glm-5p2-fast" nem tinha chave).
+    if (this.ocCatalogLimit && this.ocCatalogLimit > 0) return this.ocCatalogLimit;
     // resolvedModel (init do CLI) corrige alias resolvido por CLI antigo ou
     // default da conta — mas só quando o ID reportado é CONHECIDO: um ID novo
     // fora do mapa não pode rebaixar pro piso um config que resolve pra 1M.
@@ -989,6 +1030,53 @@ export class AgentRunner {
       }
     } catch { /* best-effort */ }
     return null;
+  }
+
+  /** Resolve o chat_history.jsonl da sessão (mesma cadeia de candidatos
+   *  do signals.json + fallback de scan por sessionId). */
+  private grokChatHistoryPath(sessionId: string): string | null {
+    for (const sigPath of this.grokSignalsCandidates(sessionId)) {
+      const p = path.join(path.dirname(sigPath), "chat_history.jsonl");
+      if (existsSync(p)) return p;
+    }
+    try {
+      const sessionsRoot = path.join(this.grokUserHome(), "sessions");
+      if (existsSync(sessionsRoot)) {
+        for (const enc of readdirSync(sessionsRoot)) {
+          const p = path.join(sessionsRoot, enc, sessionId, "chat_history.jsonl");
+          if (existsSync(p)) return p;
+        }
+      }
+    } catch { /* best-effort */ }
+    return null;
+  }
+
+  /** Tool calls do grok: o streaming-json do CLI (0.2.x) NÃO emite eventos
+   *  de tool no stdout (só thought/text/end) — a aba RUNS ficava vazia. A
+   *  fonte real é o chat_history.jsonl da sessão (parse em
+   *  parseGrokChatToolCalls). Dedupe por id de tool_call; `emit=false` só
+   *  marca como vista (prime de resume — sem isso, retomar sessão antiga
+   *  despejava o histórico inteiro de tools na aba RUNS). Releitura completa
+   *  é aceita: o guard de tamanho evita reparse quando o arquivo não cresceu. */
+  private grokSeenToolCallIds = new Set<string>();
+  private grokToolsPrimed = false;
+  private grokChatSweepState: { path: string; size: number } | null = null;
+  private grokSweepToolCalls(sessionId: string, emit: boolean): void {
+    const p = this.grokChatHistoryPath(sessionId);
+    if (!p) return;
+    let size: number;
+    try { size = statSync(p).size; } catch { return; }
+    if (this.grokChatSweepState?.path === p && this.grokChatSweepState.size === size) return;
+    let text: string;
+    try { text = readFileSync(p, "utf8"); } catch { return; }
+    this.grokChatSweepState = { path: p, size };
+    for (const line of text.split("\n")) {
+      for (const call of parseGrokChatToolCalls(line)) {
+        if (this.grokSeenToolCallIds.has(call.id)) continue;
+        this.grokSeenToolCallIds.add(call.id);
+        if (emit) this.opts.onToolUse(call.name, call.input);
+      }
+    }
   }
 
   /** Max `totalTokens` visto no updates.jsonl da sessão (às vezes > signals). */
@@ -1276,14 +1364,23 @@ export class AgentRunner {
     // BUG histórico: faltava `environment` → o mcp-bridge spawnado pelo serve
     // não recebia THE_DUDES_AGENT_TOKEN_FILE → mandava Bearer vazio →
     // /api/bridge 401 (as tools the-dudes nunca funcionaram no opencode).
+    //
+    // BUG histórico 2 (identidade trocada): opencode.json fica no
+    // workspaceRoot, que é COMPARTILHADO entre agentes — valores literais por
+    // agente aqui = last-writer-wins: todos os serves conectavam a bridge com
+    // a identidade do ÚLTIMO agente spawnado (send_message atribuído ao agente
+    // errado, replies dropados pelo self-message guard, beams saindo do robô
+    // errado). Mesmo padrão do crush: o arquivo é IDÊNTICO entre agentes —
+    // placeholders {env:VAR} resolvidos do env do PROCESSO serve (buildEnv
+    // injeta os valores por agente no spawn).
     const tdEnv: Record<string, string> = {
-      THE_DUDES_AGENT_ID: this.info.id,
-      THE_DUDES_AGENT_NAME: this.info.name,
-      THE_DUDES_ORCH_URL: this.opts.orchestratorUrl,
-      THE_DUDES_AGENT_TOKEN_FILE: this.writeAgentTokenFile(),
-      ...this.featuresEnv(),
+      THE_DUDES_AGENT_ID: "{env:THE_DUDES_AGENT_ID}",
+      THE_DUDES_AGENT_NAME: "{env:THE_DUDES_AGENT_NAME}",
+      THE_DUDES_ORCH_URL: "{env:THE_DUDES_ORCH_URL}",
+      THE_DUDES_AGENT_TOKEN_FILE: "{env:THE_DUDES_AGENT_TOKEN_FILE}",
+      THE_DUDES_FEATURES: "{env:THE_DUDES_FEATURES}",
     };
-    if (this.opts.bridgeSocketPath) tdEnv.THE_DUDES_BRIDGE_SOCKET = this.opts.bridgeSocketPath;
+    if (this.opts.bridgeSocketPath) tdEnv.THE_DUDES_BRIDGE_SOCKET = "{env:THE_DUDES_BRIDGE_SOCKET}";
     mcp["the-dudes"] = {
       type: "local",
       enabled: true,
@@ -1298,10 +1395,15 @@ export class AgentRunner {
       // MCP the-dudes, que são seguras) ficam no default (allow). Os "ask" são
       // resolvidos pelo daemon via evento SSE → política do orquestrador (mesma
       // UI do claude). Sem isto o opencode rodava com default=allow, ignorando
-      // o toggle.
-      permission: this.opts.autoApprove
-        ? "allow"
-        : { edit: "ask", bash: "ask", webfetch: "ask", external_directory: "ask" },
+      // o toggle. Placeholder {env:} pelo mesmo motivo da identidade acima
+      // (autoApprove pode divergir entre agentes do mesmo workspace); com
+      // "allow" nas 4 chaves o resto já é allow por default ("*": allow).
+      permission: {
+        edit: "{env:THE_DUDES_OC_PERMISSION}",
+        bash: "{env:THE_DUDES_OC_PERMISSION}",
+        webfetch: "{env:THE_DUDES_OC_PERMISSION}",
+        external_directory: "{env:THE_DUDES_OC_PERMISSION}",
+      },
     };
     // NÃO escrever bloco `provider.*` aqui: qualquer override de provider no
     // opencode.json (mesmo `options:{}` vazio) corrompe o zai-coding-plan
@@ -1422,6 +1524,19 @@ export class AgentRunner {
     if (this.opts.bridgeSocketPath) env.THE_DUDES_BRIDGE_SOCKET = this.opts.bridgeSocketPath;
     if (this.opts.cliRunner === "claude") {
       env.CLAUDE_CONFIG_DIR = this.resolveClaudeConfigDir();
+    }
+    if (this.opts.cliRunner === "opencode") {
+      // opencode.json é compartilhado no workspace e usa placeholders {env:} —
+      // os valores por agente entram AQUI, no env do processo serve/run.
+      // TOKEN_FILE é o PATH (0600, dir aleatório), não o token em si.
+      env.THE_DUDES_AGENT_TOKEN_FILE = this.writeAgentTokenFile();
+      // No bridge, THE_DUDES_FEATURES AUSENTE = registra tudo e "" = nada.
+      // O placeholder {env:} sempre resolve (var setada aqui), então o caso
+      // "features indefinidas" vira a lista completa explícita — mesma
+      // semântica do ausente.
+      env.THE_DUDES_FEATURES = this.featuresEnv().THE_DUDES_FEATURES
+        ?? "teammates,tasks,filelock,memory,goals,credentials,webhooks";
+      env.THE_DUDES_OC_PERMISSION = this.opts.autoApprove ? "allow" : "ask";
     }
     return env;
   }
@@ -1765,6 +1880,39 @@ export class AgentRunner {
     return { providerID, modelID };
   }
 
+  /** Janela de contexto do catálogo do opencode serve (/config/providers):
+   *  coleta automática — é a janela que o próprio CLI aplica, cobre qualquer
+   *  provider/modelo (inclusive novos) sem depender do mapa estático, que
+   *  envelhece. Uma busca por vida do runner (o model do agente não muda). */
+  private ocCatalogLimit?: number;
+  private ocCatalogLimitFetch?: Promise<void>;
+  private fetchOcCatalogLimit(): Promise<void> {
+    if (this.ocCatalogLimit !== undefined) return Promise.resolve();
+    if (this.ocCatalogLimitFetch) return this.ocCatalogLimitFetch;
+    this.ocCatalogLimitFetch = (async () => {
+      try {
+        const { providerID, modelID } = this.ocModelParts();
+        if (!modelID) return;
+        const cfg = await this.ocServeFetch("/config/providers", "GET");
+        const provs = Array.isArray(cfg?.providers) ? cfg.providers : [];
+        for (const p of provs) {
+          if (providerID && p?.id !== providerID) continue;
+          const ctx = Number(p?.models?.[modelID]?.limit?.context ?? 0);
+          if (Number.isFinite(ctx) && ctx > 0) {
+            this.ocCatalogLimit = Math.floor(ctx);
+            this.opts.log("info", `[opencode:${this.info.name}] janela do catálogo: ${this.ocCatalogLimit} (${providerID || "?"}/${modelID})`);
+            // UI: re-emite a ocupação com o denominador certo já — sem isto,
+            // a barra só corrigiria o teto no próximo turno.
+            this.opts.onContextUsage?.(this.lastInputTokens, this.contextLimit());
+            return;
+          }
+        }
+      } catch { /* best-effort — mapa estático cobre o fallback */ }
+      finally { this.ocCatalogLimitFetch = undefined; }
+    })();
+    return this.ocCatalogLimitFetch;
+  }
+
   /** Semântica do usage do opencode segue o PROVIDER, não a forma do delta:
    *  Anthropic reporta `input` EXCLUINDO cache (total = soma das parcelas);
    *  os demais (deepseek/zai/openai/google) incluem o cache lido no input.
@@ -1800,6 +1948,8 @@ export class AgentRunner {
 
   private async runOpenCodeMessageAttached(content: string, images?: ImageAttachment[], retry = 0) {
     if (this.stopped || !this.ocServerUrl) return;
+    // Coleta a janela real do catálogo em paralelo ao turno (idempotente).
+    void this.fetchOcCatalogLimit();
     // first-turn wrapping pode ser re-aplicado no retry (capturado aqui).
     const wasFirstTurn = this.ocFirstTurn;
     this.ocRunSawOutput = false;
@@ -2810,6 +2960,13 @@ export class AgentRunner {
       }
     }
 
+    // Prime do dedupe de tool_calls: em resume de sessão com histórico,
+    // marca as tools de turnos antigos como vistas SEM emitir.
+    if (!this.grokToolsPrimed) {
+      this.grokToolsPrimed = true;
+      if (this.ocSessionId) this.grokSweepToolCalls(this.ocSessionId, false);
+    }
+
     const args = this.buildGrokHeadlessArgs(message, {
       resume: this.ocSessionId,
       outputFormat: "streaming-json",
@@ -2842,6 +2999,14 @@ export class AgentRunner {
       try { proc.kill("SIGKILL"); } catch { /* ignore */ }
     }, GROK_TURN_TIMEOUT_MS);
     proc.on("close", () => clearTimeout(turnKiller));
+
+    // Tool calls ao vivo durante o turno (só possível em resume, quando o
+    // sessionId já é conhecido; turno cold emite tudo no sweep final).
+    const toolPoll = setInterval(() => {
+      if (this.stopped || epoch !== this.ocEpoch) return;
+      if (this.ocSessionId) this.grokSweepToolCalls(this.ocSessionId, true);
+    }, 3000);
+    proc.on("close", () => clearInterval(toolPoll));
 
     // Acumula o turno inteiro e emite UMA vez no final.
     // onAssistantText no orch cria uma mensagem por chamada — flush por
@@ -3034,6 +3199,10 @@ export class AgentRunner {
       } else if (sid && !this.info.sessionId && this.opts.onSessionId) {
         this.opts.onSessionId(sid);
       }
+
+      // Tool calls do turno: streaming-json não as emite no stdout — a fonte
+      // é o chat_history.jsonl (turno cold só ganha sessionId aqui no end).
+      if (sid) this.grokSweepToolCalls(sid, true);
 
       // Ocupação real da janela: signals.json / updates.jsonl (igual /context).
       // NÃO re-emitir 0 se a leitura falhar — isso apagava a barra (e em
