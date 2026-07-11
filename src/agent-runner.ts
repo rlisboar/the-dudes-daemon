@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import http from "node:http";
-import { writeFileSync, readFileSync, readdirSync, realpathSync, mkdirSync, chmodSync, mkdtempSync, rmSync, existsSync, statSync } from "node:fs";
+import { writeFileSync, readFileSync, readdirSync, realpathSync, mkdirSync, chmodSync, mkdtempSync, rmSync, existsSync, statSync, openSync, readSync, closeSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import type { AgentInfo, AgentRuntimeState, AgentUsage, CliRunner, ImageAttachment } from "./types.js";
@@ -829,6 +829,12 @@ export class AgentRunner {
     this.gemStatsBase = { input: 0, output: 0, cached: 0 };
     // crush: sessão nova = meta cumulativo novo começa do zero.
     this.crushStatsBase = { prompt: 0, completion: 0 };
+    // grok: sessão descartada → ids de tool_call antigos nunca mais colidem;
+    // sem a poda o Set crescia sem teto pela vida do daemon. Sessão nova não
+    // tem histórico pra silenciar → primed=true (prime é só pra resume).
+    this.grokSeenToolCallIds.clear();
+    this.grokChatSweepState = null;
+    this.grokToolsPrimed = true;
     this.resetContextAccounting();
     this.ocPendingSummary = summary;
   }
@@ -1056,21 +1062,47 @@ export class AgentRunner {
    *  fonte real é o chat_history.jsonl da sessão (parse em
    *  parseGrokChatToolCalls). Dedupe por id de tool_call; `emit=false` só
    *  marca como vista (prime de resume — sem isso, retomar sessão antiga
-   *  despejava o histórico inteiro de tools na aba RUNS). Releitura completa
-   *  é aceita: o guard de tamanho evita reparse quando o arquivo não cresceu. */
+   *  despejava o histórico inteiro de tools na aba RUNS).
+   *  Leitura INCREMENTAL: JSONL é append-only — lê só os bytes novos a
+   *  partir do offset consumido (reler o arquivo inteiro a cada tick de 3s
+   *  era O(N²) em sessão com histórico grande). Linha parcial no fim (flush
+   *  do CLI no meio da linha) fica pro próximo sweep, a menos que já seja
+   *  JSON completo (última linha do arquivo costuma não ter \n final). */
   private grokSeenToolCallIds = new Set<string>();
   private grokToolsPrimed = false;
-  private grokChatSweepState: { path: string; size: number } | null = null;
+  private grokChatSweepState: { path: string; offset: number } | null = null;
   private grokSweepToolCalls(sessionId: string, emit: boolean): void {
     const p = this.grokChatHistoryPath(sessionId);
     if (!p) return;
     let size: number;
     try { size = statSync(p).size; } catch { return; }
-    if (this.grokChatSweepState?.path === p && this.grokChatSweepState.size === size) return;
-    let text: string;
-    try { text = readFileSync(p, "utf8"); } catch { return; }
-    this.grokChatSweepState = { path: p, size };
-    for (const line of text.split("\n")) {
+    const prev = this.grokChatSweepState?.path === p ? this.grokChatSweepState.offset : 0;
+    // Arquivo encolheu = truncado/reescrito → recomeça do zero (dedupe por id
+    // segura re-emissão do que já foi visto).
+    const start = size >= prev ? prev : 0;
+    if (size <= start) { this.grokChatSweepState = { path: p, offset: start }; return; }
+    let buf: Buffer;
+    try {
+      const fd = openSync(p, "r");
+      try {
+        const want = size - start;
+        buf = Buffer.allocUnsafe(want);
+        const n = readSync(fd, buf, 0, want, start);
+        buf = buf.subarray(0, n);
+      } finally { closeSync(fd); }
+    } catch { return; }
+    // Só linhas completas avançam o offset (offset sempre em fronteira de
+    // linha → nunca corta um code point UTF-8 no início da próxima leitura).
+    const lastNl = buf.lastIndexOf(0x0a);
+    let consumed = lastNl >= 0 ? lastNl + 1 : 0;
+    const lines = consumed > 0 ? buf.subarray(0, consumed).toString("utf8").split("\n") : [];
+    const tail = buf.subarray(consumed).toString("utf8").trim();
+    if (tail) {
+      // Tail sem \n: consome só se já é JSON completo (senão espera o resto).
+      try { JSON.parse(tail); lines.push(tail); consumed = buf.length; } catch { /* parcial */ }
+    }
+    this.grokChatSweepState = { path: p, offset: start + consumed };
+    for (const line of lines) {
       for (const call of parseGrokChatToolCalls(line)) {
         if (this.grokSeenToolCallIds.has(call.id)) continue;
         this.grokSeenToolCallIds.add(call.id);
@@ -1339,8 +1371,33 @@ export class AgentRunner {
     writeFileSync(path.join(dir, "settings.json"), JSON.stringify(config, null, 2), { mode: 0o600 });
   }
 
+  /** Path do config do opencode POR AGENTE (dir privado, fora do workspace).
+   *  Passado ao serve/run via env OPENCODE_CONFIG (suportado no 1.17.x). */
+  private ocConfigPath(): string {
+    return path.join(this.agentTmpDir(), "opencode.json");
+  }
+
   private writeOpenCodeConfig() {
-    const configPath = path.join(this.opts.workspaceRoot, "opencode.json");
+    // Config POR AGENTE em dir privado + OPENCODE_CONFIG no env do serve.
+    // Histórico: já morou no workspaceRoot (COMPARTILHADO entre agentes) —
+    // 1ª versão com identidade literal = last-writer-wins (todos os serves
+    // viravam o último agente); 2ª com placeholders {env:} = quebrava o CLI
+    // manual no workspace, nome de agente com aspas corrompia o JSON (a
+    // substituição é texto cru pré-parse) e o bloco mcp (filtrado pelo
+    // mcpAllowlist POR agente) continuava clobberado. Arquivo por agente
+    // elimina as três classes: valores literais (JSON.stringify escapa),
+    // workspace intocado, mcp allowlist por agente respeitado.
+    const configPath = this.ocConfigPath();
+    // Remove o opencode.json legado que versões anteriores deixaram no
+    // workspace — SÓ se for nosso (marker mcp "the-dudes"); nunca o config
+    // próprio do usuário.
+    try {
+      const legacy = path.join(this.opts.workspaceRoot, "opencode.json");
+      if (existsSync(legacy) && readFileSync(legacy, "utf8").includes('"the-dudes"')) {
+        rmSync(legacy);
+        this.opts.log("info", `[opencode:${this.info.name}] opencode.json legado removido do workspace (config agora é por agente via OPENCODE_CONFIG)`);
+      }
+    } catch { /* best-effort */ }
     // OpenCode usa shape distinto: stdio = {type:"local", command:[cmd, ...args], environment?}.
     // SSE/HTTP servers ainda não suportados pelo OpenCode — descartamos com warning.
     const mcp: Record<string, unknown> = {};
@@ -1364,23 +1421,18 @@ export class AgentRunner {
     // BUG histórico: faltava `environment` → o mcp-bridge spawnado pelo serve
     // não recebia THE_DUDES_AGENT_TOKEN_FILE → mandava Bearer vazio →
     // /api/bridge 401 (as tools the-dudes nunca funcionaram no opencode).
-    //
-    // BUG histórico 2 (identidade trocada): opencode.json fica no
-    // workspaceRoot, que é COMPARTILHADO entre agentes — valores literais por
-    // agente aqui = last-writer-wins: todos os serves conectavam a bridge com
-    // a identidade do ÚLTIMO agente spawnado (send_message atribuído ao agente
-    // errado, replies dropados pelo self-message guard, beams saindo do robô
-    // errado). Mesmo padrão do crush: o arquivo é IDÊNTICO entre agentes —
-    // placeholders {env:VAR} resolvidos do env do PROCESSO serve (buildEnv
-    // injeta os valores por agente no spawn).
+    // Valores LITERAIS por agente: o arquivo agora é por agente (ver
+    // ocConfigPath), então identidade aqui é segura — e JSON.stringify escapa
+    // nome com aspas/backslash. featuresEnv via spread: chave AUSENTE segue
+    // significando "registra tudo (inclusive grupos futuros)" no bridge.
     const tdEnv: Record<string, string> = {
-      THE_DUDES_AGENT_ID: "{env:THE_DUDES_AGENT_ID}",
-      THE_DUDES_AGENT_NAME: "{env:THE_DUDES_AGENT_NAME}",
-      THE_DUDES_ORCH_URL: "{env:THE_DUDES_ORCH_URL}",
-      THE_DUDES_AGENT_TOKEN_FILE: "{env:THE_DUDES_AGENT_TOKEN_FILE}",
-      THE_DUDES_FEATURES: "{env:THE_DUDES_FEATURES}",
+      THE_DUDES_AGENT_ID: this.info.id,
+      THE_DUDES_AGENT_NAME: this.info.name,
+      THE_DUDES_ORCH_URL: this.opts.orchestratorUrl,
+      THE_DUDES_AGENT_TOKEN_FILE: this.writeAgentTokenFile(),
+      ...this.featuresEnv(),
     };
-    if (this.opts.bridgeSocketPath) tdEnv.THE_DUDES_BRIDGE_SOCKET = "{env:THE_DUDES_BRIDGE_SOCKET}";
+    if (this.opts.bridgeSocketPath) tdEnv.THE_DUDES_BRIDGE_SOCKET = this.opts.bridgeSocketPath;
     mcp["the-dudes"] = {
       type: "local",
       enabled: true,
@@ -1395,25 +1447,17 @@ export class AgentRunner {
       // MCP the-dudes, que são seguras) ficam no default (allow). Os "ask" são
       // resolvidos pelo daemon via evento SSE → política do orquestrador (mesma
       // UI do claude). Sem isto o opencode rodava com default=allow, ignorando
-      // o toggle. Placeholder {env:} pelo mesmo motivo da identidade acima
-      // (autoApprove pode divergir entre agentes do mesmo workspace); com
-      // "allow" nas 4 chaves o resto já é allow por default ("*": allow).
-      permission: {
-        edit: "{env:THE_DUDES_OC_PERMISSION}",
-        bash: "{env:THE_DUDES_OC_PERMISSION}",
-        webfetch: "{env:THE_DUDES_OC_PERMISSION}",
-        external_directory: "{env:THE_DUDES_OC_PERMISSION}",
-      },
+      // o toggle.
+      permission: this.opts.autoApprove
+        ? "allow"
+        : { edit: "ask", bash: "ask", webfetch: "ask", external_directory: "ask" },
     };
     // NÃO escrever bloco `provider.*` aqui: qualquer override de provider no
     // opencode.json (mesmo `options:{}` vazio) corrompe o zai-coding-plan
     // (provider some no run → agente mudo). reasoning_effort/thinking não são
     // configuráveis por aqui; o modelo roda no default dele.
     try {
-      // mode 0o600: arquivo fica em workspaceRoot, então pode acabar em git
-      // se .gitignore não cobrir. Mode restrito reduz blast-radius em
-      // multi-user host enquanto não migramos pro tmpdir (precisa --config
-      // flag no opencode CLI).
+      // mode 0o600: contém TOKEN_FILE path e identidade; dir já é 0700.
       writeFileSync(configPath, JSON.stringify(config, null, 2), { mode: 0o600 });
     } catch (e) {
       console.error(`[opencode:${this.info.name}] failed to write opencode.json: ${e}`);
@@ -1526,17 +1570,10 @@ export class AgentRunner {
       env.CLAUDE_CONFIG_DIR = this.resolveClaudeConfigDir();
     }
     if (this.opts.cliRunner === "opencode") {
-      // opencode.json é compartilhado no workspace e usa placeholders {env:} —
-      // os valores por agente entram AQUI, no env do processo serve/run.
-      // TOKEN_FILE é o PATH (0600, dir aleatório), não o token em si.
-      env.THE_DUDES_AGENT_TOKEN_FILE = this.writeAgentTokenFile();
-      // No bridge, THE_DUDES_FEATURES AUSENTE = registra tudo e "" = nada.
-      // O placeholder {env:} sempre resolve (var setada aqui), então o caso
-      // "features indefinidas" vira a lista completa explícita — mesma
-      // semântica do ausente.
-      env.THE_DUDES_FEATURES = this.featuresEnv().THE_DUDES_FEATURES
-        ?? "teammates,tasks,filelock,memory,goals,credentials,webhooks";
-      env.THE_DUDES_OC_PERMISSION = this.opts.autoApprove ? "allow" : "ask";
+      // Config por agente fora do workspace (identidade/permission/mcp
+      // allowlist são por agente — no workspace compartilhado viravam
+      // last-writer-wins). Serve e `opencode run` leem daqui.
+      env.OPENCODE_CONFIG = this.ocConfigPath();
     }
     return env;
   }
@@ -1892,18 +1929,27 @@ export class AgentRunner {
     this.ocCatalogLimitFetch = (async () => {
       try {
         const { providerID, modelID } = this.ocModelParts();
-        if (!modelID) return;
+        // Sem prefixo de provider o POST do turno nem envia `model` (o serve
+        // roda no default DELE) — casar o modelID em provider arbitrário
+        // fixaria a janela de um modelo que não está rodando (ex. glm-5.2 do
+        // fireworks = 1M pro turno que roda no deepseek de 128k). Nesse caso
+        // fica no mapa estático.
+        if (!providerID || !modelID) return;
         const cfg = await this.ocServeFetch("/config/providers", "GET");
         const provs = Array.isArray(cfg?.providers) ? cfg.providers : [];
         for (const p of provs) {
-          if (providerID && p?.id !== providerID) continue;
+          if (p?.id !== providerID) continue;
           const ctx = Number(p?.models?.[modelID]?.limit?.context ?? 0);
           if (Number.isFinite(ctx) && ctx > 0) {
             this.ocCatalogLimit = Math.floor(ctx);
-            this.opts.log("info", `[opencode:${this.info.name}] janela do catálogo: ${this.ocCatalogLimit} (${providerID || "?"}/${modelID})`);
+            this.opts.log("info", `[opencode:${this.info.name}] janela do catálogo: ${this.ocCatalogLimit} (${providerID}/${modelID})`);
             // UI: re-emite a ocupação com o denominador certo já — sem isto,
-            // a barra só corrigiria o teto no próximo turno.
-            this.opts.onContextUsage?.(this.lastInputTokens, this.contextLimit());
+            // a barra só corrigiria o teto no próximo turno. NUNCA re-emitir
+            // 0 (pós-restart lastInputTokens=0 apagaria a barra que o server
+            // ainda tem — mesmo invariante do finishGrokTurn).
+            if (this.lastInputTokens > 0) {
+              this.opts.onContextUsage?.(this.lastInputTokens, this.contextLimit());
+            }
             return;
           }
         }
@@ -3002,8 +3048,14 @@ export class AgentRunner {
 
     // Tool calls ao vivo durante o turno (só possível em resume, quando o
     // sessionId já é conhecido; turno cold emite tudo no sweep final).
+    // Auto-limpa quando o turno morreu: 'close' NÃO é garantido pós-SIGKILL
+    // se um neto herdou os pipes de stdio (mesmo caveat do one-shot) — sem
+    // isto cada turno wedged vazava um interval de 3s pra sempre.
     const toolPoll = setInterval(() => {
-      if (this.stopped || epoch !== this.ocEpoch) return;
+      if (this.stopped || epoch !== this.ocEpoch || !procAlive(proc)) {
+        clearInterval(toolPoll);
+        return;
+      }
       if (this.ocSessionId) this.grokSweepToolCalls(this.ocSessionId, true);
     }, 3000);
     proc.on("close", () => clearInterval(toolPoll));
@@ -3134,6 +3186,13 @@ export class AgentRunner {
   }): Promise<void> {
     try {
       if (t.epoch !== this.ocEpoch) return;
+
+      // Sweep de tool calls ANTES dos branches de falha: turno abortado é
+      // justamente o que precisa de auditoria na RUNS — e os branches de
+      // retry descartam a sessão (sweep só no sucesso perdia o registro das
+      // tools executadas pra sempre).
+      const sweepSid = t.endSessionId ?? this.ocSessionId;
+      if (sweepSid) this.grokSweepToolCalls(sweepSid, true);
 
       const failed = (t.code ?? 1) !== 0 && !t.emittedAny && !t.sawEnd;
       const combinedErr = `${t.errOut}\n${t.errFromJson}`;
