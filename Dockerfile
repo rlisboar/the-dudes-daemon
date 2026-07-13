@@ -8,7 +8,7 @@
 # O daemon em si é baixado do orchestrator no boot (com verificação SHA-256),
 # então a imagem é genérica e sempre pega a versão atual — não precisa
 # rebuildar a cada release do daemon.
-FROM node:20-slim
+FROM node:24-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git ca-certificates curl python3 ripgrep \
