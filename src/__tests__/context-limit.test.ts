@@ -93,6 +93,13 @@ test("modelos ativos fora do mapa antigo: glm-5.2 = 1M, gemini-3 GA = 1M", () =>
   assert.equal(contextLimitFor("gemini-3-flash"), 1_000_000);
 });
 
+test("família GPT-5.6 usa a janela efetiva do Codex CLI", () => {
+  for (const model of ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
+    assert.equal(contextLimitFor(model), 272_000, model);
+  }
+  assert.equal(contextLimitFor("gpt-5.6-sol:max"), 272_000);
+});
+
 test("GLM via fireworks (modelID com barras internas) resolve pós-provider", () => {
   // "fireworks-ai/accounts/fireworks/routers/glm-5p2-fast": o fallback corta
   // no PRIMEIRO "/" e o resto é a chave exata do catálogo fireworks.
