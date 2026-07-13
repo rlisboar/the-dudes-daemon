@@ -18,7 +18,7 @@ function loadAgentToken(): string {
   if (file) {
     try {
       return readFileSync(file, "utf8").trim();
-    } catch (e) {
+    } catch {
       console.error(`[mcp-bridge] failed to read THE_DUDES_AGENT_TOKEN_FILE=${file}: ${(e as Error).message}`);
     }
   }
@@ -460,7 +460,7 @@ server.tool(
     try {
       const r = await postJSON("get_credential", { name });
       return { content: [{ type: "text", text: r.value }] };
-    } catch (e) {
+    } catch {
       return {
         content: [{ type: "text", text: `credential '${name}' not found` }],
         isError: true,

@@ -1,0 +1,20 @@
+{
+  "name": "@the-dudes/protocol",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "browser": "./index.browser.js",
+      "default": "./index.js"
+    }
+  },
+  "scripts": {
+    "lint": "eslint index.js index.browser.js --max-warnings=0",
+    "test": "node --test *.test.js"
+  },
+  "dependencies": {
+    "zod": "^3.23.8"
+  }
+}

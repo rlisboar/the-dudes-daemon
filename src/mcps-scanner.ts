@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 /**
  * MCP server discovery scanner (Phase 1, read-only).
  *

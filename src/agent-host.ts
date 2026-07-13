@@ -9,11 +9,12 @@ import type { ResolvedCliCommands } from "./cli-config.js";
 import type { AgentInfo, ImageAttachment } from "./types.js";
 import type { AgentSpawn, FromDaemon } from "./protocol.js";
 import type { DropTarget } from "./privileges.js";
+import { compatibleSessionId } from "./runners/index.js";
 
 // Works in both CJS bundle (where __dirname is native) and ESM dev (tsx)
 // where we fall back to the process entry script.
 const baseDir: string = (() => {
-  // @ts-ignore — __dirname only exists in CJS
+  // @ts-expect-error — __dirname only exists in the bundled CJS build
   if (typeof __dirname !== "undefined") return __dirname as string;
   const entry = process.argv[1] || ".";
   return path.dirname(path.resolve(entry));
@@ -337,20 +338,7 @@ export class AgentHost {
     // Drop any session id that isn't valid for this runner. claude uses
     // UUIDs, opencode uses `ses_*`, codex uses opaque thread ids — passing
     // a wrong-format id makes the CLI exit immediately.
-    const sid = msg.agent.sessionId;
-    let resumeSessionId: string | undefined;
-    if (sid) {
-      const isOcSession = sid.startsWith("ses_");
-      if (cliRunner === "opencode" && isOcSession) resumeSessionId = sid;
-      else if (cliRunner === "claude" && !isOcSession && /^[0-9a-f-]{36}$/i.test(sid)) resumeSessionId = sid;
-      else if (cliRunner === "codex" && !isOcSession) resumeSessionId = sid;
-      // crush resume exige o UUID da sessão (o id curto de 16 hex não funciona
-      // no --session do run) — id em formato errado faria todo turno falhar.
-      else if (cliRunner === "crush" && /^[0-9a-f-]{36}$/i.test(sid)) resumeSessionId = sid;
-      // grok headless emite sessionId UUID no evento end / JSON final
-      else if (cliRunner === "grok" && /^[0-9a-f-]{36}$/i.test(sid)) resumeSessionId = sid;
-      else if (cliRunner === "gemini") resumeSessionId = sid;
-    }
+    const resumeSessionId = compatibleSessionId(cliRunner, msg.agent.sessionId);
     // Identidade do runner deste spawn. Usada no onExit pra só zerar
     // `e.runner` se ainda for ESTE runner — senão o exit tardio de um
     // runner antigo (troca de runner) zeraria o runner novo.

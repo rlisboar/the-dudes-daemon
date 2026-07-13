@@ -1,11 +1,8 @@
 // Subset of types shared with the server. Keep shapes byte-compatible —
 // these flow over the orchestrator WS as JSON.
 
-export type AgentRuntimeState = "idle" | "thinking" | "speaking" | "sending" | "stopping";
-/** Effort canônico do Claude/Codex + níveis extras do Grok Build
- *  (docs: none, minimal, low, medium, high, xhigh, max). */
-export type EffortLevel = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-export type CliRunner = "claude" | "opencode" | "gemini" | "codex" | "crush" | "grok";
+import type { AgentRuntimeState, CliRunner, EffortLevel } from "@the-dudes/protocol";
+export type { AgentRuntimeState, CliRunner, EffortLevel } from "@the-dudes/protocol";
 
 export interface AgentUsage {
   input: number;

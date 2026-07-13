@@ -3,10 +3,11 @@ initSentry(); // gated em SENTRY_DSN_DAEMON / SENTRY_DSN; no-op sem env
 
 import os from "node:os";
 import { parseArgs } from "node:util";
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { WebSocket } from "ws";
+import { parseWireMessage } from "@the-dudes/protocol";
 import { AgentHost } from "./agent-host.js";
 import { assertWorkspaceScoped, autoWorkspaceCwd, describeGitRoots, ensureWritableDir, expandBasePath, isInsideRoot, validateBasePath, validateGitHash, validateGitRef } from "./workspace.js";
 import { buildGraph, graphPath } from "./graph-indexer.js";
@@ -276,7 +277,7 @@ class DaemonClient {
 
     ws.on("message", (raw: Buffer) => {
       let msg: FromOrch;
-      try { msg = JSON.parse(raw.toString()); } catch { return; }
+      try { msg = parseWireMessage<FromOrch>(raw.toString()); } catch { return; }
       // Tracka maior seq visto pra resume no próximo reconnect. Server
       // injeta seq em cada msg via sendDaemon. Replay duplica msgs com
       // seq <= lastSeen — handle natural cobre (correlationId match

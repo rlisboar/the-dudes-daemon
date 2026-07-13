@@ -1,6 +1,6 @@
-import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import http from "node:http";
-import { writeFileSync, readFileSync, readdirSync, realpathSync, mkdirSync, chmodSync, mkdtempSync, rmSync, existsSync, statSync, openSync, readSync, closeSync } from "node:fs";
+import { writeFileSync, readFileSync, readdirSync, realpathSync, mkdirSync, rmSync, existsSync, statSync, openSync, readSync, closeSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import type { AgentInfo, AgentRuntimeState, AgentUsage, CliRunner, ImageAttachment } from "./types.js";
@@ -9,114 +9,25 @@ import { spawnDropped, type DropTarget } from "./privileges.js";
 import type { ResolvedCliCommands } from "./cli-config.js";
 import { resolvePython3 } from "./cli-config.js";
 import { buildGraph, graphExists, graphPath } from "./graph-indexer.js";
+import { isPerMessageRunner, runnerAdapter } from "./runners/index.js";
+import { claudeOneShotArgs, codexOneShotArgs, crushOneShotArgs, geminiOneShotArgs, grokHeadlessArgs, opencodeOneShotArgs } from "./runners/args.js";
+import { buildBaseRunnerEnv, buildBridgeAwareEnv, buildGeminiEnv, buildGrokEnv } from "./runners/env.js";
+import { extractOneShotText, grokSignalsPath, parseGrokChatToolCalls, parseGrokContextSignals, type GrokContextSignals } from "./runners/parsers.js";
+import { parseCodexTurnEvent, parseCrushSessionMeta, parseGeminiTurnEvent, parseGrokStreamEvent, parseOpenCodeTurnEvent } from "./runners/turn-parsers.js";
+import { buildBridgeEnv, buildClaudeMcpConfig, buildCodexMcpArgs, buildCrushMcpConfig, buildGeminiMcpServers, buildGrokMcpToml, buildOpenCodeMcpConfig } from "./runners/mcp-config.js";
+import { RunnerRuntimeFiles } from "./runners/runtime-files.js";
+import { ContextTracker, CumulativeUsageTracker, type UsageSemantics } from "./runners/context-tracker.js";
+import { armHardTimeout, collectProcessOutput, killProcess, processAlive as procAlive, terminateAndWait, terminateWithEscalation } from "./runners/process-lifecycle.js";
+import { OpenCodeTransport } from "./runners/opencode-transport.js";
+import { PerMessageSessionState } from "./runners/message-session.js";
+import { buildAgentContext, buildInitialMessage, buildSystemPromptHeader, buildWorkspacePrompt } from "./runners/prompts.js";
+import { claudeThinkingEffort, codexEffort, providerModelParts, resolveContextLimit } from "./runners/model-policy.js";
+import { classifyRunnerFailure, isAbortedFailure, isApiErrorMessage, isAuthenticationFailure, isLoopStopMessage, isMissingSessionFailure as isMissingSessionMessage } from "./runners/error-classifier.js";
+import { appendFileImagePrompt, buildClaudeUserContent, buildOpenCodeParts, codexImageArgs, imageExtension } from "./runners/attachments.js";
+export { extractOneShotText, grokSignalsPath, normalizeGrokCwd, parseGrokChatToolCalls, parseGrokContextSignals } from "./runners/parsers.js";
+export { CONTEXT_FULL_PATTERNS, RATE_LIMIT_TEXT_RE, contextTokensOf } from "./runners/context-tracker.js";
+export { DEFAULT_CONTEXT_LIMIT, MODEL_CONTEXT_LIMITS, contextLimitFor, lookupContextLimit } from "./runners/model-policy.js";
 
-export const MODEL_CONTEXT_LIMITS: Record<string, number> = {
-  // Claude — aliases (CLI atualizado): opus→Opus 4.8, sonnet→Sonnet 5,
-  // opusplan→Opus no plan + Sonnet na execução — todos 1M. haiku (4.5) = 200k.
-  // CLIs antigos resolvem os aliases pra gerações de 200k; isso é coberto pelo
-  // resolvedModel (init event) + IDs completos abaixo.
-  opus: 1_000_000, opusplan: 1_000_000, haiku: 200_000,
-  sonnet: 1_000_000, "claude-sonnet-5": 1_000_000,
-  fable: 1_000_000, "claude-fable-5": 1_000_000,
-  // IDs completos — batem com o model resolvido que o CLI reporta no init.
-  // Variantes "[1m]" não precisam de chave: contextLimitFor trata o sufixo.
-  "claude-opus-4-8": 1_000_000, "claude-opus-4-7": 1_000_000, "claude-opus-4-6": 1_000_000,
-  "claude-opus-4-5": 200_000,
-  "claude-sonnet-4-6": 1_000_000, "claude-sonnet-4-5": 200_000,
-  "claude-haiku-4-5": 200_000,
-  // Gerações mais antigas (CLIs bem desatualizados) — todas 200k. IDs datados
-  // caem nessas chaves via DATED_MODEL_ID_RE (claude-sonnet-4-20250514 → claude-sonnet-4).
-  "claude-opus-4-1": 200_000, "claude-opus-4": 200_000, "claude-sonnet-4": 200_000,
-  "claude-3-7-sonnet": 200_000, "claude-3-5-sonnet": 200_000, "claude-3-5-haiku": 200_000,
-  // Gemini — inclui as variantes GA (sem "-preview"): fora do mapa cairiam no
-  // piso de 200k e compactariam a cada ~20% da janela real de 1M.
-  "gemini-3-pro": 1_000_000,
-  "gemini-3-pro-preview": 1_000_000,
-  "gemini-3-flash": 1_000_000,
-  "gemini-3-flash-preview": 1_000_000,
-  "gemini-3.1-flash-lite": 1_000_000,
-  "gemini-3.1-flash-lite-preview": 1_000_000,
-  "gemini-2.5-flash": 1_000_000,
-  "gemini-2.5-flash-lite": 1_000_000,
-  "gemini-2.5-pro": 1_000_000,
-  // OpenAI / Codex. GPT-5.5 has 1M in the API, but Codex currently exposes
-  // a 400K window, so keep the runner threshold aligned with Codex.
-  "gpt-5.5": 400_000,
-  "gpt-5.4": 1_050_000,
-  "gpt-5.4-mini": 400_000,
-  "gpt-5.4-nano": 400_000,
-  "gpt-5.3-codex": 400_000,
-  "gpt-5.2-codex": 400_000,
-  "gpt-5.2": 400_000,
-  "gpt-5-codex": 400_000,
-  "gpt-5": 400_000,
-  "o4-mini": 200_000, "o3": 200_000,
-  "gpt-4.1": 1_000_000,
-  // OpenCode / ZAI — janelas conforme models.dev (catálogo que o opencode
-  // usa), snapshot 2026-07. Isto é FALLBACK: o runner opencode busca a janela
-  // real do serve (/config/providers) em runtime — mapa estático envelhece
-  // (glm-5.2 lançou com 128k e depois ganhou 1M; fireworks nem existia aqui).
-  "zai-coding-plan/glm-4.7": 204_800,
-  "zai-coding-plan/glm-4.5-air": 131_072,
-  "zai-coding-plan/glm-5-turbo": 200_000,
-  "zai-coding-plan/glm-5.1": 200_000,
-  // A chave sem prefixo cobre outros providers via fallback pós-"/".
-  "zai-coding-plan/glm-5.2": 1_000_000,
-  "glm-5.2": 1_000_000,
-  // Fireworks (GLM via router) — modelID completo vem depois de "fireworks-ai/".
-  "accounts/fireworks/routers/glm-5p2-fast": 1_048_575,
-  "accounts/fireworks/models/glm-5p2": 1_048_575,
-  // OpenCode / DeepSeek. deepseek-chat é alias do chat model corrente —
-  // 128k é o piso histórico da linha (conservador).
-  "deepseek/deepseek-v4-pro": 200_000,
-  "deepseek/deepseek-v4-flash": 200_000,
-  "deepseek/deepseek-chat": 128_000,
-  // Grok Build (xAI) — janela observada no CLI (~500k). grok-build é alias
-  // legado; grok-4.5 é o default atual; composer-fast é variante leve.
-  "grok-4.5": 500_000,
-  "grok-build": 500_000,
-  "grok-composer-2.5-fast": 500_000,
-};
-
-/** Piso conservador pra modelo ausente ou fora do mapa: o default real do CLI
- *  varia por runner, conta e versão instalada no cliente — assumir 1M mataria
- *  a compaction proativa de modelos com janela de 128k–400k. */
-export const DEFAULT_CONTEXT_LIMIT = 200_000;
-
-/** Sufixo legado ":<effort>" aceito no campo model (ex glm-5.2:high).
- *  Compartilhado entre contextLimitFor e ocModelParts — divergência aqui já
- *  causou lookup errado de janela. */
-const EFFORT_SUFFIX_RE = /:(off|minimal|none|low|medium|high|xhigh|max)$/;
-/** IDs datados que o CLI reporta no init (ex claude-sonnet-4-5-20250929). */
-const DATED_MODEL_ID_RE = /-\d{8}$/;
-
-/** Lookup estrito: janela conhecida ou undefined (sem piso).
- *  - Object.hasOwn: model vem de campo livre da UI — "constructor"/"toString"
- *    não podem acertar chave herdada de Object.prototype;
- *  - tolera o sufixo legado ":<effort>" (ver ocModelParts);
- *  - sufixo "[1m]" do Claude Code é opt-in explícito da janela de 1M;
- *  - ID datado cai pra chave sem data (claude-sonnet-4-5-20250929 →
- *    claude-sonnet-4-5). */
-export function lookupContextLimit(model: string | undefined): number | undefined {
-  const raw = model?.trim();
-  if (!raw) return undefined;
-  const base = raw.replace(EFFORT_SUFFIX_RE, "");
-  if (base.endsWith("[1m]")) return 1_000_000;
-  if (Object.hasOwn(MODEL_CONTEXT_LIMITS, base)) return MODEL_CONTEXT_LIMITS[base];
-  const undated = base.replace(DATED_MODEL_ID_RE, "");
-  if (undated !== base && Object.hasOwn(MODEL_CONTEXT_LIMITS, undated)) return MODEL_CONTEXT_LIMITS[undated];
-  // opencode usa "provider/model" e a janela é do MODEL, não do provider —
-  // sem chave exata (deepseek/, zai-coding-plan/ têm), tenta a parte pós-"/"
-  // (anthropic/claude-sonnet-5 → claude-sonnet-5 = 1M).
-  const slash = base.indexOf("/");
-  if (slash > 0) return lookupContextLimit(base.slice(slash + 1));
-  return undefined;
-}
-
-/** Janela de contexto com piso conservador pra desconhecido/ausente. */
-export function contextLimitFor(model: string | undefined): number {
-  return lookupContextLimit(model) ?? DEFAULT_CONTEXT_LIMIT;
-}
 
 /** Semântica do delta de usage por runner:
  *  - "anthropic" (claude): `input` EXCLUI cache — total = input + cacheCreate
@@ -124,142 +35,21 @@ export function contextLimitFor(model: string | undefined): number {
  *  - "inclusive" (codex/gemini): `input` já INCLUI o cache lido;
  *  - "auto" (opencode): o formato segue o provider — decide pela relação
  *    entre as parcelas (cache ⊆ input ⇒ inclusivo, senão soma). */
-export type UsageSemantics = "anthropic" | "inclusive" | "auto";
-
-export function contextTokensOf(delta: AgentUsage, semantics: UsageSemantics): number {
-  if (semantics === "anthropic") return delta.input + delta.cacheCreate + delta.cacheRead;
-  if (semantics === "inclusive") return delta.input;
-  return delta.cacheCreate + delta.cacheRead <= delta.input
-    ? delta.input
-    : delta.input + delta.cacheCreate + delta.cacheRead;
-}
-
-/** Snapshot de ocupação da janela do Grok Build (`signals.json` da sessão). */
-export interface GrokContextSignals {
-  contextTokensUsed: number;
-  contextWindowTokens: number;
-  contextWindowUsage: number;
-}
-
-/** Parse best-effort do `signals.json` do Grok. Retorna null se inválido. */
-export function parseGrokContextSignals(raw: unknown): GrokContextSignals | null {
-  if (!raw || typeof raw !== "object") return null;
-  const o = raw as Record<string, unknown>;
-  const used = Number(o.contextTokensUsed ?? 0);
-  const limit = Number(o.contextWindowTokens ?? 0);
-  const pct = Number(o.contextWindowUsage ?? 0);
-  if (!Number.isFinite(used) || used < 0) return null;
-  if (!Number.isFinite(limit) || limit <= 0) return null;
-  return {
-    contextTokensUsed: Math.floor(used),
-    contextWindowTokens: Math.floor(limit),
-    contextWindowUsage: Number.isFinite(pct) ? pct : Math.round((used / limit) * 100),
-  };
-}
-
-/**
- * Cwd que o Grok usa na pasta de sessão: absoluto, sem barra final, e
- * realpath quando possível (`/tmp` → `/private/tmp` no macOS).
- */
-export function normalizeGrokCwd(cwd: string): string {
-  const resolved = path.resolve(cwd || ".");
-  try {
-    return realpathSync(resolved);
-  } catch {
-    return resolved;
-  }
-}
-
-/** Tool call registrada no chat_history.jsonl de uma sessão Grok. */
-export interface GrokChatToolCall { id: string; name: string; input: unknown }
-
-/**
- * Extrai tool_calls de UMA linha do chat_history.jsonl do Grok. O CLI não
- * emite eventos de tool no streaming-json; o histórico é a única fonte:
- * `{type:"assistant", tool_calls:[{id, name, arguments:"<json-string>"}]}`.
- * `arguments` vem como string JSON (parse best-effort; se inválido, embrulha
- * em {raw}). Linha que não é assistant/tool_calls → [].
- */
-export function parseGrokChatToolCalls(line: string): GrokChatToolCall[] {
-  if (!line.includes('"tool_calls"')) return [];
-  try {
-    const e = JSON.parse(line) as { type?: string; tool_calls?: { id?: string; name?: string; arguments?: unknown }[] };
-    if (e.type !== "assistant" || !Array.isArray(e.tool_calls)) return [];
-    const out: GrokChatToolCall[] = [];
-    for (const c of e.tool_calls) {
-      const id = typeof c?.id === "string" ? c.id : "";
-      if (!id) continue;
-      let input: unknown = {};
-      if (typeof c.arguments === "string") {
-        try { input = JSON.parse(c.arguments); } catch { input = { raw: c.arguments }; }
-      } else if (c.arguments && typeof c.arguments === "object") {
-        input = c.arguments;
-      }
-      out.push({ id, name: typeof c.name === "string" ? c.name : "", input });
-    }
-    return out;
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Path do `signals.json` de uma sessão Grok.
- * O CLI grava em `sessions/<encodeURIComponent(cwd)>/<sessionId>/`.
- */
-export function grokSignalsPath(grokHome: string, cwd: string, sessionId: string): string {
-  return path.join(grokHome, "sessions", encodeURIComponent(normalizeGrokCwd(cwd)), sessionId, "signals.json");
-}
-
-const CONTEXT_WARN_PCT = 0.85;
-/** Cooldown do onContextFull: segura rajadas (N eventos acima do limite no
- *  mesmo turno → N compactions concorrentes) mas REARMA sozinho — um latch
- *  permanente mataria a auto-compaction após uma falha transiente do compact. */
-const CONTEXT_FULL_COOLDOWN_MS = 120_000;
 /** Timeout dos one-shots de resumo (compact). Sem isso, um CLI travado
  *  segura o guard `compacting` pra sempre e o agente fica sem processo. */
 const ONE_SHOT_TIMEOUT_MS = 300_000;
-/** Falhas consecutivas de compact antes de suspender a auto-compaction. */
-const MAX_COMPACT_FAIL_STREAK = 3;
-const OPENCODE_NO_OUTPUT_TIMEOUT_MS = 120_000;
 /** Timeout do turno opencode via API do serve (POST /message é síncrono e pode
  *  rodar tools por minutos). Generoso; o serve é morto no stop() se preciso. */
 const OPENCODE_TURN_TIMEOUT_MS = 600_000;
 /** Timeout do turno headless Grok (`grok -p …`). Sem isso, um resume + system
- *  prompt gigante (skills) deixa o processo zumbi por horas com ocBusy=true e
+ *  prompt gigante (skills) deixa o processo zumbi por horas com busy=true e
  *  a fila enche (`ocQueue cheia`). 12 min cobre turnos longos com tools. */
 const GROK_TURN_TIMEOUT_MS = 12 * 60_000;
-
-export const CONTEXT_FULL_PATTERNS = [
-  /context.{0,20}(length|window|limit).{0,20}exceed/i,
-  // Ordem inversa (exceed ANTES de context) — as duas variantes mais comuns:
-  // Anthropic "input length and `max_tokens` exceed context limit: ..." e
-  // codex "Your input exceeds the context window of this model".
-  /exceed\w*.{0,40}context.{0,20}(window|limit|length)/i,
-  /maximum.{0,20}(context|token)/i,
-  /too many tokens/i,
-  /prompt is too long/i,
-  /reduce.{0,20}(message|token|context)/i,
-];
-
-const MISSING_SESSION_PATTERNS = [
-  /no conversation found with session id/i,
-];
 
 // Banner de rate-limit do provider que o claude CLI emite como TEXTO do assistant
 // (não como erro). Sem isto o server trata como output real, cifra (E2EE), e o
 // auto-retry nunca dispara — pior, zera o contador. Roteamos como erro.
 // Ex: "API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited"
-export const RATE_LIMIT_TEXT_RE = /temporarily limiting requests|·\s*rate limited|\brate.?limit\w*\b|overloaded|too many requests|\b429\b|\b529\b/i;
-
-const MIME_EXT: Record<string, string> = {
-  "image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg",
-  "image/gif": "gif", "image/webp": "webp", "image/bmp": "bmp", "image/svg+xml": "svg",
-};
-function mimeToExt(mime: string): string {
-  return MIME_EXT[mime?.toLowerCase()] ?? "bin";
-}
-
 export interface AgentRunnerOptions {
   bridgeCommand: string;
   bridgeArgs: string[];
@@ -323,153 +113,11 @@ export interface AgentRunnerOptions {
   onGraphStatus?: (status: "building" | "ready" | "error", info?: { nodeCount?: number; edgeCount?: number; error?: string }) => void;
 }
 
-// Header montado por seções com gating por projeto (Fase 2). Cada bloco off
-// remove a prosa E as referências cruzadas — nunca deixa o agente lendo
-// instrução de uma tool que ele não tem. teammates/tasks/filelock/memory são
-// gateáveis; goals/webhooks/credentials/state-verify/footer ficam (ajustados).
-const HDR_ROUTING = `# CRITICAL ROUTING RULE
-- Direct text in your response is delivered ONLY to the human user.
-- To talk to ANOTHER AGENT (teammate), you MUST use the \`mcp__the-dudes__send_message\` tool — never as plain text.
-- If a message arrives prefixed with \`[from <name>]:\`, that came from a teammate. Your reply to them MUST go through \`mcp__the-dudes__send_message\` with \`to: "<name>"\`. Do NOT answer them via plain text — plain text will not reach the teammate.
-- Plain text is for the user. Tool call is for teammates. They are separate channels — pick the right one.
-- It is fine to also include a short status line as plain text (visible to user) AFTER calling \`send_message\`, but the actual answer to the teammate must be inside the tool call.
-- Respect the hierarchy from \`list_agents\`: managers coordinate their reports, leads route work inside their teams, and specialists/worker agents should escalate cross-team or priority conflicts to their manager.`;
-
-// Seção de teammate; a fallback de erro só cita o board quando tasks on.
-function teammateSection(tasks: boolean): string {
-  const blocked = tasks
-    ? `  - Use the task board to coordinate: add a task assigned to that teammate, or add a comment on a shared task.
-  - If the error says "preventive mode", direct messages are disabled project-wide — use only the task board.
-  - If the error says "limit reached" or "loop detected", the conversation was paused — escalate to the user with a summary.
-  - If the error says "hierarchy violation", you are not allowed to message this agent — use the task board or escalate to your manager.`
-    : `  - If the error says "preventive mode", direct messages are disabled project-wide — escalate to the user.
-  - If the error says "limit reached" or "loop detected", the conversation was paused — escalate to the user with a summary.
-  - If the error says "hierarchy violation", you are not allowed to message this agent — escalate to your manager or the user.`;
-  return `# Teammate communication
-- \`mcp__the-dudes__list_agents\` — list teammates, including hierarchy level, team, manager and skills.
-- \`mcp__the-dudes__send_message\` (args: {to, content}) — send a message to a teammate.
-- \`mcp__the-dudes__delegate\` (args: {goal, context?}) — spawn an EPHEMERAL sub-agent for ONE focused sub-task running in the BACKGROUND; returns immediately. The sub-agent works on its own and sends you the result via message when done — you don't block waiting. Use it to fan out independent work (research/implementation) instead of doing it all yourself. Keep each goal narrow and self-contained (the sub-agent starts with no context beyond what you pass). It self-terminates when finished.
-- **Hierarchy rules**: \`send_message\` is enforced by the server. You can ONLY message:
-  - Your direct manager (the agent listed as your manager)
-  - Your direct reports (agents who list you as manager)
-  - Same-team peers at your exact hierarchy level
-  - If no hierarchy is configured, all communication is allowed
-- If \`send_message\` returns an error, the message was blocked — do NOT retry. Instead:
-${blocked}`;
-}
-
-// Board de tasks SEM as tools de webhook (extraídas pra HDR_WEBHOOKS).
-const HDR_TASKS_CORE = `# Shared task board (visible to the user and any teammates)
-- \`mcp__the-dudes__list_tasks\` — read the current board. Shows lock status and blocker dependencies.
-- \`mcp__the-dudes__add_task\` (args: {title, description?, status?, assignee?}) — add a task. Status defaults to \`todo\`.
-- \`mcp__the-dudes__update_task\` (args: {id, status?, title?, description?, assignee?}) — change a task; use status to move it between todo/doing/done/blocked. You can also set \`blockedByTaskId\` to make it depend on another task.
-- \`mcp__the-dudes__lock_task\` (args: {id}) — **ALWAYS lock a task BEFORE starting work.** Atomic lock prevents double-work. Fails if already locked or blocked by an incomplete dependency.
-- \`mcp__the-dudes__unlock_task\` (args: {id}) — release the lock when done or if you must abandon the task.
-- \`mcp__the-dudes__add_task_comment\` (args: {taskId, content}) — add a comment to a task for documentation or questions.
-- \`mcp__the-dudes__list_task_comments\` (args: {taskId}) — read all comments on a task in chronological order.`;
-
-// Webhooks: tools ungated (sempre registradas no bridge) → seção própria.
-const HDR_WEBHOOKS = `# Webhooks
-- \`mcp__the-dudes__send_webhook\` (args: {webhookName, message}) — send a custom message through a named outbound webhook configured in this project (Discord, Slack, etc). Use only when the operator has configured the webhook by name and asked you to notify external systems.
-- \`mcp__the-dudes__list_webhooks\` — list webhook subscriptions in this project (name, direction, enabled, events). URLs and secrets are NOT returned. Use to discover the names accepted by send_webhook.`;
-
-const HDR_FILELOCK = `# File locking (MANDATORY when enabled)
-- If file locking is enabled in the project, you MUST use these tools before editing any file:
-- \`mcp__the-dudes__lock_file\` (args: {path}) — lock a file before editing. Fails if another agent already holds the lock. Lock expires after 5 minutes.
-- \`mcp__the-dudes__unlock_file\` (args: {path}) — release your lock when done editing.
-- \`mcp__the-dudes__list_file_locks\` — see which files are currently locked and by whom.
-- Do NOT edit files that are locked by another agent.`;
-
-// Goals ungated; a linha de add_task/atribuição só entra com tasks on.
-function goalsSection(tasks: boolean): string {
-  const lines = [
-    `# Goal alignment`,
-    `- \`mcp__the-dudes__list_goals\` — list project goals (mission, objectives, milestones). Shows hierarchy tree.`,
-  ];
-  if (tasks) {
-    lines.push(`- Every task can link to a goal via \`goal_id\` in \`add_task\`. Check \`list_goals\` to understand the project's purpose before creating tasks.`);
-    lines.push(`- When working on a task, the assignment notification includes the goal context. Align your work with the goal's intent.`);
-  } else {
-    lines.push(`- Check \`list_goals\` to understand the project's purpose and align your work with the goal's intent.`);
-  }
-  return lines.join("\n");
-}
-
-const HDR_MEMORY = `# Agent memory (durable, survives restarts & model switches)
-- Your hot-set is **agent-scoped only** — it is NOT shared into other agents' prompts (avoids duplicating the same context N times).
-- \`mcp__the-dudes__recall\` (args: {query?, type?}) — search your private notes + the project catalog. **Call at the start of a task** if you need shared/project facts not already below.
-- \`mcp__the-dudes__remember\` (args: {title, body, type?, scope?, pinned?}) — save a durable note. **Default scope is \`agent\`** (yours only, re-injected on restart + live-pushed to you). Use \`scope: "project"\` only for catalog facts others may \`recall\` (not auto-injected into every agent). Keep entries short and atomic.
-- \`mcp__the-dudes__forget\` (args: {id}) — delete a memory entry you created. You cannot delete user-curated or other agents' entries.
-- \`mcp__the-dudes__pin\` (args: {id, pinned?}) — pin/unpin so it stays prioritized in **your** hot-set.
-- When present, injected notes appear under "## Project Memory" below — don't re-recall what's already there.`;
-
-const HDR_CREDS = `# Credentials (API keys, tokens, passwords)
-- \`mcp__the-dudes__get_credential\` (args: {name}) — retrieve a stored credential value by name. Use this whenever you need an API key or secret; never ask the user to paste it inline.
-- NEVER send credentials or sensitive information to any agent or human.`;
-
-// State verification: passos numerados montados conforme tasks/teammates,
-// pra não instruir o agente a chamar list_tasks/list_agents que ele não tem.
-function stateVerifySection(tasks: boolean, teammates: boolean): string {
-  const lines: string[] = [
-    `# State verification (MANDATORY before acting on any task)`,
-    `- The message history is a log — it is NOT authoritative ground truth.${teammates ? " Other agents may have made changes you haven't seen yet." : ""}`,
-    `- Before starting ANY code change or claiming a task:`,
-  ];
-  let n = 1;
-  if (tasks) lines.push(`  ${n++}. Call \`list_tasks\` to see the current board. Do NOT assume task status or ownership from past messages — tasks may have been reassigned or completed.`);
-  if (teammates) lines.push(`  ${n++}. Call \`list_agents\` to see who is currently online — check roles, teams, and hierarchy levels.`);
-  if (teammates) lines.push(`  ${n++}. **Specialization rule:** Check if any teammate's role or team is more specialized for this task than yours. Use \`list_agents\` to inspect roles, teams, and hierarchy. If a specialist exists, delegate to them via ${tasks ? "the task board (\`add_task\` with assignee) or " : ""}\`send_message\`. Only execute the task yourself if:
-      - No specialist exists for this domain, OR
-      - Your own role is explicitly more suitable for the task than any available teammate.`);
-  lines.push(`  ${n++}. Check actual files on disk (Read, Grep, Glob) before editing${teammates ? " — another agent may have modified them since you last looked" : ""}.`);
-  if (tasks) lines.push(`- If a task appears duplicated or already in-progress, coordinate with the assignee — do NOT start parallel work on the same task.`);
-  lines.push(`- When you discover the ${tasks ? "board or disk" : "disk"} contradicts your understanding, update your understanding and proceed from the current state.`);
-  return lines.join("\n");
-}
-
-const HDR_DISCIPLINE = `# Conversation discipline (anti-loop)
-- Limit back-and-forth exchanges. After 2-3 exchanges with a teammate on the same topic without progress, STOP and escalate to the user with a summary. Do NOT keep replying.
-- If you receive a message that repeats the same point you already addressed, do NOT reply with the same counterpoint — the conversation is stuck. Escalate.
-- Reply ONLY when you have new information or a decision to communicate. "Ok", "Got it", "Thanks" do NOT count as new information — skip them.
-- If you are about to reply to a teammate and no user has spoken in the last several messages, ask yourself: "Is the user aware this conversation is happening?" If not, summarize and tag the user instead.
-- Do NOT reply to system messages about conversation pauses — those are final.`;
-
-// Rodapé: só cita board/atribuição quando os blocos correspondentes estão on.
-function footerSection(tasks: boolean, teammates: boolean): string {
-  const parts: string[] = [];
-  if (tasks) parts.push("Use the board to coordinate work: when you start a piece of work, mark it `doing`; when you finish, mark it `done`.");
-  if (tasks && teammates) parts.push("When you discover work for someone else, add a task assigned to that teammate.");
-  parts.push("Stay in character. Be concise.");
-  return parts.join(" ");
-}
-
-/** Monta o header gateando seção + referências cruzadas por projeto.
- *  Ausente/undefined numa flag = ligada (compat com server antigo). */
-function buildSystemPromptHeader(features?: ContextFeatures): string {
-  const teammates = features?.teammates !== false;
-  const tasks = features?.tasks !== false;
-  const filelock = features?.filelock !== false;
-  const memory = features?.memory !== false;
-  const sections: string[] = [];
-  sections.push(teammates
-    ? `You are part of a multi-agent team running locally.`
-    : `You are an agent running locally.`);
-  if (teammates) sections.push(HDR_ROUTING);
-  if (teammates) sections.push(teammateSection(tasks));
-  if (tasks) sections.push(HDR_TASKS_CORE);
-  if (features?.webhooks !== false) sections.push(HDR_WEBHOOKS);
-  if (filelock) sections.push(HDR_FILELOCK);
-  if (features?.goals !== false) sections.push(goalsSection(tasks));
-  if (memory) sections.push(HDR_MEMORY);
-  if (features?.credentials !== false) sections.push(HDR_CREDS);
-  sections.push(stateVerifySection(tasks, teammates));
-  if (teammates) sections.push(HDR_DISCIPLINE);
-  sections.push(footerSection(tasks, teammates));
-  return sections.join("\n\n");
-}
 
 export class AgentRunner {
   readonly info: AgentInfo;
+  private readonly runtimeFiles: RunnerRuntimeFiles;
+  private readonly contextTracker: ContextTracker;
   private proc: ChildProcessWithoutNullStreams | null = null;
   private buffer = "";
   private currentState: AgentRuntimeState = "idle";
@@ -478,18 +126,14 @@ export class AgentRunner {
   currentRuntimeState(): AgentRuntimeState { return this.currentState; }
 
   // OpenCode / Gemini per-message model
-  private ocSessionId: string | undefined;
+  private readonly messageSession: PerMessageSessionState;
   /** IDs de parts já processadas (dedup entre turnos). O POST /message só
    *  retorna a ÚLTIMA mensagem do assistant; tool calls ficam em mensagens
    *  intermediárias do loop → buscamos TODAS as msgs e processamos as novas. */
   private ocSeenPartIds = new Set<string>();
   /** Sessão veio de resume → primeira drain deve "marcar como visto" o histórico
    *  sem reemitir (senão tool calls/textos antigos reapareceriam nos RUNS). */
-  private ocNeedsPrime = false;
-  private ocQueue: Array<{ content: string; images?: ImageAttachment[] }> = [];
-  private ocBusy = false;
   private ocActiveProc: ChildProcess | null = null;
-  private ocFirstTurn = true;
   /** true se a run opencode atual emitiu algum evento produtivo (text/tool/
    *  step_finish). false no fim = falha transitória → dispara retry. */
   private ocRunSawOutput = false;
@@ -500,28 +144,14 @@ export class AgentRunner {
    *  emitindo agent:exit duplicado pro orchestrator. Flag idempotente,
    *  estilo `settled` do killClaudeForRestart. */
   private exited = false;
-  private ocPendingSummary: string | undefined;
   // OpenCode serve+attach — connection pool warm evita ECONNRESET
   // intermitente de providers (Z.AI, deepseek) que `opencode run` standalone
   // pega na criação de socket nova cada call.
-  private ocServerProc: ChildProcess | null = null;
-  private ocServerUrl: string | undefined;
-  private ocServerBootPromise: Promise<void> | null = null;
-  /** SSE /event do serve — só ativo com auto-approve OFF, p/ receber os
-   *  pedidos de permissão (permission.asked) e resolver via orquestrador. */
-  private ocEventReq: import("node:http").ClientRequest | null = null;
+  private readonly openCodeTransport: OpenCodeTransport;
 
   // Context tracking
-  private lastInputTokens = 0;
-  /** Model efetivamente resolvido pelo CLI (evento init do claude). Vence
-   *  this.info.model no contextLimit(): alias→ID depende da versão do CLI. */
-  private resolvedModel?: string;
-  private contextWarned = false;
-  /** Última emissão de onContextFull (cooldown — ver CONTEXT_FULL_COOLDOWN_MS). */
-  private lastContextFullAt = 0;
   /** Falhas consecutivas de compact — teto contra loop infinito de retry
    *  quando a falha é determinística (sessão acima do hard cap da API). */
-  private compactFailStreak = 0;
   /** Guard de reentrância do compactContext. */
   private compacting = false;
   /** Guard de reentrância do clearContext — simétrico ao `compacting`: sem
@@ -534,19 +164,18 @@ export class AgentRunner {
   /** Base acumulada dos stats do gemini (uiTelemetryService acumula por
    *  processo E re-hidrata o histórico no --resume): billing por turno é o
    *  delta contra a base, nunca o valor bruto. */
-  private gemStatsBase = { input: 0, output: 0, cached: 0 };
+  private gemUsage = new CumulativeUsageTracker({ input: 0, output: 0, cached: 0 });
   /** Base acumulada do crush (session show --json reporta prompt/completion
    *  tokens CUMULATIVOS da sessão): billing por turno = delta contra a base.
    *  null = ainda não primed — sessão RESUMIDA precisa ler o meta atual antes
    *  do primeiro turno, senão o primeiro delta re-fatura o histórico inteiro
    *  (mesmo bug que o gemini teve com gemStatsBase=0 no resume). */
-  private crushStatsBase: { prompt: number; completion: number } | null = null;
+  private crushUsage = new CumulativeUsageTracker<{ prompt: number; completion: number }>(null);
   /** Geração da sessão oc — incrementada em todo resetWithSummary. Eventos de
    *  um turno spawnado num epoch anterior (proc morto pelo clear drenando
    *  stdout, thread.started tardio do codex) são descartados por comparação
    *  de epoch — descartar por `compacting` engolia eventos LEGÍTIMOS do turno
    *  em voo durante a fase de waitOcIdle. */
-  private ocEpoch = 0;
   private sessionInvalid = false;
   private restarting = false;
   private lastVerboseIoBody = "";
@@ -558,33 +187,71 @@ export class AgentRunner {
 
   constructor(info: AgentInfo, private opts: AgentRunnerOptions) {
     this.info = info;
-    if ((opts.cliRunner === "opencode" || opts.cliRunner === "codex" || opts.cliRunner === "crush" || opts.cliRunner === "grok" || opts.cliRunner === "gemini") && opts.resumeSessionId) {
-      this.ocSessionId = opts.resumeSessionId;
-      if (opts.cliRunner === "opencode") this.ocNeedsPrime = true;
-      // crush: crushStatsBase fica null → primeiro finishCrushTurn faz prime
+    this.messageSession = new PerMessageSessionState();
+    this.runtimeFiles = new RunnerRuntimeFiles({
+      workspaceRoot: opts.workspaceRoot,
+      agentId: info.id,
+      agentToken: opts.agentToken,
+      home: opts.dropTo?.home ?? process.env.HOME ?? os.homedir(),
+    });
+    this.contextTracker = new ContextTracker({
+      resolveLimit: (resolvedModel, catalogLimit) => resolveContextLimit({
+        configuredModel: this.info.model, resolvedModel, catalogLimit,
+      }),
+      onUsage: opts.onContextUsage,
+      onWarning: opts.onContextWarning,
+      onFull: opts.onContextFull,
+      onError: opts.onError,
+    });
+    this.openCodeTransport = new OpenCodeTransport({
+      spawnServer: () => spawnDropped(
+        this.runnerCommand("opencode"),
+        ["serve", "--port", "0", "--hostname", "127.0.0.1"],
+        { cwd: this.opts.workspaceRoot, env: this.buildEnv(), stdio: ["ignore", "pipe", "pipe"] },
+        this.opts.dropTo ?? null,
+      ),
+      streamEvents: !opts.autoApprove,
+      onReady: (url) => this.opts.log("info", `[cli:${this.info.id}:opencode] serve ready ${url}`),
+      onExit: (code) => this.opts.log("warn", `[cli:${this.info.id}:opencode] serve exited (code ${code})`),
+      onEvent: (event) => {
+        const value = event as { type?: string; properties?: unknown };
+        if (value?.type === "permission.asked") void this.ocHandlePermissionAsked(value.properties ?? {});
+      },
+    });
+    if (isPerMessageRunner(opts.cliRunner) && opts.resumeSessionId) {
+      this.messageSession.resume(opts.resumeSessionId, {
+        needsPrime: opts.cliRunner === "opencode",
+        alreadyHasSystemPrompt: runnerAdapter(opts.cliRunner).resumedSessionAlreadyHasSystemPrompt,
+      });
+      // crush: o acumulador fica sem base → primeiro finishCrushTurn faz prime
       // do meta cumulativo antes de faturar (sessão resumida ≠ base zero).
       // grok/codex/crush/gemini: a sessão JÁ tem o system prompt. Re-injetar
       // no first turn com --resume (system + skills + histórico) é o que
-      // travava o gitlab/grok por horas (ocBusy preso, fila em 100).
-      if (opts.cliRunner === "grok" || opts.cliRunner === "codex" || opts.cliRunner === "crush" || opts.cliRunner === "gemini") {
-        this.ocFirstTurn = false;
-      }
+      // travava o gitlab/grok por horas (busy preso, fila em 100).
     }
   }
 
   private runnerCommand(runner: CliRunner): string {
-    return this.opts.cliCommands[runner].command;
+    return runnerAdapter(runner).command(this.opts.cliCommands);
   }
 
   private workspaceInfo(): string {
-    const lines: string[] = [];
-    lines.push(`Your working directory is \`${this.opts.workspaceRoot}\`.`);
-    lines.push("All project files and the git repository are located in this directory.");
-    if (this.info.repo) {
-      lines.push(`Repository: ${this.info.repo.gitUrl} (branch: ${this.info.repo.branch ?? "main"})`);
-    }
-    lines.push("Use this directory as the root for all file operations, git commands, and tool executions.");
-    return lines.join("\n");
+    return buildWorkspacePrompt({ workspaceRoot: this.opts.workspaceRoot, repo: this.info.repo });
+  }
+
+  private promptContext(summary?: string, addon?: string) {
+    return {
+      capabilityHeader: buildSystemPromptHeader(this.opts.features),
+      role: this.info.role,
+      systemPrompt: this.info.systemPrompt,
+      workspace: this.workspaceInfo(),
+      summary,
+      addon,
+    };
+  }
+
+  private initialMessage(content: string, summary?: string): string {
+    return buildInitialMessage({ ...this.promptContext(summary), content });
   }
 
   private ensureRunnerAvailable(runner: CliRunner): boolean {
@@ -757,78 +424,24 @@ export class AgentRunner {
       .join("\n");
   }
 
-  /** Tmpdir do agente — nome ALEATÓRIO (mkdtemp), memoizado por instância.
-   *  Antes era /tmp/the-dudes/<agentId> (path previsível): um agente irmão
-   *  same-uid sob prompt-injection fazia `cat /tmp/the-dudes/<outro>/agent.token`
-   *  e roubava o token de outro agente (cross-project). O nome aleatório sem o
-   *  agentId remove o mapeamento agentId→token — o irmão pode listar o parent
-   *  mas não sabe qual dir é de qual agente. NÃO é isolamento forte (same-uid
-   *  ainda lê qualquer arquivo do dono); isolamento real exige uid distinto/
-   *  container por agente — ver SECURITY-TODO S-05. */
-  private _tmpDir?: string;
-  private agentTmpDir(): string {
-    if (this._tmpDir) return this._tmpDir;
-    const parent = path.join(os.tmpdir(), "the-dudes");
-    mkdirSync(parent, { recursive: true, mode: 0o700 });
-    try { chmodSync(parent, 0o700); } catch {}
-    this._tmpDir = mkdtempSync(path.join(parent, "ag-")); // 0700 por padrão
-    return this._tmpDir;
-  }
-
-  /** Grava agent token em arquivo mode 0o600 e retorna path. Em vez de
-   *  passar token via env do CLI child (visible em /proc/<pid>/environ
-   *  pra outros processos do mesmo user), MCP bridge lê via TOKEN_FILE.
-   *  CLI process nunca vê o token. */
-  private writeAgentTokenFile(): string {
-    const dir = this.ensureSecureAgentTmpDir();
-    const tokenPath = path.join(dir, "agent.token");
-    writeFileSync(tokenPath, this.opts.agentToken, { mode: 0o600 });
-    try { chmodSync(tokenPath, 0o600); } catch {}
-    return tokenPath;
-  }
-
-  /** Garante o tmpdir do agente (mkdtemp já cria 0700). */
-  private ensureSecureAgentTmpDir(): string {
-    return this.agentTmpDir();
-  }
-
   /** Remove o tmpdir do agente (token plaintext + sessions). Best-effort,
    *  chamado no fim de vida pra não deixar token válido em /tmp. */
   private cleanupAgentTmpDir(): void {
-    if (!this._tmpDir) return;
-    try { rmSync(this._tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
-    this._tmpDir = undefined;
+    this.runtimeFiles.cleanup();
   }
 
   contextLimit(): number {
-    // `||` (não `??`): "" é ausente, igual aos demais usos de info.model.
-    const configured = (this.info.model || "").trim().replace(EFFORT_SUFFIX_RE, "");
-    // "[1m]" no config é opt-in explícito do usuário pela janela de 1M —
-    // vence o resolvedModel, que reporta o ID resolvido SEM o marcador.
-    if (configured.endsWith("[1m]")) return 1_000_000;
-    // opencode: janela do catálogo do serve (/config/providers) — é a que o
-    // próprio CLI aplica; vence o mapa estático, que envelhece (glm-5.2
-    // 128k→1M; "fireworks-ai/accounts/.../glm-5p2-fast" nem tinha chave).
-    if (this.ocCatalogLimit && this.ocCatalogLimit > 0) return this.ocCatalogLimit;
-    // resolvedModel (init do CLI) corrige alias resolvido por CLI antigo ou
-    // default da conta — mas só quando o ID reportado é CONHECIDO: um ID novo
-    // fora do mapa não pode rebaixar pro piso um config que resolve pra 1M.
-    const fromResolved = lookupContextLimit(this.resolvedModel);
-    if (fromResolved !== undefined) return fromResolved;
-    return contextLimitFor(configured);
+    return this.contextTracker.limit();
   }
 
   resetWithSummary(summary?: string): void {
-    this.ocEpoch++;
-    this.ocSessionId = undefined;
+    this.messageSession.reset(summary);
     this.ocSeenPartIds.clear();
-    this.ocNeedsPrime = false;
-    this.ocFirstTurn = true;
     // Sessão nova nasce sem --resume (gemini) → stats do CLI voltam a zero;
     // manter a base antiga zeraria o billing dos primeiros turnos via clamp.
-    this.gemStatsBase = { input: 0, output: 0, cached: 0 };
+    this.gemUsage.reset({ input: 0, output: 0, cached: 0 });
     // crush: sessão nova = meta cumulativo novo começa do zero.
-    this.crushStatsBase = { prompt: 0, completion: 0 };
+    this.crushUsage.reset({ prompt: 0, completion: 0 });
     // grok: sessão descartada → ids de tool_call antigos nunca mais colidem;
     // sem a poda o Set crescia sem teto pela vida do daemon. Sessão nova não
     // tem histórico pra silenciar → primed=true (prime é só pra resume).
@@ -836,19 +449,13 @@ export class AgentRunner {
     this.grokChatSweepState = null;
     this.grokToolsPrimed = true;
     this.resetContextAccounting();
-    this.ocPendingSummary = summary;
   }
 
   /** Zera a contabilidade de contexto (warning, cooldown de full, contador).
    *  Chamar em TODO caminho que troca/compacta a sessão — sem isso o warning
    *  de 85% vira one-shot por vida do runner e o onContextFull fica em cooldown. */
   private resetContextAccounting(): void {
-    this.contextWarned = false;
-    this.lastContextFullAt = 0;
-    this.lastInputTokens = 0;
-    this.compactFailStreak = 0;
-    // UI: barra de janela volta a 0 após clear/compact.
-    this.opts.onContextUsage?.(0, this.contextLimit());
+    this.contextTracker.reset();
   }
 
   async runOneShot(prompt: string): Promise<string> {
@@ -862,28 +469,19 @@ export class AgentRunner {
       }
       let proc: ChildProcess;
       const runner = this.opts.cliRunner;
-      const sid = runner === "claude" ? this.opts.resumeSessionId : this.ocSessionId;
+      const sid = runner === "claude" ? this.opts.resumeSessionId : this.messageSession.sessionId;
 
       if (runner === "gemini") {
-        const args = ["--output-format", "stream-json", "--skip-trust", "--yolo"];
-        // gemini stores latest session inside agentTmpDir; --resume latest reuses it
-        args.push("--resume", "latest");
-        args.push("-p", prompt);
-        if (this.info.model) args.push("--model", this.info.model);
+        const args = geminiOneShotArgs({ prompt, model: this.info.model, sessionId: sid });
         this.traceCli("gemini", "argv", prompt);
         this.traceSpawn("gemini", args);
         proc = spawnDropped(this.runnerCommand("gemini"), args, {
-          cwd: this.agentTmpDir(),
-          env: { ...this.buildEnv(), GEMINI_CLI_TRUST_WORKSPACE: "true" },
+          cwd: this.runtimeFiles.tempDir(),
+          env: buildGeminiEnv(this.buildEnv()),
           stdio: ["ignore", "pipe", "pipe"],
         }, this.opts.dropTo ?? null);
       } else if (runner === "codex") {
-        const baseFlags = ["--json", "--skip-git-repo-check",
-          "--dangerously-bypass-approvals-and-sandbox"];
-        const modelFlags = this.info.model ? ["-m", this.info.model] : [];
-        const args = sid
-          ? ["exec", "resume", ...baseFlags, ...modelFlags, sid, prompt]
-          : ["exec", ...baseFlags, ...modelFlags, prompt];
+        const args = codexOneShotArgs({ prompt, model: this.info.model, sessionId: sid });
         this.traceCli("codex", "argv", prompt);
         this.traceSpawn("codex", args);
         proc = spawnDropped(this.runnerCommand("codex"), args, {
@@ -892,10 +490,7 @@ export class AgentRunner {
           stdio: ["ignore", "pipe", "pipe"],
         }, this.opts.dropTo ?? null);
       } else if (runner === "crush") {
-        const args = ["run", "--quiet", "--data-dir", this.crushDataDir()];
-        if (this.info.model) args.push("-m", this.info.model);
-        if (sid) args.push("--session", sid);
-        args.push(prompt);
+        const args = crushOneShotArgs({ prompt, model: this.info.model, sessionId: sid, dataDir: this.runtimeFiles.crushDataDir() });
         this.traceCli("crush", "argv", prompt);
         this.traceSpawn("crush", args);
         proc = spawnDropped(this.runnerCommand("crush"), args, {
@@ -919,11 +514,7 @@ export class AgentRunner {
           stdio: ["ignore", "pipe", "pipe"],
         }, this.opts.dropTo ?? null);
       } else if (runner === "opencode") {
-        const args = ["run", "--format", "json"];
-        if (this.opts.autoApprove) args.push("--dangerously-skip-permissions");
-        if (this.info.model) args.push("--model", this.info.model);
-        if (sid) args.push("-s", sid);
-        args.push(prompt);
+        const args = opencodeOneShotArgs({ prompt, model: this.info.model, sessionId: sid, autoApprove: this.opts.autoApprove });
         this.traceCli("opencode", "argv", prompt);
         this.traceSpawn("opencode", args);
         const py = resolvePython3();
@@ -934,9 +525,7 @@ export class AgentRunner {
           stdio: ["ignore", "pipe", "pipe"],
         }, this.opts.dropTo ?? null);
       } else {
-        const args = ["--print", "-p", prompt];
-        if (this.info.model) args.push("--model", this.info.model);
-        if (sid) args.push("--resume", sid);
+        const args = claudeOneShotArgs({ prompt, model: this.info.model, sessionId: sid });
         this.traceCli("claude", "argv", prompt);
         this.traceSpawn("claude", args);
         proc = spawnDropped(this.runnerCommand("claude"), args, {
@@ -946,33 +535,20 @@ export class AgentRunner {
         }, this.opts.dropTo ?? null);
       }
 
-      proc.stdout!.setEncoding("utf8");
-      proc.stderr!.setEncoding("utf8");
       this.oneShotProc = proc; // stop() precisa alcançar o one-shot (senão roda órfão até o timeout)
-      let out = "";
-      // CLI travado não pode segurar o await do compact pra sempre (guard
-      // `compacting` ficaria preso e o agente sem processo). O killer resolve
-      // a promise DIRETO: "close" não é garantido pós-SIGKILL se um processo
-      // neto herdou os pipes de stdio (Node só emite close com streams fechados).
-      let settled = false;
-      const settle = (v: string) => {
-        if (!settled) {
-          settled = true;
-          if (this.oneShotProc === proc) this.oneShotProc = null;
-          resolve(v);
-        }
-      };
-      const killer = setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} settle(""); }, ONE_SHOT_TIMEOUT_MS);
-      proc.stdout!.on("data", (c: string) => { this.traceCli(runner, "stdout", c); out += c; });
-      proc.stderr!.on("data", (c: string) => { this.traceCli(runner, "stderr", c); });
-      proc.on("close", () => { clearTimeout(killer); settle(extractOneShotText(out, runner)); });
-      proc.on("error", () => { clearTimeout(killer); settle(""); });
+      void collectProcessOutput(proc, {
+        timeoutMs: ONE_SHOT_TIMEOUT_MS,
+        onStdout: (chunk) => this.traceCli(runner, "stdout", chunk),
+        onStderr: (chunk) => this.traceCli(runner, "stderr", chunk),
+      }).then((result) => {
+        if (this.oneShotProc === proc) this.oneShotProc = null;
+        resolve(result.timedOut ? "" : extractOneShotText(result.stdout, runner));
+      });
     });
   }
 
   private checkContextUsage(delta: AgentUsage, semantics: UsageSemantics): void {
-    const total = contextTokensOf(delta, semantics);
-    if (total > 0) this.reportContextOccupancy(total);
+    this.contextTracker.reportUsage(delta, semantics);
   }
 
   /**
@@ -983,27 +559,12 @@ export class AgentRunner {
    * `used === 0` é válido (pós-clear); só warning/full com used > 0.
    */
   private reportContextOccupancy(used: number, limitHint?: number): void {
-    if (!Number.isFinite(used) || used < 0) return;
-    this.lastInputTokens = Math.floor(used);
-    const mapped = this.contextLimit();
-    const limit =
-      limitHint && Number.isFinite(limitHint) && limitHint > 0
-        ? Math.max(mapped, Math.floor(limitHint))
-        : mapped;
-    this.opts.onContextUsage?.(this.lastInputTokens, limit);
-    if (this.lastInputTokens <= 0) return;
-    const pct = this.lastInputTokens / limit;
-    if (pct >= 1.0) {
-      this.notifyContextFull();
-    } else if (pct >= CONTEXT_WARN_PCT && !this.contextWarned) {
-      this.contextWarned = true;
-      this.opts.onContextWarning?.(this.lastInputTokens, limit);
-    }
+    this.contextTracker.reportOccupancy(used, limitHint);
   }
 
   /** Paths candidatos do signals.json (cwd canônico + raw + realpath variants). */
   private grokSignalsCandidates(sessionId: string): string[] {
-    const home = this.grokUserHome();
+    const home = this.runtimeFiles.grokHome();
     const cwd = this.opts.workspaceRoot;
     const out = new Set<string>();
     out.add(grokSignalsPath(home, cwd, sessionId));
@@ -1026,7 +587,7 @@ export class AgentRunner {
     }
     // Fallback: scan por sessionId (cwd do CLI pode divergir por symlink).
     try {
-      const sessionsRoot = path.join(this.grokUserHome(), "sessions");
+      const sessionsRoot = path.join(this.runtimeFiles.grokHome(), "sessions");
       if (!existsSync(sessionsRoot)) return null;
       for (const enc of readdirSync(sessionsRoot)) {
         const p = path.join(sessionsRoot, enc, sessionId, "signals.json");
@@ -1046,7 +607,7 @@ export class AgentRunner {
       if (existsSync(p)) return p;
     }
     try {
-      const sessionsRoot = path.join(this.grokUserHome(), "sessions");
+      const sessionsRoot = path.join(this.runtimeFiles.grokHome(), "sessions");
       if (existsSync(sessionsRoot)) {
         for (const enc of readdirSync(sessionsRoot)) {
           const p = path.join(sessionsRoot, enc, sessionId, "chat_history.jsonl");
@@ -1118,7 +679,7 @@ export class AgentRunner {
       tryFiles.push(path.join(path.dirname(sigPath), "updates.jsonl"));
     }
     try {
-      const sessionsRoot = path.join(this.grokUserHome(), "sessions");
+      const sessionsRoot = path.join(this.runtimeFiles.grokHome(), "sessions");
       if (existsSync(sessionsRoot)) {
         for (const enc of readdirSync(sessionsRoot)) {
           tryFiles.push(path.join(sessionsRoot, enc, sessionId, "updates.jsonl"));
@@ -1176,24 +737,13 @@ export class AgentRunner {
    *  de latch: se o compact falhar (provider flaky, timeout), o próximo sinal
    *  de contexto cheio re-dispara a compaction em vez de silenciar pra sempre. */
   private notifyContextFull(): void {
-    // Teto de retries: falha determinística de compact (sessão acima do hard
-    // cap) entraria em loop kill→one-shot→restart eterno via cooldown.
-    if (this.compactFailStreak >= MAX_COMPACT_FAIL_STREAK) return;
-    const now = Date.now();
-    if (now - this.lastContextFullAt < CONTEXT_FULL_COOLDOWN_MS) return;
-    this.lastContextFullAt = now;
-    this.opts.onContextFull?.();
+    this.contextTracker.notifyFull();
   }
 
   /** Registra falha de compact; ao atingir o teto, suspende a auto-compaction
    *  (rearmada por sucesso de compact ou clear, via resetContextAccounting). */
   private registerCompactFailure(): void {
-    this.compactFailStreak++;
-    if (this.compactFailStreak >= MAX_COMPACT_FAIL_STREAK) {
-      this.opts.onError(`[ctx] compact falhou ${this.compactFailStreak}x seguidas — auto-compaction suspensa; limpe o contexto manualmente`);
-    } else {
-      this.opts.onError("[ctx] compact: sem resumo utilizável — sessão antiga preservada; tente de novo ou limpe o contexto");
-    }
+    this.contextTracker.registerCompactFailure();
   }
 
   private checkContextFullError(msg: string): void {
@@ -1203,10 +753,7 @@ export class AgentRunner {
     // casa /maximum.{0,20}token/ — sem o filtro, rajada de rate limit
     // compacta uma sessão saudável (lossy) e 3 rajadas suspendem a
     // auto-compaction via streak.
-    if (RATE_LIMIT_TEXT_RE.test(msg)) return;
-    if (CONTEXT_FULL_PATTERNS.some((p) => p.test(msg))) {
-      this.notifyContextFull();
-    }
+    this.contextTracker.checkFullError(msg);
   }
 
   async start() {
@@ -1300,17 +847,17 @@ export class AgentRunner {
     //
     // - Resume (sessionId): sessão no disco já tem system+histórico.
     //   Próxima msg real usa --resume / -s / etc.
-    // - Cold start: ocFirstTurn permanece true → o 1º user/a2a message
+    // - Cold start: firstTurn permanece true → o 1º user/a2a message
     //   real injeta system+role+skills na hora do turno (runGrokMessage etc).
     //
     // Antes: pushUserMessage("[system] Context loaded…") forçava um call
     // ao CLI em todo start (cold e, pior, com re-injeção + resume).
     this.setState("idle");
-    if (this.ocSessionId) {
-      this.ocFirstTurn = false;
+    if (this.messageSession.sessionId) {
+      this.messageSession.firstTurn = false;
       this.opts.log(
         "info",
-        `[cli:${this.info.id}:${this.opts.cliRunner}] resume session=${this.ocSessionId.slice(0, 8)}… — idle, aguardando input`,
+        `[cli:${this.info.id}:${this.opts.cliRunner}] resume session=${this.messageSession.sessionId.slice(0, 8)}… — idle, aguardando input`,
       );
     } else {
       this.opts.log(
@@ -1337,35 +884,27 @@ export class AgentRunner {
     return { THE_DUDES_FEATURES: on.join(",") };
   }
 
+  private bridgeEnv(): Record<string, string> {
+    return buildBridgeEnv({
+      agentId: this.info.id,
+      agentName: this.info.name,
+      orchestratorUrl: this.opts.orchestratorUrl,
+      tokenFile: this.runtimeFiles.tokenFile(),
+      features: this.featuresEnv(),
+      socketPath: this.opts.bridgeSocketPath,
+    });
+  }
+
   private writeGeminiConfig() {
-    this.ensureSecureAgentTmpDir();
-    const dir = path.join(this.agentTmpDir(), ".gemini");
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
-    try { chmodSync(dir, 0o700); } catch {}
-    const env: Record<string, string> = {
-      THE_DUDES_AGENT_ID: this.info.id,
-      THE_DUDES_AGENT_NAME: this.info.name,
-      THE_DUDES_ORCH_URL: this.opts.orchestratorUrl,
-      THE_DUDES_AGENT_TOKEN_FILE: this.writeAgentTokenFile(),
-      ...this.featuresEnv(),
-    };
-    if (this.opts.bridgeSocketPath) env.THE_DUDES_BRIDGE_SOCKET = this.opts.bridgeSocketPath;
+    const dir = this.runtimeFiles.geminiConfigDir();
     // Gemini settings.json aceita `mcpServers` no mesmo shape do Claude
     // (command/args/env pra stdio; url/headers pra http). Apenas o campo
     // `type` é específico do Claude e deve ficar fora aqui.
-    const mcpServers: Record<string, unknown> = {};
-    if (this.opts.extraMcpServers) {
-      for (const [name, cfg] of Object.entries(this.opts.extraMcpServers)) {
-        if (name === "the-dudes") continue;
-        const { type: _unused, ...rest } = cfg;
-        mcpServers[name] = rest;
-      }
-    }
-    mcpServers["the-dudes"] = {
+    const mcpServers = buildGeminiMcpServers(this.opts.extraMcpServers, {
       command: this.opts.bridgeCommand,
       args: this.opts.bridgeArgs,
-      env,
-    };
+      env: this.bridgeEnv(),
+    });
     const config = { mcpServers };
     // mode 0o600: o JSON contém THE_DUDES_AGENT_TOKEN inline em "env".
     writeFileSync(path.join(dir, "settings.json"), JSON.stringify(config, null, 2), { mode: 0o600 });
@@ -1373,10 +912,6 @@ export class AgentRunner {
 
   /** Path do config do opencode POR AGENTE (dir privado, fora do workspace).
    *  Passado ao serve/run via env OPENCODE_CONFIG (suportado no 1.17.x). */
-  private ocConfigPath(): string {
-    return path.join(this.agentTmpDir(), "opencode.json");
-  }
-
   private writeOpenCodeConfig() {
     // Config POR AGENTE em dir privado + OPENCODE_CONFIG no env do serve.
     // Histórico: já morou no workspaceRoot (COMPARTILHADO entre agentes) —
@@ -1387,7 +922,7 @@ export class AgentRunner {
     // mcpAllowlist POR agente) continuava clobberado. Arquivo por agente
     // elimina as três classes: valores literais (JSON.stringify escapa),
     // workspace intocado, mcp allowlist por agente respeitado.
-    const configPath = this.ocConfigPath();
+    const configPath = this.runtimeFiles.openCodeConfigPath();
     // Remove o opencode.json legado que versões anteriores deixaram no
     // workspace — SÓ se for nosso (marker mcp "the-dudes"); nunca o config
     // próprio do usuário.
@@ -1398,26 +933,6 @@ export class AgentRunner {
         this.opts.log("info", `[opencode:${this.info.name}] opencode.json legado removido do workspace (config agora é por agente via OPENCODE_CONFIG)`);
       }
     } catch { /* best-effort */ }
-    // OpenCode usa shape distinto: stdio = {type:"local", command:[cmd, ...args], environment?}.
-    // SSE/HTTP servers ainda não suportados pelo OpenCode — descartamos com warning.
-    const mcp: Record<string, unknown> = {};
-    if (this.opts.extraMcpServers) {
-      for (const [name, cfg] of Object.entries(this.opts.extraMcpServers)) {
-        if (name === "the-dudes") continue;
-        const isStdio = (cfg.type ?? "stdio") === "stdio";
-        if (!isStdio || !cfg.command) {
-          this.opts.log("warn", `[opencode:${this.info.name}] skipping MCP "${name}" — only stdio transport is supported`);
-          continue;
-        }
-        const entry: Record<string, unknown> = {
-          type: "local",
-          enabled: true,
-          command: [cfg.command, ...(cfg.args ?? [])],
-        };
-        if (cfg.env && Object.keys(cfg.env).length > 0) entry.environment = cfg.env;
-        mcp[name] = entry;
-      }
-    }
     // BUG histórico: faltava `environment` → o mcp-bridge spawnado pelo serve
     // não recebia THE_DUDES_AGENT_TOKEN_FILE → mandava Bearer vazio →
     // /api/bridge 401 (as tools the-dudes nunca funcionaram no opencode).
@@ -1425,33 +940,13 @@ export class AgentRunner {
     // ocConfigPath), então identidade aqui é segura — e JSON.stringify escapa
     // nome com aspas/backslash. featuresEnv via spread: chave AUSENTE segue
     // significando "registra tudo (inclusive grupos futuros)" no bridge.
-    const tdEnv: Record<string, string> = {
-      THE_DUDES_AGENT_ID: this.info.id,
-      THE_DUDES_AGENT_NAME: this.info.name,
-      THE_DUDES_ORCH_URL: this.opts.orchestratorUrl,
-      THE_DUDES_AGENT_TOKEN_FILE: this.writeAgentTokenFile(),
-      ...this.featuresEnv(),
-    };
-    if (this.opts.bridgeSocketPath) tdEnv.THE_DUDES_BRIDGE_SOCKET = this.opts.bridgeSocketPath;
-    mcp["the-dudes"] = {
-      type: "local",
-      enabled: true,
-      command: [this.opts.bridgeCommand, ...this.opts.bridgeArgs],
-      environment: tdEnv,
-    };
-    const config: Record<string, unknown> = {
-      $schema: "https://opencode.ai/config.json",
-      mcp,
-      // auto-approve: ON = libera tudo; OFF = pede aprovação nas tools de risco
-      // (shell/edição/rede/fora-do-workspace). As demais (read/grep/glob/list +
-      // MCP the-dudes, que são seguras) ficam no default (allow). Os "ask" são
-      // resolvidos pelo daemon via evento SSE → política do orquestrador (mesma
-      // UI do claude). Sem isto o opencode rodava com default=allow, ignorando
-      // o toggle.
-      permission: this.opts.autoApprove
-        ? "allow"
-        : { edit: "ask", bash: "ask", webfetch: "ask", external_directory: "ask" },
-    };
+    const built = buildOpenCodeMcpConfig(this.opts.extraMcpServers, {
+      command: this.opts.bridgeCommand,
+      args: this.opts.bridgeArgs,
+      env: this.bridgeEnv(),
+    }, this.opts.autoApprove);
+    for (const warning of built.warnings) this.opts.log("warn", `[opencode:${this.info.name}] ${warning}`);
+    const config = built.config;
     // NÃO escrever bloco `provider.*` aqui: qualquer override de provider no
     // opencode.json (mesmo `options:{}` vazio) corrompe o zai-coding-plan
     // (provider some no run → agente mudo). reasoning_effort/thinking não são
@@ -1555,27 +1050,16 @@ export class AgentRunner {
     // Scrub adicional: THE_DUDES_DAEMON_TOKEN do process.env do daemon
     // vazaria pro CLI agente (prompt injection no agente poderia fazer
     // ele revelar/exfiltrar). Mesmo motivo pra outras chaves sensíveis.
-    const scrubbed = { ...process.env };
-    delete scrubbed.THE_DUDES_DAEMON_TOKEN;
-    delete scrubbed.THE_DUDES_TOKEN;
-    delete scrubbed.THE_DUDES_ENCRYPTION_KEY;
-    const env: NodeJS.ProcessEnv = {
-      ...scrubbed,
-      THE_DUDES_AGENT_ID: this.info.id,
-      THE_DUDES_AGENT_NAME: this.info.name,
-      THE_DUDES_ORCH_URL: this.opts.orchestratorUrl,
-    };
-    if (this.opts.bridgeSocketPath) env.THE_DUDES_BRIDGE_SOCKET = this.opts.bridgeSocketPath;
-    if (this.opts.cliRunner === "claude") {
-      env.CLAUDE_CONFIG_DIR = this.resolveClaudeConfigDir();
-    }
-    if (this.opts.cliRunner === "opencode") {
-      // Config por agente fora do workspace (identidade/permission/mcp
-      // allowlist são por agente — no workspace compartilhado viravam
-      // last-writer-wins). Serve e `opencode run` leem daqui.
-      env.OPENCODE_CONFIG = this.ocConfigPath();
-    }
-    return env;
+    return buildBaseRunnerEnv({
+      inherited: process.env,
+      runner: this.opts.cliRunner,
+      agentId: this.info.id,
+      agentName: this.info.name,
+      orchestratorUrl: this.opts.orchestratorUrl,
+      bridgeSocketPath: this.opts.bridgeSocketPath,
+      claudeConfigDir: this.opts.cliRunner === "claude" ? this.resolveClaudeConfigDir() : undefined,
+      opencodeConfigPath: this.opts.cliRunner === "opencode" ? this.runtimeFiles.openCodeConfigPath() : undefined,
+    });
   }
 
   private resolveClaudeConfigDir(): string {
@@ -1638,7 +1122,7 @@ export class AgentRunner {
       "--verbose",
       "--mcp-config", mcpConfig,
       "--append-system-prompt",
-      `${buildSystemPromptHeader(this.opts.features)}\n\n# Your role\n${this.info.role}\n\n${this.info.systemPrompt}\n\n# Workspace\n${this.workspaceInfo()}${planAddon}`,
+      buildAgentContext(this.promptContext(undefined, planAddon)),
       "--allowed-tools",
       [...baseAllowed, ...extraAllowed].join(","),
     ];
@@ -1656,13 +1140,12 @@ export class AgentRunner {
     // it. low/medium have ~zero budget. high/xhigh/max all engage thinking
     // when the prompt requires reasoning. Floor at "high" when the user
     // opted in but set a level too low to ever emit thinking.
-    let effort = this.info.effort;
-    if (this.info.collectThinking && (!effort || effort === "low" || effort === "medium")) {
-      const prev = effort ?? "(unset)";
-      effort = "high";
+    const effortPolicy = claudeThinkingEffort(this.info.effort, !!this.info.collectThinking);
+    if (effortPolicy.lifted) {
+      const prev = this.info.effort ?? "(unset)";
       this.traceInternalCli("info", `[cli:${this.info.id}:claude:thinking] effort lifted from "${prev}" to "high" because collectThinking=true`);
     }
-    if (effort) args.push("--effort", effort);
+    if (effortPolicy.effort) args.push("--effort", effortPolicy.effort);
     if (this.info.collectThinking) {
       // Required to make Claude CLI emit thinking content (not just signature).
       // See https://github.com/anthropics/claude-code/issues/56356
@@ -1677,36 +1160,14 @@ export class AgentRunner {
   }
 
   private writeMcpConfig(): string {
-    const dir = this.ensureSecureAgentTmpDir();
+    const dir = this.runtimeFiles.tempDir();
     const configPath = path.join(dir, "mcp.json");
-    const env: Record<string, string> = {
-      THE_DUDES_AGENT_ID: this.info.id,
-      THE_DUDES_AGENT_NAME: this.info.name,
-      THE_DUDES_ORCH_URL: this.opts.orchestratorUrl,
-      THE_DUDES_AGENT_TOKEN_FILE: this.writeAgentTokenFile(),
-      ...this.featuresEnv(),
-    };
-    if (this.opts.bridgeSocketPath) env.THE_DUDES_BRIDGE_SOCKET = this.opts.bridgeSocketPath;
-    // Bridge interno reservado em "the-dudes" — sempre presente. Servers
-    // extras (vindos do workspace via allowlist) são mesclados antes; se
-    // alguém declarar "the-dudes" no workspace, é sobrescrito pelo bridge.
-    const mcpServers: Record<string, unknown> = {};
-    if (this.opts.extraMcpServers) {
-      for (const [name, cfg] of Object.entries(this.opts.extraMcpServers)) {
-        if (name === "the-dudes") continue;
-        mcpServers[name] = cfg;
-      }
-    }
-    mcpServers["the-dudes"] = {
-      type: "stdio",
-      command: this.opts.bridgeCommand,
-      args: this.opts.bridgeArgs,
-      env,
-    };
-    const config = { mcpServers };
+    const config = buildClaudeMcpConfig(this.opts.extraMcpServers, {
+      command: this.opts.bridgeCommand, args: this.opts.bridgeArgs, env: this.bridgeEnv(),
+    });
     // mode 0o600: contém THE_DUDES_AGENT_TOKEN; tmpdir 0o700 protege parent.
     writeFileSync(configPath, JSON.stringify(config, null, 2), { mode: 0o600 });
-    const names = Object.keys(mcpServers).filter((n) => n !== "the-dudes");
+    const names = Object.keys(config.mcpServers).filter((n) => n !== "the-dudes");
     this.opts.log("info", `[mcp:write] agent=${this.info.name} servers=[${names.join(",") || "(only-bridge)"}] path=${configPath}`);
     return configPath;
   }
@@ -1739,7 +1200,7 @@ export class AgentRunner {
     }
     if (event.type === "system" && event.subtype === "init") {
       // CLI reporta o model realmente resolvido (alias→ID, default da conta).
-      if (typeof event.model === "string" && event.model) this.resolvedModel = event.model;
+      if (typeof event.model === "string" && event.model) this.contextTracker.setResolvedModel(event.model);
       this.setState("idle");
       return;
     }
@@ -1788,8 +1249,9 @@ export class AgentRunner {
           // roteia como erro p/ o server disparar auto-retry e não zerar contador.
           // Exige contexto "API Error" (o banner do claude CLI sempre tem) p/ não
           // confundir com prosa normal do agente que cite "rate limit"/"overloaded".
-          if (/API Error/i.test(text)) {
-            if (RATE_LIMIT_TEXT_RE.test(text)) {
+          if (text.toLowerCase().includes("api error")) {
+            const failure = classifyRunnerFailure(text);
+            if (failure === "rate_limit") {
               this.setState("idle");
               this.opts.onError(text);
               return;
@@ -1804,8 +1266,7 @@ export class AgentRunner {
             // SIDECHAIN (subagente Task estourando o próprio contexto) não
             // pode compactar o thread principal.
             if (!event.parent_tool_use_id && text.length < 600 &&
-                /^\s*API Error/i.test(text) &&
-                CONTEXT_FULL_PATTERNS.some((p) => p.test(text))) {
+                isApiErrorMessage(text) && failure === "context_full") {
               this.setState("idle");
               this.opts.onError(text);
               this.notifyContextFull();
@@ -1830,7 +1291,7 @@ export class AgentRunner {
       if (event.is_error || event.subtype === "error_during_execution" || event.subtype === "error_max_turns") {
         const r = String(event.result ?? event.error ?? event.message ?? "");
         if (r) {
-          if (RATE_LIMIT_TEXT_RE.test(r)) this.opts.onError(r);
+          if (classifyRunnerFailure(r) === "rate_limit") this.opts.onError(r);
           this.checkContextFullError(r);
         }
       }
@@ -1847,88 +1308,20 @@ export class AgentRunner {
    * lento). Modo equivalente ao usado pela TUI internamente.
    */
   private ensureOcServer(): Promise<void> {
-    if (this.ocServerUrl) return Promise.resolve();
-    if (this.ocServerBootPromise) return this.ocServerBootPromise;
-    this.ocServerBootPromise = new Promise<void>((resolve, reject) => {
-      const proc = spawnDropped(
-        this.runnerCommand("opencode"),
-        ["serve", "--port", "0", "--hostname", "127.0.0.1"],
-        { cwd: this.opts.workspaceRoot, env: this.buildEnv(), stdio: ["ignore", "pipe", "pipe"] },
-        this.opts.dropTo ?? null,
-      );
-      this.ocServerProc = proc;
-      let resolved = false;
-      const onData = (chunk: string) => {
-        const m = chunk.match(/https?:\/\/[\w.:-]+:\d+/);
-        if (m && !resolved) {
-          resolved = true;
-          this.ocServerUrl = m[0];
-          this.opts.log("info", `[cli:${this.info.id}:opencode] serve ready ${this.ocServerUrl}`);
-          this.ocStartEventStream(); // permission.asked listener (auto-approve OFF)
-          resolve();
-        }
-      };
-      proc.stdout!.setEncoding("utf8");
-      proc.stderr!.setEncoding("utf8");
-      proc.stdout!.on("data", onData);
-      proc.stderr!.on("data", onData);
-      proc.on("exit", (code) => {
-        // Guard de identidade: exit tardio de um serve descartado no boot
-        // timeout não pode limpar o estado de um boot NOVO já em andamento.
-        if (this.ocServerProc === proc) {
-          this.ocServerProc = null;
-          this.ocServerUrl = undefined;
-          this.ocServerBootPromise = null;
-        }
-        if (!resolved) { resolved = true; reject(new Error(`opencode serve exited before listening (code ${code})`)); }
-        else this.opts.log("warn", `[cli:${this.info.id}:opencode] serve exited (code ${code})`);
-      });
-      setTimeout(() => {
-        if (!resolved) {
-          // resolved=true: URL impressa DEPOIS do timeout não pode armar
-          // ocServerUrl num processo que está morrendo (fast-path reportaria
-          // o serve como pronto e todo turno falharia até o exit).
-          resolved = true;
-          try { proc.kill("SIGTERM"); } catch {}
-          setTimeout(() => { if (procAlive(proc)) { try { proc.kill("SIGKILL"); } catch {} } }, 1500);
-          // Um serve wedged que ignore SIGTERM sem nunca ter dado exit não
-          // pode deixar a bootPromise REJEITADA cacheada pra sempre.
-          if (this.ocServerProc === proc) { this.ocServerProc = null; this.ocServerBootPromise = null; }
-          reject(new Error("opencode serve boot timeout (10s)"));
-        }
-      }, 10_000);
-    });
-    return this.ocServerBootPromise;
-  }
-
-  /** Quebra o model do opencode em provider/modelID. Tolera um sufixo legado
-   *  ":<effort>" no model (ex glm-5.2:high) — só removido, NÃO aplicado: o
-   *  reasoning_effort NÃO é configurável via opencode.json no provider
-   *  zai-coding-plan (qualquer bloco `provider.<id>` corrompe o provider →
-   *  agente mudo). O GLM-5.2 roda no default dele (reasoning_effort=max). */
-  private ocModelParts(): { providerID: string; modelID: string } {
-    // trim ANTES do sufixo (regex ancorada em $) e igual ao lookupContextLimit:
-    // model vem de campo livre da UI — whitespace colado no providerID quebra
-    // o startsWith("anthropic") do ocUsageSemantics (subcontagem documentada lá).
-    const raw = (this.info.model ?? "").trim().replace(EFFORT_SUFFIX_RE, "");
-    const slash = raw.indexOf("/");
-    const providerID = slash > 0 ? raw.slice(0, slash) : "";
-    const modelID = slash > 0 ? raw.slice(slash + 1) : raw;
-    return { providerID, modelID };
+    return this.openCodeTransport.ensureServer();
   }
 
   /** Janela de contexto do catálogo do opencode serve (/config/providers):
    *  coleta automática — é a janela que o próprio CLI aplica, cobre qualquer
    *  provider/modelo (inclusive novos) sem depender do mapa estático, que
    *  envelhece. Uma busca por vida do runner (o model do agente não muda). */
-  private ocCatalogLimit?: number;
   private ocCatalogLimitFetch?: Promise<void>;
   private fetchOcCatalogLimit(): Promise<void> {
-    if (this.ocCatalogLimit !== undefined) return Promise.resolve();
+    if (this.contextTracker.catalogLimitValue() !== undefined) return Promise.resolve();
     if (this.ocCatalogLimitFetch) return this.ocCatalogLimitFetch;
     this.ocCatalogLimitFetch = (async () => {
       try {
-        const { providerID, modelID } = this.ocModelParts();
+        const { providerID, modelID } = providerModelParts(this.info.model);
         // Sem prefixo de provider o POST do turno nem envia `model` (o serve
         // roda no default DELE) — casar o modelID em provider arbitrário
         // fixaria a janela de um modelo que não está rodando (ex. glm-5.2 do
@@ -1941,14 +1334,14 @@ export class AgentRunner {
           if (p?.id !== providerID) continue;
           const ctx = Number(p?.models?.[modelID]?.limit?.context ?? 0);
           if (Number.isFinite(ctx) && ctx > 0) {
-            this.ocCatalogLimit = Math.floor(ctx);
-            this.opts.log("info", `[opencode:${this.info.name}] janela do catálogo: ${this.ocCatalogLimit} (${providerID}/${modelID})`);
+            this.contextTracker.setCatalogLimit(ctx);
+            this.opts.log("info", `[opencode:${this.info.name}] janela do catálogo: ${this.contextTracker.catalogLimitValue()} (${providerID}/${modelID})`);
             // UI: re-emite a ocupação com o denominador certo já — sem isto,
             // a barra só corrigiria o teto no próximo turno. NUNCA re-emitir
-            // 0 (pós-restart lastInputTokens=0 apagaria a barra que o server
+            // 0 (pós-restart sem ocupação apagaria a barra que o server
             // ainda tem — mesmo invariante do finishGrokTurn).
-            if (this.lastInputTokens > 0) {
-              this.opts.onContextUsage?.(this.lastInputTokens, this.contextLimit());
+            if (this.contextTracker.lastUsed() > 0) {
+              this.opts.onContextUsage?.(this.contextTracker.lastUsed(), this.contextLimit());
             }
             return;
           }
@@ -1966,7 +1359,7 @@ export class AgentRunner {
    *  turnos Anthropic em que o input não-cacheado excede as parcelas de
    *  cache (tool result gigante ainda não cacheado). */
   private ocUsageSemantics(): UsageSemantics {
-    const { providerID } = this.ocModelParts();
+    const { providerID } = providerModelParts(this.info.model);
     return providerID.startsWith("anthropic") ? "anthropic" : "auto";
   }
 
@@ -1979,7 +1372,7 @@ export class AgentRunner {
       () => this.runOpenCodeMessageAttached(content, images, retry),
       (err) => {
         this.opts.onError(`opencode serve falhou: ${err?.message ?? err}`);
-        this.ocBusy = false;
+        this.messageSession.busy = false;
         this.setState("idle");
         this.drainOcQueue();
       }
@@ -1993,50 +1386,47 @@ export class AgentRunner {
   private static readonly OC_EMPTY_RETRIES = 1;
 
   private async runOpenCodeMessageAttached(content: string, images?: ImageAttachment[], retry = 0) {
-    if (this.stopped || !this.ocServerUrl) return;
+    if (this.stopped || !this.openCodeTransport.ready()) return;
     // Coleta a janela real do catálogo em paralelo ao turno (idempotente).
     void this.fetchOcCatalogLimit();
-    // first-turn wrapping pode ser re-aplicado no retry (capturado aqui).
-    const wasFirstTurn = this.ocFirstTurn;
     this.ocRunSawOutput = false;
     // provider/modelID + reasoning effort (sufixo ":high"/":max" ou effort do agente).
-    const { providerID, modelID } = this.ocModelParts();
+    const { providerID, modelID } = providerModelParts(this.info.model);
 
-    // Garante sessão no serve (POST /session). Reusa ocSessionId se já existe.
-    if (!this.ocSessionId) {
+    // Garante sessão no serve (POST /session). Reusa sessionId se já existe.
+    if (!this.messageSession.sessionId) {
       try {
         const sess = await this.ocServeFetch("/session", "POST", providerID && modelID ? { model: { id: modelID, providerID } } : {});
         if (!sess?.id) throw new Error("sessão sem id");
-        this.ocSessionId = sess.id;
+        this.messageSession.sessionId = sess.id;
         if (this.opts.onSessionId) this.opts.onSessionId(sess.id);
       } catch (e) {
         this.opts.onError(`opencode: falha criando sessão no serve: ${(e as Error).message}`);
-        this.ocBusy = false; this.setState("idle"); this.drainOcQueue(); return;
+        this.messageSession.busy = false; this.setState("idle"); this.drainOcQueue(); return;
       }
     }
 
-    // Sessão deste turno: clear no meio do POST síncrono troca ocSessionId —
+    // Sessão deste turno: clear no meio do POST síncrono troca sessionId —
     // o resultado do turno antigo tem que ser descartado quando resolver
     // (texto velho "falando" pós-clear + usage da sessão cheia envenenando a
     // contabilidade recém-zerada).
-    const turnSession = this.ocSessionId;
+    const turnSession = this.messageSession.sessionId;
+    const turnEpoch = this.messageSession.epoch;
 
     // Resume: marca o histórico da sessão como já visto antes do 1º turno —
     // senão a drain por GET reemitiria tool calls/textos antigos nos RUNS.
-    if (this.ocNeedsPrime) {
-      this.ocNeedsPrime = false;
+    if (this.messageSession.needsPrime) {
+      this.messageSession.needsPrime = false;
       try {
-        const hist = await this.ocServeFetch(`/session/${this.ocSessionId}/message`, "GET");
+        const hist = await this.ocServeFetch(`/session/${this.messageSession.sessionId}/message`, "GET");
         if (Array.isArray(hist)) for (const m of hist) for (const p of (m?.parts ?? [])) { if (p?.id) this.ocSeenPartIds.add(p.id); }
       } catch { /* best-effort */ }
     }
 
     let message = content;
-    if (this.ocFirstTurn) {
-      this.ocFirstTurn = false;
-      const summary = this.ocPendingSummary ? `\n\n# Previous conversation summary\n${this.ocPendingSummary}` : "";
-      this.ocPendingSummary = undefined;
-      message = `${buildSystemPromptHeader(this.opts.features)}\n\n# Your role\n${this.info.role}\n\n${this.info.systemPrompt}\n\n# Workspace\n${this.workspaceInfo()}${summary}\n\n---\n\n${content}`;
+    const firstTurnSnapshot = this.messageSession.consumeFirstTurnIfNeeded();
+    if (firstTurnSnapshot.firstTurn) {
+      message = this.initialMessage(content, firstTurnSnapshot.pendingSummary);
     }
     this.traceCli("opencode", "stdin", message);
     // Transporte via API do serve (POST síncrono /session/:id/message) em vez
@@ -2044,40 +1434,35 @@ export class AgentRunner {
     // models (ex: deepseek-v4-pro) → agente mudo. O serve retorna a message
     // completa {info, parts:[step-start, reasoning, text, tool, step-finish]}.
     // Imagens viram FilePartInput com data-URL (opencode aceita inline; sem temp).
-    const parts: any[] = [{ type: "text", text: message }];
-    if (images && images.length) {
-      for (const img of images) {
-        parts.push({ type: "file", mime: img.mimeType, url: `data:${img.mimeType};base64,${img.base64}` });
-      }
-    }
+    const parts = buildOpenCodeParts(message, images);
     let resp: any;
     try {
       resp = await this.ocServeFetch(
-        `/session/${this.ocSessionId}/message`,
+        `/session/${this.messageSession.sessionId}/message`,
         "POST",
         { ...(providerID && modelID ? { model: { providerID, modelID } } : {}), parts },
         OPENCODE_TURN_TIMEOUT_MS,
       );
     } catch (e) {
-      if (this.stopped) { this.ocBusy = false; return; }
+      if (this.stopped) { this.messageSession.busy = false; return; }
       // Clear trocou a sessão durante o POST: este turno NÃO é mais dono de
-      // ocBusy/estado — o clear já zerou a flag e um turno NOVO pode tê-la
+      // busy/estado — o clear já zerou a flag e um turno NOVO pode tê-la
       // re-armado. Zerar/drenar aqui clobberaria o dono (waitOcIdle veria
       // falso-idle e o compact rodaria em paralelo com o turno novo).
-      if (this.ocSessionId !== turnSession) return;
-      this.ocBusy = false;
+      if (!this.messageSession.owns(turnEpoch, turnSession)) return;
+      this.messageSession.busy = false;
       const emsg = (e as Error).message;
       if (retry < AgentRunner.OC_EMPTY_RETRIES) {
         this.opts.onError(`opencode: turno falhou (${emsg}) — retry ${retry + 1}/${AgentRunner.OC_EMPTY_RETRIES}`);
-        if (wasFirstTurn) this.ocFirstTurn = true;
-        this.ocBusy = true;
+        this.messageSession.restoreFirstTurn(firstTurnSnapshot);
+        this.messageSession.busy = true;
         setTimeout(() => {
-          if (this.stopped) { this.ocBusy = false; return; }
+          if (this.stopped) { this.messageSession.busy = false; return; }
           // Clear na janela de 1,2s descartou a mensagem — re-postá-la numa
           // sessão nova ressuscitaria o conteúdo que o usuário abortou (com
-          // side effects de tools). Não toca ocBusy: o clear já zerou e um
+          // side effects de tools). Não toca busy: o clear já zerou e um
           // turno novo pode ser o dono agora.
-          if (this.ocSessionId !== turnSession) return;
+          if (!this.messageSession.owns(turnEpoch, turnSession)) return;
           void this.runOpenCodeMessage(content, images, retry + 1);
         }, 1200);
         return;
@@ -2093,9 +1478,9 @@ export class AgentRunner {
     }
 
     // Clear durante o POST: resultado pertence à sessão descartada. Retorna
-    // SEM tocar ocBusy/estado/fila — este turno não é mais o dono (ver catch).
-    if (this.stopped) { this.ocBusy = false; return; }
-    if (this.ocSessionId !== turnSession) return;
+    // SEM tocar busy/estado/fila — este turno não é mais o dono (ver catch).
+    if (this.stopped) { this.messageSession.busy = false; return; }
+    if (!this.messageSession.owns(turnEpoch, turnSession)) return;
     // Serve pode responder 200 com o erro do provider embutido em info.error
     // (nunca passa pelas parts) — cobre a variante que o reject do POST não vê.
     const infoErr = resp?.info?.error;
@@ -2110,17 +1495,17 @@ export class AgentRunner {
     await this.ocProcessNewParts(resp, turnSession);
 
     // Clear durante o GET do ocProcessNewParts: mesma regra de posse.
-    if (this.stopped) { this.ocBusy = false; return; }
-    if (this.ocSessionId !== turnSession) return;
+    if (this.stopped) { this.messageSession.busy = false; return; }
+    if (!this.messageSession.owns(turnEpoch, turnSession)) return;
     this.ocActiveProc = null;
-    this.ocBusy = false;
+    this.messageSession.busy = false;
     if (!this.ocRunSawOutput && retry < AgentRunner.OC_EMPTY_RETRIES) {
       this.opts.onError(`opencode: resposta vazia (provável flap do provider) — retry ${retry + 1}/${AgentRunner.OC_EMPTY_RETRIES}`);
-      if (wasFirstTurn) this.ocFirstTurn = true;
-      this.ocBusy = true;
+      this.messageSession.restoreFirstTurn(firstTurnSnapshot);
+      this.messageSession.busy = true;
       setTimeout(() => {
-        if (this.stopped) { this.ocBusy = false; return; }
-        if (this.ocSessionId !== turnSession) return; // clear descartou a mensagem (ver retry do catch)
+        if (this.stopped) { this.messageSession.busy = false; return; }
+        if (!this.messageSession.owns(turnEpoch, turnSession)) return; // clear descartou a mensagem (ver retry do catch)
         void this.runOpenCodeMessage(content, images, retry + 1);
       }, 1200);
       return;
@@ -2136,46 +1521,7 @@ export class AgentRunner {
    *  em status !2xx ou erro de rede/timeout. Usado pelo transporte por API
    *  (POST /session, POST /session/:id/message). */
   private ocServeFetch(path: string, method: string, body?: unknown, timeoutMs = 20_000): Promise<any> {
-    return new Promise((resolve, reject) => {
-      if (!this.ocServerUrl) { reject(new Error("serve não está pronto")); return; }
-      let u: URL;
-      try { u = new URL(this.ocServerUrl + path); } catch (e) { reject(e as Error); return; }
-      const data = body !== undefined ? JSON.stringify(body) : undefined;
-      const req = http.request(
-        {
-          hostname: u.hostname,
-          port: u.port,
-          path: u.pathname + u.search,
-          method,
-          headers: {
-            "Content-Type": "application/json",
-            ...(data ? { "Content-Length": Buffer.byteLength(data) } : {}),
-          },
-          timeout: timeoutMs,
-        },
-        (res) => {
-          const chunks: Buffer[] = [];
-          res.on("data", (c: Buffer) => chunks.push(c));
-          res.on("end", () => {
-            const txt = Buffer.concat(chunks).toString("utf8");
-            const sc = res.statusCode ?? 0;
-            if (sc >= 200 && sc < 300) {
-              try { resolve(txt ? JSON.parse(txt) : {}); } catch { resolve({}); }
-            } else {
-              reject(new Error(`HTTP ${sc}${txt ? ` — ${txt.slice(0, 200)}` : ""}`));
-            }
-          });
-          // Conexão caindo DEPOIS dos headers emite 'error' no RES (não no
-          // req): sem este handler a promise pendura pra sempre (guards
-          // compacting/ocBusy presos) e o 'error' vira uncaughtException.
-          res.on("error", (e) => reject(new Error(`resposta interrompida: ${e.message}`)));
-        },
-      );
-      req.on("error", reject);
-      req.on("timeout", () => req.destroy(new Error(`timeout ${timeoutMs}ms`)));
-      if (data) req.write(data);
-      req.end();
-    });
+    return this.openCodeTransport.fetch(path, method, body, timeoutMs);
   }
 
   /* ---------- OpenCode permission (auto-approve OFF) ---------- */
@@ -2183,44 +1529,6 @@ export class AgentRunner {
   /** Abre o stream SSE /event do serve p/ receber `permission.asked`. Só roda
    *  com auto-approve OFF (com ON o config já libera tudo, nenhum ask é emitido).
    *  Reabre se a conexão cair (serve vivo = sessão do agente viva). */
-  private ocStartEventStream(): void {
-    if (this.opts.autoApprove) return;
-    if (!this.ocServerUrl || this.ocEventReq || this.stopped) return;
-    let u: URL;
-    try { u = new URL(this.ocServerUrl + "/event"); } catch { return; }
-    const req = http.request(
-      { hostname: u.hostname, port: u.port, path: "/event", method: "GET", headers: { Accept: "text/event-stream" } },
-      (res) => {
-        res.setEncoding("utf8");
-        let buf = "";
-        res.on("data", (chunk: string) => {
-          buf += chunk;
-          let idx: number;
-          while ((idx = buf.indexOf("\n")) >= 0) {
-            const line = buf.slice(0, idx); buf = buf.slice(idx + 1);
-            if (!line.startsWith("data:")) continue;
-            const js = line.slice(5).trim();
-            if (!js) continue;
-            try {
-              const ev = JSON.parse(js);
-              if (ev?.type === "permission.asked") void this.ocHandlePermissionAsked(ev.properties ?? {});
-            } catch { /* linha SSE não-JSON (keep-alive etc) */ }
-          }
-        });
-        res.on("end", () => { this.ocEventReq = null; this.ocReopenEvents(); });
-        res.on("error", () => { this.ocEventReq = null; this.ocReopenEvents(); });
-      },
-    );
-    req.on("error", () => { this.ocEventReq = null; this.ocReopenEvents(); });
-    req.end();
-    this.ocEventReq = req;
-  }
-
-  private ocReopenEvents(): void {
-    if (this.stopped || this.opts.autoApprove || !this.ocServerUrl) return;
-    setTimeout(() => { if (!this.stopped && this.ocServerUrl) this.ocStartEventStream(); }, 1000);
-  }
-
   /** Resolve um permission.asked: consulta a política do orquestrador (mesma do
    *  approve_action do claude) e responde ao serve (once = libera / reject = nega). */
   private async ocHandlePermissionAsked(props: any): Promise<void> {
@@ -2288,10 +1596,10 @@ export class AgentRunner {
    *  Cobre tool calls que vivem em mensagens intermediárias (o POST /message
    *  só devolve a última). Fallback p/ resp.parts se o GET falhar.
    *  `sessionId` é a sessão DO TURNO (capturada antes do POST) — usar
-   *  this.ocSessionId aqui abriria janela pro clear no meio: GET em
+   *  this.messageSession.sessionId aqui abriria janela pro clear no meio: GET em
    *  /session/undefined + dispatch de histórico velho pós-reset. */
   private async ocProcessNewParts(resp: any, sessionId?: string): Promise<void> {
-    const sid = sessionId ?? this.ocSessionId;
+    const sid = sessionId ?? this.messageSession.sessionId;
     let messages: any[] | null = null;
     try {
       const r = await this.ocServeFetch(`/session/${sid}/message`, "GET");
@@ -2299,7 +1607,7 @@ export class AgentRunner {
     } catch { /* cai pro fallback abaixo */ }
     // Clear durante o GET: não despachar parts da sessão descartada (texto
     // velho "falando" pós-clear + step-finish envenenando a contabilidade).
-    if (sessionId && this.ocSessionId !== sessionId) return;
+    if (sessionId && this.messageSession.sessionId !== sessionId) return;
 
     const groups: any[][] = messages
       ? messages
@@ -2321,81 +1629,39 @@ export class AgentRunner {
 
   /** Despacha uma part da resposta opencode (text/tool/step-finish). */
   private ocDispatchPart(p: any): void {
-    const t = p?.type;
-    if (t === "text") {
-      const text = (p.text as string | undefined)?.trim();
-      if (text) { this.ocRunSawOutput = true; this.setState("speaking"); this.opts.onAssistantText(text); }
-    } else if (t === "tool" || t === "tool-use" || t === "tool_use" || t === "tool-call" || t === "tool_call") {
-      // só conta tool já resolvida (completed/error) — evita emitir pending sem input
-      const status = p.state?.status;
-      if (status && status !== "completed" && status !== "error") return;
-      this.ocRunSawOutput = true;
-      const toolName = p.tool ?? p.name ?? p.state?.name ?? "";
-      const input = p.state?.input ?? p.input ?? {};
-      this.opts.onToolUse(toolName, input);
-    } else if (t === "step-finish" || t === "step_finish") {
-      const tokens = p.tokens;
-      if (tokens) {
+    this.applyOpenCodeEvents(p);
+  }
+
+  private applyOpenCodeEvents(raw: unknown): void {
+    for (const event of parseOpenCodeTurnEvent(raw)) {
+      if (event.type === "session") {
+        if (event.sessionId !== this.messageSession.sessionId) {
+          this.messageSession.sessionId = event.sessionId;
+          this.opts.onSessionId?.(event.sessionId);
+        }
+      } else if (event.type === "text") {
+        this.ocRunSawOutput = true;
+        this.setState("speaking");
+        this.opts.onAssistantText(event.text);
+      } else if (event.type === "tool") {
+        this.ocRunSawOutput = true;
+        this.opts.onToolUse(event.name, event.input);
+        this.setState("thinking");
+      } else if (event.type === "usage") {
         const delta: AgentUsage = {
-          input: Number(tokens.input ?? 0),
-          output: Number(tokens.output ?? 0),
-          cacheCreate: Number(tokens.cache?.write ?? 0),
-          cacheRead: Number(tokens.cache?.read ?? 0),
+          input: event.input,
+          output: event.output,
+          cacheCreate: event.cacheCreate,
+          cacheRead: event.cacheRead,
         };
         this.opts.onUsageDelta?.(delta);
         this.checkContextUsage(delta, this.ocUsageSemantics());
-      }
+      } else if (event.type === "result") this.setState("thinking");
     }
   }
 
   private handleOpenCodeEvent(event: any) {
-    const sid = event.sessionID as string | undefined;
-    if (sid && sid !== this.ocSessionId) {
-      this.ocSessionId = sid;
-      if (this.opts.onSessionId) this.opts.onSessionId(sid);
-    }
-
-    switch (event.type) {
-      case "text": {
-        const text = (event.part?.text as string | undefined)?.trim();
-        if (text) {
-          this.ocRunSawOutput = true;
-          this.setState("speaking");
-          this.opts.onAssistantText(text);
-        }
-        break;
-      }
-      case "tool_use":
-      case "tool_call": {
-        this.ocRunSawOutput = true;
-        const toolName = event.part?.tool ?? event.part?.name ?? "";
-        const input = event.part?.state?.input ?? event.part?.input ?? {};
-        this.opts.onToolUse(toolName, input);
-        this.setState("thinking");
-        break;
-      }
-      case "step_start":
-        this.setState("thinking");
-        break;
-      case "step_finish": {
-        // NÃO marca ocRunSawOutput aqui: um turno que só emite usage/step_finish
-        // (sem text/tool — ex.: reasoning model cujo text não serializa pro
-        // stdout) NÃO é resposta visível. Marcar aqui mascarava o mudo (sucesso
-        // falso → sem retry, sem erro). Só text/tool_use/tool_call contam.
-        const tokens = event.part?.tokens;
-        if (tokens) {
-          const delta: AgentUsage = {
-            input: Number(tokens.input ?? 0),
-            output: Number(tokens.output ?? 0),
-            cacheCreate: Number(tokens.cache?.write ?? 0),
-            cacheRead: Number(tokens.cache?.read ?? 0),
-          };
-          this.opts.onUsageDelta?.(delta);
-          this.checkContextUsage(delta, this.ocUsageSemantics());
-        }
-        break;
-      }
-    }
+    this.applyOpenCodeEvents(event);
   }
 
   /* ---------- Gemini per-message model ---------- */
@@ -2405,30 +1671,27 @@ export class AgentRunner {
     if (!this.ensureRunnerAvailable("gemini")) return;
     this.setState("thinking");
 
-    const tmpDir = this.agentTmpDir();
-    mkdirSync(tmpDir, { recursive: true });
+    const tmpDir = this.runtimeFiles.tempDir();
     this.writeGeminiConfig();
 
     let message = content;
-    const firstTurn = this.ocFirstTurn;
+    const firstTurnSnapshot = this.messageSession.consumeFirstTurnIfNeeded();
+    const firstTurn = firstTurnSnapshot.firstTurn;
     // Preservados pra restaurar se o turno morrer sem completar: com o
     // --resume condicional, perder o firstTurn num turno falho mudaria QUAL
     // sessão o agente usa dali em diante (re-resume da sessão que o
     // clear/compact descartou) — e o resumo pendente seria perdido junto.
-    const pendingSummary = this.ocPendingSummary;
-    const epoch = this.ocEpoch;
+    const pendingSummary = firstTurnSnapshot.pendingSummary;
+    const epoch = this.messageSession.epoch;
     if (firstTurn) {
-      this.ocFirstTurn = false;
-      const summary = this.ocPendingSummary ? `\n\n# Previous conversation summary\n${this.ocPendingSummary}` : "";
-      this.ocPendingSummary = undefined;
-      message = `${buildSystemPromptHeader(this.opts.features)}\n\n# Your role\n${this.info.role}\n\n${this.info.systemPrompt}\n\n# Workspace\n${this.workspaceInfo()}${summary}\n\n---\n\n${content}`;
+      message = this.initialMessage(content, pendingSummary);
     }
     // Imagens: gemini lê arquivos referenciados por @<path> no prompt.
     let imgCleanup = () => {};
     if (images && images.length) {
       const { paths, cleanup } = this.writeImageTempFiles(images);
       imgCleanup = cleanup;
-      if (paths.length) message += `\n\n${paths.map((p) => `@${p}`).join(" ")}`;
+      message = appendFileImagePrompt(message, paths, "gemini");
     }
     this.traceCli("gemini", "argv", message);
 
@@ -2448,17 +1711,14 @@ export class AgentRunner {
     if (this.info.model) args.push("--model", this.info.model);
     if (this.opts.autoApprove) args.push("--yolo");
     // Resume SÓ quando não é primeiro turno: o storage do gemini é indexado
-    // pelo cwd (agentTmpDir, nunca rotacionado) — `--resume latest`
+    // pelo cwd (tmpdir da instância, nunca rotacionado) — `--resume latest`
     // incondicional re-abria a sessão CHEIA depois de clear/compact
     // (resetWithSummary não a apaga), tornando os dois no-ops e o compact um
     // loop infinito (resumo appendado na própria sessão que estourou).
     // Sem o resume, o processo novo cria sessão limpa que vira a "latest".
     if (!firstTurn) args.push("--resume", "latest");
 
-    const env = {
-      ...this.buildEnv(),
-      GEMINI_CLI_TRUST_WORKSPACE: "true",
-    };
+    const env = buildGeminiEnv(this.buildEnv());
 
     this.traceSpawn("gemini", args);
     const proc = spawnDropped(this.runnerCommand("gemini"), args, {
@@ -2475,7 +1735,7 @@ export class AgentRunner {
     const flush = () => {
       // Epoch trocado (clear/compact durante o turno): texto da sessão
       // descartada não pode "falar" pós-reset.
-      if (epoch !== this.ocEpoch) { pendingText = ""; return; }
+      if (!this.messageSession.owns(epoch)) { pendingText = ""; return; }
       const t = pendingText.trim();
       if (t) {
         this.setState("speaking");
@@ -2497,18 +1757,18 @@ export class AgentRunner {
         // Eventos de um turno pré-reset (proc morto pelo clear ainda drenando
         // stdout): result tardio envenenaria a gemStatsBase recém-zerada
         // (double-billing) e texto/tool velhos vazariam pós-clear.
-        if (epoch !== this.ocEpoch) continue;
+        if (!this.messageSession.owns(epoch)) continue;
         try {
-          const ev = JSON.parse(line);
-          if (ev.type === "message" && ev.role === "assistant" && typeof ev.content === "string") {
-            pendingText += ev.content;
-          } else if (ev.type === "tool_call" || ev.type === "tool_use") {
-            flush();
-            this.opts.onToolUse(ev.name ?? "", ev.args ?? {});
-            this.setState("thinking");
-          } else if (ev.type === "result") {
-            sawResult = true;
-            flush();
+          for (const event of parseGeminiTurnEvent(JSON.parse(line))) {
+            if (event.type === "text") pendingText += event.text;
+            else if (event.type === "tool") {
+              flush();
+              this.opts.onToolUse(event.name, event.input);
+              this.setState("thinking");
+            } else if (event.type === "result") {
+              sawResult = true;
+              flush();
+            } else if (event.type === "usage") {
             // stats do gemini-cli são ACUMULADOS (uiTelemetryService soma o
             // prompt de TODAS as requests do turno e o hydrate do --resume
             // pré-carrega o histórico inteiro): input_tokens ≈ Σ requests,
@@ -2517,18 +1777,18 @@ export class AgentRunner {
             // ocupação NÃO é derivável daqui — contexto cheio do gemini é
             // detectado pela rota reativa (banner no stderr →
             // checkContextFullError), nunca por estes stats.
-            const s = ev.stats ?? {};
-            const rawInput = Number(s.input_tokens ?? s.input ?? 0);
-            const rawOutput = Number(s.output_tokens ?? 0);
-            const rawCached = Number(s.cached ?? 0);
+            const rawInput = event.input;
+            const rawOutput = event.output;
+            const rawCached = event.cacheRead;
+            const cumulative = this.gemUsage.delta({ input: rawInput, output: rawOutput, cached: rawCached });
             const delta: AgentUsage = {
-              input: Math.max(0, rawInput - this.gemStatsBase.input),
-              output: Math.max(0, rawOutput - this.gemStatsBase.output),
+              input: cumulative.input,
+              output: cumulative.output,
               cacheCreate: 0,
-              cacheRead: Math.max(0, rawCached - this.gemStatsBase.cached),
+              cacheRead: cumulative.cached,
             };
-            this.gemStatsBase = { input: rawInput, output: rawOutput, cached: rawCached };
             this.opts.onUsageDelta?.(delta);
+            }
           }
         } catch {}
       }
@@ -2543,7 +1803,7 @@ export class AgentRunner {
       flush();
       imgCleanup();
       this.ocActiveProc = null;
-      this.ocBusy = false;
+      this.messageSession.busy = false;
       if (this.stopped) { this.emitExit(code); return; }
       // Primeiro turno que morreu sem completar (sem evento result — OAuth
       // expirado, 429 de quota, --model inválido: falhas antes do CLI gravar
@@ -2551,10 +1811,7 @@ export class AgentRunner {
       // roda `--resume latest` e reabre a sessão que o clear/compact
       // descartou — e o delta contra gemStatsBase=0 re-fatura o histórico
       // inteiro. Só restaura no MESMO epoch (reset no meio já re-armou tudo).
-      if (firstTurn && !sawResult && epoch === this.ocEpoch && !this.ocFirstTurn) {
-        this.ocFirstTurn = true;
-        if (this.ocPendingSummary === undefined) this.ocPendingSummary = pendingSummary;
-      }
+      if (!sawResult && this.messageSession.owns(epoch)) this.messageSession.restoreFirstTurn(firstTurnSnapshot);
       this.setState("idle");
       this.drainOcQueue();
     });
@@ -2563,54 +1820,13 @@ export class AgentRunner {
   /* ---------- Codex per-message model ---------- */
 
   private buildCodexConfigArgs(): string[] {
-    // Codex aceita config via flags `-c key=value` em TOML inline.
-    // Nome do server vira segmento da chave (`mcp_servers.<name>.command`).
-    // Strings TOML usam aspas simples pra preservar chars do nome (".", "-").
-    const tomlString = (s: string) => `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
-    const tomlStringArray = (xs: string[]) => `[${xs.map(tomlString).join(",")}]`;
-    const tomlEnvTable = (env: Record<string, string>) => {
-      const entries = Object.entries(env).map(([k, v]) => `${k}=${tomlString(v)}`);
-      return `{${entries.join(",")}}`;
-    };
-    const tomlKey = (name: string) => /^[A-Za-z0-9_-]+$/.test(name) ? name : tomlString(name);
-
-    const out: string[] = [];
-
-    // MCPs Phase 3 — extras antes do bridge (bridge reservado em "the-dudes").
-    // Codex stdio only — SSE/HTTP servers descartados com warning.
-    if (this.opts.extraMcpServers) {
-      for (const [name, cfg] of Object.entries(this.opts.extraMcpServers)) {
-        if (name === "the-dudes") continue;
-        const isStdio = (cfg.type ?? "stdio") === "stdio";
-        if (!isStdio || !cfg.command) {
-          this.opts.log("warn", `[codex:${this.info.name}] skipping MCP "${name}" — only stdio transport is supported`);
-          continue;
-        }
-        const k = tomlKey(name);
-        out.push("-c", `mcp_servers.${k}.command=${tomlString(cfg.command)}`);
-        if (cfg.args && cfg.args.length > 0) {
-          out.push("-c", `mcp_servers.${k}.args=${tomlStringArray(cfg.args)}`);
-        }
-        if (cfg.env && Object.keys(cfg.env).length > 0) {
-          out.push("-c", `mcp_servers.${k}.env=${tomlEnvTable(cfg.env)}`);
-        }
-      }
-    }
-
-    const env: Record<string, string> = {
-      THE_DUDES_AGENT_ID: this.info.id,
-      THE_DUDES_AGENT_NAME: this.info.name,
-      THE_DUDES_ORCH_URL: this.opts.orchestratorUrl,
-      THE_DUDES_AGENT_TOKEN_FILE: this.writeAgentTokenFile(),
-      ...this.featuresEnv(),
-    };
-    if (this.opts.bridgeSocketPath) env.THE_DUDES_BRIDGE_SOCKET = this.opts.bridgeSocketPath;
-    out.push(
-      "-c", `mcp_servers.the-dudes.command=${tomlString(this.opts.bridgeCommand)}`,
-      "-c", `mcp_servers.the-dudes.args=${tomlStringArray(this.opts.bridgeArgs)}`,
-      "-c", `mcp_servers.the-dudes.env=${tomlEnvTable(env)}`,
-    );
-    return out;
+    const built = buildCodexMcpArgs(this.opts.extraMcpServers, {
+      command: this.opts.bridgeCommand,
+      args: this.opts.bridgeArgs,
+      env: this.bridgeEnv(),
+    });
+    for (const warning of built.warnings) this.opts.log("warn", `[codex:${this.info.name}] ${warning}`);
+    return built.args;
   }
 
   private runCodexMessage(content: string, images?: ImageAttachment[]) {
@@ -2619,14 +1835,8 @@ export class AgentRunner {
     this.setState("thinking");
 
     let message = content;
-    if (this.ocFirstTurn) {
-      this.ocFirstTurn = false;
-      const summary = this.ocPendingSummary ? `\n\n# Previous conversation summary\n${this.ocPendingSummary}` : "";
-      this.ocPendingSummary = undefined;
-      message = `${buildSystemPromptHeader(this.opts.features)}\n\n# Your role\n${this.info.role}\n\n${this.info.systemPrompt}\n\n# Workspace\n${this.workspaceInfo()}${summary}\n\n---\n\n${content}`;
-    } else {
-      this.ocFirstTurn = false;
-    }
+    const firstTurnSnapshot = this.messageSession.consumeFirstTurnIfNeeded();
+    if (firstTurnSnapshot.firstTurn) message = this.initialMessage(content, firstTurnSnapshot.pendingSummary);
     this.traceCli("codex", "argv", message);
 
     const configArgs = this.buildCodexConfigArgs();
@@ -2647,11 +1857,11 @@ export class AgentRunner {
     if (images && images.length) {
       const { paths, cleanup } = this.writeImageTempFiles(images);
       imgCleanup = cleanup;
-      imageArgs = paths.flatMap((p) => ["-i", p]);
+      imageArgs = codexImageArgs(paths);
     }
 
-    const args = this.ocSessionId
-      ? ["exec", "resume", ...commonFlags, this.ocSessionId, ...imageArgs, message]
+    const args = this.messageSession.sessionId
+      ? ["exec", "resume", ...commonFlags, this.messageSession.sessionId, ...imageArgs, message]
       : ["exec", ...commonFlags, ...imageArgs, message];
 
     this.traceSpawn("codex", args);
@@ -2663,7 +1873,7 @@ export class AgentRunner {
     this.ocActiveProc = proc;
     // Epoch do spawn: eventos deste turno só valem enquanto a sessão não foi
     // resetada (clear/compact) — ver handleCodexEvent.
-    const epoch = this.ocEpoch;
+    const epoch = this.messageSession.epoch;
 
     let buf = "";
 
@@ -2699,7 +1909,7 @@ export class AgentRunner {
       }
       imgCleanup();
       this.ocActiveProc = null;
-      this.ocBusy = false;
+      this.messageSession.busy = false;
       if (this.stopped) { this.emitExit(code); return; }
       this.setState("idle");
       this.drainOcQueue();
@@ -2713,67 +1923,31 @@ export class AgentRunner {
     // nova). Comparar epoch (e não `compacting`) preserva os eventos LEGÍTIMOS
     // do turno em voo durante o waitOcIdle — descartar thread.started nessa
     // fase deixava o primeiro turno órfão e o one-shot resumia thread vazia.
-    if (epoch !== this.ocEpoch) return;
-    switch (event.type) {
-      case "thread.started": {
-        const tid = event.thread_id as string | undefined;
-        if (tid && tid !== this.ocSessionId) {
-          this.ocSessionId = tid;
-          if (this.opts.onSessionId) this.opts.onSessionId(tid);
+    if (!this.messageSession.owns(epoch)) return;
+    for (const normalized of parseCodexTurnEvent(event)) {
+      if (normalized.type === "session") {
+        if (normalized.sessionId !== this.messageSession.sessionId) {
+          this.messageSession.sessionId = normalized.sessionId;
+          this.opts.onSessionId?.(normalized.sessionId);
         }
-        break;
-      }
-      case "item.started": {
-        const item = event.item;
-        if (item?.type === "mcp_tool_call") {
-          this.opts.onToolUse(item.tool ?? "", item.arguments ?? {});
-          if ((item.tool as string)?.includes("send_message")) this.setState("sending");
-          else this.setState("thinking");
-        }
-        break;
-      }
-      case "item.completed": {
-        const item = event.item;
-        if (item?.type === "agent_message") {
-          const text = (item.text as string | undefined)?.trim();
-          if (text) {
-            this.setState("speaking");
-            this.opts.onAssistantText(text);
-          }
-        }
-        break;
-      }
-      case "turn.completed": {
-        const u = event.usage;
-        if (u) {
+      } else if (normalized.type === "tool") {
+        this.opts.onToolUse(normalized.name, normalized.input);
+        this.setState(normalized.name.includes("send_message") ? "sending" : "thinking");
+      } else if (normalized.type === "text") {
+        this.setState("speaking");
+        this.opts.onAssistantText(normalized.text);
+      } else if (normalized.type === "usage") {
           const delta: AgentUsage = {
-            input: Number(u.input_tokens ?? 0),
-            output: Number(u.output_tokens ?? 0),
-            cacheCreate: 0,
-            cacheRead: Number(u.cached_input_tokens ?? 0),
+            input: normalized.input,
+            output: normalized.output,
+            cacheCreate: normalized.cacheCreate,
+            cacheRead: normalized.cacheRead,
           };
           this.opts.onUsageDelta?.(delta);
           this.checkContextUsage(delta, "inclusive");
-        }
-        break;
-      }
-      // Estouro de janela do codex chega por aqui (turn.failed com
-      // error.message "Your input exceeds the context window...") e encerra
-      // SEM turn.completed — descartar esses eventos deixava o agente mudo e
-      // permanentemente quebrado (todo exec resume falha igual).
-      case "turn.failed": {
-        const emsg = String(event.error?.message ?? event.error ?? "turn failed");
-        this.checkContextFullError(emsg);
-        this.opts.onError(`codex: ${emsg}`);
-        break;
-      }
-      case "error": {
-        const emsg = String(event.message ?? event.error?.message ?? "");
-        if (emsg) {
-          this.checkContextFullError(emsg);
-          this.opts.onError(`codex: ${emsg}`);
-        }
-        break;
+      } else if (normalized.type === "error") {
+        this.checkContextFullError(normalized.message);
+        this.opts.onError(`codex: ${normalized.message}`);
       }
     }
   }
@@ -2793,42 +1967,21 @@ export class AgentRunner {
     prompt: string,
     opts: { resume?: string; outputFormat: "streaming-json" | "json" | "plain"; forCompact?: boolean },
   ): string[] {
-    const args: string[] = [
-      "-p", prompt,
-      "--output-format", opts.outputFormat,
-      "--no-auto-update",
-      "--cwd", this.opts.workspaceRoot,
-    ];
-    if (this.info.model) args.push("-m", this.info.model);
-    // Effort: níveis canônicos do Grok Build (docs headless).
-    // collectThinking pede reasoning visível → sobe pro mínimo "high" se
-    // estiver baixo/ausente (mesma ideia do Claude).
-    let effort = this.info.effort;
-    if (!opts.forCompact && this.info.collectThinking && (!effort || effort === "none" || effort === "minimal" || effort === "low" || effort === "medium")) {
-      effort = "high";
-    }
-    if (effort) args.push("--effort", effort);
-    if (opts.resume) args.push("--resume", opts.resume);
-    // Plan mode: permission-mode plan + allowlist de tools de leitura.
-    // NÃO combinar com --always-approve (anularia o plan).
-    if (this.info.planMode && !opts.forCompact) {
-      args.push("--permission-mode", "plan");
-      // Tool IDs internos do Grok (docs 14-headless-mode § Tool Filtering).
-      args.push("--tools", "read_file,grep,list_dir,web_search,web_fetch");
-    } else {
-      // Non-interactive: sem TUI não há como aprovar tools (equiv. codex/crush).
-      args.push("--always-approve");
-    }
-    // Compact/one-shot: sem subagents e sem memória pra resposta curta.
-    // max-turns generoso: o resumo pode precisar de 1–2 tool reads.
-    if (opts.forCompact) {
-      args.push("--no-subagents", "--no-memory", "--max-turns", "8");
-    }
-    return args;
+    return grokHeadlessArgs({
+      prompt,
+      outputFormat: opts.outputFormat,
+      workspaceRoot: this.opts.workspaceRoot,
+      model: this.info.model,
+      effort: this.info.effort,
+      collectThinking: this.info.collectThinking,
+      planMode: this.info.planMode,
+      sessionId: opts.resume,
+      forCompact: opts.forCompact,
+    });
   }
 
   /** Project MCP config `.grok/config.toml` (docs: project-scoped MCP).
-   *  Valores por agente via `${VAR}`. Auth NÃO mora aqui — ver grokUserHome().
+   *  Valores por agente via `${VAR}`. Auth NÃO mora aqui — ver runtimeFiles.grokHome().
    *  Nunca criar auth.json/sessions aqui (poluiria se GROK_HOME errasse). */
   private writeGrokConfig() {
     const dir = path.join(this.opts.workspaceRoot, ".grok");
@@ -2851,63 +2004,6 @@ export class AgentRunner {
       try { rmSync(path.join(dir, junk), { recursive: true, force: true }); } catch { /* best-effort */ }
     }
 
-    const lines: string[] = [
-      "# Managed by the-dudes — MCP bridge for Grok Build agents.",
-      "# Per-agent values are expanded from the process environment (${VAR}).",
-      "",
-    ];
-
-    const emitStdio = (name: string, command: string, args?: string[], env?: Record<string, string>) => {
-      // MCP server names: letters, numbers, hyphens, underscores only.
-      const safe = name.replace(/[^A-Za-z0-9_-]/g, "-");
-      lines.push(`[mcp_servers.${safe}]`);
-      lines.push(`command = ${tomlQuote(command)}`);
-      lines.push("enabled = true");
-      if (args && args.length > 0) {
-        lines.push(`args = [${args.map(tomlQuote).join(", ")}]`);
-      }
-      lines.push("");
-      if (env && Object.keys(env).length > 0) {
-        lines.push(`[mcp_servers.${safe}.env]`);
-        for (const [k, v] of Object.entries(env)) {
-          lines.push(`${k} = ${tomlQuote(v)}`);
-        }
-        lines.push("");
-      }
-    };
-
-    const emitRemote = (name: string, type: "http" | "sse", url: string, headers?: Record<string, string>) => {
-      const safe = name.replace(/[^A-Za-z0-9_-]/g, "-");
-      lines.push(`[mcp_servers.${safe}]`);
-      lines.push(`url = ${tomlQuote(url)}`);
-      lines.push("enabled = true");
-      lines.push("");
-      if (headers && Object.keys(headers).length > 0) {
-        lines.push(`[mcp_servers.${safe}.headers]`);
-        for (const [k, v] of Object.entries(headers)) {
-          lines.push(`${tomlQuote(k)} = ${tomlQuote(v)}`);
-        }
-        lines.push("");
-      }
-      void type; // Grok infere http/sse pela URL; type reservado p/ futuros campos
-    };
-
-    if (this.opts.extraMcpServers) {
-      for (const [name, cfg] of Object.entries(this.opts.extraMcpServers)) {
-        if (name === "the-dudes") continue;
-        const type = cfg.type ?? "stdio";
-        if (type === "stdio") {
-          if (!cfg.command) continue;
-          emitStdio(name, cfg.command, cfg.args, cfg.env);
-        } else if ((type === "http" || type === "sse") && cfg.url) {
-          emitRemote(name, type, cfg.url, cfg.headers);
-        } else {
-          this.opts.log("warn", `[grok:${this.info.name}] skipping MCP "${name}" — transporte "${type}" sem command/url`);
-        }
-      }
-    }
-
-    // Bridge the-dudes — env por expansão ${VAR} (multi-agente no mesmo cwd).
     const bridgeEnv: Record<string, string> = {
       THE_DUDES_AGENT_ID: "${THE_DUDES_AGENT_ID}",
       THE_DUDES_AGENT_NAME: "${THE_DUDES_AGENT_NAME}",
@@ -2920,15 +2016,13 @@ export class AgentRunner {
     for (const k of Object.keys(this.featuresEnv())) {
       bridgeEnv[k] = `\${${k}}`;
     }
-    emitStdio(
-      "the-dudes",
-      this.opts.bridgeCommand,
-      this.opts.bridgeArgs.length > 0 ? this.opts.bridgeArgs : undefined,
-      bridgeEnv,
-    );
+    const built = buildGrokMcpToml(this.opts.extraMcpServers, {
+      command: this.opts.bridgeCommand, args: this.opts.bridgeArgs, env: bridgeEnv,
+    });
+    for (const warning of built.warnings) this.opts.log("warn", `[grok:${this.info.name}] ${warning}`);
 
     try {
-      writeFileSync(path.join(dir, "config.toml"), lines.join("\n"), { mode: 0o600 });
+      writeFileSync(path.join(dir, "config.toml"), built.toml, { mode: 0o600 });
     } catch (e) {
       this.opts.log("warn", `[grok:${this.info.name}] failed to write .grok/config.toml: ${(e as Error).message}`);
     }
@@ -2939,38 +2033,23 @@ export class AgentRunner {
    * `.grok/` do workspace — esse path é só project-config (MCP); se o CLI
    * confundir com GROK_HOME, headless cai em 401 (sem credenciais).
    */
-  private grokUserHome(): string {
-    const home = this.opts.dropTo?.home ?? process.env.HOME ?? os.homedir();
-    return path.join(home, ".grok");
-  }
-
   private grokTurnEnv(): NodeJS.ProcessEnv {
-    const env = this.buildEnv();
-    // Garante HOME do usuário dropado (sudo) — sem isso auth cai em /var/root/.grok.
-    if (this.opts.dropTo?.home) {
-      env.HOME = this.opts.dropTo.home;
-      env.USER = this.opts.dropTo.user;
-      env.LOGNAME = this.opts.dropTo.user;
-      if (this.opts.dropTo.path) env.PATH = this.opts.dropTo.path;
-    }
-    return {
-      ...env,
-      THE_DUDES_AGENT_TOKEN_FILE: this.writeAgentTokenFile(),
-      ...this.featuresEnv(),
-      // Auth/sessões SEMPRE em ~/.grok do user — isolado do project config.
-      GROK_HOME: this.grokUserHome(),
-      // Evita spam de update check no stderr em headless.
-      GROK_DISABLE_AUTOUPDATER: "1",
-    };
+    return buildGrokEnv({
+      base: this.buildEnv(),
+      tokenFile: this.runtimeFiles.tokenFile(),
+      features: this.featuresEnv(),
+      grokHome: this.runtimeFiles.grokHome(),
+      dropTo: this.opts.dropTo,
+    });
   }
 
   private async runGrokMessage(content: string, images?: ImageAttachment[]) {
-    if (this.stopped) { this.ocBusy = false; return; }
-    if (!this.ensureRunnerAvailable("grok")) { this.ocBusy = false; return; }
+    if (this.stopped) { this.messageSession.busy = false; return; }
+    if (!this.ensureRunnerAvailable("grok")) { this.messageSession.busy = false; return; }
     // Nunca manda ciphertext pro CLI — hang/resposta lixo. Decryption falhou
     // no spawn (sem project key): aborta o turno em vez de travar o runner.
     if (typeof this.info.systemPrompt === "string" && this.info.systemPrompt.startsWith("e2e:")) {
-      this.ocBusy = false;
+      this.messageSession.busy = false;
       this.opts.onError(
         `[grok] systemPrompt ainda cifrado (sem project key no daemon) — abra o projeto no browser pra re-share da chave E2EE e reinicie o agente`,
       );
@@ -2982,18 +2061,16 @@ export class AgentRunner {
     this.writeGrokConfig();
 
     let message = content;
-    const firstTurn = this.ocFirstTurn;
-    const pendingSummary = this.ocPendingSummary;
-    const epoch = this.ocEpoch;
+    const firstTurn = this.messageSession.firstTurn;
+    const pendingSummary = this.messageSession.pendingSummary;
+    const epoch = this.messageSession.epoch;
     // Resume: NÃO re-injeta system+skills (já na sessão). Só first-turn cold.
-    if (firstTurn && !this.ocSessionId) {
-      this.ocFirstTurn = false;
-      const summary = this.ocPendingSummary ? `\n\n# Previous conversation summary\n${this.ocPendingSummary}` : "";
-      this.ocPendingSummary = undefined;
-      message = `${buildSystemPromptHeader(this.opts.features)}\n\n# Your role\n${this.info.role}\n\n${this.info.systemPrompt}\n\n# Workspace\n${this.workspaceInfo()}${summary}\n\n---\n\n${content}`;
+    if (firstTurn && !this.messageSession.sessionId) {
+      this.messageSession.consumeFirstTurn();
+      message = this.initialMessage(content, pendingSummary);
     } else if (firstTurn) {
-      // Tinha resumeSessionId mas ocFirstTurn ainda true (legado) — só avança flag.
-      this.ocFirstTurn = false;
+      // Tinha resumeSessionId mas firstTurn ainda true (legado) — só avança flag.
+      this.messageSession.firstTurn = false;
     }
 
     // Imagens: grava temp e referencia por path (tool read_file do Grok).
@@ -3001,20 +2078,18 @@ export class AgentRunner {
     if (images && images.length) {
       const { paths, cleanup } = this.writeImageTempFiles(images);
       imgCleanup = cleanup;
-      if (paths.length) {
-        message += `\n\nAttached image file(s) — open with your file reader tool:\n${paths.join("\n")}`;
-      }
+      message = appendFileImagePrompt(message, paths, "grok");
     }
 
     // Prime do dedupe de tool_calls: em resume de sessão com histórico,
     // marca as tools de turnos antigos como vistas SEM emitir.
     if (!this.grokToolsPrimed) {
       this.grokToolsPrimed = true;
-      if (this.ocSessionId) this.grokSweepToolCalls(this.ocSessionId, false);
+      if (this.messageSession.sessionId) this.grokSweepToolCalls(this.messageSession.sessionId, false);
     }
 
     const args = this.buildGrokHeadlessArgs(message, {
-      resume: this.ocSessionId,
+      resume: this.messageSession.sessionId,
       outputFormat: "streaming-json",
     });
     this.traceCli("grok", "argv", message);
@@ -3029,7 +2104,7 @@ export class AgentRunner {
       }, this.opts.dropTo ?? null);
     } catch (e) {
       imgCleanup();
-      this.ocBusy = false;
+      this.messageSession.busy = false;
       this.opts.onError(`grok spawn falhou: ${(e as Error).message}`);
       this.setState("idle");
       this.drainOcQueue();
@@ -3039,12 +2114,9 @@ export class AgentRunner {
 
     // Watchdog: se o CLI não sair em GROK_TURN_TIMEOUT_MS, mata e libera
     // a fila (sintoma real: resume + prompt enorme fica em 0% CPU por horas).
-    const turnKiller = setTimeout(() => {
-      if (!procAlive(proc) || epoch !== this.ocEpoch) return;
-      this.opts.log("warn", `[grok:${this.info.name}] turno excedeu ${GROK_TURN_TIMEOUT_MS / 1000}s — SIGKILL (session=${this.ocSessionId?.slice(0, 8) ?? "nova"})`);
-      try { proc.kill("SIGKILL"); } catch { /* ignore */ }
-    }, GROK_TURN_TIMEOUT_MS);
-    proc.on("close", () => clearTimeout(turnKiller));
+    armHardTimeout(proc, GROK_TURN_TIMEOUT_MS, () => {
+      this.opts.log("warn", `[grok:${this.info.name}] turno excedeu ${GROK_TURN_TIMEOUT_MS / 1000}s — SIGKILL (session=${this.messageSession.sessionId?.slice(0, 8) ?? "nova"})`);
+    }, () => this.messageSession.owns(epoch));
 
     // Tool calls ao vivo durante o turno (só possível em resume, quando o
     // sessionId já é conhecido; turno cold emite tudo no sweep final).
@@ -3052,11 +2124,11 @@ export class AgentRunner {
     // se um neto herdou os pipes de stdio (mesmo caveat do one-shot) — sem
     // isto cada turno wedged vazava um interval de 3s pra sempre.
     const toolPoll = setInterval(() => {
-      if (this.stopped || epoch !== this.ocEpoch || !procAlive(proc)) {
+      if (this.stopped || !this.messageSession.owns(epoch) || !procAlive(proc)) {
         clearInterval(toolPoll);
         return;
       }
-      if (this.ocSessionId) this.grokSweepToolCalls(this.ocSessionId, true);
+      if (this.messageSession.sessionId) this.grokSweepToolCalls(this.messageSession.sessionId, true);
     }, 3000);
     proc.on("close", () => clearInterval(toolPoll));
 
@@ -3073,43 +2145,26 @@ export class AgentRunner {
     let emittedAny = false;
 
     const ingestLine = (line: string) => {
-      if (!line.startsWith("{") || epoch !== this.ocEpoch) return;
+      if (!line.startsWith("{") || !this.messageSession.owns(epoch)) return;
       try {
-        const ev = JSON.parse(line) as {
-          type?: string;
-          data?: string;
-          message?: string;
-          text?: string;
-          sessionId?: string;
-          stopReason?: string;
-        };
-        if (ev.type === "text" && typeof ev.data === "string") {
-          fullText += ev.data;
-          // Só sinaliza "speaking" sem emitir mensagem — UI fica viva.
-          if (fullText.length > 0) this.setState("speaking");
-        } else if (ev.type === "thought" && typeof ev.data === "string") {
-          fullThought += ev.data;
-        } else if (ev.type === "end") {
-          sawEnd = true;
-          if (typeof ev.sessionId === "string" && ev.sessionId) {
-            endSessionId = ev.sessionId;
+        for (const event of parseGrokStreamEvent(JSON.parse(line))) {
+          if (event.type === "text") {
+            fullText += event.text;
+            if (fullText.length > 0) this.setState("speaking");
+          } else if (event.type === "thought") fullThought += event.text;
+          else if (event.type === "session") endSessionId = event.sessionId;
+          else if (event.type === "result") sawEnd = true;
+          else if (event.type === "error") {
+            errFromJson = event.message;
+            this.checkContextFullError(event.message);
           }
-        } else if (ev.type === "error") {
-          const msg = String(ev.message ?? ev.data ?? "grok error");
-          errFromJson = msg;
-          this.checkContextFullError(msg);
-        } else if (typeof ev.text === "string" && !ev.type) {
-          // --output-format json: objeto final { text, sessionId, ... }
-          fullText += ev.text;
-          if (typeof ev.sessionId === "string" && ev.sessionId) endSessionId = ev.sessionId;
-          sawEnd = true;
         }
       } catch { /* linha incompleta / ruído */ }
     };
 
     /** Emite no máximo 1 agent_to_user por turno. */
     const emitOnce = () => {
-      if (epoch !== this.ocEpoch || emittedAny) return;
+      if (!this.messageSession.owns(epoch) || emittedAny) return;
       if (fullThought && this.info.collectThinking && this.opts.onThinkingText) {
         this.opts.onThinkingText(fullThought);
       }
@@ -3122,7 +2177,7 @@ export class AgentRunner {
       // Billing: headless não emite usage — estima por chars (~4 chars/token).
       // Ocupação da janela NÃO usa essa heurística: finishGrokTurn lê
       // signals.json (contextTokensUsed real) após o turno.
-      if (epoch === this.ocEpoch && (message.length > 0 || t.length > 0)) {
+      if (this.messageSession.owns(epoch) && (message.length > 0 || t.length > 0)) {
         const estIn = Math.max(1, Math.ceil(message.length / 4));
         const estOut = Math.max(0, Math.ceil(t.length / 4));
         this.opts.onUsageDelta?.({
@@ -3163,7 +2218,7 @@ export class AgentRunner {
       }
       imgCleanup();
       this.ocActiveProc = null;
-      if (this.stopped) { this.ocBusy = false; this.emitExit(code); return; }
+      if (this.stopped) { this.messageSession.busy = false; this.emitExit(code); return; }
       void this.finishGrokTurn({
         code, epoch, firstTurn, pendingSummary, content, images,
         sawEnd, endSessionId, errOut, errFromJson, emittedAny,
@@ -3185,55 +2240,48 @@ export class AgentRunner {
     emittedAny: boolean;
   }): Promise<void> {
     try {
-      if (t.epoch !== this.ocEpoch) return;
+      if (!this.messageSession.owns(t.epoch)) return;
 
       // Sweep de tool calls ANTES dos branches de falha: turno abortado é
       // justamente o que precisa de auditoria na RUNS — e os branches de
       // retry descartam a sessão (sweep só no sucesso perdia o registro das
       // tools executadas pra sempre).
-      const sweepSid = t.endSessionId ?? this.ocSessionId;
+      const sweepSid = t.endSessionId ?? this.messageSession.sessionId;
       if (sweepSid) this.grokSweepToolCalls(sweepSid, true);
 
       const failed = (t.code ?? 1) !== 0 && !t.emittedAny && !t.sawEnd;
       const combinedErr = `${t.errOut}\n${t.errFromJson}`;
 
       // Resume de sessão inexistente / expurgada.
-      if (failed && this.ocSessionId && /session not found|couldn't (start|load|resume) session|no such session|404 not found/i.test(combinedErr)) {
-        this.opts.onError(`[grok] sessão ${this.ocSessionId} não existe mais — recomeçando sessão nova`);
-        this.ocSessionId = undefined;
-        this.ocFirstTurn = true;
-        this.ocPendingSummary = t.pendingSummary;
+      if (failed && this.messageSession.sessionId && isMissingSessionMessage(combinedErr)) {
+        this.opts.onError(`[grok] sessão ${this.messageSession.sessionId} não existe mais — recomeçando sessão nova`);
+        this.messageSession.resetForRetry(t.pendingSummary);
         this.info.sessionId = undefined;
         if (this.opts.onSessionId) this.opts.onSessionId("");
-        this.ocQueue.unshift({ content: t.content, images: t.images });
+        this.messageSession.prepend({ content: t.content, images: t.images });
         return;
       }
 
       // Timeout / kill sem output em resume: descarta sessão e tenta 1x cold.
       // Evita loop infinito de hang no mesmo sessionId.
-      if (failed && this.ocSessionId && !t.emittedAny && (t.code === null || t.code === 137 || t.code === 143 || /SIGKILL|SIGTERM|timed? ?out/i.test(combinedErr))) {
+      if (failed && this.messageSession.sessionId && !t.emittedAny && isAbortedFailure(combinedErr, t.code)) {
         this.opts.onError(
-          `[grok] turno abortado sem output (code=${t.code ?? "?"}) — limpando sessão ${this.ocSessionId.slice(0, 8)}… e recomeçando`,
+          `[grok] turno abortado sem output (code=${t.code ?? "?"}) — limpando sessão ${this.messageSession.sessionId.slice(0, 8)}… e recomeçando`,
         );
-        this.ocSessionId = undefined;
-        this.ocFirstTurn = true;
-        this.ocPendingSummary = t.pendingSummary;
+        this.messageSession.resetForRetry(t.pendingSummary);
         this.info.sessionId = undefined;
         if (this.opts.onSessionId) this.opts.onSessionId("");
-        this.ocQueue.unshift({ content: t.content, images: t.images });
+        this.messageSession.prepend({ content: t.content, images: t.images });
         return;
       }
 
       if (failed) {
-        if (t.firstTurn && !this.ocFirstTurn) {
-          this.ocFirstTurn = true;
-          if (this.ocPendingSummary === undefined) this.ocPendingSummary = t.pendingSummary;
-        }
+        this.messageSession.restoreFirstTurn(t);
         const err = combinedErr.trim() || `grok exit ${t.code ?? "?"} sem output`;
         this.checkContextFullError(err);
         // 401 / credenciais: mensagem acionável (login OAuth do CLI, não do the-dudes).
-        if (/401|unauthoriz|invalid (or expired )?credentials|failed to authenticate|no auth context|auth_kind=bearer/i.test(err)) {
-          const home = this.grokUserHome();
+        if (isAuthenticationFailure(err)) {
+          const home = this.runtimeFiles.grokHome();
           this.opts.onError(
             `[grok] autenticação falhou (401). Rode \`grok login\` no mesmo user do daemon ` +
             `(auth em ${home}/auth.json). Se usou XAI_API_KEY inválida, remova do env. ` +
@@ -3251,9 +2299,9 @@ export class AgentRunner {
       }
 
       // Captura sessionId do evento end (ou já tinha de resume).
-      const sid = t.endSessionId ?? this.ocSessionId;
-      if (sid && sid !== this.ocSessionId) {
-        this.ocSessionId = sid;
+      const sid = t.endSessionId ?? this.messageSession.sessionId;
+      if (sid && sid !== this.messageSession.sessionId) {
+        this.messageSession.sessionId = sid;
         if (this.opts.onSessionId) this.opts.onSessionId(sid);
       } else if (sid && !this.info.sessionId && this.opts.onSessionId) {
         this.opts.onSessionId(sid);
@@ -3276,13 +2324,13 @@ export class AgentRunner {
           this.reportContextOccupancy(sig.contextTokensUsed, sig.contextWindowTokens);
         } else if (sig) {
           // sessão nova ainda com used=0 — só reporta se ainda não temos valor
-          if (this.lastInputTokens <= 0) {
+          if (this.contextTracker.lastUsed() <= 0) {
             this.reportContextOccupancy(0, sig.contextWindowTokens);
           }
         }
       }
     } finally {
-      this.ocBusy = false;
+      this.messageSession.busy = false;
       if (!this.stopped) {
         this.setState("idle");
         this.drainOcQueue();
@@ -3294,20 +2342,10 @@ export class AgentRunner {
 
   /** Data dir do crush POR AGENTE, estável entre restarts do daemon (o
    *  sessionId persiste no DB do server → o resume precisa achar o crush.db
-   *  de novo; agentTmpDir é mkdtemp e morre com o runner). Fica dentro do
+   *  de novo; o tmpdir é aleatório e morre com o runner). Fica dentro do
    *  .crush do workspace (que o próprio crush já cobre com .gitignore "*"),
    *  segregado por agentId — sessões de agentes irmãos não colidem e o
    *  `session last` pós-turno é confiável (só vê as sessões DESTE agente). */
-  private crushDataDir(): string {
-    const dir = path.join(this.opts.workspaceRoot, ".crush", "agents", this.info.id);
-    mkdirSync(dir, { recursive: true });
-    // Defensivo: se .crush nasceu pelo nosso mkdir (não pelo crush), garante o
-    // .gitignore que o crush criaria — senão o crush.db entra no git do user.
-    const gi = path.join(this.opts.workspaceRoot, ".crush", ".gitignore");
-    try { if (!existsSync(gi)) writeFileSync(gi, "*\n", { mode: 0o644 }); } catch { /* best-effort */ }
-    return dir;
-  }
-
   /** Config de projeto do crush (`.crush.json` no workspaceRoot — prioridade
    *  máxima na cadeia de descoberta; o crush não tem flag de config path).
    *  MCPs extras + bridge the-dudes. Multi-agente no mesmo workspace: o
@@ -3316,34 +2354,12 @@ export class AgentRunner {
    *  são resolvidos do env do PROCESSO crush (buildEnv injeta por spawn). */
   private writeCrushConfig() {
     const configPath = path.join(this.opts.workspaceRoot, ".crush.json");
-    const mcp: Record<string, unknown> = {};
-    if (this.opts.extraMcpServers) {
-      for (const [name, cfg] of Object.entries(this.opts.extraMcpServers)) {
-        if (name === "the-dudes") continue;
-        const type = cfg.type ?? "stdio";
-        if (type === "stdio") {
-          if (!cfg.command) continue;
-          const entry: Record<string, unknown> = { type: "stdio", command: cfg.command };
-          if (cfg.args && cfg.args.length > 0) entry.args = cfg.args;
-          if (cfg.env && Object.keys(cfg.env).length > 0) entry.env = cfg.env;
-          mcp[name] = entry;
-        } else if ((type === "http" || type === "sse") && cfg.url) {
-          // crush suporta http/sse nativos (diferente de opencode/codex).
-          const entry: Record<string, unknown> = { type, url: cfg.url };
-          if (cfg.headers && Object.keys(cfg.headers).length > 0) entry.headers = cfg.headers;
-          mcp[name] = entry;
-        } else {
-          this.opts.log("warn", `[crush:${this.info.name}] skipping MCP "${name}" — transporte "${type}" sem command/url`);
-        }
-      }
-    }
     // Bridge the-dudes: os valores POR AGENTE (id/name/token-file) via $VAR —
     // o token file path não é secreto (o conteúdo é, mode 0600) e o env do
     // processo crush já carrega tudo (buildEnv + crushTurnEnv).
-    mcp["the-dudes"] = {
-      type: "stdio",
+    const built = buildCrushMcpConfig(this.opts.extraMcpServers, {
       command: this.opts.bridgeCommand,
-      ...(this.opts.bridgeArgs.length > 0 ? { args: this.opts.bridgeArgs } : {}),
+      args: this.opts.bridgeArgs,
       env: {
         THE_DUDES_AGENT_ID: "$THE_DUDES_AGENT_ID",
         THE_DUDES_AGENT_NAME: "$THE_DUDES_AGENT_NAME",
@@ -3352,17 +2368,10 @@ export class AgentRunner {
         ...(this.opts.bridgeSocketPath ? { THE_DUDES_BRIDGE_SOCKET: "$THE_DUDES_BRIDGE_SOCKET" } : {}),
         ...Object.fromEntries(Object.keys(this.featuresEnv()).map((k) => [k, `$${k}`])),
       },
-    };
-    const config: Record<string, unknown> = {
-      $schema: "https://charm.land/crush.json",
-      mcp,
-      // Sem bloco `providers`/`models`: o crush usa o estado global do usuário
-      // (~/.local/share/crush) — mesma filosofia do opencode (auth do host).
-      // `crush run` non-interactive auto-aprova as tools (sem TUI não há como
-      // promptar) — equivalente ao bypass incondicional do codex.
-    };
+    });
+    for (const warning of built.warnings) this.opts.log("warn", `[crush:${this.info.name}] ${warning}`);
     try {
-      writeFileSync(configPath, JSON.stringify(config, null, 2), { mode: 0o600 });
+      writeFileSync(configPath, JSON.stringify(built.config, null, 2), { mode: 0o600 });
     } catch (e) {
       this.opts.log("warn", `[crush:${this.info.name}] failed to write .crush.json: ${(e as Error).message}`);
     }
@@ -3371,11 +2380,7 @@ export class AgentRunner {
   /** Env por turno do crush: buildEnv + os valores que o `.crush.json`
    *  compartilhado referencia por `$VAR` (token file é por agente). */
   private crushTurnEnv(): NodeJS.ProcessEnv {
-    return {
-      ...this.buildEnv(),
-      THE_DUDES_AGENT_TOKEN_FILE: this.writeAgentTokenFile(),
-      ...this.featuresEnv(),
-    };
+    return buildBridgeAwareEnv(this.buildEnv(), this.runtimeFiles.tokenFile(), this.featuresEnv());
   }
 
   /** Roda um subcomando `crush session ...` e devolve o JSON parseado (null em
@@ -3386,44 +2391,35 @@ export class AgentRunner {
       if (!this.opts.cliCommands.crush.available) { resolve(null); return; }
       let proc: ChildProcess;
       try {
-        proc = spawnDropped(this.runnerCommand("crush"), [...argv, "--json", "--data-dir", this.crushDataDir()], {
+        proc = spawnDropped(this.runnerCommand("crush"), [...argv, "--json", "--data-dir", this.runtimeFiles.crushDataDir()], {
           cwd: this.opts.workspaceRoot,
           env: this.buildEnv(),
           stdio: ["ignore", "pipe", "pipe"],
         }, this.opts.dropTo ?? null);
       } catch { resolve(null); return; }
-      let out = "";
-      let settled = false;
-      const settle = (v: any) => { if (!settled) { settled = true; resolve(v); } };
-      const killer = setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} settle(null); }, 15_000);
-      proc.stdout!.setEncoding("utf8");
-      proc.stdout!.on("data", (c: string) => { out += c; });
-      proc.on("close", () => {
-        clearTimeout(killer);
-        try { settle(JSON.parse(out.trim())); } catch { settle(null); }
+      void collectProcessOutput(proc, { timeoutMs: 15_000 }).then((result) => {
+        if (result.timedOut) { resolve(null); return; }
+        try { resolve(JSON.parse(result.stdout.trim())); } catch { resolve(null); }
       });
-      proc.on("error", () => { clearTimeout(killer); settle(null); });
     });
   }
 
   private async runCrushMessage(content: string, images?: ImageAttachment[]) {
-    if (this.stopped) { this.ocBusy = false; return; }
-    if (!this.ensureRunnerAvailable("crush")) { this.ocBusy = false; return; }
+    if (this.stopped) { this.messageSession.busy = false; return; }
+    if (!this.ensureRunnerAvailable("crush")) { this.messageSession.busy = false; return; }
     this.setState("thinking");
     this.writeCrushConfig();
 
     let message = content;
-    const firstTurn = this.ocFirstTurn;
+    const firstTurnSnapshot = this.messageSession.consumeFirstTurnIfNeeded();
+    const firstTurn = firstTurnSnapshot.firstTurn;
     // Preservados pra restaurar se o turno morrer sem output (mesma lógica do
     // gemini): perder o firstTurn num turno falho descartaria system prompt e
     // resumo pendente pra sempre.
-    const pendingSummary = this.ocPendingSummary;
-    const epoch = this.ocEpoch;
+    const pendingSummary = firstTurnSnapshot.pendingSummary;
+    const epoch = this.messageSession.epoch;
     if (firstTurn) {
-      this.ocFirstTurn = false;
-      const summary = this.ocPendingSummary ? `\n\n# Previous conversation summary\n${this.ocPendingSummary}` : "";
-      this.ocPendingSummary = undefined;
-      message = `${buildSystemPromptHeader(this.opts.features)}\n\n# Your role\n${this.info.role}\n\n${this.info.systemPrompt}\n\n# Workspace\n${this.workspaceInfo()}${summary}\n\n---\n\n${content}`;
+      message = this.initialMessage(content, pendingSummary);
     }
     // Imagens: crush run não tem flag de attachment — grava temp e referencia
     // por path no prompt (a tool `view` do crush lê imagem do disco).
@@ -3431,28 +2427,28 @@ export class AgentRunner {
     if (images && images.length) {
       const { paths, cleanup } = this.writeImageTempFiles(images);
       imgCleanup = cleanup;
-      if (paths.length) message += `\n\nAttached image file(s) — open with your file viewer tool:\n${paths.join("\n")}`;
+      message = appendFileImagePrompt(message, paths, "crush");
     }
     this.traceCli("crush", "argv", message);
 
     // Sessão RESUMIDA (daemon restart): prime da base de billing ANTES do
     // turno — o meta é cumulativo e a base zero re-faturaria o histórico.
-    if (this.ocSessionId && this.crushStatsBase === null) {
-      const meta = await this.crushSessionJson(["session", "show", this.ocSessionId]);
-      const m = meta?.meta ?? meta;
-      this.crushStatsBase = {
-        prompt: Number(m?.prompt_tokens ?? 0),
-        completion: Number(m?.completion_tokens ?? 0),
-      };
-      if (this.stopped) { this.ocBusy = false; return; }
+    if (this.messageSession.sessionId && this.crushUsage.current() === null) {
+      const meta = await this.crushSessionJson(["session", "show", this.messageSession.sessionId]);
+      const parsed = parseCrushSessionMeta(meta);
+      this.crushUsage.prime({
+        prompt: parsed.prompt,
+        completion: parsed.completion,
+      });
+      if (this.stopped) { this.messageSession.busy = false; return; }
     }
-    if (this.crushStatsBase === null) this.crushStatsBase = { prompt: 0, completion: 0 };
+    this.crushUsage.prime({ prompt: 0, completion: 0 });
 
-    const args = ["run", "--quiet", "--data-dir", this.crushDataDir()];
+    const args = ["run", "--quiet", "--data-dir", this.runtimeFiles.crushDataDir()];
     if (this.info.model) args.push("-m", this.info.model);
     // Resume por UUID (campo `uuid` do session list — o `id` curto NÃO
     // funciona no --session do run, testado na v0.82.0).
-    if (this.ocSessionId) args.push("--session", this.ocSessionId);
+    if (this.messageSession.sessionId) args.push("--session", this.messageSession.sessionId);
     args.push(message);
 
     this.traceSpawn("crush", args);
@@ -3465,7 +2461,7 @@ export class AgentRunner {
       }, this.opts.dropTo ?? null);
     } catch (e) {
       imgCleanup();
-      this.ocBusy = false;
+      this.messageSession.busy = false;
       this.opts.onError(`crush spawn falhou: ${(e as Error).message}`);
       this.setState("idle");
       return;
@@ -3492,14 +2488,14 @@ export class AgentRunner {
     proc.on("close", (code) => {
       imgCleanup();
       this.ocActiveProc = null;
-      if (this.stopped) { this.ocBusy = false; this.emitExit(code); return; }
+      if (this.stopped) { this.messageSession.busy = false; this.emitExit(code); return; }
       void this.finishCrushTurn({ out, errOut, code, epoch, firstTurn, pendingSummary, content, images });
     });
   }
 
   /** Pós-turno do crush: emite o texto, captura o uuid da sessão nova, fatura
    *  o delta de tokens e trata falha de resume (sessão sumida do crush.db).
-   *  Só libera a fila (ocBusy) DEPOIS da captura de sessão — um segundo turno
+   *  Só libera a fila (busy) DEPOIS da captura de sessão — um segundo turno
    *  spawnado antes criaria OUTRA sessão e a conversa se partiria em duas. */
   private async finishCrushTurn(t: {
     out: string; errOut: string; code: number | null; epoch: number;
@@ -3509,7 +2505,7 @@ export class AgentRunner {
     try {
       // Epoch trocado (clear/compact no meio do turno): nada deste turno pode
       // falar/faturar/ressuscitar sessão pós-reset.
-      if (t.epoch !== this.ocEpoch) return;
+      if (!this.messageSession.owns(t.epoch)) return;
 
       const text = t.out.trim();
       const failed = (t.code ?? 1) !== 0 && !text;
@@ -3517,26 +2513,21 @@ export class AgentRunner {
       // Resume apontando pra sessão que sumiu do crush.db (reboot limpou o
       // data dir, delete manual): "session not found". Larga o id e re-tenta
       // o turno UMA vez como sessão nova (a mensagem não pode se perder).
-      if (failed && this.ocSessionId && /session not found/i.test(t.errOut)) {
-        this.opts.onError(`[crush] sessão ${this.ocSessionId} não existe mais — recomeçando sessão nova`);
-        this.ocSessionId = undefined;
-        this.crushStatsBase = { prompt: 0, completion: 0 };
-        this.ocFirstTurn = true;
-        this.ocPendingSummary = t.pendingSummary;
+      if (failed && this.messageSession.sessionId && isMissingSessionMessage(t.errOut)) {
+        this.opts.onError(`[crush] sessão ${this.messageSession.sessionId} não existe mais — recomeçando sessão nova`);
+        this.messageSession.resetForRetry(t.pendingSummary);
+        this.crushUsage.reset({ prompt: 0, completion: 0 });
         this.info.sessionId = undefined;
         if (this.opts.onSessionId) this.opts.onSessionId("");
-        this.ocQueue.unshift({ content: t.content, images: t.images });
-        return; // finally libera ocBusy e drena — o retry roda como turno novo
+        this.messageSession.prepend({ content: t.content, images: t.images });
+        return; // finally libera busy e drena — o retry roda como turno novo
       }
 
       if (failed) {
         // Primeiro turno que morreu sem output (key inválida, modelo errado,
         // provider fora): restaurar firstTurn/summary pro retry não perder o
         // system prompt (mesma proteção do gemini).
-        if (t.firstTurn && !this.ocFirstTurn) {
-          this.ocFirstTurn = true;
-          if (this.ocPendingSummary === undefined) this.ocPendingSummary = t.pendingSummary;
-        }
+        this.messageSession.restoreFirstTurn(t);
         const err = t.errOut.trim() || `crush exit ${t.code ?? "?"} sem output`;
         this.checkContextFullError(err);
         this.opts.onError(`crush: ${err.slice(0, 500)}`);
@@ -3551,15 +2542,14 @@ export class AgentRunner {
 
       // Captura da sessão criada pelo run (o stdout não traz o id): com o
       // data dir POR AGENTE, a mais recente é necessariamente a deste turno.
-      if (!this.ocSessionId) {
+      if (!this.messageSession.sessionId) {
         const last = await this.crushSessionJson(["session", "last"]);
         // `session last --json` retorna {meta:{uuid,...},messages:[...]} —
         // o uuid mora em .meta (o shape raiz {uuid} é só do `session list`).
-        const lm = last?.meta ?? last;
-        const uuid = typeof lm?.uuid === "string" ? lm.uuid : undefined;
-        if (t.epoch !== this.ocEpoch) return; // reset durante a captura
+        const uuid = parseCrushSessionMeta(last).sessionId;
+        if (!this.messageSession.owns(t.epoch)) return; // reset durante a captura
         if (uuid) {
-          this.ocSessionId = uuid;
+          this.messageSession.sessionId = uuid;
           if (this.opts.onSessionId) this.opts.onSessionId(uuid);
         } else {
           this.opts.log("warn", `[crush:${this.info.name}] não consegui capturar o uuid da sessão — próximo turno cria sessão nova`);
@@ -3570,26 +2560,25 @@ export class AgentRunner {
       // é derivável daqui (turno com N tool-calls soma N prompts) — contexto
       // cheio do crush é detectado pela rota reativa (checkContextFullError no
       // stderr), igual ao gemini.
-      if (this.ocSessionId) {
-        const show = await this.crushSessionJson(["session", "show", this.ocSessionId]);
-        if (t.epoch !== this.ocEpoch) return;
-        const m = show?.meta ?? show;
-        const prompt = Number(m?.prompt_tokens ?? 0);
-        const completion = Number(m?.completion_tokens ?? 0);
-        const base = this.crushStatsBase ?? { prompt: 0, completion: 0 };
+      if (this.messageSession.sessionId) {
+        const show = await this.crushSessionJson(["session", "show", this.messageSession.sessionId]);
+        if (!this.messageSession.owns(t.epoch)) return;
+        const parsed = parseCrushSessionMeta(show);
+        const prompt = parsed.prompt;
+        const completion = parsed.completion;
         if (prompt > 0 || completion > 0) {
+          const cumulative = this.crushUsage.delta({ prompt, completion });
           const delta: AgentUsage = {
-            input: Math.max(0, prompt - base.prompt),
-            output: Math.max(0, completion - base.completion),
+            input: cumulative.prompt,
+            output: cumulative.completion,
             cacheCreate: 0,
             cacheRead: 0,
           };
-          this.crushStatsBase = { prompt, completion };
           if (delta.input > 0 || delta.output > 0) this.opts.onUsageDelta?.(delta);
         }
       }
     } finally {
-      this.ocBusy = false;
+      this.messageSession.busy = false;
       if (!this.stopped) {
         this.setState("idle");
         this.drainOcQueue();
@@ -3601,15 +2590,9 @@ export class AgentRunner {
    *  per-message que aceitam imagem por caminho de arquivo (codex `-i`, gemini
    *  `@path`). Retorna paths + cleanup. opencode usa data-URL inline (não temp). */
   private writeImageTempFiles(images: ImageAttachment[]): { paths: string[]; cleanup: () => void } {
-    const dir = this.agentTmpDir();
-    mkdirSync(dir, { recursive: true });
-    const paths: string[] = [];
-    images.forEach((img, i) => {
-      const p = path.join(dir, `img-${Date.now()}-${i}.${mimeToExt(img.mimeType)}`);
-      try { writeFileSync(p, Buffer.from(img.base64, "base64"), { mode: 0o600 }); paths.push(p); }
-      catch (e) { this.opts.log("warn", `[cli:${this.info.id}] falha gravando imagem temp: ${(e as Error).message}`); }
-    });
-    return { paths, cleanup: () => { for (const p of paths) { try { rmSync(p, { force: true }); } catch { /* noop */ } } } };
+    const result = this.runtimeFiles.writeImages(images, imageExtension);
+    for (const error of result.errors) this.opts.log("warn", `[cli:${this.info.id}] falha gravando imagem temp: ${error.message}`);
+    return { paths: result.paths, cleanup: result.cleanup };
   }
 
   private drainOcQueue() {
@@ -3617,9 +2600,11 @@ export class AgentRunner {
     // paralelo com o one-shot/summarize na MESMA sessão (prime engoliria a
     // resposta dele; thread.started ressuscitaria a sessão pós-reset).
     // Re-drenada no finally do compactContext.
-    if (this.ocBusy || this.compacting || this.ocQueue.length === 0 || this.stopped) return;
-    this.ocBusy = true;
-    const { content, images } = this.ocQueue.shift()!;
+    if (this.messageSession.busy || this.compacting || this.messageSession.queuedCount() === 0 || this.stopped) return;
+    this.messageSession.busy = true;
+    const next = this.messageSession.dequeue();
+    if (!next) { this.messageSession.busy = false; return; }
+    const { content, images } = next;
     if (this.opts.cliRunner === "gemini") {
       this.runGeminiMessage(content, images);
     } else if (this.opts.cliRunner === "codex") {
@@ -3641,25 +2626,19 @@ export class AgentRunner {
   // queimava tokens por horas.
   private static readonly MAX_BUFFERED_MESSAGES = 20;
 
-  /** Stop de loop / anti-loop do server — esvazia backlog pra não processar
-   *  dezenas de a2a enfileirados depois do pause. */
-  private static readonly LOOP_STOP_RE =
-    /\[loop-stop\]|Conversation paused|loop detected|agent message limit reached|preventive mode active/i;
-
   pushUserMessage(content: string, images?: ImageAttachment[]) {
-    if (AgentRunner.LOOP_STOP_RE.test(content)) {
-      const dropped = this.ocQueue.length;
-      this.ocQueue = [];
+    if (isLoopStopMessage(content)) {
+      const dropped = this.messageSession.clearQueue();
       if (dropped > 0) {
         this.opts.log("warn", `[cli:${this.info.id}:${this.opts.cliRunner}] loop-stop — limpou ${dropped} msg(s) da fila`);
       }
     }
-    if (this.opts.cliRunner === "opencode" || this.opts.cliRunner === "gemini" || this.opts.cliRunner === "codex" || this.opts.cliRunner === "crush" || this.opts.cliRunner === "grok") {
-      if (this.ocQueue.length >= AgentRunner.MAX_BUFFERED_MESSAGES) {
-        this.opts.log("warn", `[cli:${this.info.id}:${this.opts.cliRunner}] ocQueue cheia (${this.ocQueue.length}) — drop mensagem`);
+    if (isPerMessageRunner(this.opts.cliRunner)) {
+      const queued = this.messageSession.queuedCount();
+      if (!this.messageSession.enqueue({ content, images }, AgentRunner.MAX_BUFFERED_MESSAGES)) {
+        this.opts.log("warn", `[cli:${this.info.id}:${this.opts.cliRunner}] ocQueue cheia (${queued}) — drop mensagem`);
         return;
       }
-      this.ocQueue.push({ content, images });
       this.drainOcQueue();
       return;
     }
@@ -3674,20 +2653,7 @@ export class AgentRunner {
       this.opts.log("info", `[cli:${this.info.id}:claude] buffered message during restart (queued=${this.pendingMessages.length})`);
       return;
     }
-    let messageContent: any;
-    if (images && images.length > 0) {
-      const blocks: any[] = [];
-      if (content) blocks.push({ type: "text", text: content });
-      for (const img of images) {
-        blocks.push({
-          type: "image",
-          source: { type: "base64", media_type: img.mimeType, data: img.base64 },
-        });
-      }
-      messageContent = blocks;
-    } else {
-      messageContent = content;
-    }
+    const messageContent = buildClaudeUserContent(content, images);
     const line = JSON.stringify({
       type: "user",
       message: { role: "user", content: messageContent },
@@ -3703,24 +2669,16 @@ export class AgentRunner {
     // restart ficam em memory por toda vida do AgentRunner (mesmo após
     // stop). Cleanup explicit pra GC.
     this.pendingMessages = [];
-    this.ocQueue = [];
-    if (this.ocEventReq) { try { this.ocEventReq.destroy(); } catch { /* noop */ } this.ocEventReq = null; }
+    this.messageSession.clearQueue();
+    this.openCodeTransport.stop();
     // One-shot de resumo em voo (compact): sem kill, roda órfão por até
     // ONE_SHOT_TIMEOUT_MS consumindo API — e o emitExit abaixo apaga o tmpdir
     // (cwd + session store do gemini) debaixo dele.
-    if (this.oneShotProc) { try { this.oneShotProc.kill("SIGKILL"); } catch {} this.oneShotProc = null; }
-    if (this.opts.cliRunner === "opencode" || this.opts.cliRunner === "gemini" || this.opts.cliRunner === "codex" || this.opts.cliRunner === "crush" || this.opts.cliRunner === "grok") {
-      if (procAlive(this.ocServerProc)) {
-        try { this.ocServerProc!.kill("SIGTERM"); } catch {}
-        setTimeout(() => {
-          if (procAlive(this.ocServerProc)) { try { this.ocServerProc!.kill("SIGKILL"); } catch {} }
-        }, 1500);
-      }
+    killProcess(this.oneShotProc, "SIGKILL");
+    this.oneShotProc = null;
+    if (isPerMessageRunner(this.opts.cliRunner)) {
       if (procAlive(this.ocActiveProc)) {
-        this.ocActiveProc!.kill("SIGTERM");
-        setTimeout(() => {
-          if (procAlive(this.ocActiveProc)) this.ocActiveProc!.kill("SIGKILL");
-        }, 1500);
+        terminateWithEscalation(this.ocActiveProc);
       } else {
         this.emitExit(0);
       }
@@ -3728,10 +2686,7 @@ export class AgentRunner {
     }
     if (procAlive(this.proc)) {
       try { this.proc!.stdin.end(); } catch {}
-      this.proc!.kill("SIGTERM");
-      setTimeout(() => {
-        if (procAlive(this.proc)) this.proc!.kill("SIGKILL");
-      }, 1500);
+      terminateWithEscalation(this.proc);
     }
   }
 
@@ -3760,15 +2715,11 @@ export class AgentRunner {
         return;
       }
       // Mata turno em voo E one-shot de compact (simétrico a stop()).
-      if (this.oneShotProc) { try { this.oneShotProc.kill("SIGKILL"); } catch {} this.oneShotProc = null; }
-      if (procAlive(this.ocActiveProc)) {
-        try { this.ocActiveProc!.kill("SIGTERM"); } catch {}
-        setTimeout(() => {
-          if (procAlive(this.ocActiveProc)) try { this.ocActiveProc!.kill("SIGKILL"); } catch {}
-        }, 1500);
-      }
-      this.ocQueue = [];
-      this.ocBusy = false;
+      killProcess(this.oneShotProc, "SIGKILL");
+      this.oneShotProc = null;
+      terminateWithEscalation(this.ocActiveProc);
+      this.messageSession.clearQueue();
+      this.messageSession.busy = false;
       this.resetWithSummary(undefined);
       this.info.sessionId = undefined;
       if (this.opts.onSessionId) this.opts.onSessionId("");
@@ -3813,13 +2764,13 @@ export class AgentRunner {
     //     conversa real) — pede MEMORY_JSON, parseia, salva via bridge;
     // (2) compacta a sessão real com o summarize NATIVO do serve.
     if (this.opts.cliRunner === "opencode") {
-      if (!this.ocServerUrl || !this.ocSessionId) {
+      if (!this.openCodeTransport.ready() || !this.messageSession.sessionId) {
         this.opts.onError("[ctx] compact: sessão opencode ainda não ativa — manda uma mensagem primeiro");
         return;
       }
       // ocModelParts remove o sufixo legado ":<effort>" — split inline aqui
       // mandava "deepseek-v4-pro:max" pro serve e o compact falhava sempre.
-      const { providerID, modelID } = this.ocModelParts();
+      const { providerID, modelID } = providerModelParts(this.info.model);
       if (!providerID || !modelID) { this.opts.onError("[ctx] compact: modelo inválido"); return; }
       // Turno em voo compartilha a sessão do serve: o prime pós-summarize
       // marcaria as parts dele como vistas (resposta engolida + retry
@@ -3837,7 +2788,7 @@ export class AgentRunner {
         const extractPrompt =
           "Extract NEW durable knowledge from this conversation worth keeping permanently — every explicit decision, convention, preference, architectural choice or stable fact. Be generous." + already +
           " Respond with ONLY one line: `MEMORY_JSON:` + a single-line JSON array, each item {\"title\":\"<short>\",\"body\":\"<full>\",\"type\":\"decision\"|\"fact\"|\"reference\"|\"preference\",\"supersedes\":[\"<id>\"]?} in the conversation's language. Use `MEMORY_JSON: []` if nothing. No markdown.";
-        const fork = await this.ocServeFetch(`/session/${this.ocSessionId}/fork`, "POST", {});
+        const fork = await this.ocServeFetch(`/session/${this.messageSession.sessionId}/fork`, "POST", {});
         const forkId = fork?.id as string | undefined;
         if (forkId) {
           try {
@@ -3862,23 +2813,23 @@ export class AgentRunner {
       // em sessão grande — e como timeout não contava no streak, virava loop
       // infinito de compacts caros a cada cooldown.
       try {
-        await this.ocServeFetch(`/session/${this.ocSessionId}/summarize`, "POST", { providerID, modelID }, ONE_SHOT_TIMEOUT_MS);
+        await this.ocServeFetch(`/session/${this.messageSession.sessionId}/summarize`, "POST", { providerID, modelID }, ONE_SHOT_TIMEOUT_MS);
         // O summarize cria uma mensagem nova na sessão (resumo + step-finish
         // com tokens do contexto PRÉ-compactação). Prime IMEDIATO marca essas
-        // parts como vistas — a flag ocNeedsPrime só seria consumida no início
+        // parts como vistas — a flag needsPrime só seria consumida no início
         // do próximo turno, e um turno em voo drenaria o step-finish antes,
         // re-disparando context_full logo após o reset (resumo-do-resumo).
         try {
-          const hist = await this.ocServeFetch(`/session/${this.ocSessionId}/message`, "GET");
+          const hist = await this.ocServeFetch(`/session/${this.messageSession.sessionId}/message`, "GET");
           if (Array.isArray(hist)) for (const m of hist) for (const p of (m?.parts ?? [])) { if (p?.id) this.ocSeenPartIds.add(p.id); }
-        } catch { this.ocNeedsPrime = true; /* fallback: prime no próximo turno */ }
+        } catch { this.messageSession.needsPrime = true; /* fallback: prime no próximo turno */ }
         this.resetContextAccounting();
         this.opts.onError(`[ctx] contexto compactado${saveMemory ? " + memória salva" : " (sem salvar memória)"}`);
       } catch (e) {
         // Timeout do cliente não desfaz o summarize no serve: se ele concluir
         // depois, as parts do resumo precisam de prime mesmo assim — senão o
         // próximo turno re-despacha o resumo como fala + context_full espúrio.
-        this.ocNeedsPrime = true;
+        this.messageSession.needsPrime = true;
         // Timeout CONTA no streak: isentá-lo reabria o loop infinito quando o
         // timeout é determinístico (o teto de 3 existe exatamente pra isso).
         // O falso positivo (summarize concluiu no serve após o timeout) fica
@@ -3924,7 +2875,7 @@ export class AgentRunner {
       // "API Error" no meio do texto (conversa sobre debugging) é válido.
       // NÃO descartar a conversa com base em resumo-lixo: preserva a sessão
       // antiga e deixa o retry (cooldown) ou o usuário decidir.
-      const summaryIsError = /^\s*API Error/i.test(summary);
+      const summaryIsError = isApiErrorMessage(summary);
       if (oldSession && (!summary || summaryIsError)) {
         this.registerCompactFailure();
         this.opts.resumeSessionId = oldSession;
@@ -3952,8 +2903,8 @@ export class AgentRunner {
     // gemini (--resume latest incondicional) ressuscitaria a sessão que um
     // clear acabou de descartar (a "latest" no storage do tmpdir ainda é
     // ela); no codex, exec sem sid "resumiria" uma thread nova vazia.
-    // Espelha os guards do claude (oldSession) e do opencode (ocSessionId).
-    if (this.ocFirstTurn || ((this.opts.cliRunner === "codex" || this.opts.cliRunner === "crush" || this.opts.cliRunner === "grok") && !this.ocSessionId)) {
+    // Espelha os guards do claude (oldSession) e do opencode (sessionId).
+    if (this.messageSession.firstTurn || ((this.opts.cliRunner === "codex" || this.opts.cliRunner === "crush" || this.opts.cliRunner === "grok") && !this.messageSession.sessionId)) {
       this.opts.onError("[ctx] compact: sessão ainda não ativa — manda uma mensagem primeiro");
       return;
     }
@@ -3991,10 +2942,10 @@ export class AgentRunner {
    *  teto) ou stop() no meio. */
   private async waitOcIdle(maxMs = 120_000): Promise<boolean> {
     const step = 250;
-    for (let waited = 0; this.ocBusy && !this.stopped && waited < maxMs; waited += step) {
+    for (let waited = 0; this.messageSession.busy && !this.stopped && waited < maxMs; waited += step) {
       await new Promise((r) => setTimeout(r, step));
     }
-    return !this.ocBusy && !this.stopped;
+    return !this.messageSession.busy && !this.stopped;
   }
 
   /** Extrai o bloco `MEMORY_JSON: [...]` do output do summary one-shot,
@@ -4155,17 +3106,7 @@ export class AgentRunner {
     const proc = this.proc;
     if (!procAlive(proc)) return;
     this.restarting = true;
-    await new Promise<void>((resolve) => {
-      let settled = false;
-      const done = () => { if (!settled) { settled = true; resolve(); } };
-      proc!.once("exit", done);
-      try { proc!.stdin.end(); } catch {}
-      try { proc!.kill("SIGTERM"); } catch {}
-      setTimeout(() => {
-        if (procAlive(proc)) { try { proc!.kill("SIGKILL"); } catch {} }
-      }, 1500);
-      setTimeout(done, 3000);
-    });
+    await terminateAndWait(proc, { beforeTerminate: () => { try { proc.stdin!.end(); } catch {} } });
     this.restarting = false;
   }
 
@@ -4184,25 +3125,15 @@ export class AgentRunner {
         env: this.buildEnv(),
         stdio: ["ignore", "pipe", "pipe"],
       }, this.opts.dropTo ?? null);
-      proc.stdout!.setEncoding("utf8");
-      proc.stderr!.setEncoding("utf8");
       this.oneShotProc = proc; // stop() precisa alcançar o one-shot
-      let out = "";
-      // Mesmo timeout/settle do runOneShot — killer resolve direto porque
-      // "close" não é garantido pós-SIGKILL (pipes herdados por processo neto).
-      let settled = false;
-      const settle = (v: string) => {
-        if (!settled) {
-          settled = true;
-          if (this.oneShotProc === proc) this.oneShotProc = null;
-          resolve(v);
-        }
-      };
-      const killer = setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} settle(""); }, ONE_SHOT_TIMEOUT_MS);
-      proc.stdout!.on("data", (c: string) => { this.traceCli("claude", "stdout", c); out += c; });
-      proc.stderr!.on("data", (c: string) => { this.traceCli("claude", "stderr", c); });
-      proc.on("close", () => { clearTimeout(killer); settle(out.trim()); });
-      proc.on("error", () => { clearTimeout(killer); settle(""); });
+      void collectProcessOutput(proc, {
+        timeoutMs: ONE_SHOT_TIMEOUT_MS,
+        onStdout: (chunk) => this.traceCli("claude", "stdout", chunk),
+        onStderr: (chunk) => this.traceCli("claude", "stderr", chunk),
+      }).then((result) => {
+        if (this.oneShotProc === proc) this.oneShotProc = null;
+        resolve(result.timedOut ? "" : result.stdout.trim());
+      });
     });
   }
 
@@ -4224,93 +3155,4 @@ export class AgentRunner {
     this.info.state = state;
     this.opts.onState(state);
   }
-}
-
-/**
- * Codex reasoning levels (per the gpt-5.x picker): low | medium | high |
- * xhigh ("Extra high"). Pass our EffortLevel through, cap "max" → "xhigh"
- * since that's the highest codex accepts.
- */
-function codexEffort(level: string): string {
-  if (level === "low" || level === "medium" || level === "high" || level === "xhigh") return level;
-  return "xhigh";
-}
-
-function isMissingSessionMessage(msg: string): boolean {
-  return MISSING_SESSION_PATTERNS.some((p) => p.test(msg));
-}
-
-/** Processo ainda vivo? `.killed` só diz que um sinal foi ENVIADO (vira true
- *  no próprio kill(), antes do exit) — como teste de vida em timeouts de
- *  escalação, `!p.killed` é sempre false e o SIGKILL nunca sai. */
-function procAlive(p: ChildProcess | null | undefined): boolean {
-  return !!p && p.exitCode === null && p.signalCode === null;
-}
-
-export function extractOneShotText(out: string, runner: CliRunner): string {
-  if (runner === "codex") {
-    const texts: string[] = [];
-    for (const line of out.split("\n")) {
-      try {
-        const ev = JSON.parse(line.trim());
-        if (ev.type === "item.completed" && ev.item?.type === "agent_message") {
-          texts.push(ev.item.text ?? "");
-        }
-      } catch {}
-    }
-    return texts.join("\n").trim();
-  }
-  if (runner === "gemini") {
-    const texts: string[] = [];
-    for (const line of out.split("\n")) {
-      try {
-        const ev = JSON.parse(line.trim());
-        if (ev.type === "message" && ev.role === "assistant") texts.push(String(ev.content ?? ""));
-      } catch {}
-    }
-    return texts.join("\n").trim();
-  }
-  if (runner === "opencode") {
-    const texts: string[] = [];
-    for (const line of out.split("\n")) {
-      try {
-        const ev = JSON.parse(line.trim().replace(/\x1b\[[0-9;]*[a-zA-Z]/g, ""));
-        if (ev.type === "text") texts.push(String(ev.part?.text ?? ""));
-      } catch {}
-    }
-    return texts.join("\n").trim();
-  }
-  if (runner === "grok") {
-    // --output-format json: objeto único (pode ser pretty-printed multi-linha
-    // com "text"/"thought"/"sessionId"). Antes exigíamos single-line e o
-    // pretty-print caía no return bruto → TTS falava o JSON inteiro.
-    const trimmed = out.trim();
-    if (trimmed.startsWith("{")) {
-      try {
-        const ev = JSON.parse(trimmed);
-        if (typeof ev?.text === "string" && ev.text.trim()) return ev.text.trim();
-        // error object: { type:"error", message:"..." }
-        if (ev?.type === "error" && typeof ev.message === "string") return "";
-      } catch { /* fall through to NDJSON */ }
-    }
-    // --output-format streaming-json: NDJSON type=text chunks
-    const texts: string[] = [];
-    for (const line of out.split("\n")) {
-      const s = line.trim();
-      if (!s.startsWith("{")) continue;
-      try {
-        const ev = JSON.parse(s);
-        if (ev.type === "text" && typeof ev.data === "string") texts.push(ev.data);
-        else if (typeof ev.text === "string") texts.push(ev.text);
-      } catch { /* skip */ }
-    }
-    if (texts.length) return texts.join("").trim();
-    return "";
-  }
-  return out.trim();
-}
-
-/** TOML double-quoted string (usado em `.grok/config.toml` gerado). */
-function tomlQuote(s: string): string {
-  return `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }

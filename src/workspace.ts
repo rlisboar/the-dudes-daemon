@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { existsSync, statSync, accessSync, constants as fsConsts, mkdirSync, chownSync, rmSync, readdirSync, realpathSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
