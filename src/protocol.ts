@@ -646,6 +646,38 @@ export interface GitlabApiResult {
   error?: string;
 }
 
+/* ---------- runner model discovery (orch ↔ daemon) ---------- */
+
+export interface DiscoveredRunnerModel {
+  id: string;
+  label: string;
+  description?: string;
+  isDefault?: boolean;
+  efforts?: string[];
+  inputModalities?: string[];
+}
+
+export interface RunnerModelCatalog {
+  runner: "claude" | "codex" | "opencode" | "gemini" | "crush" | "grok";
+  models: DiscoveredRunnerModel[];
+  source: "codex-app-server" | "cli-command" | "unsupported";
+  fetchedAt: number;
+  error?: string;
+}
+
+export interface ModelsDiscoverRequest {
+  type: "models:discover";
+  correlationId: string;
+  runner?: RunnerModelCatalog["runner"];
+  force?: boolean;
+}
+
+export interface ModelsCatalogResult {
+  type: "models:catalog";
+  correlationId: string;
+  catalogs: RunnerModelCatalog[];
+}
+
 export type FromDaemon =
   | GitlabApiResult
   | DaemonHello | DaemonPing | DaemonChallengeResponse
@@ -666,7 +698,8 @@ export type FromDaemon =
   | MCPSaveResult
   | MCPDeleteResult
   | GraphStatusEvent
-  | GraphDataEvent;
+  | GraphDataEvent
+  | ModelsCatalogResult;
 
 export type FromOrch =
   | DaemonWelcome | DaemonPong | DaemonChallenge
@@ -691,4 +724,5 @@ export type FromOrch =
   | MCPSaveRequest
   | MCPDeleteRequest
   | GraphBuildRequest
-  | GraphFetchRequest;
+  | GraphFetchRequest
+  | ModelsDiscoverRequest;

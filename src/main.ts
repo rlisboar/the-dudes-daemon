@@ -18,6 +18,7 @@ import type { FromDaemon, FromOrch } from "./protocol.js";
 import { runSummarizer } from "./summarizer-runner.js";
 import { decryptForProject, encryptForProject, forgetAllProjectKeys, getDaemonPublicKey, hasProjectKey, isE2eEncrypted, rememberProjectKey } from "./daemon-crypto.js";
 import { dispatchWebhook } from "./webhook-dispatch.js";
+import { ModelDiscovery } from "./model-discovery.js";
 
 const VERSION = "0.1.0";
 
@@ -148,6 +149,7 @@ class DaemonClient {
   private dropTo: DropTarget | null;
   private relay: BridgeRelay | null = null;
   private cliCommands: ResolvedCliCommands;
+  private modelDiscovery: ModelDiscovery;
   // Workspace é per-request (cada msg do server traz workspaceRoot do
   // projeto ATIVO). Sem state global pra evitar last-write-wins.
   /** Spawns adiados esperando project key E2EE (race: spawn chega antes do wrap). */
@@ -161,6 +163,7 @@ class DaemonClient {
     this.orchUrl = args.orch.replace(/\/$/, "");
     this.dropTo = detectDropTarget();
     this.cliCommands = cliCommands;
+    this.modelDiscovery = new ModelDiscovery(cliCommands, this.dropTo);
     if (this.dropTo) {
       log("info", `running as root via sudo — child processes will drop to uid=${this.dropTo.uid} (${this.dropTo.user}) home=${this.dropTo.home}`);
     }
@@ -630,6 +633,11 @@ class DaemonClient {
         await this.reportMCPsScan(msg.workspaceRoot).catch((e) =>
           log("warn", `mcps rescan failed: ${(e as Error).message}`)
         );
+        return;
+      }
+      case "models:discover": {
+        const catalogs = await this.modelDiscovery.discoverMany(msg.runner, msg.force === true);
+        this.send({ type: "models:catalog", correlationId: msg.correlationId, catalogs });
         return;
       }
       case "debug:sentry-test" as any: {

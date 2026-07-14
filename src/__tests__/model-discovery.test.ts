@@ -1,0 +1,59 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { parseCodexModelList, parseLineModelCatalog } from "../model-discovery.js";
+
+test("line catalogs parse plain model IDs and remove duplicates/noise", () => {
+  assert.deepEqual(
+    parseLineModelCatalog("provider/model-a\nprovider/model-a\ninvalid model\ngpt-5.6\n", "crush"),
+    [
+      { id: "provider/model-a", label: "provider/model-a", isDefault: undefined },
+      { id: "gpt-5.6", label: "gpt-5.6", isDefault: undefined },
+    ],
+  );
+});
+
+test("Grok catalog recognizes its advertised default", () => {
+  assert.deepEqual(
+    parseLineModelCatalog("Default model: grok-build\n* grok-build (default)\n* grok-fast\n", "grok"),
+    [
+      { id: "grok-build", label: "grok-build", isDefault: true },
+      { id: "grok-fast", label: "grok-fast", isDefault: undefined },
+    ],
+  );
+});
+
+test("Codex app-server catalog preserves capabilities and ignores hidden models", () => {
+  const models = parseCodexModelList({
+    result: {
+      data: [
+        {
+          model: "gpt-5.6-sol",
+          displayName: "GPT-5.6 Sol",
+          description: "Power model",
+          isDefault: true,
+          supportedReasoningEfforts: [
+            { reasoningEffort: "low" },
+            { reasoningEffort: "xhigh" },
+          ],
+          inputModalities: ["text", "image"],
+        },
+        { model: "hidden-model", hidden: true },
+        { model: "invalid model" },
+        { model: "gpt-5.6-sol" },
+      ],
+    },
+  });
+  assert.deepEqual(models, [{
+    id: "gpt-5.6-sol",
+    label: "GPT-5.6 Sol",
+    description: "Power model",
+    isDefault: true,
+    efforts: ["low", "xhigh"],
+    inputModalities: ["text", "image"],
+  }]);
+});
+
+test("Codex parser tolerates malformed responses", () => {
+  assert.deepEqual(parseCodexModelList(null), []);
+  assert.deepEqual(parseCodexModelList({ result: { data: "nope" } }), []);
+});
