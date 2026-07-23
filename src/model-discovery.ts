@@ -5,6 +5,7 @@ import type { ResolvedCliCommands } from "./cli-config.js";
 import { spawnDropped, type DropTarget } from "./privileges.js";
 import type { DiscoveredRunnerModel, RunnerModelCatalog } from "./protocol.js";
 import { killProcess } from "./runners/process-lifecycle.js";
+import { openCodeEffortsFor } from "./runners/opencode-effort.js";
 
 const CACHE_TTL_MS = 5 * 60_000;
 const COMMAND_TIMEOUT_MS = 12_000;
@@ -44,7 +45,12 @@ export function parseLineModelCatalog(output: string, runner: "opencode" | "crus
     }
     if (!MODEL_ID_RE.test(id) || seen.has(id)) continue;
     seen.add(id);
-    models.push({ id, label: id, isDefault: isDefault || id === advertisedDefault || undefined });
+    models.push({
+      id,
+      label: id,
+      isDefault: isDefault || id === advertisedDefault || undefined,
+      ...(runner === "opencode" ? { efforts: openCodeEffortsFor(id) } : {}),
+    });
     if (models.length >= MAX_MODELS) break;
   }
   if (advertisedDefault && models.every((model) => !model.isDefault)) {
