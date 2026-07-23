@@ -91,8 +91,7 @@ function extractUsage(out: string, runner: CliRunner, promptLen: number, outputL
 
 const MAX_TIMEOUT_MS = 60_000;
 
-function expandHome(p: string): string {
-  const home = homedir();
+function expandHome(p: string, home = homedir()): string {
   if (p === "~") return home;
   if (p.startsWith("~/")) return join(home, p.slice(2));
   if (p === "$HOME" || p === "${HOME}") return home;
@@ -278,9 +277,10 @@ export async function runCliText(prompt: string, args: CliTextArgs): Promise<Cli
   delete env.THE_DUDES_TOKEN;
   delete env.THE_DUDES_ENCRYPTION_KEY;
   if (args.runner === "claude") {
+    const claudeHome = args.dropTo?.home ?? homedir();
     env.CLAUDE_CONFIG_DIR = args.claudeConfigDir
-      ? expandHome(args.claudeConfigDir)
-      : join(homedir(), ".config", "claude");
+      ? expandHome(args.claudeConfigDir, claudeHome)
+      : join(claudeHome, ".claude");
   }
   if (args.runner === "gemini") {
     env.GEMINI_CLI_TRUST_WORKSPACE = "true";

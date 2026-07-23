@@ -1072,7 +1072,9 @@ export class AgentRunner {
     if (forced) return this.expandHome(forced, home);
     const custom = this.info.claudeConfigDir?.trim();
     if (custom) return this.expandHome(custom, home);
-    return home ? path.join(home, ".config", "claude") : path.join(".config", "claude");
+    // Claude Code nativo guarda auth/settings em ~/.claude. Containers que
+    // montam outro destino continuam cobertos pelo override explícito acima.
+    return home ? path.join(home, ".claude") : ".claude";
   }
 
   private expandHome(p: string, home: string): string {
