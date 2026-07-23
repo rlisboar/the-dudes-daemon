@@ -265,6 +265,8 @@ class DaemonClient {
         // persistente per-tokenId. 0/ausente = primeira conn / buffer
         // expirou (server faz nothing, comportamento legado).
         resumeFromSeq: this.lastSeenSeq,
+        availableRunners: (["claude", "codex", "opencode", "gemini", "crush", "grok"] as const)
+          .filter((runner) => this.cliCommands[runner].available),
       });
       // Ressincroniza tokens de agents já rodando localmente — sem isso,
       // após restart do server, o Map agentTokens fica vazio e o

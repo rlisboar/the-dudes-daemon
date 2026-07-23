@@ -34,6 +34,8 @@ export interface DaemonHello {
    *  anterior. Server replay buffer das msgs com seq > resumeFromSeq.
    *  0/ausente = primeira conn ou buffer expirou. */
   resumeFromSeq?: number;
+  /** CLIs resolvidos como executáveis neste daemon. */
+  availableRunners?: Array<"claude" | "codex" | "opencode" | "gemini" | "crush" | "grok">;
 }
 
 export interface ProjectKeyForDaemon {

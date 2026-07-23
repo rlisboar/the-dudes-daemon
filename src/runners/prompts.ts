@@ -20,7 +20,7 @@ function teammateSection(tasks: boolean): string {
   return `# Teammate communication
 - \`mcp__the-dudes__list_agents\` — list teammates, including hierarchy level, team, manager and skills.
 - \`mcp__the-dudes__send_message\` (args: {to, content}) — send a message to a teammate.
-- \`mcp__the-dudes__delegate\` (args: {goal, context?}) — spawn an EPHEMERAL sub-agent for ONE focused sub-task running in the BACKGROUND; returns immediately. The sub-agent works on its own and sends you the result via message when done — you don't block waiting. Use it to fan out independent work (research/implementation) instead of doing it all yourself. Keep each goal narrow and self-contained (the sub-agent starts with no context beyond what you pass). It self-terminates when finished.
+- \`mcp__the-dudes__delegate\` (args: {goal, context?, task_type, complexity, preferred_runner?, preferred_model?}) — Brain delegation: spawn an EPHEMERAL specialist for ONE focused sub-task in the BACKGROUND. Proactively use it when independent work can run in parallel or needs a different specialty. Classify the work honestly: \`simple\` for mechanical/search/formatting work, \`moderate\` for ordinary implementation, \`complex\` for architecture or difficult debugging, and \`critical\` only for high-risk cross-system decisions. The platform chooses the least expensive adequate model among installed runners. Keep goals narrow and self-contained; the specialist reports back and self-terminates.
 - **Hierarchy rules**: \`send_message\` is enforced by the server. You can ONLY message:
   - Your direct manager (the agent listed as your manager)
   - Your direct reports (agents who list you as manager)

@@ -163,16 +163,20 @@ server.tool(
 
 server.tool(
   "delegate",
-  "Spawn an EPHEMERAL sub-agent to handle ONE focused sub-task in the background, then it self-terminates. Returns a task id immediately (async). The sub-agent does the work and sends its result back to you via a message when done — you don't block. Use for parallel research/implementation you'd otherwise do yourself. Keep goals narrow and self-contained.",
+  "Brain delegation: spawn an EPHEMERAL specialist for ONE focused sub-task. YOU classify task_type and complexity; the platform selects the least expensive adequate model among installed runners. Use simple for mechanical/search/formatting work, moderate for ordinary implementation, complex for architecture or difficult debugging, and critical only for high-risk cross-system decisions. The specialist reports back and self-terminates.",
   {
     goal: z.string().describe("The focused task for the sub-agent (self-contained — it has no prior context)."),
     context: z.string().optional().describe("Optional background/inputs the sub-agent needs (paths, constraints, prior findings)."),
+    task_type: z.enum(["coding", "research", "analysis", "review", "testing", "documentation", "general"]).describe("Dominant kind of work; drives runner selection."),
+    complexity: z.enum(["simple", "moderate", "complex", "critical"]).describe("Minimum capability required. Prefer the lowest reliable tier."),
+    preferred_runner: z.enum(["claude", "codex", "opencode", "gemini", "crush", "grok"]).optional().describe("Optional override; used only if installed."),
+    preferred_model: z.string().optional().describe("Optional exact model override for advanced cases."),
   },
-  async ({ goal, context }) => {
+  async ({ goal, context, task_type, complexity, preferred_runner, preferred_model }) => {
     try {
-      const r = await postJSON("delegate", { goal, context: context ?? "" });
+      const r = await postJSON("delegate", { goal, context: context ?? "", taskType: task_type, complexity, preferredRunner: preferred_runner, preferredModel: preferred_model });
       if (r.error) return { content: [{ type: "text", text: `delegate falhou: ${r.error}` }], isError: true };
-      return { content: [{ type: "text", text: `subagente "${r.subagentName}" criado (task ${r.taskId}). Ele te manda o resultado por mensagem quando terminar.` }] };
+      return { content: [{ type: "text", text: `subagente "${r.subagentName}" criado com ${r.route} (task ${r.taskId}). Ele te manda o resultado por mensagem quando terminar.` }] };
     } catch (e) {
       return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
     }
