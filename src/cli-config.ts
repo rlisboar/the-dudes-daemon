@@ -18,8 +18,6 @@ export interface CliPathConfig {
 
 export interface DaemonCliConfig {
   cliPaths?: CliPathConfig;
-  /** Runners instalados que não podem ser usados (conta inativa/custo). */
-  disabledRunners?: CliRunner[];
 }
 
 export interface ResolvedCliCommand {
@@ -67,7 +65,6 @@ export function mergeCliConfig(...configs: Array<DaemonCliConfig | undefined | n
   for (const cfg of configs) {
     if (!cfg) continue;
     merged.cliPaths = { ...(merged.cliPaths ?? {}), ...(cfg.cliPaths ?? {}) };
-    if (cfg.disabledRunners !== undefined) merged.disabledRunners = cfg.disabledRunners;
   }
   return sanitizeCliConfig(merged);
 }
@@ -90,9 +87,6 @@ export function resolveCliCommands(config: DaemonCliConfig = {}): ResolvedCliCom
     graphify: resolveOne("graphify", config.cliPaths?.graphify, pythonBinDirs()),
     graphifyMcp: resolveOne("graphify-mcp", config.cliPaths?.graphifyMcp, pythonBinDirs()),
   };
-  for (const runner of config.disabledRunners ?? []) {
-    resolved[runner] = { ...resolved[runner], available: false };
-  }
   return resolved;
 }
 
@@ -225,12 +219,5 @@ function sanitizeCliConfig(cfg: DaemonCliConfig): DaemonCliConfig {
       graphify: normalizePath(cliPaths.graphify),
       graphifyMcp: normalizePath(cliPaths.graphifyMcp),
     },
-    disabledRunners: sanitizeDisabledRunners(cfg.disabledRunners),
   };
-}
-
-function sanitizeDisabledRunners(value: unknown): CliRunner[] {
-  if (!Array.isArray(value)) return [];
-  const known = new Set<CliRunner>(["claude", "opencode", "gemini", "codex", "crush", "grok"]);
-  return [...new Set(value.filter((v): v is CliRunner => typeof v === "string" && known.has(v as CliRunner)))];
 }

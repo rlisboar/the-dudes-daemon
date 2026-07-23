@@ -54,6 +54,12 @@ export interface DaemonWelcome {
 export interface DaemonPing { type: "daemon:ping"; ts: number }
 export interface DaemonPong { type: "daemon:pong"; ts: number }
 
+/** Política definida no dashboard e persistida no servidor. */
+export interface RunnerPolicySet {
+  type: "runner-policy:set";
+  allowedRunners: Array<"claude" | "codex" | "opencode" | "gemini" | "crush" | "grok">;
+}
+
 /* H-18 proof-of-possession da pubkey RSA do daemon. Server gera nonce
  * após receber hello; daemon assina com privkey e responde. Server só
  * promove cryptoVerified=true após verificar signature. */
@@ -704,7 +710,7 @@ export type FromDaemon =
   | ModelsCatalogResult;
 
 export type FromOrch =
-  | DaemonWelcome | DaemonPong | DaemonChallenge
+  | DaemonWelcome | DaemonPong | DaemonChallenge | RunnerPolicySet
   | AgentSpawn | AgentStop | AgentSend | AgentClear | AgentCompact
   | AutoApproveSet | WorkspaceSet
   | FileListRequest | FileReadRequest | FileWriteRequest

@@ -32,7 +32,6 @@ interface Args {
   verboseHumanIo: boolean;
   cliConfigPath: string;
   cliPaths: DaemonCliConfig["cliPaths"];
-  disabledRunners: DaemonCliConfig["disabledRunners"];
 }
 
 function parseCli(): Args {
@@ -59,7 +58,6 @@ function parseCli(): Args {
       "codex-path": { type: "string" },
       "crush-path": { type: "string" },
       "grok-path": { type: "string" },
-      "disable-runners": { type: "string" },
       verbose: { type: "boolean", short: "v" },
       "verbose-human": { type: "boolean" },
       "verbose-human-io": { type: "boolean" },
@@ -83,11 +81,9 @@ function parseCli(): Args {
     crush: values["crush-path"] ?? process.env.THE_DUDES_CRUSH_PATH,
     grok: values["grok-path"] ?? process.env.THE_DUDES_GROK_PATH,
   };
-  const disabledRunners = String(values["disable-runners"] ?? process.env.THE_DUDES_DISABLED_RUNNERS ?? "")
-    .split(",").map((v) => v.trim()).filter(Boolean) as DaemonCliConfig["disabledRunners"];
   if (!orch) { console.error("error: --orch required (or THE_DUDES_ORCHenv)"); printHelp(); process.exit(1); }
   if (!token) { console.error("error: --token required (or THE_DUDES_DAEMON_TOKEN env)"); printHelp(); process.exit(1); }
-  return { orch, token, name, pingMs, verbose, verboseHuman, verboseHumanIo: verboseHumanIoFlag, cliConfigPath, cliPaths, disabledRunners };
+  return { orch, token, name, pingMs, verbose, verboseHuman, verboseHumanIo: verboseHumanIoFlag, cliConfigPath, cliPaths };
 }
 
 function printHelp() {
@@ -114,8 +110,6 @@ Options:
   -vhio
              Alias for -vh
   --cli-config  Local JSON file with cliPaths overrides (default: ~/.the-dudes/daemon-config.json)
-  --disable-runners  Comma-separated runners unavailable by account/policy
-             (or THE_DUDES_DISABLED_RUNNERS, e.g. gemini,grok)
   --claude-path / --opencode-path / --gemini-path / --codex-path / --crush-path / --grok-path
              Manual executable overrides for each CLI
   -h, --help Show this help`);
@@ -123,6 +117,7 @@ Options:
 
 class DaemonClient {
   private args: Args;
+  private readonly installedRunnerAvailability: Record<string, boolean>;
   private ws: WebSocket | null = null;
   private reconnectDelay = 1_000;
   private static readonly RECONNECT_CAP_MS = 60_000;
@@ -169,6 +164,10 @@ class DaemonClient {
     this.orchUrl = args.orch.replace(/\/$/, "");
     this.dropTo = detectDropTarget();
     this.cliCommands = cliCommands;
+    this.installedRunnerAvailability = Object.fromEntries(
+      (["claude", "codex", "opencode", "gemini", "crush", "grok"] as const)
+        .map((runner) => [runner, cliCommands[runner].available]),
+    );
     this.modelDiscovery = new ModelDiscovery(cliCommands, this.dropTo);
     if (this.dropTo) {
       log("info", `running as root via sudo — child processes will drop to uid=${this.dropTo.uid} (${this.dropTo.user}) home=${this.dropTo.home}`);
@@ -399,6 +398,14 @@ class DaemonClient {
         return;
       case "daemon:pong":
         return;
+      case "runner-policy:set": {
+        const allowed = new Set(msg.allowedRunners);
+        for (const runner of ["claude", "codex", "opencode", "gemini", "crush", "grok"] as const) {
+          this.cliCommands[runner].available = this.installedRunnerAvailability[runner] === true && allowed.has(runner);
+        }
+        log("info", `runner policy synced: ${[...allowed].join(", ") || "none"}`);
+        return;
+      }
       case "daemon:challenge": {
         // H-18 PoP: server pediu prova de posse da privkey RSA. Sem
         // responder, server marca daemon como unverified e admin web
@@ -1613,7 +1620,7 @@ function cliLog(level: "info" | "warn" | "error", msg: string) {
 const args = parseCli();
 const cliConfig = mergeCliConfig(
   loadDaemonCliConfig(args.cliConfigPath),
-  { cliPaths: args.cliPaths, disabledRunners: args.disabledRunners.length ? args.disabledRunners : undefined },
+  { cliPaths: args.cliPaths },
 );
 const cliCommands = resolveCliCommands(cliConfig);
 new DaemonClient(args, cliCommands).start().catch(async (e) => {
