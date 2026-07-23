@@ -13,7 +13,7 @@ import { build } from "esbuild";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { sign as edSign, createPrivateKey } from "node:crypto";
+import { sign as edSign, createHash, createPrivateKey } from "node:crypto";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = resolve(__dirname, "..");
@@ -58,6 +58,12 @@ await build({
   entryPoints: [resolve(root, "src/mcp-bridge.ts")],
   outfile: resolve(root, "dist/mcp-bridge.cjs"),
 });
+
+for (const name of ["daemon.cjs", "mcp-bridge.cjs"]) {
+  const bundle = readFileSync(resolve(root, "dist", name));
+  const checksum = createHash("sha256").update(bundle).digest("hex");
+  writeFileSync(resolve(root, "dist", `${name}.sha256`), `${checksum}  ${name}\n`);
+}
 
 // Assinatura Ed25519 dos bundles (autenticidade, além do SHA-256 de
 // integridade). A chave PRIVADA fica só no host de build (offline em relação

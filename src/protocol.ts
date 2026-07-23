@@ -663,6 +663,9 @@ export interface DiscoveredRunnerModel {
   isDefault?: boolean;
   efforts?: string[];
   inputModalities?: string[];
+  capabilityTier?: 1 | 2 | 3 | 4;
+  speedTier?: 1 | 2 | 3;
+  costTier?: 1 | 2 | 3;
 }
 
 export interface RunnerModelCatalog {

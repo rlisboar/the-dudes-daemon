@@ -6,6 +6,7 @@ import { spawnDropped, type DropTarget } from "./privileges.js";
 import type { DiscoveredRunnerModel, RunnerModelCatalog } from "./protocol.js";
 import { killProcess } from "./runners/process-lifecycle.js";
 import { openCodeEffortsFor } from "./runners/opencode-effort.js";
+import { withModelCapability } from "./model-capability.js";
 
 const CACHE_TTL_MS = 5 * 60_000;
 const COMMAND_TIMEOUT_MS = 12_000;
@@ -45,12 +46,12 @@ export function parseLineModelCatalog(output: string, runner: "opencode" | "crus
     }
     if (!MODEL_ID_RE.test(id) || seen.has(id)) continue;
     seen.add(id);
-    models.push({
+    models.push(withModelCapability({
       id,
       label: id,
       isDefault: isDefault || id === advertisedDefault || undefined,
       ...(runner === "opencode" ? { efforts: openCodeEffortsFor(id) } : {}),
-    });
+    }));
     if (models.length >= MAX_MODELS) break;
   }
   if (advertisedDefault && models.every((model) => !model.isDefault)) {
@@ -79,14 +80,14 @@ export function parseCodexModelList(message: unknown): DiscoveredRunnerModel[] {
     const inputModalities = Array.isArray(item.inputModalities)
       ? item.inputModalities.filter((value): value is string => typeof value === "string" && value.length <= 32)
       : undefined;
-    models.push({
+    models.push(withModelCapability({
       id,
       label: typeof item.displayName === "string" ? item.displayName.slice(0, 120) : id,
       description: typeof item.description === "string" ? item.description.slice(0, 500) : undefined,
       isDefault: item.isDefault === true || undefined,
       efforts: efforts?.length ? efforts : undefined,
       inputModalities: inputModalities?.length ? inputModalities : undefined,
-    });
+    }));
     if (models.length >= MAX_MODELS) break;
   }
   return models;
