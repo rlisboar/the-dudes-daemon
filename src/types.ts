@@ -33,7 +33,7 @@ export interface AgentInfo {
   effort?: EffortLevel;
   cliRunner?: CliRunner;
   planMode?: boolean;
-  /** Custom CLAUDE_CONFIG_DIR. Empty/undefined → daemon uses "$HOME/.claude". */
+  /** Custom CLAUDE_CONFIG_DIR. Empty/undefined → native Claude default (env unset). */
   claudeConfigDir?: string;
   sessionId?: string;
   repo?: AgentRepoSpec;

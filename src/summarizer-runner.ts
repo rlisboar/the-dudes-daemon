@@ -278,9 +278,8 @@ export async function runCliText(prompt: string, args: CliTextArgs): Promise<Cli
   delete env.THE_DUDES_ENCRYPTION_KEY;
   if (args.runner === "claude") {
     const claudeHome = args.dropTo?.home ?? homedir();
-    env.CLAUDE_CONFIG_DIR = args.claudeConfigDir
-      ? expandHome(args.claudeConfigDir, claudeHome)
-      : join(claudeHome, ".claude");
+    delete env.CLAUDE_CONFIG_DIR;
+    if (args.claudeConfigDir) env.CLAUDE_CONFIG_DIR = expandHome(args.claudeConfigDir, claudeHome);
   }
   if (args.runner === "gemini") {
     env.GEMINI_CLI_TRUST_WORKSPACE = "true";

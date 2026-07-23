@@ -1062,7 +1062,7 @@ export class AgentRunner {
     });
   }
 
-  private resolveClaudeConfigDir(): string {
+  private resolveClaudeConfigDir(): string | undefined {
     const home = this.opts.dropTo?.home ?? process.env.HOME ?? "";
     // Override por env (container): ignora o campo por-agente, que costuma
     // apontar pra path do HOST inexistente no container. Permite montar as
@@ -1072,9 +1072,10 @@ export class AgentRunner {
     if (forced) return this.expandHome(forced, home);
     const custom = this.info.claudeConfigDir?.trim();
     if (custom) return this.expandHome(custom, home);
-    // Claude Code nativo guarda auth/settings em ~/.claude. Containers que
-    // montam outro destino continuam cobertos pelo override explícito acima.
-    return home ? path.join(home, ".claude") : ".claude";
+    // Default nativo: NÃO definir CLAUDE_CONFIG_DIR. Claude Code pode guardar
+    // OAuth no Keychain/credential store associado ao HOME; forçar até mesmo
+    // ~/.claude altera o contexto de autenticação em versões atuais.
+    return undefined;
   }
 
   private expandHome(p: string, home: string): string {

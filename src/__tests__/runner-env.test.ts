@@ -23,6 +23,8 @@ test("runner-specific config variables do not leak across providers", () => {
   const claude = buildBaseRunnerEnv({ ...baseInput, inherited, runner: "claude", claudeConfigDir: "/claude" });
   const opencode = buildBaseRunnerEnv({ ...baseInput, inherited, runner: "opencode", opencodeConfigPath: "/oc.json" });
   assert.equal(claude.CLAUDE_CONFIG_DIR, "/claude");
+  const claudeNative = buildBaseRunnerEnv({ ...baseInput, inherited, runner: "claude" });
+  assert.equal(claudeNative.CLAUDE_CONFIG_DIR, undefined);
   assert.equal(claude.OPENCODE_CONFIG, undefined);
   assert.equal(opencode.OPENCODE_CONFIG, "/oc.json");
   assert.equal(opencode.CLAUDE_CONFIG_DIR, undefined);
