@@ -48,10 +48,11 @@ test("Grok emits escaped TOML for local, remote and interpolated bridge entries"
 });
 
 test("OpenCode keeps stdio only and returns actionable warnings", () => {
-  const result = buildOpenCodeMcpConfig({ local: { command: "tool", args: ["--x"] }, remote: { type: "http", url: "https://mcp" } }, bridge, false);
+  const result = buildOpenCodeMcpConfig({ local: { command: "tool", args: ["--x"] }, remote: { type: "http", url: "https://mcp" } }, bridge, false, { model: "openai/gpt-5", reasoningEffort: "high" });
   assert.equal(result.warnings.length, 1);
   assert.deepEqual((result.config.mcp as Record<string, unknown>).local, { type: "local", enabled: true, command: ["tool", "--x"] });
   assert.deepEqual(result.config.permission, { edit: "ask", bash: "ask", webfetch: "ask", external_directory: "ask" });
+  assert.deepEqual((result.config.agent as Record<string, unknown>)["the-dudes-managed"], { model: "openai/gpt-5", reasoningEffort: "high" });
 });
 
 test("Codex TOML args escape quoted names and values without shell interpolation", () => {

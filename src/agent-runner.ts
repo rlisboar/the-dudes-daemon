@@ -19,6 +19,7 @@ import { RunnerRuntimeFiles } from "./runners/runtime-files.js";
 import { ContextTracker, CumulativeUsageTracker, type UsageSemantics } from "./runners/context-tracker.js";
 import { armHardTimeout, collectProcessOutput, killProcess, processAlive as procAlive, terminateAndWait, terminateWithEscalation } from "./runners/process-lifecycle.js";
 import { OpenCodeTransport } from "./runners/opencode-transport.js";
+import { buildOpenCodeAgentConfig, OPENCODE_MANAGED_AGENT } from "./runners/opencode-effort.js";
 import { PerMessageSessionState } from "./runners/message-session.js";
 import { buildAgentContext, buildInitialMessage, buildSystemPromptHeader, buildWorkspacePrompt } from "./runners/prompts.js";
 import { claudeThinkingEffort, codexEffort, providerModelParts, resolveContextLimit } from "./runners/model-policy.js";
@@ -944,13 +945,12 @@ export class AgentRunner {
       command: this.opts.bridgeCommand,
       args: this.opts.bridgeArgs,
       env: this.bridgeEnv(),
-    }, this.opts.autoApprove);
+    }, this.opts.autoApprove, buildOpenCodeAgentConfig(this.info.model, this.info.effort));
     for (const warning of built.warnings) this.opts.log("warn", `[opencode:${this.info.name}] ${warning}`);
     const config = built.config;
-    // NÃO escrever bloco `provider.*` aqui: qualquer override de provider no
-    // opencode.json (mesmo `options:{}` vazio) corrompe o zai-coding-plan
-    // (provider some no run → agente mudo). reasoning_effort/thinking não são
-    // configuráveis por aqui; o modelo roda no default dele.
+    // Não escreve `provider.*`: isso pode substituir/corromper providers
+    // nativos. Effort entra num agent isolado, cujas opções adicionais o
+    // OpenCode repassa ao provider sem alterar a configuração global.
     try {
       // mode 0o600: contém TOKEN_FILE path e identidade; dir já é 0700.
       writeFileSync(configPath, JSON.stringify(config, null, 2), { mode: 0o600 });
@@ -1399,7 +1399,7 @@ export class AgentRunner {
     // Garante sessão no serve (POST /session). Reusa sessionId se já existe.
     if (!this.messageSession.sessionId) {
       try {
-        const sess = await this.ocServeFetch("/session", "POST", providerID && modelID ? { model: { id: modelID, providerID } } : {});
+        const sess = await this.ocServeFetch("/session", "POST", { ...(providerID && modelID ? { model: { id: modelID, providerID } } : {}), agent: OPENCODE_MANAGED_AGENT });
         if (!sess?.id) throw new Error("sessão sem id");
         this.messageSession.sessionId = sess.id;
         if (this.opts.onSessionId) this.opts.onSessionId(sess.id);
@@ -1443,7 +1443,7 @@ export class AgentRunner {
       resp = await this.ocServeFetch(
         `/session/${this.messageSession.sessionId}/message`,
         "POST",
-        { ...(providerID && modelID ? { model: { providerID, modelID } } : {}), parts },
+        { ...(providerID && modelID ? { model: { providerID, modelID } } : {}), agent: OPENCODE_MANAGED_AGENT, parts },
         OPENCODE_TURN_TIMEOUT_MS,
       );
     } catch (e) {

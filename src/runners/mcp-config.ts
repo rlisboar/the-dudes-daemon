@@ -78,7 +78,7 @@ export function buildCrushMcpConfig(
   return { config: { $schema: "https://charm.land/crush.json", mcp }, warnings };
 }
 
-export function buildOpenCodeMcpConfig(extras: Record<string, McpServerConfig> | undefined, bridge: BridgeConfig, autoApprove: boolean) {
+export function buildOpenCodeMcpConfig(extras: Record<string, McpServerConfig> | undefined, bridge: BridgeConfig, autoApprove: boolean, managedAgent?: Record<string, unknown>) {
   const mcp: Record<string, unknown> = {};
   const warnings: string[] = [];
   for (const [name, config] of Object.entries(extras ?? {})) {
@@ -99,6 +99,7 @@ export function buildOpenCodeMcpConfig(extras: Record<string, McpServerConfig> |
       $schema: "https://opencode.ai/config.json",
       mcp,
       permission: autoApprove ? "allow" : { edit: "ask", bash: "ask", webfetch: "ask", external_directory: "ask" },
+      ...(managedAgent ? { agent: { "the-dudes-managed": managedAgent } } : {}),
     },
     warnings,
   };
