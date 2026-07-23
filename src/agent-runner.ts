@@ -1399,7 +1399,9 @@ export class AgentRunner {
     // Garante sessão no serve (POST /session). Reusa sessionId se já existe.
     if (!this.messageSession.sessionId) {
       try {
-        const sess = await this.ocServeFetch("/session", "POST", { ...(providerID && modelID ? { model: { id: modelID, providerID } } : {}), agent: OPENCODE_MANAGED_AGENT });
+        const sess = await this.ocServeFetch("/session", "POST", {
+          ...(providerID && modelID ? { model: { id: modelID, providerID }, agent: OPENCODE_MANAGED_AGENT } : {}),
+        });
         if (!sess?.id) throw new Error("sessão sem id");
         this.messageSession.sessionId = sess.id;
         if (this.opts.onSessionId) this.opts.onSessionId(sess.id);
@@ -1443,7 +1445,7 @@ export class AgentRunner {
       resp = await this.ocServeFetch(
         `/session/${this.messageSession.sessionId}/message`,
         "POST",
-        { ...(providerID && modelID ? { model: { providerID, modelID } } : {}), agent: OPENCODE_MANAGED_AGENT, parts },
+        { ...(providerID && modelID ? { model: { providerID, modelID }, agent: OPENCODE_MANAGED_AGENT } : {}), parts },
         OPENCODE_TURN_TIMEOUT_MS,
       );
     } catch (e) {
