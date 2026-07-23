@@ -32,6 +32,7 @@ interface Args {
   verboseHumanIo: boolean;
   cliConfigPath: string;
   cliPaths: DaemonCliConfig["cliPaths"];
+  disabledRunners: DaemonCliConfig["disabledRunners"];
 }
 
 function parseCli(): Args {
@@ -58,6 +59,7 @@ function parseCli(): Args {
       "codex-path": { type: "string" },
       "crush-path": { type: "string" },
       "grok-path": { type: "string" },
+      "disable-runners": { type: "string" },
       verbose: { type: "boolean", short: "v" },
       "verbose-human": { type: "boolean" },
       "verbose-human-io": { type: "boolean" },
@@ -81,9 +83,11 @@ function parseCli(): Args {
     crush: values["crush-path"] ?? process.env.THE_DUDES_CRUSH_PATH,
     grok: values["grok-path"] ?? process.env.THE_DUDES_GROK_PATH,
   };
+  const disabledRunners = String(values["disable-runners"] ?? process.env.THE_DUDES_DISABLED_RUNNERS ?? "")
+    .split(",").map((v) => v.trim()).filter(Boolean) as DaemonCliConfig["disabledRunners"];
   if (!orch) { console.error("error: --orch required (or THE_DUDES_ORCHenv)"); printHelp(); process.exit(1); }
   if (!token) { console.error("error: --token required (or THE_DUDES_DAEMON_TOKEN env)"); printHelp(); process.exit(1); }
-  return { orch, token, name, pingMs, verbose, verboseHuman, verboseHumanIo: verboseHumanIoFlag, cliConfigPath, cliPaths };
+  return { orch, token, name, pingMs, verbose, verboseHuman, verboseHumanIo: verboseHumanIoFlag, cliConfigPath, cliPaths, disabledRunners };
 }
 
 function printHelp() {
@@ -110,6 +114,8 @@ Options:
   -vhio
              Alias for -vh
   --cli-config  Local JSON file with cliPaths overrides (default: ~/.the-dudes/daemon-config.json)
+  --disable-runners  Comma-separated runners unavailable by account/policy
+             (or THE_DUDES_DISABLED_RUNNERS, e.g. gemini,grok)
   --claude-path / --opencode-path / --gemini-path / --codex-path / --crush-path / --grok-path
              Manual executable overrides for each CLI
   -h, --help Show this help`);
@@ -1607,7 +1613,7 @@ function cliLog(level: "info" | "warn" | "error", msg: string) {
 const args = parseCli();
 const cliConfig = mergeCliConfig(
   loadDaemonCliConfig(args.cliConfigPath),
-  { cliPaths: args.cliPaths },
+  { cliPaths: args.cliPaths, disabledRunners: args.disabledRunners.length ? args.disabledRunners : undefined },
 );
 const cliCommands = resolveCliCommands(cliConfig);
 new DaemonClient(args, cliCommands).start().catch(async (e) => {
