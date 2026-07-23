@@ -23,7 +23,7 @@ test("runner effort policies preserve provider-specific accepted levels", () => 
   assert.deepEqual(claudeThinkingEffort("low", true), { effort: "high", lifted: true });
   assert.deepEqual(claudeThinkingEffort("none", true), { effort: "none", lifted: false });
   assert.deepEqual(claudeThinkingEffort("medium", false), { effort: "medium", lifted: false });
-  assert.equal(codexEffort("max"), "max");
+  assert.equal(codexEffort("max"), "xhigh");
   assert.equal(codexEffort("minimal"), "xhigh");
   assert.equal(codexEffort("high"), "high");
   assert.equal(grokThinkingEffort("minimal", true, false), "high");

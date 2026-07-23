@@ -65,8 +65,8 @@ export function providerModelParts(model: string | undefined): { providerID: str
   return { providerID: slash > 0 ? raw.slice(0, slash) : "", modelID: slash > 0 ? raw.slice(slash + 1) : raw };
 }
 
-export function codexEffort(level: string): "low" | "medium" | "high" | "xhigh" | "max" {
-  return level === "low" || level === "medium" || level === "high" || level === "xhigh" || level === "max" ? level : "xhigh";
+export function codexEffort(level: string): "low" | "medium" | "high" | "xhigh" {
+  return level === "low" || level === "medium" || level === "high" || level === "xhigh" ? level : "xhigh";
 }
 
 export function claudeThinkingEffort(effort: EffortLevel | undefined, collectThinking: boolean): {
