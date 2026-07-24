@@ -6,6 +6,7 @@ import { parseArgs } from "node:util";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { WebSocket } from "ws";
 import { parseWireMessage } from "@the-dudes/protocol";
 import { AgentHost } from "./agent-host.js";
@@ -21,6 +22,11 @@ import { dispatchWebhook } from "./webhook-dispatch.js";
 import { ModelDiscovery } from "./model-discovery.js";
 
 const VERSION = "0.1.0";
+
+function runningBinaryHash(): string | undefined {
+  try { return createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"); }
+  catch { return undefined; }
+}
 
 interface Args {
   orch: string;
@@ -265,6 +271,7 @@ class DaemonClient {
         os: process.platform,
         hostname: os.hostname(),
         version: VERSION,
+        binaryHash: runningBinaryHash(),
         cryptoPublicKey,
         // Resume: server reenvia msgs com seq > lastSeenSeq do buffer
         // persistente per-tokenId. 0/ausente = primeira conn / buffer
