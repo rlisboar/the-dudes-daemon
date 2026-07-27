@@ -53,7 +53,16 @@ export interface GrokHeadlessArgs extends OneShotArgs {
 }
 
 export function grokHeadlessArgs(input: GrokHeadlessArgs): string[] {
-  const args = ["-p", input.prompt, "--output-format", input.outputFormat, "--no-auto-update", "--cwd", input.workspaceRoot];
+  // --trust: MCP/hooks/LSP de projeto (.grok/config.toml) só sobem em pastas
+  // trusted. Sem isso, workspaces secundários (ex.: baremetalv2 do latitude)
+  // ficam com the-dudes "Tool not found" enquanto claudinho (já trusted) funciona.
+  const args = [
+    "-p", input.prompt,
+    "--output-format", input.outputFormat,
+    "--no-auto-update",
+    "--trust",
+    "--cwd", input.workspaceRoot,
+  ];
   if (input.model) args.push("-m", input.model);
   const effort = grokThinkingEffort(input.effort, !!input.collectThinking, !!input.forCompact);
   if (effort) args.push("--effort", effort);

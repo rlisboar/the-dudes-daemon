@@ -18,8 +18,12 @@ function loadAgentToken(): string {
   if (file) {
     try {
       return readFileSync(file, "utf8").trim();
-    } catch {
-      console.error(`[mcp-bridge] failed to read THE_DUDES_AGENT_TOKEN_FILE=${file}: ${(e as Error).message}`);
+    } catch (err) {
+      // catch sem binding derrubava o bridge inteiro (ReferenceError: e is not defined)
+      // e o runner Grok ficava sem tools the-dudes (send_message etc. "Tool not found").
+      console.error(
+        `[mcp-bridge] failed to read THE_DUDES_AGENT_TOKEN_FILE=${file}: ${(err as Error).message}`,
+      );
     }
   }
   return process.env.THE_DUDES_AGENT_TOKEN ?? "";

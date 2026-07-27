@@ -26,6 +26,11 @@ test("runner effort policies preserve provider-specific accepted levels", () => 
   assert.equal(codexEffort("max"), "xhigh");
   assert.equal(codexEffort("minimal"), "xhigh");
   assert.equal(codexEffort("high"), "high");
+  // Grok wire: only low|medium|high. xhigh/max → high; none/minimal → low (or high when lifted).
   assert.equal(grokThinkingEffort("minimal", true, false), "high");
-  assert.equal(grokThinkingEffort("minimal", true, true), "minimal");
+  assert.equal(grokThinkingEffort("minimal", true, true), "low");
+  assert.equal(grokThinkingEffort("xhigh", false, false), "high");
+  assert.equal(grokThinkingEffort("max", false, false), "high");
+  assert.equal(grokThinkingEffort("medium", false, false), "medium");
+  assert.equal(grokThinkingEffort(undefined, false, false), undefined);
 });

@@ -18,6 +18,7 @@ import { join } from "node:path";
 import type { ResolvedCliCommands } from "./cli-config.js";
 import { extractOneShotText } from "./agent-runner.js";
 import { spawnDropped, type DropTarget } from "./privileges.js";
+import { normalizeGrokEffort } from "./runners/model-policy.js";
 import type { CliRunner } from "./types.js";
 
 export interface SummarizerArgs {
@@ -323,6 +324,7 @@ export async function runCliText(prompt: string, args: CliTextArgs): Promise<Cli
   } else if (args.runner === "grok") {
     // Grok Build headless (docs: 14-headless-mode.md): -p + json + always-approve.
     // GROK_HOME explícito pro auth do user (não o tmpdir efêmero do summarizer).
+    // Effort: só low|medium|high no wire.
     argv = [
       "-p", promptText,
       "--output-format", "json",
@@ -334,7 +336,8 @@ export async function runCliText(prompt: string, args: CliTextArgs): Promise<Cli
       "--cwd", cwd,
     ];
     if (args.model) argv.push("-m", args.model);
-    if (args.effort) argv.push("--effort", args.effort);
+    const grokEffort = normalizeGrokEffort(args.effort);
+    if (grokEffort) argv.push("--effort", grokEffort);
   } else {
     return { ok: false, error: `runner inválido: ${args.runner}` };
   }

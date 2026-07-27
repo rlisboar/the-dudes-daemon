@@ -21,7 +21,7 @@ mkdir -p "$DEST"
 # Chave pública Ed25519 que assina os bundles (privada offline no host de build).
 # Canônica: https://github.com/rlisboar/the-dudes-daemon/blob/main/signing-pub.pem
 SIGN_PUB='-----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEA5cl9IhFYXt+DADMOTBktX8/SeaLtmeBHlHB0cdc+IhA=
+MCowBQYDK2VwAyEAhnydRabRqG76LrgUBsx+1Wk5HcojzeYcr3CB/EkglaI=
 -----END PUBLIC KEY-----'
 export SIGN_PUB
 

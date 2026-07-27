@@ -23,9 +23,17 @@ test("grok plan, compact and thinking policies are mutually consistent", () => {
   const plan = grokHeadlessArgs({ prompt, outputFormat: "streaming-json", workspaceRoot: "/repo", planMode: true, collectThinking: true, effort: "low" });
   assert.ok(plan.includes("plan"));
   assert.ok(plan.includes("high"));
+  assert.ok(plan.includes("--trust"));
   assert.ok(!plan.includes("--always-approve"));
   const compact = grokHeadlessArgs({ prompt, outputFormat: "json", workspaceRoot: "/repo", planMode: true, forCompact: true });
   assert.ok(compact.includes("--always-approve"));
+  assert.ok(compact.includes("--trust"));
   assert.ok(compact.includes("--no-subagents"));
   assert.ok(!compact.includes("--permission-mode"));
+  // xhigh is not a Grok wire level — maps to high
+  const xhigh = grokHeadlessArgs({ prompt, outputFormat: "json", workspaceRoot: "/repo", effort: "xhigh" });
+  const effortIdx = xhigh.indexOf("--effort");
+  assert.ok(effortIdx >= 0);
+  assert.equal(xhigh[effortIdx + 1], "high");
+  assert.ok(!xhigh.includes("xhigh"));
 });

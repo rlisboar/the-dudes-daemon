@@ -77,6 +77,29 @@ export function claudeThinkingEffort(effort: EffortLevel | undefined, collectThi
   return { effort: lifted ? "high" : effort, lifted };
 }
 
-export function grokThinkingEffort(effort: EffortLevel | undefined, collectThinking: boolean, forCompact: boolean): EffortLevel | undefined {
-  return !forCompact && collectThinking && (!effort || ["none", "minimal", "low", "medium"].includes(effort)) ? "high" : effort;
+/** Wire levels do Grok Build (CLI 0.2.x / grok-4.5): só `low|medium|high`.
+ *  none/minimal/xhigh/max existem no union multi-runner mas o CLI rejeita
+ *  (`unknown effort level 'xhigh'; use one of: high, medium, low`). */
+export const GROK_WIRE_EFFORTS = ["low", "medium", "high"] as const;
+export type GrokWireEffort = (typeof GROK_WIRE_EFFORTS)[number];
+
+export function normalizeGrokEffort(effort: string | undefined | null): GrokWireEffort | undefined {
+  if (!effort) return undefined;
+  if (effort === "low" || effort === "medium" || effort === "high") return effort;
+  if (effort === "none" || effort === "minimal" || effort === "off") return "low";
+  if (effort === "xhigh" || effort === "max") return "high";
+  return "medium";
+}
+
+export function grokThinkingEffort(
+  effort: EffortLevel | undefined,
+  collectThinking: boolean,
+  forCompact: boolean,
+): GrokWireEffort | undefined {
+  // Com thinking coletado, sobe effort fraco pra high (mesmo padrão do claude).
+  const lifted =
+    !forCompact && collectThinking && (!effort || ["none", "minimal", "low", "medium"].includes(effort))
+      ? "high"
+      : effort;
+  return normalizeGrokEffort(lifted);
 }
