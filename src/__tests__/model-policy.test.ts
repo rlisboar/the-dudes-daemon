@@ -23,6 +23,14 @@ test("runner effort policies preserve provider-specific accepted levels", () => 
   assert.deepEqual(claudeThinkingEffort("low", true), { effort: "high", lifted: true });
   assert.deepEqual(claudeThinkingEffort("none", true), { effort: "none", lifted: false });
   assert.deepEqual(claudeThinkingEffort("medium", false), { effort: "medium", lifted: false });
+  // Claude Code wire: high/xhigh/max passam intactos (não rebaixar pra high).
+  assert.deepEqual(claudeThinkingEffort("high", false), { effort: "high", lifted: false });
+  assert.deepEqual(claudeThinkingEffort("xhigh", false), { effort: "xhigh", lifted: false });
+  assert.deepEqual(claudeThinkingEffort("max", false), { effort: "max", lifted: false });
+  assert.deepEqual(claudeThinkingEffort("xhigh", true), { effort: "xhigh", lifted: false });
+  assert.deepEqual(claudeThinkingEffort("max", true), { effort: "max", lifted: false });
+  assert.deepEqual(claudeThinkingEffort(undefined, false), { effort: undefined, lifted: false });
+  assert.deepEqual(claudeThinkingEffort(undefined, true), { effort: "high", lifted: true });
   assert.equal(codexEffort("max"), "xhigh");
   assert.equal(codexEffort("minimal"), "xhigh");
   assert.equal(codexEffort("high"), "high");

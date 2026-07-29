@@ -22,6 +22,62 @@ export function parseGrokContextSignals(raw: unknown): GrokContextSignals | null
   };
 }
 
+/**
+ * Ocupação da janela a partir de updates.jsonl do Grok CLI.
+ *
+ * NÃO use `usage.totalTokens` / max regex: no turn_completed multi-step
+ * (`modelCalls`/`numTurns` > 1) esses campos somam billing do loop de tools
+ * e inflacionam 4–12× a janela real (ex.: 939k vs signals 78k).
+ *
+ * Fonte correta no stream: último `params._meta.totalTokens` (espelha
+ * `signals.contextTokensUsed`).
+ */
+export function parseGrokUpdatesContextTokens(text: string): number {
+  let last = 0;
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || !trimmed.includes('"totalTokens"')) continue;
+    try {
+      const event = JSON.parse(trimmed) as {
+        params?: { _meta?: { totalTokens?: unknown } };
+      };
+      const n = Number(event.params?._meta?.totalTokens);
+      if (Number.isFinite(n) && n > 0) last = Math.floor(n);
+    } catch { /* linha incompleta / ruído */ }
+  }
+  return last;
+}
+
+/**
+ * Combina signals.json (preferido) com fallback de updates.jsonl.
+ * Nunca promove billing acumulado acima da ocupação real do signals.
+ */
+export function mergeGrokContextOccupancy(
+  signals: GrokContextSignals | null,
+  updatesTokens: number,
+  fallbackLimit: number,
+): GrokContextSignals | null {
+  const limit = signals?.contextWindowTokens && signals.contextWindowTokens > 0
+    ? signals.contextWindowTokens
+    : fallbackLimit;
+  if (!Number.isFinite(limit) || limit <= 0) return null;
+  const fromUpdates = Number.isFinite(updatesTokens) && updatesTokens > 0
+    ? Math.floor(updatesTokens)
+    : 0;
+  // signals com used>0 é a fonte autoritativa da janela.
+  const used = signals && signals.contextTokensUsed > 0
+    ? signals.contextTokensUsed
+    : fromUpdates > 0
+      ? fromUpdates
+      : signals?.contextTokensUsed ?? 0;
+  if (used <= 0 && !signals) return null;
+  return {
+    contextTokensUsed: used,
+    contextWindowTokens: Math.floor(limit),
+    contextWindowUsage: Math.round((used / limit) * 100),
+  };
+}
+
 export function normalizeGrokCwd(cwd: string): string {
   const resolved = path.resolve(cwd || ".");
   try { return realpathSync(resolved); } catch { return resolved; }

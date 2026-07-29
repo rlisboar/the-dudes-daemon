@@ -111,15 +111,19 @@ export class AgentHost {
     const existing = this.entries.get(msg.agent.id);
     if (existing?.runner) {
       // Distingue RECONNECT (WS reconectou; mesma config) de RECONFIG
-      // (troca de runner/model — server parou e re-spawnou). No reconfig,
-      // o spawn pode chegar ANTES do runner antigo terminar de sair (race
-      // com o fallback de 8s do server). Sem este check, o re-broadcast
-      // abaixo re-attacha no runner VELHO e o novo runner nunca sobe —
-      // agente fica mudo até reiniciar. Detecta a mudança e derruba o
-      // velho, caindo pra criação do novo abaixo.
+      // (troca de runner/model/effort/… — server parou e re-spawnou). No
+      // reconfig, o spawn pode chegar ANTES do runner antigo terminar de
+      // sair (race com o fallback de 8s do server). Sem este check, o
+      // re-broadcast abaixo re-attacha no runner VELHO e o novo nunca sobe
+      // — agente fica mudo até reiniciar, OU (pior) segue com effort/model
+      // antigo se só o effort mudou. Detecta a mudança e derruba o velho.
       const reconfig =
         existing.info?.cliRunner !== msg.agent.cliRunner ||
-        existing.info?.model !== msg.agent.model;
+        existing.info?.model !== msg.agent.model ||
+        existing.info?.effort !== msg.agent.effort ||
+        existing.info?.collectThinking !== msg.agent.collectThinking ||
+        existing.info?.planMode !== msg.agent.planMode ||
+        existing.info?.claudeConfigDir !== msg.agent.claudeConfigDir;
       if (!reconfig) {
         // Reconnect puro — re-anuncia estado pro orchestrator reconciliar.
         // Re-anuncia o token: server perdeu o Map agentTokens (in-memory)

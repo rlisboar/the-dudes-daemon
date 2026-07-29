@@ -9,6 +9,8 @@ import {
   lookupContextLimit,
   contextTokensOf,
   parseGrokContextSignals,
+  parseGrokUpdatesContextTokens,
+  mergeGrokContextOccupancy,
   grokSignalsPath,
   normalizeGrokCwd,
 } from "../agent-runner.js";
@@ -231,6 +233,63 @@ test("parseGrokContextSignals: rejeita inválido / incompleto", () => {
     parseGrokContextSignals({ contextTokensUsed: 0, contextWindowTokens: 500000 }),
     { contextTokensUsed: 0, contextWindowTokens: 500000, contextWindowUsage: 0 },
   );
+});
+
+test("parseGrokUpdatesContextTokens: usa último _meta.totalTokens, ignora billing usage", () => {
+  // Reproduz o bug: usage.totalTokens de tool-loop multi-step (939k) >> janela real (78k).
+  const updates = [
+    JSON.stringify({
+      params: {
+        update: {
+          sessionUpdate: "turn_completed",
+          usage: { inputTokens: 926814, outputTokens: 12222, totalTokens: 939036, modelCalls: 12, numTurns: 12 },
+        },
+        _meta: { totalTokens: 95513, updateType: "AgentMessageChunk" },
+      },
+    }),
+    JSON.stringify({
+      params: {
+        update: {
+          sessionUpdate: "turn_completed",
+          usage: { inputTokens: 98689, outputTokens: 1052, totalTokens: 99741, modelCalls: 1, numTurns: 1 },
+        },
+        _meta: { totalTokens: 78852, updateType: "AgentMessageChunk" },
+      },
+    }),
+  ].join("\n");
+  assert.equal(parseGrokUpdatesContextTokens(updates), 78852);
+  // regex-max ingenuo pegaria 939036 — garantimos que NÃO é isso
+  assert.notEqual(parseGrokUpdatesContextTokens(updates), 939036);
+});
+
+test("mergeGrokContextOccupancy: signals manda; updates só fallback; nunca infla", () => {
+  const signals = {
+    contextTokensUsed: 78852,
+    contextWindowTokens: 500000,
+    contextWindowUsage: 15,
+  };
+  // billing max não pode sobrescrever signals
+  assert.deepEqual(mergeGrokContextOccupancy(signals, 939036, 200_000), {
+    contextTokensUsed: 78852,
+    contextWindowTokens: 500000,
+    contextWindowUsage: 16,
+  });
+  // sem signals: usa updates + fallback limit
+  assert.deepEqual(mergeGrokContextOccupancy(null, 78852, 500_000), {
+    contextTokensUsed: 78852,
+    contextWindowTokens: 500000,
+    contextWindowUsage: 16,
+  });
+  // signals used=0 + updates: fallback
+  assert.deepEqual(
+    mergeGrokContextOccupancy(
+      { contextTokensUsed: 0, contextWindowTokens: 500000, contextWindowUsage: 0 },
+      12000,
+      200_000,
+    ),
+    { contextTokensUsed: 12000, contextWindowTokens: 500000, contextWindowUsage: 2 },
+  );
+  assert.equal(mergeGrokContextOccupancy(null, 0, 500_000), null);
 });
 
 test("grokSignalsPath: cwd encodeURIComponent + sessionId", () => {

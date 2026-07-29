@@ -12,7 +12,15 @@ import { buildGraph, graphExists, graphPath } from "./graph-indexer.js";
 import { isPerMessageRunner, runnerAdapter } from "./runners/index.js";
 import { claudeOneShotArgs, codexOneShotArgs, crushOneShotArgs, geminiOneShotArgs, grokHeadlessArgs, opencodeOneShotArgs } from "./runners/args.js";
 import { buildBaseRunnerEnv, buildBridgeAwareEnv, buildGeminiEnv, buildGrokEnv } from "./runners/env.js";
-import { extractOneShotText, grokSignalsPath, parseGrokChatToolCalls, parseGrokContextSignals, type GrokContextSignals } from "./runners/parsers.js";
+import {
+  extractOneShotText,
+  grokSignalsPath,
+  mergeGrokContextOccupancy,
+  parseGrokChatToolCalls,
+  parseGrokContextSignals,
+  parseGrokUpdatesContextTokens,
+  type GrokContextSignals,
+} from "./runners/parsers.js";
 import { parseCodexTurnEvent, parseCrushSessionMeta, parseGeminiTurnEvent, parseGrokStreamEvent, parseOpenCodeTurnEvent } from "./runners/turn-parsers.js";
 import { buildBridgeEnv, buildClaudeMcpConfig, buildCodexMcpArgs, buildCrushMcpConfig, buildGeminiMcpServers, buildGrokMcpToml, buildOpenCodeMcpConfig } from "./runners/mcp-config.js";
 import { RunnerRuntimeFiles } from "./runners/runtime-files.js";
@@ -25,7 +33,15 @@ import { buildAgentContext, buildInitialMessage, buildSystemPromptHeader, buildW
 import { claudeThinkingEffort, codexEffort, providerModelParts, resolveContextLimit } from "./runners/model-policy.js";
 import { classifyRunnerFailure, isAbortedFailure, isApiErrorMessage, isAuthenticationFailure, isLoopStopMessage, isMissingSessionFailure as isMissingSessionMessage } from "./runners/error-classifier.js";
 import { appendFileImagePrompt, buildClaudeUserContent, buildOpenCodeParts, codexImageArgs, imageExtension } from "./runners/attachments.js";
-export { extractOneShotText, grokSignalsPath, normalizeGrokCwd, parseGrokChatToolCalls, parseGrokContextSignals } from "./runners/parsers.js";
+export {
+  extractOneShotText,
+  grokSignalsPath,
+  mergeGrokContextOccupancy,
+  normalizeGrokCwd,
+  parseGrokChatToolCalls,
+  parseGrokContextSignals,
+  parseGrokUpdatesContextTokens,
+} from "./runners/parsers.js";
 export { CONTEXT_FULL_PATTERNS, RATE_LIMIT_TEXT_RE, contextTokensOf } from "./runners/context-tracker.js";
 export { DEFAULT_CONTEXT_LIMIT, MODEL_CONTEXT_LIMITS, contextLimitFor, lookupContextLimit } from "./runners/model-policy.js";
 
@@ -673,8 +689,12 @@ export class AgentRunner {
     }
   }
 
-  /** Max `totalTokens` visto no updates.jsonl da sessão (às vezes > signals). */
-  private readGrokUpdatesMaxTokens(sessionId: string): number {
+  /**
+   * Fallback de ocupação via updates.jsonl: último `_meta.totalTokens`
+   * (espelha a janela). NÃO usar max de `usage.totalTokens` — billing de
+   * tool-loops multi-step infla 4–12× vs signals.contextTokensUsed.
+   */
+  private readGrokUpdatesContextTokens(sessionId: string): number {
     const tryFiles: string[] = [];
     for (const sigPath of this.grokSignalsCandidates(sessionId)) {
       tryFiles.push(path.join(path.dirname(sigPath), "updates.jsonl"));
@@ -687,26 +707,23 @@ export class AgentRunner {
         }
       }
     } catch { /* noop */ }
-    let max = 0;
+    let best = 0;
     const seen = new Set<string>();
     for (const p of tryFiles) {
       if (seen.has(p) || !existsSync(p)) continue;
       seen.add(p);
       try {
-        const text = readFileSync(p, "utf8");
-        // updates.jsonl pode ser grande — só varre totalTokens
-        for (const m of text.matchAll(/"totalTokens"\s*:\s*(\d+)/g)) {
-          const n = Number(m[1]);
-          if (n > max) max = n;
-        }
+        const n = parseGrokUpdatesContextTokens(readFileSync(p, "utf8"));
+        if (n > best) best = n;
       } catch { /* next */ }
     }
-    return max;
+    return best;
   }
 
   /**
    * Poll pós-turno: o Grok às vezes flusha signals.json um pouco depois do
    * exit do processo. Nunca devolve "forçar 0" — null se ainda não souber.
+   * Prefere signals; updates só como fallback (nunca infla acima do signals).
    */
   private async pollGrokContextOccupancy(sessionId: string): Promise<GrokContextSignals | null> {
     let best: GrokContextSignals | null = null;
@@ -719,17 +736,11 @@ export class AgentRunner {
         if (sig.contextTokensUsed > 0) break;
       }
     }
-    const fromUpdates = this.readGrokUpdatesMaxTokens(sessionId);
-    const limit = best?.contextWindowTokens && best.contextWindowTokens > 0
-      ? best.contextWindowTokens
-      : this.contextLimit();
-    const used = Math.max(best?.contextTokensUsed ?? 0, fromUpdates);
-    if (used <= 0 && !best) return null;
-    return {
-      contextTokensUsed: used,
-      contextWindowTokens: limit,
-      contextWindowUsage: Math.round((used / limit) * 100),
-    };
+    // Só abre updates se signals ainda não deu ocupação (I/O em arquivo grande).
+    const fromUpdates = best && best.contextTokensUsed > 0
+      ? 0
+      : this.readGrokUpdatesContextTokens(sessionId);
+    return mergeGrokContextOccupancy(best, fromUpdates, this.contextLimit());
   }
 
   /** Dispara onContextFull no máximo uma vez por janela de cooldown. Sem
