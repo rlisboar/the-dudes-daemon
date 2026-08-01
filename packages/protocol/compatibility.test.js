@@ -23,14 +23,14 @@ function discriminators(source) {
 test("web and server expose exactly the same ClientCommand discriminators", () => {
   const server = discriminators(section(serverTypes, "export type ClientCommand"));
   const web = discriminators(section(webTypes, "export type ClientCommand"));
-  assert.equal(server.length, 155, "intentional command additions must update this contract count");
+  assert.equal(server.length, 157, "intentional command additions must update this contract count");
   assert.deepEqual(web, server);
 });
 
 test("web and server expose exactly the same ServerEvent discriminators", () => {
   const server = discriminators(section(serverTypes, "export type ServerEvent", "export type ClientCommand"));
   const web = discriminators(section(webTypes, "export type ServerEvent", "export type ClientCommand"));
-  assert.equal(server.length, 112, "intentional event additions must update this contract count");
+  assert.equal(server.length, 114, "intentional event additions must update this contract count");
   assert.deepEqual(web, server);
 });
 

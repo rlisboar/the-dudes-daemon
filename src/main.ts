@@ -20,6 +20,7 @@ import { runSummarizer } from "./summarizer-runner.js";
 import { decryptForProject, encryptForProject, forgetAllProjectKeys, getDaemonPublicKey, hasProjectKey, isE2eEncrypted, rememberProjectKey } from "./daemon-crypto.js";
 import { dispatchWebhook } from "./webhook-dispatch.js";
 import { ModelDiscovery } from "./model-discovery.js";
+import { parseGitPorcelain } from "./git-status.js";
 
 const VERSION = "0.1.0";
 
@@ -606,6 +607,12 @@ class DaemonClient {
       case "file:write":
         await this.handleFileWrite(msg.correlationId, msg.path, msg.content, msg.workspaceRoot);
         return;
+      case "file:operation":
+        await this.handleFileOperation(msg.correlationId, msg.op, msg.path, msg.newPath, msg.workspaceRoot);
+        return;
+      case "file:search":
+        await this.handleFileSearch(msg.correlationId, msg.query, msg.workspaceRoot);
+        return;
       case "summarize:request":
         await this.handleSummarize(msg);
         return;
@@ -698,11 +705,10 @@ class DaemonClient {
         await this.handleGitOp(msg.correlationId, "unstage", ["reset", "HEAD", "--", msg.path]);
         return;
       case "git:commit": {
-        const paths = msg.paths ?? [];
-        // paths user-controlled vão direto pra git commit como pathspec.
-        // Sem `--` separador, path "-help" vira flag. Inserimos `--`
-        // explicit antes da lista.
-        await this.handleGitOp(msg.correlationId, "commit", ["commit", "-m", msg.message, "--", ...paths]);
+        // Commit sem pathspec respeita exatamente o índice. Com paths, o Git
+        // pode usar o conteúdo atual do working tree e furar a expectativa de
+        // que somente o que aparece em "Em stage" será enviado.
+        await this.handleGitOp(msg.correlationId, "commit", ["commit", "-m", msg.message]);
         return;
       }
       case "git:push":
@@ -1282,8 +1288,15 @@ class DaemonClient {
         this.send({ type: "file:read_result", correlationId, path: targetPath, error: "arquivo muito grande (> 2MB)" });
         return;
       }
-      const content = await fs.promises.readFile(resolved, "utf-8");
-      this.send({ type: "file:read_result", correlationId, path: targetPath, content });
+      const imageMimes: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml", ".ico": "image/x-icon" };
+      const mimeType = imageMimes[path.extname(resolved).toLowerCase()];
+      if (mimeType && mimeType !== "image/svg+xml") {
+        const content = (await fs.promises.readFile(resolved)).toString("base64");
+        this.send({ type: "file:read_result", correlationId, path: targetPath, content, encoding: "base64", mimeType });
+      } else {
+        const content = await fs.promises.readFile(resolved, "utf-8");
+        this.send({ type: "file:read_result", correlationId, path: targetPath, content, encoding: "utf8", mimeType });
+      }
     } catch (e) {
       this.send({ type: "file:read_result", correlationId, path: targetPath, error: (e as Error).message });
     }
@@ -1322,6 +1335,70 @@ class DaemonClient {
       this.send({ type: "file:write_result", correlationId, path: targetPath, ok: true });
     } catch (e) {
       this.send({ type: "file:write_result", correlationId, path: targetPath, ok: false, error: (e as Error).message });
+    }
+  }
+
+  private async handleFileOperation(
+    correlationId: string,
+    op: "create_file" | "create_directory" | "rename" | "delete",
+    targetPath: string,
+    newPath: string | undefined,
+    override?: string,
+  ) {
+    const reply = (ok: boolean, error?: string) => this.send({
+      type: "file:operation_result" as const, correlationId, op, path: targetPath, newPath, ok, error,
+    });
+    if (!override) { reply(false, "workspaceRoot ausente na msg"); return; }
+    const root = expandBasePath(override);
+    try {
+      this.enforceWorkspaceScope(root);
+      const resolved = path.resolve(root, targetPath);
+      if (!targetPath || targetPath === "." || !isInsideRoot(resolved, root)) { reply(false, "acesso negado"); return; }
+      if (op === "create_file") {
+        await fs.promises.mkdir(path.dirname(resolved), { recursive: true });
+        await fs.promises.writeFile(resolved, "", { encoding: "utf-8", flag: "wx", mode: 0o644 });
+      } else if (op === "create_directory") {
+        await fs.promises.mkdir(resolved, { recursive: false });
+      } else if (op === "rename") {
+        if (!newPath) { reply(false, "novo caminho ausente"); return; }
+        const next = path.resolve(root, newPath);
+        if (!isInsideRoot(next, root)) { reply(false, "acesso negado"); return; }
+        try { await fs.promises.access(next); reply(false, "destino já existe"); return; }
+        catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
+        await fs.promises.rename(resolved, next);
+      } else {
+        await fs.promises.rm(resolved, { recursive: true, force: false });
+      }
+      reply(true);
+    } catch (e) {
+      reply(false, (e as Error).message);
+    }
+  }
+
+  private async handleFileSearch(correlationId: string, rawQuery: string, override?: string) {
+    const query = rawQuery.trim().toLocaleLowerCase();
+    if (!override) { this.send({ type: "file:search_result", correlationId, query: rawQuery, entries: [], error: "workspaceRoot ausente na msg" }); return; }
+    const root = expandBasePath(override);
+    try {
+      this.enforceWorkspaceScope(root);
+      const ignored = new Set([".git", "node_modules", "dist", "build", ".next", ".cache", "coverage"]);
+      const entries: Array<{ name: string; path: string; isDirectory: boolean }> = [];
+      const walk = async (dir: string, depth: number): Promise<void> => {
+        if (entries.length >= 300 || depth > 14) return;
+        const children = await fs.promises.readdir(dir, { withFileTypes: true });
+        for (const child of children) {
+          if (entries.length >= 300) return;
+          if (child.isSymbolicLink() || (child.isDirectory() && ignored.has(child.name))) continue;
+          const absolute = path.join(dir, child.name);
+          const relative = path.relative(root, absolute);
+          if (relative.toLocaleLowerCase().includes(query)) entries.push({ name: child.name, path: relative, isDirectory: child.isDirectory() });
+          if (child.isDirectory()) await walk(absolute, depth + 1);
+        }
+      };
+      if (query) await walk(root, 0);
+      this.send({ type: "file:search_result", correlationId, query: rawQuery, entries });
+    } catch (e) {
+      this.send({ type: "file:search_result", correlationId, query: rawQuery, entries: [], error: (e as Error).message });
     }
   }
 
@@ -1404,13 +1481,10 @@ class DaemonClient {
     try {
       const [branchOut, statusOut] = await Promise.all([
         this.gitExec(["branch", "--show-current"]),
-        this.gitExec(["status", "--porcelain"]),
+        this.gitExec(["status", "--porcelain=v1", "--untracked-files=all", "--no-renames"]),
       ]);
       const branch = branchOut.trim() || undefined;
-      const files = statusOut.trim().split("\n").filter(Boolean).map((line) => ({
-        status: line.slice(0, 2).trim() || "M",
-        path: line.slice(3).trim(),
-      }));
+      const files = parseGitPorcelain(statusOut);
       this.send({ type: "git:status_result", correlationId, files, branch });
     } catch (e) {
       this.send({ type: "git:status_result", correlationId, files: [], error: (e as Error).message });
@@ -1423,7 +1497,7 @@ class DaemonClient {
       return;
     }
     try {
-      const output = await this.gitExec(["diff", "--", targetPath]);
+      const output = await this.gitExec(["diff", "HEAD", "--", targetPath]);
       this.send({ type: "git:diff_result", correlationId, path: targetPath, diff: output || "(sem alterações)" });
     } catch (e) {
       this.send({ type: "git:diff_result", correlationId, path: targetPath, error: (e as Error).message });

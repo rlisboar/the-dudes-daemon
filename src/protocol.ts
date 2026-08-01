@@ -240,6 +240,22 @@ export interface FileWriteRequest {
   workspaceRoot?: string;
 }
 
+export interface FileOperationRequest {
+  type: "file:operation";
+  correlationId: string;
+  op: "create_file" | "create_directory" | "rename" | "delete";
+  path: string;
+  newPath?: string;
+  workspaceRoot?: string;
+}
+
+export interface FileSearchRequest {
+  type: "file:search";
+  correlationId: string;
+  query: string;
+  workspaceRoot?: string;
+}
+
 /* ---------- file browser results (daemon → orch) ---------- */
 
 export interface FileListResult {
@@ -255,6 +271,8 @@ export interface FileReadResult {
   correlationId: string;
   path: string;
   content?: string;
+  encoding?: "utf8" | "base64";
+  mimeType?: string;
   error?: string;
 }
 
@@ -263,6 +281,24 @@ export interface FileWriteResult {
   correlationId: string;
   path: string;
   ok: boolean;
+  error?: string;
+}
+
+export interface FileOperationResult {
+  type: "file:operation_result";
+  correlationId: string;
+  op: FileOperationRequest["op"];
+  path: string;
+  newPath?: string;
+  ok: boolean;
+  error?: string;
+}
+
+export interface FileSearchResult {
+  type: "file:search_result";
+  correlationId: string;
+  query: string;
+  entries: FileEntry[];
   error?: string;
 }
 
@@ -696,7 +732,7 @@ export type FromDaemon =
   | AgentTextEv | AgentToolUseEv | AgentThinkingEv | AgentErrorEv | AgentExitEv
   | AgentContextWarningEv | AgentContextFullEv | AgentContextEv
   | WorkspaceResult
-  | FileListResult | FileReadResult | FileWriteResult
+  | FileListResult | FileReadResult | FileWriteResult | FileOperationResult | FileSearchResult
   | GitLogResult | GitStatusResult | GitDiffResult
   | GitResult
   | SummarizeResult
@@ -716,7 +752,7 @@ export type FromOrch =
   | DaemonWelcome | DaemonPong | DaemonChallenge | RunnerPolicySet
   | AgentSpawn | AgentStop | AgentSend | AgentClear | AgentCompact
   | AutoApproveSet | WorkspaceSet
-  | FileListRequest | FileReadRequest | FileWriteRequest
+  | FileListRequest | FileReadRequest | FileWriteRequest | FileOperationRequest | FileSearchRequest
   | GitLogRequest | GitStatusRequest | GitDiffRequest
   | GitStageRequest | GitUnstageRequest | GitCommitRequest
   | GitPushRequest | GitPullRequest | GitBranchesRequest
