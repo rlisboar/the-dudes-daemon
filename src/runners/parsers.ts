@@ -27,23 +27,75 @@ export function parseGrokContextSignals(raw: unknown): GrokContextSignals | null
  *
  * NÃO use `usage.totalTokens` / max regex: no turn_completed multi-step
  * (`modelCalls`/`numTurns` > 1) esses campos somam billing do loop de tools
- * e inflacionam 4–12× a janela real (ex.: 939k vs signals 78k).
+ * e inflacionam 4–12× a janela real (ex.: 939k vs signals 78k; vimos turns
+ * com usage.inputTokens > 10M).
  *
  * Fonte correta no stream: último `params._meta.totalTokens` (espelha
- * `signals.contextTokensUsed`).
+ * `signals.contextTokensUsed`). Rejeita valores absurdo (> teto da janela).
  */
-export function parseGrokUpdatesContextTokens(text: string): number {
+export function parseGrokUpdatesContextTokens(text: string, maxTokens = 2_000_000): number {
   let last = 0;
   for (const line of text.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed || !trimmed.includes('"totalTokens"')) continue;
     try {
       const event = JSON.parse(trimmed) as {
-        params?: { _meta?: { totalTokens?: unknown } };
+        params?: { _meta?: { totalTokens?: unknown; updateType?: unknown } };
       };
-      const n = Number(event.params?._meta?.totalTokens);
-      if (Number.isFinite(n) && n > 0) last = Math.floor(n);
+      const meta = event.params?._meta;
+      const n = Number(meta?.totalTokens);
+      // Só confia em meta de chunk de mensagem (não em billing de turn_completed).
+      if (!Number.isFinite(n) || n <= 0) continue;
+      if (n > maxTokens) continue; // billing multi-step disfarçado
+      last = Math.floor(n);
     } catch { /* linha incompleta / ruído */ }
+  }
+  return last;
+}
+
+/** Usage de billing do último turn_completed (somatório do loop de tools do turno). */
+export interface GrokTurnBilling {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheCreate: number;
+}
+
+/**
+ * Lê o último `turn_completed.usage` do updates.jsonl.
+ * Campos são do TURNO (não cumulativos da sessão) — ok somar no billing.
+ * NÃO usar pra janela de contexto (inputTokens multi-step infla).
+ */
+export function parseGrokTurnBillingFromUpdates(text: string): GrokTurnBilling | null {
+  let last: GrokTurnBilling | null = null;
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || !trimmed.includes("turn_completed")) continue;
+    try {
+      const event = JSON.parse(trimmed) as {
+        params?: {
+          update?: {
+            sessionUpdate?: string;
+            usage?: Record<string, unknown>;
+          };
+        };
+      };
+      const upd = event.params?.update;
+      if (upd?.sessionUpdate !== "turn_completed") continue;
+      const u = upd.usage;
+      if (!u || typeof u !== "object") continue;
+      const input = Math.floor(Number(u.inputTokens ?? 0));
+      const output = Math.floor(Number(u.outputTokens ?? 0));
+      const cacheRead = Math.floor(Number(u.cachedReadTokens ?? 0));
+      const cacheCreate = Math.floor(Number(u.cacheCreationTokens ?? 0));
+      if (!Number.isFinite(input) || input < 0) continue;
+      last = {
+        input: Math.max(0, input),
+        output: Math.max(0, Number.isFinite(output) ? output : 0),
+        cacheRead: Math.max(0, Number.isFinite(cacheRead) ? cacheRead : 0),
+        cacheCreate: Math.max(0, Number.isFinite(cacheCreate) ? cacheCreate : 0),
+      };
+    } catch { /* ignore */ }
   }
   return last;
 }
@@ -51,6 +103,7 @@ export function parseGrokUpdatesContextTokens(text: string): number {
 /**
  * Combina signals.json (preferido) com fallback de updates.jsonl.
  * Nunca promove billing acumulado acima da ocupação real do signals.
+ * Se used > limit (ex.: contaminação com usage multi-step), clamp no limit.
  */
 export function mergeGrokContextOccupancy(
   signals: GrokContextSignals | null,
@@ -61,20 +114,24 @@ export function mergeGrokContextOccupancy(
     ? signals.contextWindowTokens
     : fallbackLimit;
   if (!Number.isFinite(limit) || limit <= 0) return null;
+  // updates só como fallback e nunca acima da janela (billing multi-step
+  // tipo 5.13M não vaza pra barra).
   const fromUpdates = Number.isFinite(updatesTokens) && updatesTokens > 0
-    ? Math.floor(updatesTokens)
+    ? Math.min(Math.floor(updatesTokens), Math.floor(limit))
     : 0;
   // signals com used>0 é a fonte autoritativa da janela.
-  const used = signals && signals.contextTokensUsed > 0
+  let used = signals && signals.contextTokensUsed > 0
     ? signals.contextTokensUsed
     : fromUpdates > 0
       ? fromUpdates
       : signals?.contextTokensUsed ?? 0;
   if (used <= 0 && !signals) return null;
+  // Contaminação / overflow: ocupação da UI nunca > limit.
+  if (used > limit) used = limit;
   return {
-    contextTokensUsed: used,
+    contextTokensUsed: Math.floor(used),
     contextWindowTokens: Math.floor(limit),
-    contextWindowUsage: Math.round((used / limit) * 100),
+    contextWindowUsage: Math.min(100, Math.round((used / limit) * 100)),
   };
 }
 

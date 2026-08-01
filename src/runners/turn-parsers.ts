@@ -1,7 +1,7 @@
 export type NormalizedTurnEvent =
   | { type: "session"; sessionId: string }
   | { type: "text"; text: string }
-  | { type: "tool"; name: string; input: unknown }
+  | { type: "tool"; name: string; input: unknown; id?: string }
   | { type: "usage"; input: number; output: number; cacheCreate: number; cacheRead: number; cumulative: boolean }
   | { type: "result" }
   | { type: "thought"; text: string }
@@ -85,15 +85,36 @@ export function parseOpenCodeTurnEvent(raw: unknown): NormalizedTurnEvent[] {
   return out;
 }
 
+/**
+ * Grok headless `--output-format streaming-json` (docs/user-guide/14-headless-mode.md):
+ *   thought | text | tool_call | tool_call_update | usage | plan | end | error
+ *
+ * `tool_call` / `tool_call_update` existem desde o stream ACP — não depender
+ * só do poll de chat_history.jsonl pra estado/RUNS.
+ */
 export function parseGrokStreamEvent(raw: unknown): NormalizedTurnEvent[] {
   const event = record(raw);
   if (!event) return [];
   if (event.type === "text" && typeof event.data === "string") return [{ type: "text", text: event.data }];
   if (event.type === "thought" && typeof event.data === "string") return [{ type: "thought", text: event.data }];
+  if (event.type === "tool_call" || event.type === "tool_call_update") {
+    // tool_call: início (in_progress). tool_call_update: progresso/conclusão.
+    // Estado "thinking" em ambos — o agente ainda está no loop de tools.
+    const name = String(event.toolName ?? event.title ?? event.name ?? "");
+    const input = event.rawInput ?? event.input ?? {};
+    const id = typeof event.toolCallId === "string" && event.toolCallId
+      ? event.toolCallId
+      : undefined;
+    const tool: NormalizedTurnEvent = id
+      ? { type: "tool", name, input, id }
+      : { type: "tool", name, input };
+    return [tool];
+  }
   if (event.type === "end") return typeof event.sessionId === "string" && event.sessionId
     ? [{ type: "session", sessionId: event.sessionId }, { type: "result" }]
     : [{ type: "result" }];
   if (event.type === "error") return [{ type: "error", message: String(event.message ?? event.data ?? "grok error") }];
+  // JSON final (output-format json): { text, sessionId, … }
   if (!event.type && typeof event.text === "string") {
     const out: NormalizedTurnEvent[] = [{ type: "text", text: event.text }];
     if (typeof event.sessionId === "string" && event.sessionId) out.push({ type: "session", sessionId: event.sessionId });

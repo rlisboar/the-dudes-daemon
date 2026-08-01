@@ -10,6 +10,7 @@ import {
   contextTokensOf,
   parseGrokContextSignals,
   parseGrokUpdatesContextTokens,
+  parseGrokTurnBillingFromUpdates,
   mergeGrokContextOccupancy,
   grokSignalsPath,
   normalizeGrokCwd,
@@ -237,6 +238,7 @@ test("parseGrokContextSignals: rejeita inválido / incompleto", () => {
 
 test("parseGrokUpdatesContextTokens: usa último _meta.totalTokens, ignora billing usage", () => {
   // Reproduz o bug: usage.totalTokens de tool-loop multi-step (939k) >> janela real (78k).
+  // Caso real fullstack: 5.13M usage.total vs 244k janela.
   const updates = [
     JSON.stringify({
       params: {
@@ -251,15 +253,69 @@ test("parseGrokUpdatesContextTokens: usa último _meta.totalTokens, ignora billi
       params: {
         update: {
           sessionUpdate: "turn_completed",
-          usage: { inputTokens: 98689, outputTokens: 1052, totalTokens: 99741, modelCalls: 1, numTurns: 1 },
+          usage: { inputTokens: 5112222, outputTokens: 18200, totalTokens: 5130422, modelCalls: 27, numTurns: 27 },
         },
         _meta: { totalTokens: 78852, updateType: "AgentMessageChunk" },
       },
     }),
   ].join("\n");
   assert.equal(parseGrokUpdatesContextTokens(updates), 78852);
-  // regex-max ingenuo pegaria 939036 — garantimos que NÃO é isso
+  // regex-max ingenuo pegaria 5130422 — garantimos que NÃO é isso
+  assert.notEqual(parseGrokUpdatesContextTokens(updates), 5130422);
   assert.notEqual(parseGrokUpdatesContextTokens(updates), 939036);
+});
+
+test("parseGrokUpdatesContextTokens: rejeita meta.totalTokens acima do teto (billing disfarçado)", () => {
+  const updates = [
+    JSON.stringify({ params: { _meta: { totalTokens: 244242, updateType: "AgentMessageChunk" } } }),
+    JSON.stringify({ params: { _meta: { totalTokens: 5_130_422, updateType: "AgentMessageChunk" } } }),
+  ].join("\n");
+  // default max 2M: 5.13M rejeitado; last válido fica 244242
+  assert.equal(parseGrokUpdatesContextTokens(updates), 244242);
+  // teto baixo (janela): também rejeita
+  assert.equal(parseGrokUpdatesContextTokens(updates, 550_000), 244242);
+});
+
+test("parseGrokTurnBillingFromUpdates: último turn_completed.usage (billing, não janela)", () => {
+  const updates = [
+    JSON.stringify({
+      params: {
+        update: {
+          sessionUpdate: "turn_completed",
+          usage: {
+            inputTokens: 1000,
+            outputTokens: 50,
+            totalTokens: 1050,
+            cachedReadTokens: 800,
+            cacheCreationTokens: 0,
+          },
+        },
+      },
+    }),
+    JSON.stringify({
+      params: {
+        update: {
+          sessionUpdate: "turn_completed",
+          usage: {
+            inputTokens: 5_112_222,
+            outputTokens: 18_200,
+            totalTokens: 5_130_422,
+            cachedReadTokens: 5_000_000,
+            cacheCreationTokens: 12,
+            modelCalls: 27,
+          },
+        },
+      },
+    }),
+  ].join("\n");
+  assert.deepEqual(parseGrokTurnBillingFromUpdates(updates), {
+    input: 5_112_222,
+    output: 18_200,
+    cacheRead: 5_000_000,
+    cacheCreate: 12,
+  });
+  assert.equal(parseGrokTurnBillingFromUpdates(""), null);
+  assert.equal(parseGrokTurnBillingFromUpdates("{not json}"), null);
 });
 
 test("mergeGrokContextOccupancy: signals manda; updates só fallback; nunca infla", () => {
@@ -274,11 +330,17 @@ test("mergeGrokContextOccupancy: signals manda; updates só fallback; nunca infl
     contextWindowTokens: 500000,
     contextWindowUsage: 16,
   });
-  // sem signals: usa updates + fallback limit
+  // sem signals: usa updates + fallback limit, mas clamp em ~105% da janela
   assert.deepEqual(mergeGrokContextOccupancy(null, 78852, 500_000), {
     contextTokensUsed: 78852,
     contextWindowTokens: 500000,
     contextWindowUsage: 16,
+  });
+  // updates multi-step (5.13M) sem signals → clamp no limit (não 100% falso com 5.13M)
+  assert.deepEqual(mergeGrokContextOccupancy(null, 5_130_422, 500_000), {
+    contextTokensUsed: 500_000,
+    contextWindowTokens: 500000,
+    contextWindowUsage: 100,
   });
   // signals used=0 + updates: fallback
   assert.deepEqual(

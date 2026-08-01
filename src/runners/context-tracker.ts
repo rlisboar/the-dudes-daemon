@@ -54,10 +54,17 @@ export class ContextTracker {
 
   reportOccupancy(used: number, limitHint?: number): void {
     if (!Number.isFinite(used) || used < 0) return;
-    this.used = Math.floor(used);
     const mapped = this.limit();
     const limit = limitHint && Number.isFinite(limitHint) && limitHint > 0
       ? Math.max(mapped, Math.floor(limitHint)) : mapped;
+    // Ocupação da janela nunca deve exceder o teto. Valores > limit costumam
+    // ser billing multi-step (Grok usage.inputTokens soma modelCalls) vazando
+    // pra barra — clamp pra UI/pct e pra auto-compact não disparar em falso.
+    let next = Math.floor(used);
+    if (limit > 0 && next > limit) {
+      next = limit;
+    }
+    this.used = next;
     this.input.onUsage?.(this.used, limit);
     if (this.used <= 0) return;
     const pct = this.used / limit;

@@ -35,9 +35,40 @@ test("OpenCode normalizes session, completed tools and step usage", () => {
 
 test("Grok normalizes stream chunks, final objects, sessions and errors", () => {
   assert.deepEqual(parseGrokStreamEvent({ type: "thought", data: "why" }), [{ type: "thought", text: "why" }]);
+  assert.deepEqual(parseGrokStreamEvent({ type: "text", data: "hi" }), [{ type: "text", text: "hi" }]);
   assert.deepEqual(parseGrokStreamEvent({ type: "end", sessionId: "g1" }), [{ type: "session", sessionId: "g1" }, { type: "result" }]);
   assert.deepEqual(parseGrokStreamEvent({ text: "done", sessionId: "g2" }), [{ type: "text", text: "done" }, { type: "session", sessionId: "g2" }, { type: "result" }]);
   assert.deepEqual(parseGrokStreamEvent({ type: "error", message: "bad" }), [{ type: "error", message: "bad" }]);
+});
+
+test("Grok stream tool_call / tool_call_update → tool (estado thinking no runner)", () => {
+  assert.deepEqual(
+    parseGrokStreamEvent({
+      type: "tool_call",
+      toolCallId: "call_1",
+      toolName: "read_file",
+      status: "in_progress",
+      rawInput: { path: "src/main.rs" },
+    }),
+    [{ type: "tool", name: "read_file", input: { path: "src/main.rs" }, id: "call_1" }],
+  );
+  assert.deepEqual(
+    parseGrokStreamEvent({
+      type: "tool_call_update",
+      toolCallId: "call_1",
+      status: "completed",
+      rawOutput: { lines: 42 },
+    }),
+    [{ type: "tool", name: "", input: {}, id: "call_1" }],
+  );
+  assert.deepEqual(
+    parseGrokStreamEvent({
+      type: "tool_call",
+      toolName: "run_terminal_command",
+      rawInput: { command: "ls" },
+    }),
+    [{ type: "tool", name: "run_terminal_command", input: { command: "ls" } }],
+  );
 });
 
 test("Crush session metadata accepts nested and flat CLI shapes", () => {

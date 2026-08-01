@@ -18,8 +18,10 @@ import {
   mergeGrokContextOccupancy,
   parseGrokChatToolCalls,
   parseGrokContextSignals,
+  parseGrokTurnBillingFromUpdates,
   parseGrokUpdatesContextTokens,
   type GrokContextSignals,
+  type GrokTurnBilling,
 } from "./runners/parsers.js";
 import { parseCodexTurnEvent, parseCrushSessionMeta, parseGeminiTurnEvent, parseGrokStreamEvent, parseOpenCodeTurnEvent } from "./runners/turn-parsers.js";
 import { buildBridgeEnv, buildClaudeMcpConfig, buildCodexMcpArgs, buildCrushMcpConfig, buildGeminiMcpServers, buildGrokMcpToml, buildOpenCodeMcpConfig } from "./runners/mcp-config.js";
@@ -40,6 +42,7 @@ export {
   normalizeGrokCwd,
   parseGrokChatToolCalls,
   parseGrokContextSignals,
+  parseGrokTurnBillingFromUpdates,
   parseGrokUpdatesContextTokens,
 } from "./runners/parsers.js";
 export { CONTEXT_FULL_PATTERNS, RATE_LIMIT_TEXT_RE, contextTokensOf } from "./runners/context-tracker.js";
@@ -649,16 +652,16 @@ export class AgentRunner {
   private grokSeenToolCallIds = new Set<string>();
   private grokToolsPrimed = false;
   private grokChatSweepState: { path: string; offset: number } | null = null;
-  private grokSweepToolCalls(sessionId: string, emit: boolean): void {
+  private grokSweepToolCalls(sessionId: string, emit: boolean): boolean {
     const p = this.grokChatHistoryPath(sessionId);
-    if (!p) return;
+    if (!p) return false;
     let size: number;
-    try { size = statSync(p).size; } catch { return; }
+    try { size = statSync(p).size; } catch { return false; }
     const prev = this.grokChatSweepState?.path === p ? this.grokChatSweepState.offset : 0;
     // Arquivo encolheu = truncado/reescrito → recomeça do zero (dedupe por id
     // segura re-emissão do que já foi visto).
     const start = size >= prev ? prev : 0;
-    if (size <= start) { this.grokChatSweepState = { path: p, offset: start }; return; }
+    if (size <= start) { this.grokChatSweepState = { path: p, offset: start }; return false; }
     let buf: Buffer;
     try {
       const fd = openSync(p, "r");
@@ -668,7 +671,7 @@ export class AgentRunner {
         const n = readSync(fd, buf, 0, want, start);
         buf = buf.subarray(0, n);
       } finally { closeSync(fd); }
-    } catch { return; }
+    } catch { return false; }
     // Só linhas completas avançam o offset (offset sempre em fronteira de
     // linha → nunca corta um code point UTF-8 no início da próxima leitura).
     const lastNl = buf.lastIndexOf(0x0a);
@@ -680,21 +683,25 @@ export class AgentRunner {
       try { JSON.parse(tail); lines.push(tail); consumed = buf.length; } catch { /* parcial */ }
     }
     this.grokChatSweepState = { path: p, offset: start + consumed };
+    let emittedTool = false;
     for (const line of lines) {
       for (const call of parseGrokChatToolCalls(line)) {
         if (this.grokSeenToolCallIds.has(call.id)) continue;
         this.grokSeenToolCallIds.add(call.id);
-        if (emit) this.opts.onToolUse(call.name, call.input);
+        if (emit) {
+          this.opts.onToolUse(call.name, call.input);
+          emittedTool = true;
+          // Volta pra thinking/sending: o stream pode ter marcado "speaking"
+          // com text intermediário, mas o agente ainda está no tool-loop.
+          this.setState(call.name.includes("send_message") ? "sending" : "thinking");
+        }
       }
     }
+    return emittedTool;
   }
 
-  /**
-   * Fallback de ocupação via updates.jsonl: último `_meta.totalTokens`
-   * (espelha a janela). NÃO usar max de `usage.totalTokens` — billing de
-   * tool-loops multi-step infla 4–12× vs signals.contextTokensUsed.
-   */
-  private readGrokUpdatesContextTokens(sessionId: string): number {
+  /** Caminhos candidatos de updates.jsonl da sessão Grok (cwd variants + scan). */
+  private grokUpdatesCandidates(sessionId: string): string[] {
     const tryFiles: string[] = [];
     for (const sigPath of this.grokSignalsCandidates(sessionId)) {
       tryFiles.push(path.join(path.dirname(sigPath), "updates.jsonl"));
@@ -707,14 +714,46 @@ export class AgentRunner {
         }
       }
     } catch { /* noop */ }
+    return tryFiles;
+  }
+
+  /**
+   * Fallback de ocupação via updates.jsonl: último `_meta.totalTokens`
+   * (espelha a janela). NÃO usar max de `usage.totalTokens` — billing de
+   * tool-loops multi-step infla 4–12× vs signals.contextTokensUsed
+   * (ex.: 5.13M vs janela real ~244k).
+   */
+  private readGrokUpdatesContextTokens(sessionId: string): number {
+    // Teto = ~janela: rejeita billing multi-step disfarçado de totalTokens.
+    const maxTokens = Math.max(Math.floor(this.contextLimit() * 1.1), 600_000);
     let best = 0;
     const seen = new Set<string>();
-    for (const p of tryFiles) {
+    for (const p of this.grokUpdatesCandidates(sessionId)) {
       if (seen.has(p) || !existsSync(p)) continue;
       seen.add(p);
       try {
-        const n = parseGrokUpdatesContextTokens(readFileSync(p, "utf8"));
+        const n = parseGrokUpdatesContextTokens(readFileSync(p, "utf8"), maxTokens);
         if (n > best) best = n;
+      } catch { /* next */ }
+    }
+    return best;
+  }
+
+  /**
+   * Billing do último turn_completed no updates.jsonl.
+   * Soma do loop de tools do turno — correto pra billing, NÃO pra janela.
+   */
+  private readGrokTurnBilling(sessionId: string): GrokTurnBilling | null {
+    let best: GrokTurnBilling | null = null;
+    const seen = new Set<string>();
+    for (const p of this.grokUpdatesCandidates(sessionId)) {
+      if (seen.has(p) || !existsSync(p)) continue;
+      seen.add(p);
+      try {
+        const b = parseGrokTurnBillingFromUpdates(readFileSync(p, "utf8"));
+        if (!b) continue;
+        // Prefere o arquivo com mais input (cwd canônico costuma ser o completo).
+        if (!best || b.input > best.input) best = b;
       } catch { /* next */ }
     }
     return best;
@@ -2151,6 +2190,12 @@ export class AgentRunner {
     // Acumula o turno inteiro e emite UMA vez no final.
     // onAssistantText no orch cria uma mensagem por chamada — flush por
     // chunk/newline virava dezenas de balões "PM → Você" (UI quebrada).
+    //
+    // Estado: o stream emite text/thought/tool_call ao longo do tool-loop.
+    // O texto só chega no usuário no emitOnce — por isso NÃO marcamos
+    // "speaking" em cada chunk (ficava SPEAKING o turno inteiro enquanto
+    // o agente ainda lia arquivos / rodava bash). Fica thinking durante
+    // thought/tools; speaking só na entrega final da mensagem.
     let buf = "";
     let fullText = "";
     let fullThought = "";
@@ -2166,9 +2211,24 @@ export class AgentRunner {
         for (const event of parseGrokStreamEvent(JSON.parse(line))) {
           if (event.type === "text") {
             fullText += event.text;
-            if (fullText.length > 0) this.setState("speaking");
-          } else if (event.type === "thought") fullThought += event.text;
-          else if (event.type === "session") endSessionId = event.sessionId;
+            // Mantém thinking: texto é bufferizado; "speaking" só no emitOnce.
+          } else if (event.type === "thought") {
+            fullThought += event.text;
+            this.setState("thinking");
+          } else if (event.type === "tool") {
+            // Stream ACP emite tool_call ao vivo (CLI ≥0.2) — não esperar poll 3s.
+            // Dedupe por toolCallId (mesmo id no chat_history.jsonl do sweep).
+            if (event.name) {
+              const toolKey = event.id || `stream:${event.name}:${JSON.stringify(event.input).slice(0, 120)}`;
+              if (!this.grokSeenToolCallIds.has(toolKey)) {
+                this.grokSeenToolCallIds.add(toolKey);
+                this.opts.onToolUse(event.name, event.input);
+              }
+            }
+            this.setState(
+              event.name.includes("send_message") ? "sending" : "thinking",
+            );
+          } else if (event.type === "session") endSessionId = event.sessionId;
           else if (event.type === "result") sawEnd = true;
           else if (event.type === "error") {
             errFromJson = event.message;
@@ -2190,19 +2250,9 @@ export class AgentRunner {
         this.opts.onAssistantText(t);
         emittedAny = true;
       }
-      // Billing: headless não emite usage — estima por chars (~4 chars/token).
-      // Ocupação da janela NÃO usa essa heurística: finishGrokTurn lê
-      // signals.json (contextTokensUsed real) após o turno.
-      if (this.messageSession.owns(epoch) && (message.length > 0 || t.length > 0)) {
-        const estIn = Math.max(1, Math.ceil(message.length / 4));
-        const estOut = Math.max(0, Math.ceil(t.length / 4));
-        this.opts.onUsageDelta?.({
-          input: estIn,
-          output: estOut,
-          cacheCreate: 0,
-          cacheRead: 0,
-        });
-      }
+      // Billing real vem do turn_completed em finishGrokTurn (usage do loop).
+      // Char-estimate só como fallback se updates.jsonl não tiver usage.
+      // Ocupação da janela: signals.json / _meta.totalTokens — NUNCA usage.totalTokens.
     };
 
     proc.stdout!.setEncoding("utf8");
@@ -2330,6 +2380,9 @@ export class AgentRunner {
       // Ocupação real da janela: signals.json / updates.jsonl (igual /context).
       // NÃO re-emitir 0 se a leitura falhar — isso apagava a barra (e em
       // dual-daemon um processo "cego" zerava o valor do outro).
+      // Billing: turn_completed.usage (somatório do tool-loop do turno).
+      // NÃO misturar: usage.inputTokens multi-step pode ser 5–10M enquanto a
+      // janela real fica em ~200–400k — só a janela alimenta a barra.
       if (sid) {
         const sig = await this.pollGrokContextOccupancy(sid);
         if (sig && sig.contextTokensUsed > 0) {
@@ -2343,6 +2396,32 @@ export class AgentRunner {
           if (this.contextTracker.lastUsed() <= 0) {
             this.reportContextOccupancy(0, sig.contextWindowTokens);
           }
+        }
+
+        const billing = this.readGrokTurnBilling(sid);
+        if (billing && (billing.input > 0 || billing.output > 0)) {
+          // Grok reporta input inclusivo de cache (input ≈ cacheRead + fresh).
+          // Normaliza pra estilo anthropic: input = fresh, cacheRead separado.
+          const cacheRead = billing.cacheRead;
+          const exclusiveIn = cacheRead > 0 && cacheRead <= billing.input
+            ? billing.input - cacheRead
+            : billing.input;
+          this.opts.onUsageDelta?.({
+            input: exclusiveIn,
+            output: billing.output,
+            cacheCreate: billing.cacheCreate,
+            cacheRead,
+          });
+        } else if (t.emittedAny || t.content.length > 0) {
+          // Fallback: headless sem usage no updates — estima por chars.
+          const estIn = Math.max(1, Math.ceil(t.content.length / 4));
+          // output estimado não temos facilmente aqui; 0 é ok (billing parcial)
+          this.opts.onUsageDelta?.({
+            input: estIn,
+            output: 0,
+            cacheCreate: 0,
+            cacheRead: 0,
+          });
         }
       }
     } finally {

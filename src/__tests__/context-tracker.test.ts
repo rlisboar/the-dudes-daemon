@@ -74,3 +74,20 @@ test("cumulative usage tracker primes resumed sessions and clamps counter resets
   tracker.reset({ input: 0, output: 0 });
   assert.deepEqual(tracker.delta({ input: 7, output: 3 }), { input: 7, output: 3 });
 });
+
+test("reportOccupancy clampa used ao limit (billing multi-step Grok não vira 5.13M/500k)", () => {
+  const usage: Array<[number, number]> = [];
+  let full = 0;
+  const tracker = new ContextTracker({
+    resolveLimit: () => 500_000,
+    onUsage: (used, limit) => usage.push([used, limit]),
+    onFull: () => full++,
+  });
+  // Caso real: matchAll max de usage.totalTokens = 5_130_422
+  tracker.reportOccupancy(5_130_422, 500_000);
+  assert.deepEqual(usage.at(-1), [500_000, 500_000]);
+  assert.equal(full, 1); // pct == 1 dispara full (já no teto)
+  // valor legítimo sob a janela passa intacto
+  tracker.reportOccupancy(244_242, 500_000);
+  assert.deepEqual(usage.at(-1), [244_242, 500_000]);
+});
