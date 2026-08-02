@@ -126,6 +126,10 @@ const TOOL_GROUP: Record<string, string> = {
   lock_task: "tasks", unlock_task: "tasks",
   add_task_comment: "tasks", list_task_comments: "tasks",
   lock_file: "filelock", unlock_file: "filelock", list_file_locks: "filelock",
+  // Plans = grupo ordenado de board tasks; gate junto com tasks.
+  list_plans: "tasks", get_plan: "tasks", create_plan: "tasks",
+  add_plan_task: "tasks", apply_plan_tasks: "tasks",
+  start_plan: "tasks", pause_plan: "tasks", validate_plan_task: "tasks",
   remember: "memory", recall: "memory", forget: "memory", pin: "memory",
   list_goals: "goals",
   get_credential: "credentials",
@@ -415,6 +419,310 @@ server.tool(
       };
     }
   }
+);
+
+/* ---------- Planners: ordered group of board tasks; Start → Mission ---------- */
+
+const VALIDATOR_MODE = z.enum(["human", "creator", "agent"]);
+
+server.tool(
+  "list_plans",
+  "List project plans. A plan is an ordered group of BOARD tasks (not a separate work item). Returns plan id, status, progress, goal, default validator, and membership items (board task ids).",
+  {},
+  async () => {
+    try {
+      const r = await postJSON("plans_list", {});
+      const plans = r.plans ?? [];
+      if (plans.length === 0) {
+        return { content: [{ type: "text", text: "(no plans yet — use create_plan)" }] };
+      }
+      const text = plans
+        .map((p: any) => {
+          const items = (p.tasks ?? [])
+            .map(
+              (t: any) =>
+                `    ${t.idx + 1}. [${t.status}] board=${t.taskId ?? "?"}${t.taskNumber != null ? ` #${t.taskNumber}` : ""} · ${t.title}` +
+                (t.validator?.mode ? ` ✓${t.validator.mode}` : "") +
+                (t.executorAgentId ? ` @${t.executorAgentId}` : ""),
+            )
+            .join("\n");
+          return (
+            `- [${p.status}] ${p.id} · ${p.title} (${p.progressPct ?? 0}%, ${p.taskCount ?? 0} items)` +
+            (p.goalId ? `\n    goal: ${p.goalId}` : "") +
+            (p.defaultValidator?.mode ? `\n    default validator: ${p.defaultValidator.mode}` : "") +
+            (p.linkedMissionId ? `\n    run: ${p.linkedMissionId}` : "") +
+            (items ? `\n${items}` : "")
+          );
+        })
+        .join("\n\n");
+      return { content: [{ type: "text", text }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "get_plan",
+  "Get full detail of one plan by id (including membership prompts/outputs).",
+  { id: z.string().describe("Plan id (e.g. pln_xxxx)") },
+  async ({ id }) => {
+    try {
+      const r = await postJSON("plans_get", { id });
+      if (!r.plan) {
+        return { content: [{ type: "text", text: r.error ?? `plan ${id} not found` }], isError: true };
+      }
+      return { content: [{ type: "text", text: JSON.stringify(r.plan, null, 2) }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "create_plan",
+  "Create a plan (ordered group of board tasks). Optionally pass existing task_ids and/or draft tasks (title/prompt) that become real board tasks. YOU become plannerAgentId (creator validator). default_validator: human | creator | agent.",
+  {
+    title: z.string().describe("Plan title"),
+    description: z.string().optional().describe("Objective / context"),
+    goal_id: z.string().optional().describe("Link to a goal from list_goals"),
+    default_validator_mode: VALIDATOR_MODE.optional().describe("Default who validates each item (default human)"),
+    default_validator_agent: z.string().optional().describe("If mode=agent: teammate name or id for reviewer"),
+    task_ids: z.array(z.string()).optional().describe("Existing board task ids to include (ordered)"),
+    tasks: z
+      .array(
+        z.object({
+          title: z.string().optional(),
+          prompt: z.string().optional().describe("Executor instructions (becomes board task description)"),
+          task_id: z.string().optional().describe("Or link an existing board task"),
+          assignee: z.string().optional().describe("Executor teammate name/id"),
+          validator_mode: VALIDATOR_MODE.optional(),
+          validator_agent: z.string().optional(),
+          acceptance: z.string().optional(),
+        }),
+      )
+      .optional()
+      .describe("Draft items: creates board tasks + membership"),
+  },
+  async (args) => {
+    try {
+      const defaultValidator = args.default_validator_mode
+        ? {
+            mode: args.default_validator_mode,
+            ...(args.default_validator_mode === "agent" && args.default_validator_agent
+              ? { agent: args.default_validator_agent }
+              : {}),
+          }
+        : undefined;
+      const tasks = args.tasks?.map((t) => ({
+        title: t.title,
+        prompt: t.prompt,
+        taskId: t.task_id,
+        assignee: t.assignee,
+        validator: t.validator_mode
+          ? {
+              mode: t.validator_mode,
+              ...(t.validator_mode === "agent" && t.validator_agent ? { agent: t.validator_agent } : {}),
+            }
+          : undefined,
+        acceptance: t.acceptance,
+      }));
+      const r = await postJSON("plans_create", {
+        title: args.title,
+        description: args.description,
+        goal_id: args.goal_id,
+        defaultValidator,
+        taskIds: args.task_ids,
+        tasks,
+      });
+      if (r.error) return { content: [{ type: "text", text: `error: ${r.error}` }], isError: true };
+      const p = r.plan;
+      return {
+        content: [
+          {
+            type: "text",
+            text: `created plan ${p.id}: "${p.title}" [${p.status}] with ${p.tasks?.length ?? 0} items. Use start_plan when ready to run.`,
+          },
+        ],
+      };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "add_plan_task",
+  "Add one item to a draft/paused plan: either link an existing board task_id OR create a new board task with title/prompt.",
+  {
+    plan_id: z.string().describe("Plan id"),
+    task_id: z.string().optional().describe("Existing board task to link"),
+    title: z.string().optional().describe("New board task title (if not linking)"),
+    prompt: z.string().optional().describe("Executor instructions / board description"),
+    assignee: z.string().optional().describe("Executor teammate"),
+    validator_mode: VALIDATOR_MODE.optional(),
+    validator_agent: z.string().optional(),
+    acceptance: z.string().optional(),
+  },
+  async (args) => {
+    try {
+      const r = await postJSON("plans_add_task", {
+        planId: args.plan_id,
+        taskId: args.task_id,
+        title: args.title,
+        prompt: args.prompt,
+        assignee: args.assignee,
+        validator: args.validator_mode
+          ? {
+              mode: args.validator_mode,
+              ...(args.validator_mode === "agent" && args.validator_agent
+                ? { agent: args.validator_agent }
+                : {}),
+            }
+          : undefined,
+        acceptance: args.acceptance,
+      });
+      if (r.error || !r.plan) {
+        return { content: [{ type: "text", text: r.error ?? "failed" }], isError: true };
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: `plan ${r.plan.id} now has ${r.plan.tasks?.length ?? 0} items`,
+          },
+        ],
+      };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "apply_plan_tasks",
+  "Bulk add items to a draft/paused plan (append or replace). Each item without task_id creates a new board task. Use after you design a multi-step decomposition.",
+  {
+    plan_id: z.string(),
+    mode: z.enum(["append", "replace"]).optional().describe("append (default) or replace existing membership"),
+    tasks: z.array(
+      z.object({
+        title: z.string().optional(),
+        prompt: z.string().optional(),
+        task_id: z.string().optional(),
+        assignee: z.string().optional(),
+        validator_mode: VALIDATOR_MODE.optional(),
+        validator_agent: z.string().optional(),
+        acceptance: z.string().optional(),
+      }),
+    ).describe("1–200 items"),
+  },
+  async (args) => {
+    try {
+      const r = await postJSON("plans_apply_tasks", {
+        planId: args.plan_id,
+        mode: args.mode ?? "append",
+        tasks: args.tasks.map((t) => ({
+          title: t.title,
+          prompt: t.prompt,
+          taskId: t.task_id,
+          assignee: t.assignee,
+          validator: t.validator_mode
+            ? {
+                mode: t.validator_mode,
+                ...(t.validator_mode === "agent" && t.validator_agent
+                  ? { agent: t.validator_agent }
+                  : {}),
+              }
+            : undefined,
+          acceptance: t.acceptance,
+        })),
+      });
+      if (r.error || !r.plan) {
+        return { content: [{ type: "text", text: r.error ?? "failed" }], isError: true };
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: `applied ${args.tasks.length} item(s) to plan ${r.plan.id} (${args.mode ?? "append"}) — now ${r.plan.tasks?.length ?? 0} total`,
+          },
+        ],
+      };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "start_plan",
+  "Start a draft/paused plan: materializes a Mission (1 step per board task) and runs it with MissionEngine. Validators map to requiresHuman / reviewer. Board tasks move todo→doing→done as steps complete.",
+  { id: z.string().describe("Plan id") },
+  async ({ id }) => {
+    try {
+      const r = await postJSON("plans_start", { id });
+      if (r.error || !r.plan) {
+        return { content: [{ type: "text", text: r.error ?? `cannot start plan ${id}` }], isError: true };
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: `started plan ${r.plan.id} [${r.plan.status}]` +
+              (r.plan.linkedMissionId ? ` → mission ${r.plan.linkedMissionId}` : ""),
+          },
+        ],
+      };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "pause_plan",
+  "Pause a running plan (and its linked mission).",
+  { id: z.string().describe("Plan id") },
+  async ({ id }) => {
+    try {
+      const r = await postJSON("plans_pause", { id });
+      if (r.error || !r.plan) {
+        return { content: [{ type: "text", text: r.error ?? `cannot pause plan ${id}` }], isError: true };
+      }
+      return { content: [{ type: "text", text: `paused plan ${r.plan.id}` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "validate_plan_task",
+  "Approve or reject a plan membership item awaiting human validation (plan membership id from list_plans / get_plan, not board task id). Use after human/agent review of executor output.",
+  {
+    task_id: z.string().describe("Plan membership id (plt_xxxx), NOT board task id"),
+    approve: z.boolean().describe("true = approve and continue; false = reject (retry/fail)"),
+    note: z.string().optional().describe("Optional comment"),
+  },
+  async ({ task_id, approve, note }) => {
+    try {
+      const r = await postJSON("plans_validate_task", { taskId: task_id, approve, note });
+      if (r.error || !r.plan) {
+        return { content: [{ type: "text", text: r.error ?? "validate failed" }], isError: true };
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: `${approve ? "approved" : "rejected"} membership ${task_id}; plan ${r.plan.id} is [${r.plan.status}] ${r.plan.progressPct ?? 0}%`,
+          },
+        ],
+      };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
+    }
+  },
 );
 
 server.tool(

@@ -367,6 +367,16 @@ export class AgentHost {
       log: this.log,
       cliLog: this.cliLog,
       onState: (state) => this.send({ type: "agent:state", agentId: msg.agent.id, state }),
+      onHung: (info) => {
+        this.send({
+          type: "agent:hung",
+          agentId: msg.agent.id,
+          soft: info.soft,
+          reason: info.reason,
+          idleMs: info.idleMs,
+          runner: cliRunner,
+        });
+      },
       onAssistantText: (text) => {
         // Redact credenciais que o agente buscou (get_credential) e ecoou, ANTES
         // de cifrar — em projeto E2EE o server não vê o plaintext, então a

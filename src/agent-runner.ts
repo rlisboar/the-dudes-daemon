@@ -28,6 +28,13 @@ import { buildBridgeEnv, buildClaudeMcpConfig, buildCodexMcpArgs, buildCrushMcpC
 import { RunnerRuntimeFiles } from "./runners/runtime-files.js";
 import { ContextTracker, CumulativeUsageTracker, type UsageSemantics } from "./runners/context-tracker.js";
 import { armHardTimeout, collectProcessOutput, killProcess, processAlive as procAlive, terminateAndWait, terminateWithEscalation } from "./runners/process-lifecycle.js";
+import {
+  createActivityClock,
+  hangPhase,
+  hangThresholds,
+  touchActivityClock,
+  type TurnActivityClock,
+} from "./runners/turn-watchdog.js";
 import { OpenCodeTransport } from "./runners/opencode-transport.js";
 import { buildOpenCodeAgentConfig, OPENCODE_MANAGED_AGENT } from "./runners/opencode-effort.js";
 import { PerMessageSessionState } from "./runners/message-session.js";
@@ -127,6 +134,11 @@ export interface AgentRunnerOptions {
   onSessionInvalid?: () => void;
   onError: (err: string) => void;
   onExit: (code: number | null) => void;
+  /**
+   * Hang detection (0 tokens): soft = stalled/avisando; hard = turno morto
+   * e busy liberado. Server usa hard pra abortar mission steps.
+   */
+  onHung?: (info: { soft: boolean; reason: string; idleMs: number }) => void;
   /** projectId (pra rotular graph:status emitido pelo auto-build do grafo). */
   projectId?: string;
   /** Reporta status do índice graphify durante o auto-build no spawn. */
@@ -205,6 +217,11 @@ export class AgentRunner {
    *  perde dispatches feitos no meio do clearContext/compact. */
   private pendingMessages: Array<{ content: string; images?: ImageAttachment[] }> = [];
 
+  /** Hang watchdog: last I/O / tool / state activity (0 tokens). */
+  private activityClock: TurnActivityClock = createActivityClock();
+  private hangWatchTimer: NodeJS.Timeout | null = null;
+  private recoveringHung = false;
+
   constructor(info: AgentInfo, private opts: AgentRunnerOptions) {
     this.info = info;
     this.messageSession = new PerMessageSessionState();
@@ -223,6 +240,7 @@ export class AgentRunner {
       onFull: opts.onContextFull,
       onError: opts.onError,
     });
+    this.startHangWatch();
     this.openCodeTransport = new OpenCodeTransport({
       spawnServer: () => spawnDropped(
         this.runnerCommand("opencode"),
@@ -2258,6 +2276,7 @@ export class AgentRunner {
     proc.stdout!.setEncoding("utf8");
     proc.stderr!.setEncoding("utf8");
     proc.stdout!.on("data", (chunk: string) => {
+      this.touchActivity();
       this.traceCli("grok", "stdout", chunk);
       buf += chunk;
       let idx: number;
@@ -2270,6 +2289,7 @@ export class AgentRunner {
     proc.stderr!.on("data", (chunk: string) => {
       const msg = chunk.trim();
       if (!msg) return;
+      this.touchActivity();
       this.traceCli("grok", "stderr", msg);
       errOut += chunk;
       this.checkContextFullError(msg);
@@ -2697,6 +2717,7 @@ export class AgentRunner {
     // Re-drenada no finally do compactContext.
     if (this.messageSession.busy || this.compacting || this.messageSession.queuedCount() === 0 || this.stopped) return;
     this.messageSession.busy = true;
+    this.touchActivity();
     const next = this.messageSession.dequeue();
     if (!next) { this.messageSession.busy = false; return; }
     const { content, images } = next;
@@ -2760,6 +2781,7 @@ export class AgentRunner {
 
   stop() {
     this.stopped = true;
+    this.stopHangWatch();
     // Limpa buffers pendentes — sem isso, mensagens bufferadas durante
     // restart ficam em memory por toda vida do AgentRunner (mesmo após
     // stop). Cleanup explicit pra GC.
@@ -3248,6 +3270,133 @@ export class AgentRunner {
     if (state === this.currentState) return;
     this.currentState = state;
     this.info.state = state;
+    // Atividade real (não stalled/idle) zera o soft-stall
+    if (state !== "idle" && state !== "stopping" && state !== "stalled") {
+      this.touchActivity();
+    }
     this.opts.onState(state);
+  }
+
+  /* ---------- Hang watchdog (0 tokens) ---------- */
+
+  private touchActivity(): void {
+    touchActivityClock(this.activityClock);
+  }
+
+  private startHangWatch(): void {
+    if (this.hangWatchTimer) return;
+    this.hangWatchTimer = setInterval(() => {
+      try { this.tickHangWatch(); } catch (e) {
+        this.opts.log("warn", `[hang] tick error: ${(e as Error).message}`);
+      }
+    }, 5_000);
+    if (this.hangWatchTimer.unref) this.hangWatchTimer.unref();
+  }
+
+  private stopHangWatch(): void {
+    if (this.hangWatchTimer) {
+      clearInterval(this.hangWatchTimer);
+      this.hangWatchTimer = null;
+    }
+  }
+
+  /** true se o agent está no meio de um turno (busy per-message ou estado ativo). */
+  private isInTurn(): boolean {
+    if (this.messageSession.busy) return true;
+    const s = this.currentState;
+    return s === "thinking" || s === "speaking" || s === "sending" || s === "stalled";
+  }
+
+  /** Grok: mtime de signals/updates avança sem stdout → conta como atividade. */
+  private grokSessionRecentWrite(withinMs: number): boolean {
+    const sid = this.messageSession.sessionId;
+    if (!sid) return false;
+    const now = Date.now();
+    const paths = [
+      ...this.grokSignalsCandidates(sid),
+      ...this.grokUpdatesCandidates(sid),
+    ];
+    for (const p of paths) {
+      try {
+        if (now - statSync(p).mtimeMs < withinMs) return true;
+      } catch { /* missing */ }
+    }
+    return false;
+  }
+
+  private tickHangWatch(): void {
+    if (this.stopped || this.recoveringHung) return;
+    if (!this.isInTurn()) {
+      this.activityClock.deadSince = null;
+      return;
+    }
+
+    const runner = this.opts.cliRunner;
+    const t = hangThresholds(runner);
+
+    // Grok: atividade em arquivos de sessão (tools rodando sem stream)
+    if (runner === "grok" && this.grokSessionRecentWrite(45_000)) {
+      this.touchActivity();
+    }
+
+    const now = Date.now();
+    const idleMs = now - this.activityClock.lastActivityAt;
+
+    // Processo do turno morreu mas busy/estado não limpou
+    const proc = this.ocActiveProc;
+    if (this.messageSession.busy && proc && !procAlive(proc)) {
+      if (this.activityClock.deadSince == null) this.activityClock.deadSince = now;
+      const deadFor = now - this.activityClock.deadSince;
+      if (deadFor >= t.deadProcMs) {
+        this.recoverHungTurn(`process dead for ${Math.round(deadFor / 1000)}s while busy`, idleMs);
+        return;
+      }
+    } else {
+      this.activityClock.deadSince = null;
+    }
+
+    const phase = hangPhase(idleMs, t);
+    if (phase === "hard" && this.messageSession.busy) {
+      // Só hard-kill em per-message (tem ocActiveProc / busy). Claude continuous
+      // fica em soft (stalled) — matar o proc claude derruba o agent inteiro.
+      this.recoverHungTurn(`no activity for ${Math.round(idleMs / 1000)}s`, idleMs);
+      return;
+    }
+    if (phase === "soft" && !this.activityClock.softReported) {
+      this.activityClock.softReported = true;
+      this.setState("stalled");
+      const msg = `[hang] sem atividade há ${Math.round(idleMs / 1000)}s (runner=${runner}) — aguardando…`;
+      this.opts.log("warn", `${msg} agent=${this.info.name}`);
+      this.opts.onError(msg);
+      this.opts.onHung?.({ soft: true, reason: msg, idleMs });
+    }
+  }
+
+  /** Hard recover: mata turno, libera busy, avisa server (mission abort). */
+  private recoverHungTurn(reason: string, idleMs: number): void {
+    if (this.recoveringHung || this.stopped) return;
+    this.recoveringHung = true;
+    try {
+      this.opts.log(
+        "warn",
+        `[hang:${this.info.name}] HARD recover: ${reason} (runner=${this.opts.cliRunner})`,
+      );
+      killProcess(this.ocActiveProc, "SIGKILL");
+      killProcess(this.oneShotProc, "SIGKILL");
+      this.ocActiveProc = null;
+      this.oneShotProc = null;
+      this.messageSession.busy = false;
+      this.activityClock.softReported = false;
+      this.activityClock.deadSince = null;
+      this.touchActivity();
+      this.setState("idle");
+      const full = `[hang] turno abortado: ${reason}`;
+      this.opts.onHung?.({ soft: false, reason: full, idleMs });
+      this.opts.onError(full);
+      // Continua fila se houver mensagens pendentes
+      try { this.drainOcQueue(); } catch { /* */ }
+    } finally {
+      this.recoveringHung = false;
+    }
   }
 }

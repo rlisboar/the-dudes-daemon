@@ -206,7 +206,7 @@ export class BridgeRelay {
       // plaintext. Server stores ciphertext per project; daemon holds the
       // project key and rewrites the response body in place before handing
       // it to the MCP bridge child.
-      const m2 = parsed.pathname.match(/^\/api\/bridge\/([^/]+)\/(tasks_list|tasks_comment_list|goals_list|memory_list)$/);
+      const m2 = parsed.pathname.match(/^\/api\/bridge\/([^/]+)\/(tasks_list|tasks_comment_list|goals_list|memory_list|plans_list|plans_get)$/);
       if (m2 && this.agentProjectLookup && upstream.status === 200) {
         const agentId = m2[1];
         const op = m2[2];
@@ -217,6 +217,13 @@ export class BridgeRelay {
             const dec = (s: unknown): unknown => {
               if (typeof s !== "string" || !isE2eEncrypted(s)) return s;
               return decryptForProject(s, projectId) ?? s;
+            };
+            const decryptPlanTasks = (tasks: any[]) => {
+              for (const t of tasks) {
+                if (t.title) t.title = dec(t.title);
+                if (t.prompt) t.prompt = dec(t.prompt);
+                if (t.output) t.output = dec(t.output);
+              }
             };
             if (op === "tasks_list" && Array.isArray(json.tasks)) {
               for (const t of json.tasks) {
@@ -233,12 +240,22 @@ export class BridgeRelay {
                 if (g.description) g.description = dec(g.description);
               }
             } else if (op === "memory_list" && Array.isArray(json.memories)) {
+              // entrega title/body em plaintext pro agente (a tool recall
+              // filtra query/substring sobre isto). Mantém os campos cipher.
               for (const e of json.memories) {
-                // entrega title/body em plaintext pro agente (a tool recall
-                // filtra query/substring sobre isto). Mantém os campos cipher.
                 if (e.titleCipher) e.title = dec(e.titleCipher);
                 if (e.bodyCipher) e.body = dec(e.bodyCipher);
               }
+            } else if (op === "plans_list" && Array.isArray(json.plans)) {
+              for (const p of json.plans) {
+                if (p.title) p.title = dec(p.title);
+                if (p.description) p.description = dec(p.description);
+                if (Array.isArray(p.tasks)) decryptPlanTasks(p.tasks);
+              }
+            } else if (op === "plans_get" && json.plan) {
+              if (json.plan.title) json.plan.title = dec(json.plan.title);
+              if (json.plan.description) json.plan.description = dec(json.plan.description);
+              if (Array.isArray(json.plan.tasks)) decryptPlanTasks(json.plan.tasks);
             }
             buf = Buffer.from(JSON.stringify(json), "utf8");
           } catch { /* leave as-is on parse / decrypt failure */ }

@@ -201,6 +201,15 @@ export interface AgentTextEv { type: "agent:text"; agentId: string; text: string
 export interface AgentToolUseEv { type: "agent:tool_use"; agentId: string; toolName: string; input: unknown }
 export interface AgentThinkingEv { type: "agent:thinking"; agentId: string; text: string; redacted: boolean }
 export interface AgentErrorEv { type: "agent:error"; agentId: string; message: string }
+/** Runner sem atividade / processo morto — soft=aviso; hard=turno abortado. */
+export interface AgentHungEv {
+  type: "agent:hung";
+  agentId: string;
+  soft: boolean;
+  reason: string;
+  idleMs: number;
+  runner?: string;
+}
 export interface AgentExitEv { type: "agent:exit"; agentId: string; code: number | null }
 export interface AgentContextWarningEv { type: "agent:context_warning"; agentId: string; used: number; limit: number }
 export interface AgentContextFullEv { type: "agent:context_full"; agentId: string }
@@ -729,7 +738,7 @@ export type FromDaemon =
   | GitlabApiResult
   | DaemonHello | DaemonPing | DaemonChallengeResponse
   | AgentStateEv | AgentRunningEv | AgentSessionEv | AgentTokenResyncEv | AgentUsageDeltaEv
-  | AgentTextEv | AgentToolUseEv | AgentThinkingEv | AgentErrorEv | AgentExitEv
+  | AgentTextEv | AgentToolUseEv | AgentThinkingEv | AgentErrorEv | AgentHungEv | AgentExitEv
   | AgentContextWarningEv | AgentContextFullEv | AgentContextEv
   | WorkspaceResult
   | FileListResult | FileReadResult | FileWriteResult | FileOperationResult | FileSearchResult
