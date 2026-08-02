@@ -877,18 +877,40 @@ const MEMORY_TYPES = ["fact", "decision", "reference", "preference", "task_state
 
 server.tool(
   "remember",
-  "Save a durable note to YOUR agent memory (default). It is re-injected into YOUR system prompt on every restart and pushed live only to you — not duplicated into other agents. Keep entries short and atomic. Use scope 'project' only for catalog facts that others may recall (not auto-injected into every agent).",
+  "Save a durable note to YOUR agent memory (default scope=agent). Default is NOT pinned (catalog/recall only). Set pinned=true only if it must re-inject into YOUR system prompt every restart (hot-set quota ~15). Use scope 'project' only for shared catalog facts others may recall (never auto-injected into all agents). Keep entries short and atomic. Use supersedes to replace an older mem_ id of the same fact.",
   {
     title: z.string().describe("Short one-line title"),
     body: z.string().describe("The fact/decision/reference to remember"),
     type: z.enum(MEMORY_TYPES).optional().describe("fact (default) | decision | reference | preference | task_state"),
-    scope: z.enum(["project", "agent"]).optional().describe("agent = yours only (default, injected); project = shared catalog (recall only, not injected into all)"),
-    pinned: z.boolean().optional().describe("Pin so it stays in your hot-set"),
+    scope: z.enum(["project", "agent"]).optional().describe("agent = yours only (default); project = shared catalog (recall only)"),
+    pinned: z.boolean().optional().describe("true = hot-set injection (opt-in). Default false."),
+    tags: z.array(z.string()).optional().describe("Optional short tags for filtering"),
+    supersedes: z.array(z.string()).optional().describe("mem_ ids this entry replaces (same fact updated)"),
   },
-  async ({ title, body, type, scope, pinned }) => {
+  async ({ title, body, type, scope, pinned, tags, supersedes }) => {
     try {
-      const r = await postJSON("memory_add", { title, body, type, scope: scope ?? "agent", pinned });
-      return { content: [{ type: "text", text: `remembered ${r.memory?.id ?? ""} [${r.memory?.type ?? type ?? "fact"}/${r.memory?.scope ?? scope ?? "agent"}]` }] };
+      const sup = (supersedes ?? []).filter((id) => /^mem_[a-z0-9]+$/i.test(id)).slice(0, 5);
+      const r = await postJSON("memory_add", {
+        title, body, type,
+        scope: scope ?? "agent",
+        pinned: pinned === true,
+        tags: tags?.slice(0, 12),
+        supersedesId: sup[0],
+      });
+      const newId = r.memory?.id as string | undefined;
+      let merged = 0;
+      if (newId && sup.length > 0) {
+        for (const oldId of sup) {
+          if (oldId === newId) continue;
+          try {
+            await postJSON("memory_remove", { id: oldId });
+            merged++;
+          } catch { /* ownership */ }
+        }
+      }
+      const pin = r.memory?.pinned ? " pinned" : "";
+      const mrg = merged > 0 ? ` superseded ${merged}` : "";
+      return { content: [{ type: "text", text: `remembered ${newId ?? ""} [${r.memory?.type ?? type ?? "fact"}/${r.memory?.scope ?? scope ?? "agent"}]${pin}${mrg}` }] };
     } catch (e) {
       return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
     }
@@ -897,22 +919,51 @@ server.tool(
 
 server.tool(
   "recall",
-  "Search memory visible to you: your private agent entries + project catalog. Your agent hot-set is already in the system prompt; use recall for project-shared catalog or older notes not injected. Optional query substring-matches title/body; optional type filters by kind.",
+  "Search memory visible to you: your private agent entries + project catalog (not archived). Hot-set (pinned) is already in the system prompt. Query multi-word: mode 'and' (default, all terms) or 'or' (any term). Ranked pin > sticky types > recent access.",
   {
-    query: z.string().optional().describe("Substring to match in title/body"),
+    query: z.string().optional().describe("Search terms in title/body/tags"),
     type: z.enum(MEMORY_TYPES).optional(),
+    limit: z.number().int().min(1).max(100).optional().describe("Max results (default 40)"),
+    mode: z.enum(["and", "or"]).optional().describe("Multi-term match mode (default and)"),
   },
-  async ({ query, type }) => {
+  async ({ query, type, limit, mode }) => {
     try {
-      const r = await postJSON("memory_list", { type });
-      let entries = (r.memories ?? []) as Array<{ id: string; type: string; scope: string; agentId?: string | null; pinned?: boolean; title?: string; body?: string }>;
-      if (query) {
-        const q = query.toLowerCase();
-        entries = entries.filter((e) => `${e.title ?? ""}\n${e.body ?? ""}`.toLowerCase().includes(q));
+      // touch:false no list — só touch dos IDs que passaram no filtro (ranking honesto)
+      const r = await postJSON("memory_list", { type, limit: limit ?? 80, touch: false });
+      let entries = (r.memories ?? []) as Array<{
+        id: string; type: string; scope: string; agentId?: string | null;
+        pinned?: boolean; title?: string; body?: string; tags?: string[];
+      }>;
+      const matchMode = mode === "or" ? "or" : "and";
+      if (query?.trim()) {
+        const terms = query.toLowerCase().split(/\s+/).map((t) => t.trim()).filter(Boolean);
+        if (terms.length > 0) {
+          entries = entries.filter((e) => {
+            const hay = `${e.title ?? ""}\n${e.body ?? ""}\n${(e.tags ?? []).join(" ")}`.toLowerCase();
+            return matchMode === "or" ? terms.some((t) => hay.includes(t)) : terms.every((t) => hay.includes(t));
+          });
+        }
+      }
+      // Boost sticky types after pin sort (server already ranks; re-boost filtered set)
+      entries.sort((a, b) => {
+        const pa = a.pinned ? 0 : 1;
+        const pb = b.pinned ? 0 : 1;
+        if (pa !== pb) return pa - pb;
+        const sa = a.type === "decision" || a.type === "preference" ? 0 : 1;
+        const sb = b.type === "decision" || b.type === "preference" ? 0 : 1;
+        return sa - sb;
+      });
+      entries = entries.slice(0, limit ?? 40);
+      if (entries.length > 0 && (query?.trim() || entries.length <= 15)) {
+        void postJSON("memory_touch", { ids: entries.map((e) => e.id) }).catch(() => {});
       }
       if (entries.length === 0) return { content: [{ type: "text", text: "(no matching memory)" }] };
       const text = entries
-        .map((e) => `- ${e.id} [${e.type}/${e.scope}]${e.pinned ? " 📌" : ""} ${e.title ?? "🔒"}\n    ${(e.body ?? "").replace(/\n/g, "\n    ")}`)
+        .map((e) => {
+          const tagStr = e.tags?.length ? ` tags:${e.tags.join(",")}` : "";
+          const hot = e.pinned && e.scope === "agent" ? " 📌hot" : "";
+          return `- ${e.id} [${e.type}/${e.scope}]${hot}${tagStr} ${e.title ?? "🔒"}\n    ${(e.body ?? "").replace(/\n/g, "\n    ")}`;
+        })
         .join("\n");
       return { content: [{ type: "text", text }] };
     } catch (e) {
@@ -938,7 +989,7 @@ server.tool(
 
 server.tool(
   "pin",
-  "Pin or unpin a memory entry. Pinned entries are prioritized in the hot-set injected into agent system prompts.",
+  "Pin or unpin a memory entry. Pinned agent-scoped entries enter YOUR hot-set (injected on restart + live-push). Server enforces ~15 pinned per agent (oldest auto-unpin).",
   { id: z.string().describe("Memory id (mem_xxxx)"), pinned: z.boolean().optional().describe("true to pin (default), false to unpin") },
   async ({ id, pinned }) => {
     try {

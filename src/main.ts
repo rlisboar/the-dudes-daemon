@@ -21,6 +21,7 @@ import { decryptForProject, encryptForProject, forgetAllProjectKeys, getDaemonPu
 import { dispatchWebhook } from "./webhook-dispatch.js";
 import { ModelDiscovery } from "./model-discovery.js";
 import { parseGitPorcelain } from "./git-status.js";
+import { applyMemoryCharBudget } from "./memory-utils.js";
 
 const VERSION = "0.1.0";
 
@@ -512,28 +513,20 @@ class DaemonClient {
         // we assemble here. Re-built on every spawn, so durable knowledge
         // survives model/runner switches and context compaction.
         if (msg.projectId && msg.memory && msg.memory.length > 0) {
-          // Budget token-aware: server manda candidatos ordenados (pinned >
-          // recente); aqui cortamos por tamanho decriptado (~2k tokens ≈
-          // 8000 chars) pra a memória não dominar o contexto. Server é cego
-          // a tokens (cipher), então o corte real é aqui.
+          // Budget token-aware + reserva p/ decision/preference (sticky).
+          // Server é cego a tokens (cipher); corte real é aqui.
           const MEMORY_CHAR_BUDGET = 8000;
-          const entries: string[] = [];
-          let used = 0;
-          let dropped = 0;
+          const decoded: Array<{ type: string; text: string }> = [];
           for (const m of msg.memory) {
             const title = isE2eEncrypted(m.titleCipher) ? decryptForProject(m.titleCipher, msg.projectId) : m.titleCipher;
             const body = isE2eEncrypted(m.bodyCipher) ? decryptForProject(m.bodyCipher, msg.projectId) : m.bodyCipher;
-            if (title === null || body === null) continue; // sem chave — pula
-            const block = `### [${m.type}] ${title}\n${body}`;
-            if (used + block.length > MEMORY_CHAR_BUDGET && entries.length > 0) { dropped++; continue; }
-            entries.push(block);
-            used += block.length;
+            if (title === null || body === null) continue;
+            decoded.push({ type: m.type || "fact", text: `### [${m.type}] ${title}\n${body}` });
           }
+          const { kept: entries, dropped, used } = applyMemoryCharBudget(decoded, MEMORY_CHAR_BUDGET, 0.45);
           if (dropped > 0) {
-            log("info", `memory budget: ${entries.length} injected, ${dropped} dropped (over ${MEMORY_CHAR_BUDGET} chars) for ${spec.agent.id}`);
-            // Overflow visível: avisa o agente que a memória foi truncada pra ele
-            // usar `recall` em vez de assumir que o injetado é tudo.
-            entries.push(`### [system] memória truncada\n${dropped} memória(s) mais antiga(s) omitida(s) por limite de contexto. Use a tool \`recall\` pra buscar conhecimento que não esteja aqui.`);
+            log("info", `memory budget: ${entries.length} injected (~${used} chars), ${dropped} dropped (over ${MEMORY_CHAR_BUDGET}) for ${spec.agent.id}`);
+            entries.push(`### [system] memória truncada\n${dropped} memória(s) omitida(s) por limite (decisions/preferences têm prioridade). Use \`recall\` para o resto.`);
           }
           if (entries.length > 0) {
             const block = `## Project Memory\n\nNotas duráveis **deste agente** (não são copiadas para os outros). Catálogo do projeto: use a tool \`recall\`. Verifique antes de confiar em detalhes específicos.\n\n${entries.join("\n\n")}`;

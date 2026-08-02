@@ -64,12 +64,14 @@ function goalsSection(tasks: boolean): string {
 }
 
 const MEMORY = `# Agent memory (durable, survives restarts & model switches)
-- Your hot-set is **agent-scoped only** — it is NOT shared into other agents' prompts (avoids duplicating the same context N times).
-- \`mcp__the-dudes__recall\` (args: {query?, type?}) — search your private notes + the project catalog. **Call at the start of a task** if you need shared/project facts not already below.
-- \`mcp__the-dudes__remember\` (args: {title, body, type?, scope?, pinned?}) — save a durable note. **Default scope is \`agent\`** (yours only, re-injected on restart + live-pushed to you). Use \`scope: "project"\` only for catalog facts others may \`recall\` (not auto-injected into every agent). Keep entries short and atomic.
-- \`mcp__the-dudes__forget\` (args: {id}) — delete a memory entry you created. You cannot delete user-curated or other agents' entries.
-- \`mcp__the-dudes__pin\` (args: {id, pinned?}) — pin/unpin so it stays prioritized in **your** hot-set.
-- When present, injected notes appear under "## Project Memory" below — don't re-recall what's already there.`;
+- Your **hot-set** is **agent-scoped + pinned only** — NOT shared into other agents' prompts. Max ~15 pinned; older pins auto-unpin.
+- Unpinned notes stay in the catalog (yours + project) — retrieve with \`recall\`, they are NOT auto-injected.
+- \`mcp__the-dudes__recall\` (args: {query?, type?, limit?}) — search private notes + project catalog. Multi-word query = all terms must match. **Call at the start of a non-trivial task** if you need shared/project facts not already under "## Project Memory".
+- \`mcp__the-dudes__remember\` (args: {title, body, type?, scope?, pinned?, tags?, supersedes?}) — save a durable note. **Default scope=\`agent\`, pinned=false** (catalog/recall). Set \`pinned:true\` only for facts you need on every restart. Use \`scope: "project"\` only for shared catalog (never auto-injected). Pass \`supersedes: ["mem_…"]\` when updating an existing fact (old entries are removed). Keep entries short and atomic; one fact per entry.
+- Prefer \`type: "decision"\` / \`"preference"\` for sticky rules; use \`"fact"\` for neutral notes.
+- \`mcp__the-dudes__forget\` (args: {id}) — delete an entry you created.
+- \`mcp__the-dudes__pin\` (args: {id, pinned?}) — pin/unpin for **your** hot-set (quota enforced server-side).
+- When "## Project Memory" is present below, do not re-recall those titles; use \`recall\` for everything else.`;
 
 const CREDENTIALS = `# Credentials (API keys, tokens, passwords)
 - \`mcp__the-dudes__get_credential\` (args: {name}) — retrieve a stored credential value by name. Use this whenever you need an API key or secret; never ask the user to paste it inline.

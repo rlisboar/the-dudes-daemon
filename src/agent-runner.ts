@@ -28,6 +28,7 @@ import { buildBridgeEnv, buildClaudeMcpConfig, buildCodexMcpArgs, buildCrushMcpC
 import { RunnerRuntimeFiles } from "./runners/runtime-files.js";
 import { ContextTracker, CumulativeUsageTracker, type UsageSemantics } from "./runners/context-tracker.js";
 import { armHardTimeout, collectProcessOutput, killProcess, processAlive as procAlive, terminateAndWait, terminateWithEscalation } from "./runners/process-lifecycle.js";
+import { memoryTitleNearDup, parseAndStripMemory } from "./memory-utils.js";
 import {
   createActivityClock,
   hangPhase,
@@ -2991,7 +2992,7 @@ export class AgentRunner {
     const summaryPrompt =
       "Two tasks. Write BOTH the summary and the memory entries in the SAME LANGUAGE as the conversation (e.g. if the conversation is in Portuguese, respond in Portuguese). Only the `MEMORY_JSON:` marker and JSON keys stay in English.\n\n" +
       "TASK 1 — Summarize this conversation concisely (decisions made, tasks in progress, key findings, context needed to continue). Be brief.\n\n" +
-      "TASK 2 — Extract NEW durable knowledge worth keeping permanently. Include EVERY explicit decision, convention, preference, architectural choice, or stable fact stated by the user or any agent — even a single one matters. Be generous: when in doubt, include it." + alreadyBlock + " Output it on a NEW FINAL LINE as exactly `MEMORY_JSON:` followed by a single-line JSON array. Each element MUST be {\"title\": \"<short>\", \"body\": \"<the fact in full>\", \"type\": \"decision\"|\"fact\"|\"reference\"|\"preference\", \"supersedes\": [\"<id>\"]?} where title/body are in the conversation's language. " +
+      "TASK 2 — Extract NEW durable knowledge worth keeping permanently. Prefer decisions, conventions, preferences, and stable architectural facts. Skip ephemeral task chatter and one-off debug noise. Max 5 entries." + alreadyBlock + " Output it on a NEW FINAL LINE as exactly `MEMORY_JSON:` followed by a single-line JSON array. Each element MUST be {\"title\": \"<short>\", \"body\": \"<the fact in full>\", \"type\": \"decision\"|\"fact\"|\"reference\"|\"preference\", \"supersedes\": [\"<id>\"]?} where title/body are in the conversation's language. Use type decision/preference for sticky rules; fact for neutral notes. " +
       "Example: MEMORY_JSON: [{\"title\":\"DB engine\",\"body\":\"The project uses PostgreSQL partitioned by month\",\"type\":\"decision\"}]. " +
       "Output `MEMORY_JSON: []` ONLY if there is no NEW durable info. No markdown, no code fences, single line.";
 
@@ -3086,44 +3087,12 @@ export class AgentRunner {
     return !this.messageSession.busy && !this.stopped;
   }
 
-  /** Extrai o bloco `MEMORY_JSON: [...]` do output do summary one-shot,
-   *  retorna o summary limpo (sem o bloco) + os itens parseados. Tolerante
-   *  a markdown/prefixos e a JSON malformado (retorna [] nesse caso). */
-  private parseAndStripMemory(summary: string): { clean: string; items: Array<{ title: string; body: string; type: string; supersedes: string[] }> } {
-    const m = summary.match(/^[ \t>*-]*MEMORY_JSON:\s*(\[[\s\S]*?\])\s*$/m);
-    if (!m) return { clean: summary.trim(), items: [] };
-    let items: Array<{ title: string; body: string; type: string; supersedes: string[] }> = [];
-    try {
-      const arr = JSON.parse(m[1]);
-      if (Array.isArray(arr)) {
-        const allowed = new Set(["fact", "decision", "reference", "preference", "task_state"]);
-        // Tolerante a variações de schema do modelo: aceita item como
-        // objeto (várias keys alternativas) ou string solta.
-        const pick = (o: any, keys: string[]): string => {
-          for (const k of keys) if (typeof o?.[k] === "string" && o[k].trim()) return o[k];
-          return "";
-        };
-        items = arr
-          .map((x) => {
-            if (typeof x === "string") {
-              const s = x.trim();
-              return { title: s.slice(0, 80), body: s, type: "fact", supersedes: [] as string[] };
-            }
-            const title = pick(x, ["title", "name", "heading", "summary"]);
-            const body = pick(x, ["body", "content", "detail", "details", "text", "value", "description"]) || title;
-            const rawType = typeof x?.type === "string" ? x.type : (typeof x?.kind === "string" ? x.kind : "fact");
-            // supersedes: ids que esta entrada substitui. Filtra ao formato
-            // mem_xxxx (anti-alucinação); validação final é contra a lista real.
-            const supRaw = Array.isArray(x?.supersedes) ? x.supersedes : (Array.isArray(x?.replaces) ? x.replaces : []);
-            const supersedes = supRaw.filter((s: unknown) => typeof s === "string" && /^mem_[a-z0-9]+$/i.test(s)).slice(0, 5) as string[];
-            return { title: (title || body).slice(0, 200), body: body.slice(0, 4000), type: allowed.has(rawType) ? rawType : "fact", supersedes };
-          })
-          .filter((it) => it.title && it.body)
-          .slice(0, 5);
-      }
-    } catch { /* malformed — skip extraction, keep summary */ }
-    const clean = summary.replace(m[0], "").trim();
-    return { clean, items };
+  private parseAndStripMemory(summary: string) {
+    return parseAndStripMemory(summary);
+  }
+
+  private memoryTitleNearDup(a: string, b: string): boolean {
+    return memoryTitleNearDup(a, b);
   }
 
   /** Grava as memórias auto-extraídas via relay socket — o relay cifra
@@ -3132,7 +3101,8 @@ export class AgentRunner {
    *  modelo marca `supersedes`, remove as memórias antigas que a nova
    *  consolida (só ids reais da lista existente; só se o add criou entry NOVA,
    *  não dedup-hit). Add ANTES, remove DEPOIS (sem transação — duplicata
-   *  benigna é preferível a perda). */
+   *  benigna é preferível a perda).
+   *  Pin: só decision/preference por default (hot-set enxuto). */
   private async saveExtractedMemory(items: Array<{ title: string; body: string; type: string; supersedes: string[] }>, existing: Array<{ id: string; title: string; body: string }> = []): Promise<void> {
     this.opts.onError(`[compact] memory extracted=${items.length}`);
     if (items.length === 0) return;
@@ -3142,23 +3112,46 @@ export class AgentRunner {
       return;
     }
     const existingIds = new Set(existing.map((e) => e.id));
-    let saved = 0, merged = 0;
+    let saved = 0, merged = 0, skippedNear = 0;
     for (const it of items) {
       try {
-        // Agent-scoped: compact extrai fatos da SESSÃO deste agente — não
-        // deve poluir o prompt de todos os irmãos.
-        const r = await this.postBridgeJson(socket, "memory_add", { title: it.title, body: it.body, type: it.type, scope: "agent" });
+        // Near-dup: se já existe título muito parecido, consolida (supersede) em vez de criar ruído
+        const near = existing.find((e) => this.memoryTitleNearDup(e.title, it.title));
+        const supersedes = [...it.supersedes];
+        if (near && !supersedes.includes(near.id)) supersedes.push(near.id);
+
+        // Skip se near-dup e body essencialmente igual
+        if (near) {
+          const bn = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim();
+          if (bn(near.body).slice(0, 400) === bn(it.body).slice(0, 400)) {
+            skippedNear++;
+            continue;
+          }
+        }
+
+        // Compact: default NÃO pin. Só decision/preference sobem pro hot-set
+        // (fatos genéricos ficam no catálogo — recall).
+        const pin = it.type === "decision" || it.type === "preference";
+        const r = await this.postBridgeJson(socket, "memory_add", {
+          title: it.title,
+          body: it.body,
+          type: it.type,
+          scope: "agent",
+          pinned: pin,
+          supersedesId: supersedes[0] ?? undefined,
+        });
         saved++;
         const newId = r?.memory?.id as string | undefined;
-        // Só faz merge se o add criou entry NOVA (id não estava na lista) —
-        // senão foi dedup-hit e remover a "antiga" perderia o dado.
         const isNew = !!newId && !existingIds.has(newId);
         if (isNew) {
-          for (const oldId of it.supersedes) {
-            if (!existingIds.has(oldId) || oldId === newId) continue; // só ids reais existentes
+          if (newId) existingIds.add(newId);
+          existing.push({ id: newId!, title: it.title, body: it.body });
+          for (const oldId of supersedes) {
+            if (!existingIds.has(oldId) || oldId === newId) continue;
             try {
               await this.postBridgeJson(socket, "memory_remove", { id: oldId });
               merged++;
+              existingIds.delete(oldId);
             } catch { /* 403 = não foi o agente que criou → mantém viva. ok. */ }
           }
         }
@@ -3166,7 +3159,13 @@ export class AgentRunner {
         this.opts.onError(`[compact] memory save failed: ${(e as Error).message}`);
       }
     }
-    if (saved > 0) this.opts.onError(`[compact] auto-saved ${saved} memory entry(ies)${merged > 0 ? `, consolidou ${merged} antiga(s)` : ""}`);
+    if (saved > 0 || skippedNear > 0) {
+      this.opts.onError(
+        `[compact] auto-saved ${saved} memory entry(ies)` +
+          `${merged > 0 ? `, consolidou ${merged} antiga(s)` : ""}` +
+          `${skippedNear > 0 ? `, skip near-dup ${skippedNear}` : ""}`,
+      );
+    }
   }
 
   /** Memórias já existentes (project + camada agent) com id/title/body, via
