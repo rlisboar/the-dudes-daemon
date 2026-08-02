@@ -8,11 +8,13 @@ import {
 } from "../runners/turn-watchdog.js";
 
 describe("turn-watchdog", () => {
-  it("grok thresholds are stricter than default", () => {
+  it("grok thresholds are stricter than claude continuous", () => {
     const g = hangThresholds("grok");
-    const d = hangThresholds("claude");
-    assert.ok(g.softMs < d.softMs);
-    assert.ok(g.hardMs < d.hardMs);
+    const c = hangThresholds("claude");
+    assert.ok(g.softMs < c.softMs);
+    assert.ok(g.hardMs < c.hardMs);
+    // Claude soft ≥ 10min: tools longas sem stream não devem marcar stalled cedo
+    assert.ok(c.softMs >= 10 * 60_000);
   });
 
   it("hangPhase transitions ok → soft → hard", () => {

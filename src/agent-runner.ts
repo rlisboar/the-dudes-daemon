@@ -221,6 +221,11 @@ export class AgentRunner {
   private activityClock: TurnActivityClock = createActivityClock();
   private hangWatchTimer: NodeJS.Timeout | null = null;
   private recoveringHung = false;
+  /**
+   * Claude (e similares): tool_use abertos sem tool_result ainda.
+   * Enquanto >0 o CLI pode ficar minutos sem stream — NÃO é hang.
+   */
+  private toolsInFlight = 0;
 
   constructor(info: AgentInfo, private opts: AgentRunnerOptions) {
     this.info = info;
@@ -1065,6 +1070,7 @@ export class AgentRunner {
 
     proc.stdout.on("data", (chunk: string) => {
       if (this.proc !== proc) return; // chunk tardio de processo substituído
+      this.touchActivity();
       this.traceCli("claude", "stdout", chunk);
       this.handleStdout(chunk);
     });
@@ -1072,6 +1078,7 @@ export class AgentRunner {
       if (this.proc !== proc) return;
       const msg = chunk.trim();
       if (!msg) return;
+      this.touchActivity();
       this.traceCli("claude", "stderr", msg);
       if (isMissingSessionMessage(msg)) {
         this.sessionInvalid = true;
@@ -1262,6 +1269,8 @@ export class AgentRunner {
   }
 
   private handleStreamEvent(event: any) {
+    // Qualquer evento de stream = atividade real (deltas, tools, etc.).
+    this.touchActivity();
     // claude emits session_id on every stream event. Only forward to
     // the orchestrator when it actually changes — otherwise we'd flood
     // listeners with redundant agent:session messages (one per chunk).
@@ -1272,6 +1281,7 @@ export class AgentRunner {
     if (event.type === "system" && event.subtype === "init") {
       // CLI reporta o model realmente resolvido (alias→ID, default da conta).
       if (typeof event.model === "string" && event.model) this.contextTracker.setResolvedModel(event.model);
+      this.toolsInFlight = 0;
       this.setState("idle");
       return;
     }
@@ -1308,6 +1318,7 @@ export class AgentRunner {
         }
         if (b.type === "tool_use") {
           hasToolUse = true;
+          this.toolsInFlight++;
           this.opts.onToolUse(b.name, b.input);
           if (b.name?.includes("send_message")) this.setState("sending");
           else this.setState("thinking");
@@ -1352,10 +1363,20 @@ export class AgentRunner {
       return;
     }
     if (event.type === "user") {
+      // tool_result volta como content blocks do user — fecha tools em voo.
+      const blocks = event.message?.content ?? event.content ?? [];
+      if (Array.isArray(blocks)) {
+        for (const b of blocks) {
+          if (b?.type === "tool_result") {
+            this.toolsInFlight = Math.max(0, this.toolsInFlight - 1);
+          }
+        }
+      }
       this.setState("thinking");
       return;
     }
     if (event.type === "result") {
+      this.toolsInFlight = 0;
       this.setState("idle");
       // Resultado de erro (ex rate limit) que não veio como texto do assistant:
       // surfacia como erro p/ auto-retry. result/error pode estar em vários campos.
@@ -3281,6 +3302,10 @@ export class AgentRunner {
 
   private touchActivity(): void {
     touchActivityClock(this.activityClock);
+    // Soft hang anterior: qualquer I/O/stream limpa o visual "stalled".
+    if (this.currentState === "stalled") {
+      this.setState("thinking");
+    }
   }
 
   private startHangWatch(): void {
@@ -3328,11 +3353,22 @@ export class AgentRunner {
     if (this.stopped || this.recoveringHung) return;
     if (!this.isInTurn()) {
       this.activityClock.deadSince = null;
+      // Fora de turno: limpa contagem residual de tools.
+      if (this.toolsInFlight > 0 && this.currentState === "idle") this.toolsInFlight = 0;
       return;
     }
 
     const runner = this.opts.cliRunner;
     const t = hangThresholds(runner);
+
+    // Tools em execução (Claude continuous): silêncio de stream é esperado
+    // (build, MCP, shell longo). Não marcar stalled — só hard se per-message
+    // busy e processo morto (abaixo).
+    if (this.toolsInFlight > 0) {
+      this.touchActivity();
+      if (this.currentState === "stalled") this.setState("thinking");
+      return;
+    }
 
     // Grok: atividade em arquivos de sessão (tools rodando sem stream)
     if (runner === "grok" && this.grokSessionRecentWrite(45_000)) {
@@ -3362,6 +3398,8 @@ export class AgentRunner {
       this.recoverHungTurn(`no activity for ${Math.round(idleMs / 1000)}s`, idleMs);
       return;
     }
+    // Claude continuous: soft hang sem busy = aviso visual apenas. Soft alto
+    // (12min) + toolsInFlight acima cobrem o caso normal.
     if (phase === "soft" && !this.activityClock.softReported) {
       this.activityClock.softReported = true;
       this.setState("stalled");

@@ -16,13 +16,19 @@ export interface HangThresholds {
 
 export function hangThresholds(runner?: string): HangThresholds {
   if (runner === "grok") {
+    // Headless: pior caso busy sem stream — soft cedo.
     return { softMs: 90_000, hardMs: 5 * 60_000, deadProcMs: 15_000 };
   }
   if (runner === "opencode") {
     return { softMs: 180_000, hardMs: 10 * 60_000, deadProcMs: 20_000 };
   }
-  // claude continuous / codex / crush / gemini
-  return { softMs: 150_000, hardMs: 8 * 60_000, deadProcMs: 20_000 };
+  if (runner === "claude") {
+    // Continuous: tools longas (build, test, MCP) não emitem stream por minutos.
+    // Soft alto evita "stalled" falso; hard só mata per-message (busy), não o proc contínuo.
+    return { softMs: 12 * 60_000, hardMs: 25 * 60_000, deadProcMs: 20_000 };
+  }
+  // codex / crush / gemini (per-message)
+  return { softMs: 5 * 60_000, hardMs: 12 * 60_000, deadProcMs: 20_000 };
 }
 
 export function hangPhase(idleMs: number, t: HangThresholds): HangPhase {
