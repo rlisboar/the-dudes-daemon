@@ -17,7 +17,11 @@ export interface HangThresholds {
 export function hangThresholds(runner?: string): HangThresholds {
   if (runner === "grok") {
     // Headless: pior caso busy sem stream — soft cedo.
-    return { softMs: 90_000, hardMs: 5 * 60_000, deadProcMs: 15_000 };
+    // hard 4min: armHardTimeout do turno ainda é 12min, mas se o processo
+    // escreve arquivos de sessão sem stdout, o hang watch precisa matar
+    // antes (senão busy preso até restart). 4min cobre tool loops longos
+    // com stdout ocasional (cada chunk reseta idle).
+    return { softMs: 90_000, hardMs: 4 * 60_000, deadProcMs: 12_000 };
   }
   if (runner === "opencode") {
     return { softMs: 180_000, hardMs: 10 * 60_000, deadProcMs: 20_000 };

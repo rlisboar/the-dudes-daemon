@@ -12,13 +12,26 @@ test("capability header defaults every feature on", () => {
 test("disabled capabilities remove their prose and cross-references", () => {
   const header = buildSystemPromptHeader({
     teammates: false, tasks: false, filelock: false, memory: false,
-    goals: false, credentials: false, webhooks: false,
+    goals: false, credentials: false, webhooks: false, graph: false,
   });
   assert.ok(header.startsWith("You are an agent running locally."));
-  for (const absent of ["send_message", "list_agents", "list_tasks", "lock_file", "list_goals", "recall", "get_credential", "send_webhook", "task board"]) {
+  for (const absent of ["send_message", "list_agents", "list_tasks", "lock_file", "list_goals", "recall", "get_credential", "send_webhook", "task board", "graphify", "query_graph"]) {
     assert.ok(!header.includes(absent), `leaked disabled capability: ${absent}`);
   }
   assert.ok(header.includes("Check actual files on disk"));
+});
+
+test("graph capability is opt-in and only present when graph:true", () => {
+  const off = buildSystemPromptHeader({ graph: false });
+  assert.ok(!off.includes("Knowledge graph"), "graph prose must be absent when off");
+  assert.ok(!off.includes("query_graph"), "graph tools must be absent when off");
+  const on = buildSystemPromptHeader({ graph: true });
+  assert.ok(on.includes("Knowledge graph"), "missing GRAPH section");
+  assert.ok(on.includes("query_graph"));
+  assert.ok(on.includes("god_nodes"));
+  // default (undefined) also omits graph — opt-in only
+  const def = buildSystemPromptHeader();
+  assert.ok(!def.includes("Knowledge graph"));
 });
 
 test("tasks without teammates keep the board but omit teammate routing", () => {

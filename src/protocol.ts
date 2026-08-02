@@ -36,6 +36,10 @@ export interface DaemonHello {
   resumeFromSeq?: number;
   /** CLIs resolvidos como executáveis neste daemon. */
   availableRunners?: Array<"claude" | "codex" | "opencode" | "gemini" | "crush" | "grok">;
+  /** Disponibilidade do graphify (build) e graphify-mcp (serve) no PATH do daemon. */
+  graphify?: { cli: boolean; mcp: boolean };
+  /** CLIs instalados (espelho de availableRunners) p/ a UI do mapa. */
+  installedRunners?: Array<"claude" | "codex" | "opencode" | "gemini" | "crush" | "grok">;
 }
 
 export interface ProjectKeyForDaemon {
@@ -412,6 +416,22 @@ export interface GraphStatusEvent {
   error?: string;
   inputTokens?: number;
   outputTokens?: number;
+  /** 0–100 durante extract/update (quando o CLI imprime progresso). */
+  progress?: number;
+  /** Fase legível: "ast" | "semantic" | "update" | "watch" | … */
+  phase?: string;
+  /** mtime do graph.json (ms epoch) quando ready. */
+  indexMtime?: number;
+  /** true se arquivos mudaram e um reindex debounced está pendente. */
+  stale?: boolean;
+  /** graphify CLI (build) disponível no daemon. */
+  graphifyAvailable?: boolean;
+  /** graphify-mcp (serve) disponível no daemon. */
+  graphifyMcpAvailable?: boolean;
+  /** Docs/imagens pendentes de re-extract semântico (+ docs). */
+  docsPending?: boolean;
+  /** true se o grafo tem (ou preservou) camada semântica de docs. */
+  hasSemantic?: boolean;
   correlationId?: string;
 }
 /** Orch pede o graph.json do workspace pra renderizar o mapa na UI. */

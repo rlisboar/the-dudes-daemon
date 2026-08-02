@@ -11,7 +11,8 @@ import { WebSocket } from "ws";
 import { parseWireMessage } from "@the-dudes/protocol";
 import { AgentHost } from "./agent-host.js";
 import { assertWorkspaceScoped, autoWorkspaceCwd, describeGitRoots, ensureWritableDir, expandBasePath, isInsideRoot, validateBasePath, validateGitHash, validateGitRef } from "./workspace.js";
-import { buildGraph, graphPath } from "./graph-indexer.js";
+import { buildGraph, graphMtime, graphPath, hasSemanticMarker, loadGraphJsonForUi, needsSemanticUpdate } from "./graph-indexer.js";
+import { ensureGraphWatch, stopAllGraphWatches } from "./graph-watcher.js";
 import { detectDropTarget, spawnDropped, type DropTarget } from "./privileges.js";
 import { BridgeRelay } from "./bridge-relay.js";
 import { defaultDaemonConfigPath, formatCliStatus, loadDaemonCliConfig, mergeCliConfig, resolveCliCommands, type DaemonCliConfig, type ResolvedCliCommands } from "./cli-config.js";
@@ -183,6 +184,32 @@ class DaemonClient {
     setTag("daemon_name", this.args.name);
     setTag("hostname", os.hostname());
     this.host = new AgentHost((msg) => this.send(msg), this.dropTo, null, this.cliCommands, this.args.verbose, this.args.verboseHuman, this.args.verboseHumanIo, log, cliLog);
+    this.wireGraphWatch();
+  }
+
+  /** Liga callback de watch do grafo no AgentHost (rebuilds debounced). */
+  private wireGraphWatch(): void {
+    this.host.onGraphWatch = (root, gbin, projectId) => {
+      ensureGraphWatch(root, gbin, {
+        onStatus: (status, info) => {
+          this.send({
+            type: "graph:status",
+            projectId,
+            status,
+            nodeCount: info?.nodeCount,
+            edgeCount: info?.edgeCount,
+            error: info?.error,
+            progress: info?.progress,
+            phase: info?.phase,
+            indexMtime: info?.indexMtime,
+            stale: info?.stale,
+            graphifyAvailable: !!this.cliCommands.graphify?.available,
+            graphifyMcpAvailable: !!this.cliCommands.graphifyMcp?.available,
+          });
+        },
+        log,
+      }, projectId);
+    };
   }
 
   async start() {
@@ -206,6 +233,7 @@ class DaemonClient {
       await this.relay.start();
       log("info", `bridge relay listening on ${this.relay.socketPath}`);
       this.host = new AgentHost((msg) => this.send(msg), this.dropTo, this.relay.socketPath, this.cliCommands, this.args.verbose, this.args.verboseHuman, this.args.verboseHumanIo, log, cliLog);
+      this.wireGraphWatch();
     } catch (e) {
       log("warn", `bridge relay failed to start (${(e as Error).message}) — agents will fetch orch directly`);
     }
@@ -281,6 +309,12 @@ class DaemonClient {
         resumeFromSeq: this.lastSeenSeq,
         availableRunners: (["claude", "codex", "opencode", "gemini", "crush", "grok"] as const)
           .filter((runner) => this.cliCommands[runner].available),
+        installedRunners: (["claude", "codex", "opencode", "gemini", "crush", "grok"] as const)
+          .filter((runner) => this.cliCommands[runner].available),
+        graphify: {
+          cli: !!this.cliCommands.graphify?.available,
+          mcp: !!this.cliCommands.graphifyMcp?.available,
+        },
       });
       // Ressincroniza tokens de agents já rodando localmente — sem isso,
       // após restart do server, o Map agentTokens fica vazio e o
@@ -1159,42 +1193,133 @@ class DaemonClient {
       this.send({ type: "graph:status", projectId: msg.projectId, status: "error", error: "graphify não instalado (pip install graphifyy mcp)", correlationId: msg.correlationId });
       return;
     }
-    // modo semântico (docs/.md/.yaml via LLM). Backend claude-cli exige o
-    // `claude` CLI; outros backends leem a API key do env do daemon.
+    // modo semântico (docs/.md/.yaml via LLM).
+    // - claude-cli: nativo no graphify
+    // - *-cli (opencode/codex/gemini/crush/grok): shim loopback via ollama backend
+    // - API (gemini/openai/claude/deepseek/kimi/ollama): key do vault
     const claude = this.cliCommands.claude;
     const backend = msg.backend || "claude-cli";
     if (msg.semantic && backend === "claude-cli" && !claude?.available) {
       this.send({ type: "graph:status", projectId: msg.projectId, status: "error", error: "backend claude-cli exige o claude CLI instalado (ou escolha outro backend)", correlationId: msg.correlationId });
       return;
     }
-    // Backends *-cli (opencode/codex/gemini via shim OpenAI-compat) exigem o
-    // respectivo CLI instalado no daemon.
-    const SHIM_CLI: Record<string, "opencode" | "codex" | "gemini"> = { "opencode-cli": "opencode", "codex-cli": "codex", "gemini-cli": "gemini" };
+    // Todos os CLIs de agente que o shim cobre (graphify não tem backend nativo
+    // pra eles — usamos OLLAMA_BASE_URL → shim OpenAI-compat).
+    const SHIM_CLI: Record<string, "opencode" | "codex" | "gemini" | "crush" | "grok"> = {
+      "opencode-cli": "opencode",
+      "codex-cli": "codex",
+      "gemini-cli": "gemini",
+      "crush-cli": "crush",
+      "grok-cli": "grok",
+    };
     const shimCli = SHIM_CLI[backend];
     if (msg.semantic && shimCli && !this.cliCommands[shimCli]?.available) {
       this.send({ type: "graph:status", projectId: msg.projectId, status: "error", error: `backend ${backend} exige o CLI ${shimCli} instalado no daemon`, correlationId: msg.correlationId });
       return;
     }
-    // API key do backend não-claude: server manda o cipher do vault; daemon
-    // decifra (project key) e injeta como env var do backend.
+    // API key: server manda cipher do vault; daemon decifra e injeta no env.
     let apiKey: string | undefined;
     if (msg.semantic && msg.apiKeyEnv && msg.apiKeyCipher && msg.projectId) {
       const dec = isE2eEncrypted(msg.apiKeyCipher) ? decryptForProject(msg.apiKeyCipher, msg.projectId) : msg.apiKeyCipher;
       if (dec) apiKey = dec;
     }
-    this.send({ type: "graph:status", projectId: msg.projectId, status: "building", correlationId: msg.correlationId });
-    const r = await buildGraph(root, gbin.command, msg.semantic
-      ? { semantic: true, backend, model: msg.model, claudeCmd: claude?.command, apiKeyEnv: msg.apiKeyEnv, apiKey, cliCommands: this.cliCommands, dropTo: this.dropTo, log }
-      : {});
+    // Backends de API sem key (exceto ollama local / claude-cli / *-cli) → erro cedo.
+    if (msg.semantic && !shimCli && backend !== "claude-cli" && backend !== "ollama" && backend !== "bedrock") {
+      const needsKey = ["claude", "anthropic", "gemini", "openai", "deepseek", "kimi", "azure"].includes(backend);
+      if (needsKey && !apiKey) {
+        const hint = msg.apiKeyEnv || "API_KEY";
+        this.send({
+          type: "graph:status",
+          projectId: msg.projectId,
+          status: "error",
+          error: `backend ${backend} exige a credencial "${hint}" salva em Credenciais do projeto (ou use um runner *-cli / claude-cli / ollama local)`,
+          correlationId: msg.correlationId,
+        });
+        return;
+      }
+    }
+    const avail = {
+      graphifyAvailable: true,
+      graphifyMcpAvailable: !!this.cliCommands.graphifyMcp?.available,
+    };
+    this.send({
+      type: "graph:status",
+      projectId: msg.projectId,
+      status: "building",
+      phase: msg.semantic ? "extract" : "update",
+      progress: 5,
+      correlationId: msg.correlationId,
+      ...avail,
+    });
+    const r = await buildGraph(root, gbin.command, {
+      ...(msg.semantic
+        ? { semantic: true as const, backend, model: msg.model, claudeCmd: claude?.command, apiKeyEnv: msg.apiKeyEnv, apiKey, cliCommands: this.cliCommands, dropTo: this.dropTo, log }
+        : {}),
+      onProgress: (p) => {
+        this.send({
+          type: "graph:status",
+          projectId: msg.projectId,
+          status: "building",
+          phase: p.phase ?? (msg.semantic ? "extract" : "update"),
+          progress: p.progress,
+          correlationId: msg.correlationId,
+          ...avail,
+        });
+      },
+    });
     if (!r.ok) {
-      this.send({ type: "graph:status", projectId: msg.projectId, status: "error", error: r.error, correlationId: msg.correlationId });
+      this.send({ type: "graph:status", projectId: msg.projectId, status: "error", error: r.error, correlationId: msg.correlationId, ...avail });
       return;
     }
-    this.send({ type: "graph:status", projectId: msg.projectId, status: "ready", nodeCount: r.nodeCount, edgeCount: r.edgeCount, inputTokens: r.inputTokens, outputTokens: r.outputTokens, correlationId: msg.correlationId });
+    const docsPending = needsSemanticUpdate(root);
+    const hasSemantic = hasSemanticMarker(root) || msg.semantic === true;
+    this.send({
+      type: "graph:status",
+      projectId: msg.projectId,
+      status: "ready",
+      nodeCount: r.nodeCount,
+      edgeCount: r.edgeCount,
+      inputTokens: r.inputTokens,
+      outputTokens: r.outputTokens,
+      indexMtime: graphMtime(root),
+      stale: docsPending,
+      docsPending,
+      hasSemantic,
+      progress: 100,
+      correlationId: msg.correlationId,
+      ...avail,
+    });
+    // Hot-inject MCP graphify em agentes já rodando (configs no disco).
+    const mcpBin = this.cliCommands.graphifyMcp;
+    if (mcpBin?.available) {
+      const n = this.host.refreshGraphifyMcpForAgents(mcpBin.command, graphPath(root));
+      if (n > 0) log("info", `[graph] MCP graphify hot-inject em ${n} agente(s)`);
+    }
+    // Mantém índice fresco após reindex manual (code-only; preserva semantic).
+    ensureGraphWatch(root, gbin.command, {
+      onStatus: (status, info) => {
+        this.send({
+          type: "graph:status",
+          projectId: msg.projectId,
+          status,
+          nodeCount: info?.nodeCount,
+          edgeCount: info?.edgeCount,
+          error: info?.error,
+          progress: info?.progress,
+          phase: info?.phase,
+          indexMtime: info?.indexMtime,
+          stale: info?.stale ?? needsSemanticUpdate(root),
+          docsPending: needsSemanticUpdate(root),
+          hasSemantic: hasSemanticMarker(root),
+          ...avail,
+        });
+      },
+      log,
+    }, msg.projectId);
   }
 
   /** graph:fetch — lê o graphify-out/graph.json do workspace pra renderizar o
-   *  mapa na UI. Scope-checked; cap 4MB. */
+   *  mapa na UI. Scope-checked; se grande, devolve amostra top-N por grau. */
   private async handleGraphFetch(msg: Extract<FromOrch, { type: "graph:fetch" }>): Promise<void> {
     if (!msg.workspaceRoot) {
       this.send({ type: "graph:data", projectId: msg.projectId, error: "workspace não configurado no projeto", correlationId: msg.correlationId });
@@ -1204,18 +1329,20 @@ class DaemonClient {
       const root = expandBasePath(msg.workspaceRoot);
       validateBasePath(root);
       this.enforceWorkspaceScope(root);
-      const gp = graphPath(root);
-      const stat = await fs.promises.stat(gp).catch(() => null);
-      if (!stat) {
-        this.send({ type: "graph:data", projectId: msg.projectId, error: "índice ainda não gerado — reindexe", correlationId: msg.correlationId });
+      const loaded = loadGraphJsonForUi(root, { maxBytes: 48 * 1024 * 1024, maxNodes: 1200 });
+      if (loaded.error) {
+        this.send({ type: "graph:data", projectId: msg.projectId, error: loaded.error, correlationId: msg.correlationId });
         return;
       }
-      if (stat.size > 16 * 1024 * 1024) {
-        this.send({ type: "graph:data", projectId: msg.projectId, error: "grafo muito grande (> 16MB) pra renderizar", correlationId: msg.correlationId });
-        return;
+      this.send({
+        type: "graph:data",
+        projectId: msg.projectId,
+        json: loaded.json,
+        correlationId: msg.correlationId,
+      });
+      if (loaded.truncated) {
+        log("info", `[graph] fetch amostrado: top ${1200} de ${loaded.totalNodes ?? "?"} nós`);
       }
-      const json = await fs.promises.readFile(gp, "utf-8");
-      this.send({ type: "graph:data", projectId: msg.projectId, json, correlationId: msg.correlationId });
     } catch (e) {
       this.send({ type: "graph:data", projectId: msg.projectId, error: (e as Error).message, correlationId: msg.correlationId });
     }
@@ -1626,6 +1753,7 @@ class DaemonClient {
   private shutdown() {
     log("info", "shutting down");
     this.stopped = true;
+    try { stopAllGraphWatches(); } catch { /* noop */ }
     this.host.shutdown();
     if (this.relay) this.relay.stop();
     this.stopPing();

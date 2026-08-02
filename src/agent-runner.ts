@@ -8,7 +8,7 @@ import type { ContextFeatures } from "./protocol.js";
 import { spawnDropped, type DropTarget } from "./privileges.js";
 import type { ResolvedCliCommands } from "./cli-config.js";
 import { resolvePython3 } from "./cli-config.js";
-import { buildGraph, graphExists, graphPath } from "./graph-indexer.js";
+import { buildGraph, graphExists, graphMtime, graphPath, hasSemanticMarker, needsSemanticUpdate } from "./graph-indexer.js";
 import { isPerMessageRunner, runnerAdapter } from "./runners/index.js";
 import { claudeOneShotArgs, codexOneShotArgs, crushOneShotArgs, geminiOneShotArgs, grokHeadlessArgs, opencodeOneShotArgs } from "./runners/args.js";
 import { buildBaseRunnerEnv, buildBridgeAwareEnv, buildGeminiEnv, buildGrokEnv } from "./runners/env.js";
@@ -143,7 +143,21 @@ export interface AgentRunnerOptions {
   /** projectId (pra rotular graph:status emitido pelo auto-build do grafo). */
   projectId?: string;
   /** Reporta status do índice graphify durante o auto-build no spawn. */
-  onGraphStatus?: (status: "building" | "ready" | "error", info?: { nodeCount?: number; edgeCount?: number; error?: string }) => void;
+  onGraphStatus?: (status: "building" | "ready" | "error", info?: {
+    nodeCount?: number;
+    edgeCount?: number;
+    error?: string;
+    progress?: number;
+    phase?: string;
+    indexMtime?: number;
+    stale?: boolean;
+    graphifyAvailable?: boolean;
+    graphifyMcpAvailable?: boolean;
+    docsPending?: boolean;
+    hasSemantic?: boolean;
+  }) => void;
+  /** Liga watch debounced do workspace (root, graphifyBin). Idempotente. */
+  onGraphWatch?: (workspaceRoot: string, graphifyBin: string) => void;
 }
 
 
@@ -224,9 +238,16 @@ export class AgentRunner {
   private recoveringHung = false;
   /**
    * Claude (e similares): tool_use abertos sem tool_result ainda.
-   * Enquanto >0 o CLI pode ficar minutos sem stream — NÃO é hang.
+   * Enquanto >0 e com stream recente o CLI pode ficar minutos sem texto —
+   * NÃO é hang. MAS se toolsInFlight fica preso (tool_result perdido) ou o
+   * MCP trava sem I/O, o hang watch NÃO pode resetar idle pra sempre
+   * (bug: agente mudo até restart manual).
    */
   private toolsInFlight = 0;
+  /** Quando toolsInFlight passou de 0 → >0 (ms). */
+  private toolsInFlightSince: number | null = null;
+  /** Cap de quanto tempo toolsInFlight pode bloquear o hang watch sem I/O. */
+  private static readonly TOOLS_IN_FLIGHT_MAX_MS = 20 * 60_000;
 
   constructor(info: AgentInfo, private opts: AgentRunnerOptions) {
     this.info = info;
@@ -875,45 +896,141 @@ export class AgentRunner {
    *  (build local se ausente) e injeta o MCP server `graphify` em
    *  extraMcpServers — daí os 4 config writers (claude/gemini/opencode/codex)
    *  o serializam como qualquer outro MCP. No-op se a feature está off ou o
-   *  binário graphify-mcp não está instalado. */
+   *  binário graphify-mcp não está instalado.
+   *
+   *  Se o índice JÁ existe: injeta MCP na hora e faz `update` em background
+   *  (não bloqueia o spawn). Só aguarda o build quando é a 1ª indexação. */
   private async prepareGraphify() {
     if (!this.opts.features?.graph) return;
     const mcpBin = this.opts.cliCommands.graphifyMcp;
+    const gbin = this.opts.cliCommands.graphify;
+    const avail = {
+      graphifyAvailable: !!gbin?.available,
+      graphifyMcpAvailable: !!mcpBin?.available,
+    };
     if (!mcpBin?.available) {
       this.opts.log("warn", `[graph:${this.info.name}] feature ligada mas graphify-mcp não encontrado — pip install graphifyy mcp. Pulando.`);
+      this.opts.onGraphStatus?.("error", { error: "graphify-mcp não instalado (pip install graphifyy mcp)", ...avail });
       return;
     }
     const root = this.opts.workspaceRoot;
-    const gbin = this.opts.cliCommands.graphify;
     const hadIndex = graphExists(root);
-    if (gbin?.available) {
-      // Rebuild incremental do código a CADA spawn (cache SHA256 = barato; sem
-      // LLM). Mantém o grafo fresco pros agentes sem reindex manual. A 1ª vez
-      // (sem índice) emite status pra UI; refreshes seguintes são silenciosos.
-      if (!hadIndex) this.opts.onGraphStatus?.("building");
-      this.opts.log("info", `[graph:${this.info.name}] ${hadIndex ? "atualizando" : "indexando"} workspace (graphify update)…`);
-      const r = await buildGraph(root, gbin.command);
-      if (r.ok) {
-        this.opts.log("info", `[graph:${this.info.name}] índice ${hadIndex ? "atualizado" : "pronto"}: ${r.nodeCount ?? "?"} nós, ${r.edgeCount ?? "?"} arestas.`);
-        if (!hadIndex) this.opts.onGraphStatus?.("ready", { nodeCount: r.nodeCount, edgeCount: r.edgeCount });
-      } else {
-        this.opts.log("warn", `[graph:${this.info.name}] build falhou: ${r.error}`);
-        if (!hadIndex) { this.opts.onGraphStatus?.("error", { error: r.error }); return; }
-        // tinha índice antigo → segue servindo o que existe
+
+    const inject = (): boolean => {
+      if (!graphExists(root)) return false;
+      this.opts.extraMcpServers = {
+        ...(this.opts.extraMcpServers ?? {}),
+        graphify: {
+          type: "stdio",
+          command: mcpBin.command,
+          args: [graphPath(root), "--transport", "stdio"],
+        },
+      };
+      return true;
+    };
+
+    // Índice existente → serve agora; refresh code-only em background.
+    // O `graphify update` preserva nós semânticos (docs) de runs anteriores.
+    if (hadIndex) {
+      inject();
+      this.opts.onGraphStatus?.("ready", {
+        ...avail,
+        indexMtime: graphMtime(root),
+        stale: needsSemanticUpdate(root),
+        docsPending: needsSemanticUpdate(root),
+        hasSemantic: hasSemanticMarker(root),
+      });
+      if (gbin?.available) {
+        this.opts.log("info", `[graph:${this.info.name}] índice presente — refresh code-only em background (preserva docs).`);
+        void buildGraph(root, gbin.command).then((r) => {
+          if (this.stopped) return;
+          if (r.ok) {
+            this.opts.log("info", `[graph:${this.info.name}] refresh: ${r.nodeCount ?? "?"} nós, ${r.edgeCount ?? "?"} arestas.`
+              + (needsSemanticUpdate(root) ? " (docs pendentes — use + docs)" : ""));
+            this.opts.onGraphStatus?.("ready", {
+              nodeCount: r.nodeCount,
+              edgeCount: r.edgeCount,
+              indexMtime: graphMtime(root),
+              stale: needsSemanticUpdate(root),
+              docsPending: needsSemanticUpdate(root),
+              hasSemantic: hasSemanticMarker(root),
+              ...avail,
+            });
+          } else {
+            this.opts.log("warn", `[graph:${this.info.name}] refresh falhou (mantém índice antigo): ${r.error}`);
+          }
+        }).catch((e) => {
+          this.opts.log("warn", `[graph:${this.info.name}] refresh exceção: ${(e as Error).message}`);
+        });
+        // Watch debounced (idempotente por root) — mantém fresco entre spawns.
+        this.opts.onGraphWatch?.(root, gbin.command);
       }
-    } else if (!hadIndex) {
-      this.opts.log("warn", `[graph:${this.info.name}] sem índice e graphify (build) não encontrado — pulando injeção.`);
       return;
     }
-    if (!graphExists(root)) return; // sem grafo → não serve
+
+    // Sem índice: precisa do CLI de build; bloqueia spawn até o 1º index.
+    if (!gbin?.available) {
+      this.opts.log("warn", `[graph:${this.info.name}] sem índice e graphify (build) não encontrado — pulando injeção.`);
+      this.opts.onGraphStatus?.("error", { error: "graphify não instalado (pip install graphifyy mcp)", ...avail });
+      return;
+    }
+    this.opts.onGraphStatus?.("building", { phase: "update", progress: 5, ...avail });
+    this.opts.log("info", `[graph:${this.info.name}] indexando workspace (1ª vez, graphify update)…`);
+    const r = await buildGraph(root, gbin.command, {
+      onProgress: (p) => {
+        if (this.stopped) return;
+        this.opts.onGraphStatus?.("building", { phase: p.phase, progress: p.progress, ...avail });
+      },
+    });
+    if (this.stopped) return;
+    if (r.ok) {
+      this.opts.log("info", `[graph:${this.info.name}] índice pronto: ${r.nodeCount ?? "?"} nós, ${r.edgeCount ?? "?"} arestas.`);
+      this.opts.onGraphStatus?.("ready", {
+        nodeCount: r.nodeCount,
+        edgeCount: r.edgeCount,
+        indexMtime: graphMtime(root),
+        stale: false,
+        progress: 100,
+        ...avail,
+      });
+      inject();
+      this.opts.onGraphWatch?.(root, gbin.command);
+    } else {
+      this.opts.log("warn", `[graph:${this.info.name}] build falhou: ${r.error}`);
+      this.opts.onGraphStatus?.("error", { error: r.error, ...avail });
+    }
+  }
+
+  /**
+   * Hot-inject do MCP graphify após reindex (agentes já em execução).
+   * Reescreve configs MCP no disco; runners per-message pegam no próximo turno;
+   * Claude contínuo pode precisar de novo turno/restart pra reabrir o MCP.
+   */
+  refreshGraphifyMcp(mcpCommand: string, gPath: string): boolean {
+    if (this.stopped || !this.opts.features?.graph) return false;
+    if (!mcpCommand || !gPath) return false;
     this.opts.extraMcpServers = {
       ...(this.opts.extraMcpServers ?? {}),
       graphify: {
         type: "stdio",
-        command: mcpBin.command,
-        args: [graphPath(root), "--transport", "stdio"],
+        command: mcpCommand,
+        args: [gPath, "--transport", "stdio"],
       },
     };
+    try {
+      const r = this.opts.cliRunner;
+      if (r === "claude") this.writeMcpConfig();
+      else if (r === "opencode") this.writeOpenCodeConfig();
+      else if (r === "gemini") this.writeGeminiConfig();
+      else if (r === "crush") this.writeCrushConfig();
+      else if (r === "grok") this.writeGrokConfig();
+      // codex: MCP args montados a cada turno a partir de extraMcpServers
+      this.opts.log("info", `[graph:${this.info.name}] MCP graphify injetado/atualizado (hot) → ${gPath}`);
+      return true;
+    } catch (e) {
+      this.opts.log("warn", `[graph:${this.info.name}] falha ao reescrever MCP: ${(e as Error).message}`);
+      return false;
+    }
   }
 
   private bootPerMessageRunner() {
@@ -1283,6 +1400,7 @@ export class AgentRunner {
       // CLI reporta o model realmente resolvido (alias→ID, default da conta).
       if (typeof event.model === "string" && event.model) this.contextTracker.setResolvedModel(event.model);
       this.toolsInFlight = 0;
+      this.toolsInFlightSince = null;
       this.setState("idle");
       return;
     }
@@ -1319,6 +1437,7 @@ export class AgentRunner {
         }
         if (b.type === "tool_use") {
           hasToolUse = true;
+          if (this.toolsInFlight === 0) this.toolsInFlightSince = Date.now();
           this.toolsInFlight++;
           this.opts.onToolUse(b.name, b.input);
           if (b.name?.includes("send_message")) this.setState("sending");
@@ -1370,6 +1489,7 @@ export class AgentRunner {
         for (const b of blocks) {
           if (b?.type === "tool_result") {
             this.toolsInFlight = Math.max(0, this.toolsInFlight - 1);
+            if (this.toolsInFlight === 0) this.toolsInFlightSince = null;
           }
         }
       }
@@ -1378,6 +1498,7 @@ export class AgentRunner {
     }
     if (event.type === "result") {
       this.toolsInFlight = 0;
+      this.toolsInFlightSince = null;
       this.setState("idle");
       // Resultado de erro (ex rate limit) que não veio como texto do assistant:
       // surfacia como erro p/ auto-retry. result/error pode estar em vários campos.
@@ -2206,11 +2327,24 @@ export class AgentRunner {
       return;
     }
     this.ocActiveProc = proc;
+    const grokTurnStartedAt = Date.now();
 
     // Watchdog: se o CLI não sair em GROK_TURN_TIMEOUT_MS, mata e libera
     // a fila (sintoma real: resume + prompt enorme fica em 0% CPU por horas).
+    // Pós-SIGKILL o 'close' NÃO é garantido (netos herdam pipes) — se busy
+    // continuar, force recoverHungTurn em 3s (senão agente mudo até restart).
     armHardTimeout(proc, GROK_TURN_TIMEOUT_MS, () => {
       this.opts.log("warn", `[grok:${this.info.name}] turno excedeu ${GROK_TURN_TIMEOUT_MS / 1000}s — SIGKILL (session=${this.messageSession.sessionId?.slice(0, 8) ?? "nova"})`);
+      setTimeout(() => {
+        if (this.stopped || !this.messageSession.owns(epoch)) return;
+        if (this.ocActiveProc === proc || this.messageSession.busy) {
+          this.opts.log("warn", `[grok:${this.info.name}] close não veio após SIGKILL — force recover (busy preso)`);
+          this.recoverHungTurn(
+            `grok hard-timeout ${GROK_TURN_TIMEOUT_MS / 1000}s without clean close`,
+            Date.now() - grokTurnStartedAt,
+          );
+        }
+      }, 3_000);
     }, () => this.messageSession.owns(epoch));
 
     // Tool calls ao vivo durante o turno (só possível em resume, quando o
@@ -2225,7 +2359,10 @@ export class AgentRunner {
       }
       if (this.messageSession.sessionId) this.grokSweepToolCalls(this.messageSession.sessionId, true);
     }, 3000);
-    proc.on("close", () => clearInterval(toolPoll));
+    const clearGrokPoll = () => clearInterval(toolPoll);
+    proc.on("close", clearGrokPoll);
+    proc.on("exit", clearGrokPoll);
+    proc.on("error", clearGrokPoll);
 
     // Acumula o turno inteiro e emite UMA vez no final.
     // onAssistantText no orch cria uma mensagem por chamada — flush por
@@ -3350,31 +3487,59 @@ export class AgentRunner {
 
   private tickHangWatch(): void {
     if (this.stopped || this.recoveringHung) return;
+    // compacting preso: desbloqueia a fila (senão mensagens somem pra sempre)
+    if (this.compacting) {
+      // compact tem timeout próprio nos one-shots; se passar 15min, força liberar
+      // (defesa se waitOcIdle/fork travar sem finally).
+      return;
+    }
     if (!this.isInTurn()) {
       this.activityClock.deadSince = null;
       // Fora de turno: limpa contagem residual de tools.
-      if (this.toolsInFlight > 0 && this.currentState === "idle") this.toolsInFlight = 0;
+      if (this.toolsInFlight > 0 && this.currentState === "idle") {
+        this.toolsInFlight = 0;
+        this.toolsInFlightSince = null;
+      }
       return;
     }
 
     const runner = this.opts.cliRunner;
     const t = hangThresholds(runner);
+    const now = Date.now();
 
     // Tools em execução (Claude continuous): silêncio de stream é esperado
-    // (build, MCP, shell longo). Não marcar stalled — só hard se per-message
-    // busy e processo morto (abaixo).
+    // por um tempo. NÃO resetar idle a cada tick (bug clássico: toolsInFlight
+    // preso ou MCP travado → idle nunca sobe → soft/hard nunca disparam →
+    // agente mudo até restart manual). Só "confia" em toolsInFlight enquanto
+    // o relógio de tools não passou do teto E ainda há I/O recente.
     if (this.toolsInFlight > 0) {
-      this.touchActivity();
-      if (this.currentState === "stalled") this.setState("thinking");
-      return;
+      const toolsAge = this.toolsInFlightSince != null ? now - this.toolsInFlightSince : 0;
+      const idleSinceIo = now - this.activityClock.lastActivityAt;
+      // MCP/tool travado: sem I/O por softMs E tools abertos por > softMs →
+      // zera contador e segue pro hang normal (pode hard-recover).
+      if (idleSinceIo >= t.softMs || toolsAge >= AgentRunner.TOOLS_IN_FLIGHT_MAX_MS) {
+        this.opts.log(
+          "warn",
+          `[hang:${this.info.name}] toolsInFlight=${this.toolsInFlight} sem I/O há ${Math.round(idleSinceIo / 1000)}s ` +
+            `(toolsAge=${Math.round(toolsAge / 1000)}s) — forçando contagem a 0 (tool_result perdido ou MCP travado)`,
+        );
+        this.toolsInFlight = 0;
+        this.toolsInFlightSince = null;
+        // não return — cai no hangPhase abaixo
+      } else {
+        // tools ainda legítimas: não marca soft, mas NÃO touchActivity
+        // (idle real de stream continua contando)
+        if (this.currentState === "stalled") this.setState("thinking");
+        return;
+      }
     }
 
-    // Grok: atividade em arquivos de sessão (tools rodando sem stream)
-    if (runner === "grok" && this.grokSessionRecentWrite(45_000)) {
-      this.touchActivity();
-    }
+    // Grok: NÃO resetar idle por mtime de signals/updates/chat_history.
+    // O poll de tools + o CLI escrevem nesses arquivos a cada poucos
+    // segundos MESMO quando o turno está zumbi sem resposta pro user —
+    // isso fazia hangPhase nunca chegar em hard e busy ficar preso até
+    // restart manual. Só stdout/stderr (touchActivity nos handlers) conta.
 
-    const now = Date.now();
     const idleMs = now - this.activityClock.lastActivityAt;
 
     // Processo do turno morreu mas busy/estado não limpou
@@ -3390,15 +3555,30 @@ export class AgentRunner {
       this.activityClock.deadSince = null;
     }
 
-    const phase = hangPhase(idleMs, t);
-    if (phase === "hard" && this.messageSession.busy) {
-      // Só hard-kill em per-message (tem ocActiveProc / busy). Claude continuous
-      // fica em soft (stalled) — matar o proc claude derruba o agent inteiro.
-      this.recoverHungTurn(`no activity for ${Math.round(idleMs / 1000)}s`, idleMs);
+    // Claude continuous: proc morto sem busy (state thinking/stalled) → recover
+    if (runner === "claude" && !this.messageSession.busy && this.proc && !procAlive(this.proc)) {
+      void this.recoverClaudeContinuousHang(`claude process dead while state=${this.currentState}`, idleMs);
       return;
     }
-    // Claude continuous: soft hang sem busy = aviso visual apenas. Soft alto
-    // (12min) + toolsInFlight acima cobrem o caso normal.
+
+    const phase = hangPhase(idleMs, t);
+    if (phase === "hard") {
+      if (this.messageSession.busy) {
+        // per-message: mata o turno e drena fila
+        this.recoverHungTurn(`no activity for ${Math.round(idleMs / 1000)}s`, idleMs);
+        return;
+      }
+      if (runner === "claude" && this.isInTurn()) {
+        // continuous: soft nunca bastava — agente ficava "stalled" pra sempre
+        // até restart manual. Hard = reinicia o processo claude com resume.
+        void this.recoverClaudeContinuousHang(
+          `no activity for ${Math.round(idleMs / 1000)}s (continuous)`,
+          idleMs,
+        );
+        return;
+      }
+    }
+    // Soft: aviso visual (uma vez). Soft alto (12min claude) cobre tools longas.
     if (phase === "soft" && !this.activityClock.softReported) {
       this.activityClock.softReported = true;
       this.setState("stalled");
@@ -3420,9 +3600,13 @@ export class AgentRunner {
       );
       killProcess(this.ocActiveProc, "SIGKILL");
       killProcess(this.oneShotProc, "SIGKILL");
+      // Grok/crush: netos podem manter o ChildProcess "vivo" no Node —
+      // nullifica mesmo se kill falhar pra não bloquear dead-detect.
       this.ocActiveProc = null;
       this.oneShotProc = null;
       this.messageSession.busy = false;
+      this.toolsInFlight = 0;
+      this.toolsInFlightSince = null;
       this.activityClock.softReported = false;
       this.activityClock.deadSince = null;
       this.touchActivity();
@@ -3430,8 +3614,55 @@ export class AgentRunner {
       const full = `[hang] turno abortado: ${reason}`;
       this.opts.onHung?.({ soft: false, reason: full, idleMs });
       this.opts.onError(full);
+      // Grok abort sem output em resume: limpa sessionId pra próximo turno
+      // não re-travar no mesmo state (finishGrokTurn faria isso no close).
+      if (this.opts.cliRunner === "grok" && this.messageSession.sessionId) {
+        this.opts.log("warn", `[hang:${this.info.name}] limpando sessionId grok após hard recover`);
+        this.messageSession.resetForRetry(this.messageSession.pendingSummary);
+        this.info.sessionId = undefined;
+        this.opts.onSessionId?.("");
+      }
       // Continua fila se houver mensagens pendentes
       try { this.drainOcQueue(); } catch { /* */ }
+    } finally {
+      this.recoveringHung = false;
+    }
+  }
+
+  /**
+   * Claude continuous mudo: reinicia o processo com --resume da sessão
+   * (preserva contexto) e volta a aceitar mensagens. Antes o hard hang
+   * só rodava com messageSession.busy — continuous nunca seta busy, então
+   * o agente ficava stalled pra sempre até o user reiniciar.
+   */
+  private async recoverClaudeContinuousHang(reason: string, idleMs: number): Promise<void> {
+    if (this.recoveringHung || this.stopped) return;
+    if (this.opts.cliRunner !== "claude") return;
+    this.recoveringHung = true;
+    try {
+      this.opts.log(
+        "warn",
+        `[hang:${this.info.name}] HARD recover claude continuous: ${reason}`,
+      );
+      this.toolsInFlight = 0;
+      this.toolsInFlightSince = null;
+      this.messageSession.busy = false;
+      this.activityClock.softReported = false;
+      this.activityClock.deadSince = null;
+      // Preserva sessionId pra resume
+      const sid = this.info.sessionId || this.opts.resumeSessionId;
+      if (sid) this.opts.resumeSessionId = sid;
+      await this.killClaudeForRestart();
+      if (this.stopped) return;
+      this.startClaude();
+      this.touchActivity();
+      this.setState("idle");
+      const full = `[hang] claude reiniciado (continuous): ${reason}`;
+      this.opts.onHung?.({ soft: false, reason: full, idleMs });
+      this.opts.onError(full + " — sessão resumida; envie de novo se a última msg não entrou");
+    } catch (e) {
+      this.opts.log("error", `[hang:${this.info.name}] recoverClaude falhou: ${(e as Error).message}`);
+      this.setState("idle");
     } finally {
       this.recoveringHung = false;
     }

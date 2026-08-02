@@ -7,6 +7,12 @@ import type { DropTarget } from "./privileges.js";
 import type { CliRunner } from "./types.js";
 import { startCliShim, type CliShim } from "./graph-llm-shim.js";
 
+export interface GraphProgress {
+  phase?: string;
+  progress?: number;
+  message?: string;
+}
+
 export interface BuildOpts {
   /** true = `graphify extract` (AST + semântico via LLM, indexa docs/.md/.yaml
    *  além de código). false/undefined = `graphify update` (code-only, local). */
@@ -33,10 +39,17 @@ export interface BuildOpts {
   /** logger do daemon (status do shim). */
   log?: (level: "info" | "warn" | "error", msg: string) => void;
   timeoutMs?: number;
+  /** Progresso parseado do stdout (extract/update). */
+  onProgress?: (p: GraphProgress) => void;
 }
 
 /** Backends *-cli → runner do shim OpenAI-compat. claude tem backend nativo
- *  (claude-cli), então não passa pelo shim. */
+ *  (claude-cli), então não passa pelo shim.
+ *
+ *  Importante (graphify ≥0.8): o backend `openai` **ignora** OPENAI_BASE_URL
+ *  (base_url fixo em api.openai.com). O backend `ollama` lê OLLAMA_BASE_URL
+ *  do env no import — por isso o shim se apresenta como ollama apontando pro
+ *  loopback. */
 const CLI_SHIM_RUNNER: Record<string, CliRunner> = {
   "opencode-cli": "opencode",
   "codex-cli": "codex",
@@ -44,6 +57,18 @@ const CLI_SHIM_RUNNER: Record<string, CliRunner> = {
   "crush-cli": "crush",
   "grok-cli": "grok",
 };
+
+/** Backends nativos do graphify que usam API key (não CLI). */
+export const GRAPHIFY_API_BACKENDS = new Set([
+  "claude", "gemini", "openai", "deepseek", "kimi", "ollama", "azure", "anthropic",
+]);
+
+/** Normaliza aliases da UI → nome que o graphify entende. */
+export function normalizeGraphifyBackend(backend?: string): string {
+  const b = (backend || "claude-cli").trim();
+  if (b === "anthropic") return "claude"; // graphify chama ANTHROPIC de "claude"
+  return b;
+}
 
 // O graphify roda `claude -p` SEM CLAUDE_CONFIG_DIR → claude usa o default
 // (~/.claude), que pode não estar autenticado (a auth pode estar em
@@ -87,12 +112,26 @@ async function resolveAuthedClaudeConfigDir(claudeCmd: string): Promise<string |
 /** env var de modelo por backend do graphify (ver llm.py model_env_key). */
 const MODEL_ENV: Record<string, string> = {
   "claude-cli": "GRAPHIFY_CLAUDE_CLI_MODEL",
+  claude: "ANTHROPIC_MODEL", // fallback; graphify default model se ausente
   gemini: "GRAPHIFY_GEMINI_MODEL",
   openai: "GRAPHIFY_OPENAI_MODEL",
   deepseek: "GRAPHIFY_DEEPSEEK_MODEL",
   azure: "GRAPHIFY_AZURE_MODEL",
   bedrock: "GRAPHIFY_BEDROCK_MODEL",
   ollama: "OLLAMA_MODEL",
+  kimi: "GRAPHIFY_KIMI_MODEL",
+};
+
+/** Env var de API key que o graphify lê por backend (llm.py env_key/env_keys). */
+export const GRAPHIFY_BACKEND_KEY_ENV: Record<string, string[]> = {
+  claude: ["ANTHROPIC_API_KEY"],
+  anthropic: ["ANTHROPIC_API_KEY"],
+  gemini: ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+  openai: ["OPENAI_API_KEY"],
+  deepseek: ["DEEPSEEK_API_KEY"],
+  kimi: ["MOONSHOT_API_KEY"],
+  ollama: ["OLLAMA_API_KEY"], // opcional em loopback
+  azure: ["AZURE_OPENAI_API_KEY"],
 };
 
 // Integração com graphify (knowledge graph). O build (`graphify update <path>`)
@@ -118,6 +157,158 @@ export function graphExists(workspaceRoot: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** mtime do graph.json em ms epoch, ou undefined se ausente. */
+export function graphMtime(workspaceRoot: string): number | undefined {
+  try {
+    return statSync(graphPath(workspaceRoot)).mtimeMs;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Flag do graphify: docs/imagens mudaram e pedem re-extract semântico (+ docs). */
+export function needsSemanticUpdate(workspaceRoot: string): boolean {
+  try {
+    return existsSync(path.join(graphDir(workspaceRoot), "needs_update"));
+  } catch {
+    return false;
+  }
+}
+
+/** Marker escrito pelo `extract` quando houve camada semântica (docs). */
+export function hasSemanticMarker(workspaceRoot: string): boolean {
+  try {
+    return existsSync(path.join(graphDir(workspaceRoot), ".graphify_semantic_marker"));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Lê graph.json e, se grande demais ou com nós demais, devolve amostra dos
+ * top-N por grau (mesmo critério do renderer web). Usado no graph:fetch.
+ */
+export function loadGraphJsonForUi(workspaceRoot: string, opts?: { maxBytes?: number; maxNodes?: number }): {
+  json?: string;
+  error?: string;
+  truncated?: boolean;
+  totalNodes?: number;
+} {
+  const maxBytes = opts?.maxBytes ?? 48 * 1024 * 1024;
+  const maxNodes = opts?.maxNodes ?? 1200;
+  const gp = graphPath(workspaceRoot);
+  let st: { size: number };
+  try {
+    st = statSync(gp);
+  } catch {
+    return { error: "índice ainda não gerado — reindexe" };
+  }
+  if (st.size <= 0) return { error: "índice vazio — reindexe" };
+  if (st.size > maxBytes) {
+    return { error: `grafo muito grande (> ${Math.round(maxBytes / (1024 * 1024))}MB) pra renderizar — reduza o escopo (.graphifyignore) ou use as tools MCP do agente` };
+  }
+  let raw: string;
+  try {
+    raw = readFileSync(gp, "utf8");
+  } catch (e) {
+    return { error: (e as Error).message };
+  }
+  // Abaixo de ~4MB e poucos nós: manda cru (renderer web também capia).
+  if (st.size < 4 * 1024 * 1024) {
+    try {
+      const j = JSON.parse(raw) as { nodes?: unknown[] };
+      const n = Array.isArray(j.nodes) ? j.nodes.length : 0;
+      if (n <= maxNodes) return { json: raw, truncated: false, totalNodes: n };
+    } catch {
+      return { error: "graph.json inválido" };
+    }
+  }
+  // Sample top-N por grau
+  try {
+    const j = JSON.parse(raw) as {
+      nodes?: Array<{ id?: string; label?: string; community?: number; [k: string]: unknown }>;
+      edges?: Array<{ source?: string; target?: string; [k: string]: unknown }>;
+      links?: Array<{ source?: string; target?: string; [k: string]: unknown }>;
+      [k: string]: unknown;
+    };
+    const nodes = Array.isArray(j.nodes) ? j.nodes : [];
+    const links = Array.isArray(j.links) ? j.links : Array.isArray(j.edges) ? j.edges : [];
+    const totalNodes = nodes.length;
+    if (totalNodes <= maxNodes) return { json: raw, truncated: false, totalNodes };
+    const deg = new Map<string, number>();
+    for (const l of links) {
+      if (l.source != null) deg.set(String(l.source), (deg.get(String(l.source)) ?? 0) + 1);
+      if (l.target != null) deg.set(String(l.target), (deg.get(String(l.target)) ?? 0) + 1);
+    }
+    const picked = [...nodes]
+      .sort((a, b) => (deg.get(String(b.id)) ?? 0) - (deg.get(String(a.id)) ?? 0))
+      .slice(0, maxNodes);
+    const idSet = new Set(picked.map((n) => String(n.id)));
+    const keptLinks = links.filter((l) => idSet.has(String(l.source)) && idSet.has(String(l.target)));
+    const out = {
+      ...j,
+      nodes: picked,
+      links: keptLinks,
+      edges: undefined,
+      _ui: { truncated: true, totalNodes, shown: picked.length },
+    };
+    return { json: JSON.stringify(out), truncated: true, totalNodes };
+  } catch (e) {
+    return { error: `falha ao amostrar grafo: ${(e as Error).message}` };
+  }
+}
+
+/** Melhora mensagens de erro de backends CLI (auth/tier). */
+export function friendlyGraphifyError(err: string): string {
+  const e = err || "";
+  if (/IneligibleTierError|no longer supported for Gemini Code Assist|migrate to the Antigravity/i.test(e)) {
+    return "Gemini CLI: plano/tier individual não suportado neste ambiente. Use Gemini (API) com GEMINI_API_KEY no vault, ou outro runner (OpenCode/Claude Code/Grok).";
+  }
+  if (/not logged in|auth|unauthorized|401|login/i.test(e) && /gemini|codex|opencode|grok|crush|claude/i.test(e)) {
+    return `${e.slice(0, 400)} — confira o login do CLI no daemon (rode o CLI uma vez no host).`;
+  }
+  return e;
+}
+
+/** Parseia linhas de progresso do graphify (AST / semantic N/M / tokens). */
+export function parseGraphifyProgressLine(line: string): GraphProgress | null {
+  const t = line.trim();
+  if (!t) return null;
+  // "Rebuilt: N nodes…" primeiro (também pode conter a palavra communities)
+  if (/Rebuilt:\s*\d+\s+nodes?/i.test(t) || /nodes?,\s*\d+\s+edges?/i.test(t)) {
+    return { phase: "done", progress: 100, message: t.slice(0, 200) };
+  }
+  // "[graphify extract] semantic extraction 3/12 …" ou "semantic 3/12"
+  const sem = t.match(/semantic[^0-9]*(\d+)\s*\/\s*(\d+)/i);
+  if (sem) {
+    const cur = Number(sem[1]), tot = Math.max(1, Number(sem[2]));
+    return { phase: "semantic", progress: Math.min(99, Math.round((cur / tot) * 100)), message: t.slice(0, 200) };
+  }
+  if (/AST\s+extraction|extracting\s+AST|\[graphify[^\]]*\]\s*AST/i.test(t)) {
+    return { phase: "ast", progress: 15, message: t.slice(0, 200) };
+  }
+  if (/semantic\s+extraction|labeling\s+communit/i.test(t)) {
+    return { phase: "semantic", progress: 40, message: t.slice(0, 200) };
+  }
+  // "semantic extraction on 3 files" / "chunk 2/8"
+  const chunk = t.match(/chunk\s+(\d+)\s*\/\s*(\d+)/i);
+  if (chunk) {
+    const cur = Number(chunk[1]), tot = Math.max(1, Number(chunk[2]));
+    return { phase: "semantic", progress: Math.min(99, Math.round((cur / tot) * 100)), message: t.slice(0, 200) };
+  }
+  const files = t.match(/semantic extraction on\s+(\d+)\s+files/i);
+  if (files) {
+    return { phase: "semantic", progress: 35, message: t.slice(0, 200) };
+  }
+  if (/\[graphify\s+update\]|incremental|nothing to (update|rebuild)/i.test(t)) {
+    return { phase: "update", progress: 50, message: t.slice(0, 200) };
+  }
+  if (/preserving semantic|preserved semantic|preserve semantic/i.test(t)) {
+    return { phase: "update", progress: 70, message: t.slice(0, 200) };
+  }
+  return null;
 }
 
 export interface GraphBuildResult {
@@ -222,12 +413,13 @@ async function runBuild(
   // Descobre o CLAUDE_CONFIG_DIR autenticado (probe + cache) p/ o claude-cli do
   // graphify não cair no default ~/.claude desautenticado (401 → exit 1).
   let claudeCfgDir: string | undefined;
-  if (opts.semantic && (opts.backend || "claude-cli") === "claude-cli" && opts.claudeCmd) {
+  const reqBackend = normalizeGraphifyBackend(opts.backend);
+  if (opts.semantic && reqBackend === "claude-cli" && opts.claudeCmd) {
     claudeCfgDir = await resolveAuthedClaudeConfigDir(opts.claudeCmd);
   }
-  // Backend *-cli: sobe o shim OpenAI-compat ANTES do graphify (precisa do
-  // baseUrl/token). O graphify roda como `--backend openai` apontando pro shim.
-  const reqBackend = opts.backend || "claude-cli";
+  // Backend *-cli: sobe o shim OpenAI-compat ANTES do graphify.
+  // graphify 0.8+ ignora OPENAI_BASE_URL no backend openai — usamos ollama
+  // (que lê OLLAMA_BASE_URL do env) apontando pro shim loopback.
   const shimRunner: CliRunner | undefined = opts.semantic ? CLI_SHIM_RUNNER[reqBackend] : undefined;
   let shim: CliShim | undefined;
   if (shimRunner) {
@@ -258,20 +450,22 @@ async function runBuild(
     try {
       if (opts.semantic) {
         // `extract` faz AST + semântico via LLM. Backend via flag --backend.
-        // claude-cli usa o claude Code local (sem key) — graphify resolve
-        // `claude` via PATH, então injetamos o dir. Outros backends leem a API
-        // key do env do daemon. Herda o resto do env (HOME etc).
+        // claude-cli: nativo no graphify (claude -p no PATH).
+        // *-cli: shim loopback via backend ollama + OLLAMA_BASE_URL.
+        // API (gemini/openai/…): key do vault no env.
         let backend = reqBackend;
         const env: NodeJS.ProcessEnv = { ...process.env };
         if (shim) {
-          // Backend *-cli: graphify fala OpenAI-compat com o shim local.
-          backend = "openai";
-          env.OPENAI_BASE_URL = shim.baseUrl;
-          env.OPENAI_API_KEY = shim.token;
-          // label (o modelo real é forçado pelo CLI); seta as duas env vars que
-          // versões diferentes do graphify leem.
-          env.OPENAI_MODEL = shim.model;
-          env.GRAPHIFY_OPENAI_MODEL = shim.model;
+          // graphify openai ignora OPENAI_BASE_URL; ollama honra OLLAMA_BASE_URL.
+          backend = "ollama";
+          env.OLLAMA_BASE_URL = shim.baseUrl;
+          env.OLLAMA_API_KEY = shim.token; // shim exige Bearer
+          env.OLLAMA_MODEL = shim.model;
+          // permite chunks em paralelo no shim (default ollama é serial)
+          env.GRAPHIFY_OLLAMA_PARALLEL = "1";
+          // evita confusão se o user tiver OPENAI_* no ambiente
+          delete env.OPENAI_BASE_URL;
+          opts.log?.("info", `[graph] shim ${shimRunner} → graphify --backend ollama @ ${shim.baseUrl}`);
         } else {
           if (backend === "claude-cli" && opts.claudeCmd) {
             env.PATH = `${path.dirname(opts.claudeCmd)}:${process.env.PATH ?? ""}`;
@@ -281,11 +475,18 @@ async function runBuild(
             const mEnv = MODEL_ENV[backend];
             if (mEnv) env[mEnv] = opts.model;
           }
-          // API key do backend (do vault, já decifrada) → env var do backend.
-          if (opts.apiKeyEnv && opts.apiKey) env[opts.apiKeyEnv] = opts.apiKey;
+          // API key do backend (do vault, já decifrada) → env var(s) do backend.
+          if (opts.apiKey) {
+            const envs = opts.apiKeyEnv
+              ? [opts.apiKeyEnv]
+              : (GRAPHIFY_BACKEND_KEY_ENV[backend] ?? []);
+            for (const k of envs) if (k) env[k] = opts.apiKey;
+          }
         }
         const args = ["extract", workspaceRoot];
         if (backend !== "auto") args.push("--backend", backend);
+        // --model do graphify sobrescreve o default do backend
+        if (opts.model) args.push("--model", opts.model);
         proc = spawn(graphifyBin, args, { cwd: workspaceRoot, env });
       } else {
         // code-only: build local; herda PATH pro python resolver libs.
@@ -297,10 +498,25 @@ async function runBuild(
     }
     const timer = setTimeout(() => {
       try { proc.kill("SIGKILL"); } catch { /* noop */ }
-      done({ ok: false, error: `graphify update timeout (${timeoutMs}ms)` });
+      done({ ok: false, error: `graphify ${opts.semantic ? "extract" : "update"} timeout (${timeoutMs}ms)` });
     }, timeoutMs);
-    proc.stdout?.on("data", (c: Buffer) => { out += c.toString(); });
-    proc.stderr?.on("data", (c: Buffer) => { out += c.toString(); });
+    let lineBuf = "";
+    const onChunk = (c: Buffer) => {
+      const s = c.toString();
+      out += s;
+      if (!opts.onProgress) return;
+      lineBuf += s;
+      const parts = lineBuf.split(/\r?\n/);
+      lineBuf = parts.pop() ?? "";
+      for (const line of parts) {
+        const p = parseGraphifyProgressLine(line);
+        if (p) {
+          try { opts.onProgress(p); } catch { /* noop */ }
+        }
+      }
+    };
+    proc.stdout?.on("data", onChunk);
+    proc.stderr?.on("data", onChunk);
     proc.on("error", (e) => { clearTimeout(timer); done({ ok: false, error: `graphify spawn falhou: ${e.message}` }); });
     proc.on("close", (code) => {
       clearTimeout(timer);
@@ -344,7 +560,7 @@ async function runBuild(
             hint = " — verifique a API key do backend (credencial no vault) e o escopo (.graphifyignore).";
           }
         }
-        done({ ok: false, error: `graphify ${cmd} exit ${code}: ${picked}${hint}` });
+        done({ ok: false, error: friendlyGraphifyError(`graphify ${cmd} exit ${code}: ${picked}${hint}`) });
         return;
       }
       ensureGitignored(workspaceRoot);

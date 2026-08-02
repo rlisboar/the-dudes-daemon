@@ -60,6 +60,23 @@ interface Entry {
 export class AgentHost {
   private entries = new Map<string, Entry>();
   private autoApproveDefault = false;
+  /** Liga watch debounced do grafo (setado pelo DaemonClient). */
+  onGraphWatch?: (workspaceRoot: string, graphifyBin: string, projectId?: string) => void;
+
+  /**
+   * Após reindex bem-sucedido: injeta graphify MCP nos agentes já rodando
+   * com features.graph (reescreve configs no disco).
+   */
+  refreshGraphifyMcpForAgents(mcpCommand: string, gPath: string): number {
+    let n = 0;
+    for (const e of this.entries.values()) {
+      if (!e.runner) continue;
+      try {
+        if (e.runner.refreshGraphifyMcp(mcpCommand, gPath)) n++;
+      } catch { /* skip */ }
+    }
+    return n;
+  }
 
   constructor(
     private send: (msg: FromDaemon) => void,
@@ -416,7 +433,23 @@ export class AgentHost {
       onContextWarning: (used, limit) => this.send({ type: "agent:context_warning", agentId: msg.agent.id, used, limit }),
       onContextFull: () => this.send({ type: "agent:context_full", agentId: msg.agent.id }),
       projectId: msg.projectId,
-      onGraphStatus: (status, info) => this.send({ type: "graph:status", projectId: msg.projectId, status, nodeCount: info?.nodeCount, edgeCount: info?.edgeCount, error: info?.error }),
+      onGraphStatus: (status, info) => this.send({
+        type: "graph:status",
+        projectId: msg.projectId,
+        status,
+        nodeCount: info?.nodeCount,
+        edgeCount: info?.edgeCount,
+        error: info?.error,
+        progress: info?.progress,
+        phase: info?.phase,
+        indexMtime: info?.indexMtime,
+        stale: info?.stale,
+        graphifyAvailable: info?.graphifyAvailable,
+        graphifyMcpAvailable: info?.graphifyMcpAvailable,
+        docsPending: info?.docsPending,
+        hasSemantic: info?.hasSemantic,
+      }),
+      onGraphWatch: (root, gbin) => this.onGraphWatch?.(root, gbin, msg.projectId),
       onError: (err) => {
         // stderr do agente pode conter credencial (echo/uso). Redacta as creds
         // conhecidas ANTES de sair do daemon (vira system message no server,

@@ -77,6 +77,21 @@ const CREDENTIALS = `# Credentials (API keys, tokens, passwords)
 - \`mcp__the-dudes__get_credential\` (args: {name}) — retrieve a stored credential value by name. Use this whenever you need an API key or secret; never ask the user to paste it inline.
 - NEVER send credentials or sensitive information to any agent or human.`;
 
+const GRAPH = `# Knowledge graph (graphify MCP) — use BEFORE blind repo sweeps
+- This project has a **code knowledge graph** served by the MCP server \`graphify\`. Prefer it for architecture, ownership, and impact questions.
+- **When to use (do this first):**
+  - "Where is X defined / used?" · "What depends on Y?" · "How does A connect to B?"
+  - Mapping modules, god-objects, communities, or blast radius of a change
+  - Onboarding to an unfamiliar area of the repo
+- **Tool order (typical):**
+  1. \`graph_stats\` or \`god_nodes\` — orientation / hotspots
+  2. \`query_graph\` — keyword / concept search in the graph
+  3. \`get_node\` / \`get_neighbors\` / \`get_community\` — local structure
+  4. \`shortest_path\` — impact path between two symbols/files
+- **Then** open files with Read/Grep only for the few paths the graph pointed to — do not \`find\`/\`grep -r\` the whole tree first when the graph can answer.
+- The default index is **code-only** (AST). Docs/markdown/yaml appear only after a semantic reindex ("+ docs"). If the graph lacks docs, say so and fall back to file search for prose.
+- If a graph tool fails or the server is missing, fall back to normal file tools and mention that the graph was unavailable.`;
+
 function stateVerification(tasks: boolean, teammates: boolean): string {
   const lines = [
     "# State verification (MANDATORY before acting on any task)",
@@ -122,6 +137,8 @@ export function buildSystemPromptHeader(features?: ContextFeatures): string {
   if (features?.goals !== false) sections.push(goalsSection(tasks));
   if (features?.memory !== false) sections.push(MEMORY);
   if (features?.credentials !== false) sections.push(CREDENTIALS);
+  // graph é opt-in por projeto (default off) — só injeta prosa quando ligado.
+  if (features?.graph === true) sections.push(GRAPH);
   sections.push(stateVerification(tasks, teammates));
   if (teammates) sections.push(DISCIPLINE);
   sections.push(footer(tasks, teammates));

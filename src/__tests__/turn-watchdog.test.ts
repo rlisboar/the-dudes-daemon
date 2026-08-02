@@ -33,4 +33,13 @@ describe("turn-watchdog", () => {
     assert.equal(c.softReported, false);
     assert.equal(c.deadSince, null);
   });
+
+  it("claude hard threshold is finite (continuous must recover eventually)", () => {
+    // Regressão: continuous sem busy nunca hard-recoverava se hardMs
+    // fosse "infinito". Garante hard finito e > soft.
+    const c = hangThresholds("claude");
+    assert.ok(Number.isFinite(c.hardMs));
+    assert.ok(c.hardMs > c.softMs);
+    assert.ok(c.hardMs <= 30 * 60_000); // ≤30min
+  });
 });

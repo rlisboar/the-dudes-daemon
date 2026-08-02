@@ -1,19 +1,18 @@
 /**
- * Shim OpenAI-compat (loopback) que deixa o graphify usar opencode/codex/gemini
- * CLI como backend semântico.
+ * Shim OpenAI-compat (loopback) que deixa o graphify usar opencode/codex/gemini/
+ * crush/grok CLI como backend semântico.
  *
- * O graphify só tem `claude-cli` como backend CLI real; os outros backends
- * (openai/gemini/deepseek/…) falam HTTP OpenAI-compat e exigem API key. Mas o
- * backend `openai` aceita um `OPENAI_BASE_URL` custom — então subimos um servidor
- * HTTP mínimo em 127.0.0.1:<porta aleatória> que implementa
- * `POST /v1/chat/completions`, e por dentro roda o CLI escolhido (one-shot, via
- * runCliText, mesmo caminho do TTS summarizer — dropa privilégios, scrub de
- * secrets). O graphify roda com `--backend openai`, `OPENAI_BASE_URL` apontando
- * pro shim e `OPENAI_API_KEY` = token aleatório (autoriza só o graphify local).
+ * O graphify só tem `claude-cli` como backend CLI real. Os backends HTTP
+ * (openai/gemini/deepseek/…) exigem API key. A partir do graphify 0.8 o backend
+ * `openai` **ignora** OPENAI_BASE_URL (base_url fixo em api.openai.com); o
+ * backend `ollama` lê `OLLAMA_BASE_URL` do env — por isso o indexador aponta
+ * graphify para `--backend ollama` com OLLAMA_BASE_URL = este shim.
  *
- * Vida curta: sobe antes do `graphify extract`, derruba no fim do build. Bind
- * exclusivo no loopback + bearer token aleatório → outros processos locais não
- * conseguem gastar a assinatura do CLI durante a janela do build.
+ * Implementa `POST /v1/chat/completions` (e GET /v1/models) e por dentro roda
+ * o CLI escolhido (one-shot via runCliText — drop de privilégios + scrub de
+ * secrets). Bearer token aleatório autoriza só o graphify local.
+ *
+ * Vida curta: sobe antes do `graphify extract`, derruba no fim do build.
  */
 
 import http from "node:http";

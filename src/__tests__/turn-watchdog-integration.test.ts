@@ -49,4 +49,12 @@ describe("hang detection scenario (Grok)", () => {
     assert.ok(t.deadProcMs < t.softMs);
     assert.ok(t.deadProcMs <= 20_000);
   });
+
+  it("grok hard is well under the 12min turn hard-timeout", () => {
+    // Hang watch deve matar busy ANTES do armHardTimeout de 12min —
+    // senão mtime de sessão mantinha o agente mudo por tempo demais.
+    const t = hangThresholds("grok");
+    assert.ok(t.hardMs <= 5 * 60_000);
+    assert.ok(t.hardMs >= 2 * 60_000);
+  });
 });
