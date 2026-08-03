@@ -186,6 +186,49 @@ export class BridgeRelay {
           } catch { /* leave alone */ }
         }
       }
+      // E2EE do Quadro de explicação. O quadro era o ÚNICO conteúdo sensível
+      // que subia em texto claro — e, desde que passou a persistir em
+      // Postgres, ficava assim no banco. Como ele carrega explicação do código
+      // do usuário, é a mesma classe de segredo do chat.
+      //
+      // Cifra só os campos de TEXTO; a estrutura (kind, order, ids, tone,
+      // números do chart) segue em claro pro server continuar aplicando os
+      // limites estruturais que protegem ELE (48 blocos, 24 steps, 80
+      // anotações). Os limites por caractere passam a ser do escritor, que é
+      // quem tem o plaintext.
+      const bm = parsed.pathname.match(/^\/api\/bridge\/([^/]+)\/(board_[a-z_]+)$/);
+      if (bm) {
+        const projectId = this.agentProjectLookup(bm[1]);
+        if (projectId) {
+          try {
+            const json = JSON.parse(body.toString("utf8"));
+            const cifra = (v: unknown): unknown => {
+              if (typeof v !== "string" || !v || isE2eEncrypted(v)) return v;
+              return encryptForProject(v, projectId) ?? v;
+            };
+            for (const campo of ["title", "body", "say", "text", "label"]) {
+              if (campo in json) json[campo] = cifra(json[campo]);
+            }
+            if (Array.isArray(json.steps)) {
+              json.steps = json.steps.map((st: Record<string, unknown>) =>
+                st && typeof st === "object"
+                  ? { ...st, label: cifra(st.label), detail: cifra(st.detail) }
+                  : st,
+              );
+            }
+            if (json.chart && typeof json.chart === "object") {
+              const c = json.chart as { labels?: unknown[]; series?: Record<string, unknown>[] };
+              if (Array.isArray(c.labels)) c.labels = c.labels.map(cifra);
+              if (Array.isArray(c.series)) {
+                c.series = c.series.map((se) =>
+                  se && typeof se === "object" ? { ...se, name: cifra(se.name) } : se,
+                );
+              }
+            }
+            body = Buffer.from(JSON.stringify(json), "utf8");
+          } catch { /* leave alone */ }
+        }
+      }
     }
     // Strip headers that don't make sense to forward (host/connection/etc).
     const fwd: Record<string, string> = {};

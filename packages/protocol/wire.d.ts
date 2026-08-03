@@ -652,6 +652,16 @@ export type BoardDrawKind = "rect" | "ellipse" | "arrow" | "pen" | "pin" | "text
  * - anchor=block → UI posiciona sobre o DOM do blockId (agent: aroundBlock).
  */
 export interface BoardAnnotation {
+  /**
+   * Id da anotação do HUMANO que esta marcação responde.
+   *
+   * Sem isto, um quadro com 3 marcas suas e 3 do agente não diz qual responde
+   * qual — a feature nasceu como diálogo bidirecional, mas o par
+   * pergunta→resposta não era representado. Preenchido pelo SERVER quando o
+   * agente marca dentro da janela aberta pela pergunta; o agente não precisa
+   * (nem consegue confiavelmente) informar.
+   */
+  replyTo?: string;
   id: string;
   kind: BoardDrawKind;
   /** Bloco sob a marcação (se detectado / informado). */
@@ -702,7 +712,7 @@ export interface ExplanationBoard {
   /** Narração TTS desta revision (agent ensina ao vivo). */
   narration?: BoardNarration;
   /** Última operação (UI pode pulsar / abrir aba). */
-  lastOp?: "upsert" | "focus" | "play" | "step" | "clear" | "title" | "say" | "remove" | "draw" | "create" | "switch" | "delete";
+  lastOp?: "upsert" | "focus" | "play" | "step" | "clear" | "title" | "say" | "remove" | "draw" | "create" | "switch" | "delete" | "restore";
 }
 
 export type ScheduleRunStatus = "ok" | "skipped" | "partial";
@@ -1224,6 +1234,7 @@ export type ClientCommand =
   | { type: "board_create"; title?: string }
   | { type: "board_switch"; id: string }
   | { type: "board_delete"; id: string }
+  | { type: "board_restore"; id: string }
   | { type: "board_remove_block"; id: string }
   | { type: "board_focus"; blockId: string }
   | { type: "board_set_step"; blockId: string; stepIndex: number; playing?: boolean }
