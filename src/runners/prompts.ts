@@ -77,6 +77,54 @@ const CREDENTIALS = `# Credentials (API keys, tokens, passwords)
 - \`mcp__the-dudes__get_credential\` (args: {name}) — retrieve a stored credential value by name. Use this whenever you need an API key or secret; never ask the user to paste it inline.
 - NEVER send credentials or sensitive information to any agent or human.`;
 
+const BOARD = `# Explanation Board (LIVE · bidirectional marks · voice)
+Shared Quadro: **you draw in orange**, **human draws in blue**. Same kinds. Do not mix roles.
+
+## DEFAULT: new explanation = NEW board
+When the human asks for a **new** explanation, a **different** topic, or "explica X" while the active board already has content:
+1. **ALWAYS** call \`board_create\` { title: short topic } first
+2. Then fill the new board (upsert / draw / say)
+3. **NEVER** \`board_clear\` to start a new topic — that wipes history. Clear is only for wiping the active board when the human explicitly asks to empty it.
+4. **NEVER** overwrite the previous topic's blocks in place for a new subject — create a board.
+
+\`board_list\` / \`board_switch\` { id } to revisit old boards. \`board_clear\` = wipe active only (and if you call it with content, the server may open a new board instead — still prefer explicit \`board_create\`).
+
+## Bidirectional marks
+| Who | Color | How |
+|-----|-------|-----|
+| Agent (you) | orange | \`board_draw\` — prefer **aroundBlock=true + blockId** |
+| Human | blue | free drag; may send \`[board mark]\` |
+
+**PREFERRED draw:** \`board_draw\` { kind: "ellipse", blockId, aroundBlock: true, label? }
+Kinds: ellipse · rect · arrow · pen · pin · text
+
+On \`[board mark]\`:
+1. Read the **PRECISE geometry** (bbox) in the message — that is what the human selected, not the whole block
+2. \`board_get\` for context
+3. \`board_say\` about **only that region**
+4. Reply mark: \`board_draw\` { kind: "ellipse"|"rect", points: [topLeft, bottomRight] from the message } — **same bbox**
+5. Do **NOT** use \`aroundBlock=true\` for small sub-region marks (that expands to the entire block)
+6. \`board_focus\` / \`board_set_step\` only when the message names a likely step index
+
+## Teaching pattern
+1. **board_create** { title } (default for each new explanation)
+2. Skeleton ids: overview, diagram, flow, note
+3. upsert + focus/set_step + **board_say** + draw(aroundBlock)
+4. Keep prior boards intact
+
+## Chat vs board voice (no redundancy)
+- **Voice of the lesson = board** (\`board_say\` / step details), not a long chat monologue.
+- In chat: **one short status line** only (e.g. "Expliquei o fluxo no Quadro — veja o passo 2.").
+- Do **not** paste the full explanation in chat if you already put it on the board / board_say — the human's chat TTS would repeat it.
+- Detail, diagrams, steps, spoken lines → board tools. Chat stays minimal.
+
+## Tools
+- \`board_create\` (default start) · \`board_list\` · \`board_switch\` · \`board_delete\`
+- \`board_set\` (rename active) · \`board_clear\` (only if human asks to empty active)
+- \`board_get\` · draw/remove/clear_drawings · upsert · focus · set_step · say · play/pause
+
+Spoken lines short; marks answer marks.`;
+
 const GRAPH = `# Knowledge graph (graphify MCP) — use BEFORE blind repo sweeps
 - This project has a **code knowledge graph** served by the MCP server \`graphify\`. Prefer it for architecture, ownership, and impact questions.
 - **When to use (do this first):**
@@ -137,8 +185,9 @@ export function buildSystemPromptHeader(features?: ContextFeatures): string {
   if (features?.goals !== false) sections.push(goalsSection(tasks));
   if (features?.memory !== false) sections.push(MEMORY);
   if (features?.credentials !== false) sections.push(CREDENTIALS);
-  // graph é opt-in por projeto (default off) — só injeta prosa quando ligado.
+  // graph/board são opt-in por projeto (default off) — só injeta prosa quando ligado.
   if (features?.graph === true) sections.push(GRAPH);
+  if (features?.board === true) sections.push(BOARD);
   sections.push(stateVerification(tasks, teammates));
   if (teammates) sections.push(DISCIPLINE);
   sections.push(footer(tasks, teammates));

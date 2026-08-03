@@ -122,8 +122,20 @@ function describeEvent(event: any, agentNames: Record<string, string> = {}): Eve
     };
   }
   if (t === "schedule:fired") {
-    const s = event.schedule ?? {};
-    return { title: `Schedule disparou: ${s.title ?? "?"}` };
+    const title = typeof event.title === "string" && event.title
+      ? truncate(event.title, 120)
+      : String(event.id ?? "?").slice(0, 16);
+    const status = String(event.status ?? "ok");
+    const reason = typeof event.reason === "string" ? truncate(event.reason, 80) : undefined;
+    const delivered = Array.isArray(event.deliveredTo) ? event.deliveredTo.length : 0;
+    return {
+      title: `Schedule ${status}: ${title}`,
+      description: reason,
+      fields: [
+        { name: "status", value: status, inline: true },
+        { name: "entregues", value: String(delivered), inline: true },
+      ],
+    };
   }
   if (t === "goal:added" || t === "goal:updated") {
     const g = event.goal ?? {};

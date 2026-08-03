@@ -131,6 +131,8 @@ export interface ContextFeatures {
   /** Knowledge graph (graphify) — injeta o MCP server graphify-mcp no agente
    *  e indexa o workspace sob demanda. Off = não injeta nem indexa. */
   graph?: boolean;
+  /** Explanation Board — tools board_* + prosa no system prompt. Opt-in. */
+  board?: boolean;
 }
 
 export interface MemoryInjectionEntry {

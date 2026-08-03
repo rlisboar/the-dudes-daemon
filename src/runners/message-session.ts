@@ -39,6 +39,15 @@ export class PerMessageSessionState {
     this.pendingSummary = summary;
   }
 
+  /**
+   * Invalida turnos em voo (close/finish tardio do proc morto).
+   * Sem isso, finishGrokTurn.finally zera busy de um turno NOVO e o
+   * agente fica mudo até restart manual (sintoma: Claude→Grok “para”).
+   */
+  bumpEpoch(): void {
+    this.epoch++;
+  }
+
   enqueue(message: QueuedMessage, maxSize: number): boolean {
     if (this.queue.length >= maxSize) return false;
     this.queue.push(message);

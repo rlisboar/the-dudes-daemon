@@ -33,6 +33,16 @@ test("retry reset drops only the broken session without invalidating the current
   assert.equal(state.pendingSummary, "retry summary");
 });
 
+test("bumpEpoch invalidates stale finish handlers after hard hang recover", () => {
+  const state = new PerMessageSessionState();
+  const epoch = state.epoch;
+  state.busy = true;
+  assert.equal(state.owns(epoch), true);
+  state.bumpEpoch();
+  assert.equal(state.owns(epoch), false);
+  assert.equal(state.owns(state.epoch), true);
+});
+
 test("message queue is bounded, ordered and supports retry at the front", () => {
   const state = new PerMessageSessionState();
   assert.equal(state.enqueue({ content: "one" }, 2), true);

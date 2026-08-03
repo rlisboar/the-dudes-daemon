@@ -237,6 +237,16 @@ export class AgentRunner {
   private hangWatchTimer: NodeJS.Timeout | null = null;
   private recoveringHung = false;
   /**
+   * Mensagem per-message (grok/etc) em execução — re-enfileirada 1x no
+   * hard hang recover. Sem isso a instrução Claude→Grok some e o Grok
+   * fica idle “morto” até restart manual.
+   */
+  private inflightPerMessage: {
+    content: string;
+    images?: ImageAttachment[];
+    attempt: number;
+  } | null = null;
+  /**
    * Claude (e similares): tool_use abertos sem tool_result ainda.
    * Enquanto >0 e com stream recente o CLI pode ficar minutos sem texto —
    * NÃO é hang. MAS se toolsInFlight fica preso (tool_result perdido) ou o
@@ -1073,6 +1083,9 @@ export class AgentRunner {
     if (f.goals !== false) on.push("goals");
     if (f.credentials !== false) on.push("credentials");
     if (f.webhooks !== false) on.push("webhooks");
+    // board/graph são opt-in (default off) — só entram se true explícito
+    if (f.graph === true) on.push("graph");
+    if (f.board === true) on.push("board");
     return { THE_DUDES_FEATURES: on.join(",") };
   }
 
@@ -2273,6 +2286,12 @@ export class AgentRunner {
       this.drainOcQueue();
       return;
     }
+    // Rastreia inflight pra re-fila no hard recover (hang / SIGKILL sem close).
+    const prevAttempt =
+      this.inflightPerMessage?.content === content
+        ? this.inflightPerMessage.attempt
+        : 0;
+    this.inflightPerMessage = { content, images, attempt: prevAttempt };
     this.setState("thinking");
     this.writeGrokConfig();
 
@@ -2484,9 +2503,16 @@ export class AgentRunner {
     errFromJson: string;
     emittedAny: boolean;
   }): Promise<void> {
+    // Turno stale (hard recover já bumpou epoch / iniciou outro): NÃO mexer
+    // em busy/fila — era o bug que silenciava Grok até restart manual.
+    if (!this.messageSession.owns(t.epoch)) {
+      this.opts.log(
+        "info",
+        `[grok:${this.info.name}] finishGrokTurn ignorado (epoch stale ${t.epoch}≠${this.messageSession.epoch})`,
+      );
+      return;
+    }
     try {
-      if (!this.messageSession.owns(t.epoch)) return;
-
       // Sweep de tool calls ANTES dos branches de falha: turno abortado é
       // justamente o que precisa de auditoria na RUNS — e os branches de
       // retry descartam a sessão (sweep só no sucesso perdia o registro das
@@ -2603,11 +2629,18 @@ export class AgentRunner {
           });
         }
       }
+      // Sucesso (ou falha terminal tratada): limpa inflight
+      if (this.inflightPerMessage?.content === t.content) {
+        this.inflightPerMessage = null;
+      }
     } finally {
-      this.messageSession.busy = false;
-      if (!this.stopped) {
-        this.setState("idle");
-        this.drainOcQueue();
+      // Só o dono do epoch libera busy — evita race com hard recover.
+      if (this.messageSession.owns(t.epoch)) {
+        this.messageSession.busy = false;
+        if (!this.stopped) {
+          this.setState("idle");
+          this.drainOcQueue();
+        }
       }
     }
   }
@@ -2852,10 +2885,13 @@ export class AgentRunner {
         }
       }
     } finally {
-      this.messageSession.busy = false;
-      if (!this.stopped) {
-        this.setState("idle");
-        this.drainOcQueue();
+      // Mesmo invariante do finishGrokTurn: não zerar busy se epoch stale.
+      if (this.messageSession.owns(t.epoch)) {
+        this.messageSession.busy = false;
+        if (!this.stopped) {
+          this.setState("idle");
+          this.drainOcQueue();
+        }
       }
     }
   }
@@ -3604,25 +3640,51 @@ export class AgentRunner {
       // nullifica mesmo se kill falhar pra não bloquear dead-detect.
       this.ocActiveProc = null;
       this.oneShotProc = null;
-      this.messageSession.busy = false;
       this.toolsInFlight = 0;
       this.toolsInFlightSince = null;
       this.activityClock.softReported = false;
       this.activityClock.deadSince = null;
-      this.touchActivity();
-      this.setState("idle");
-      const full = `[hang] turno abortado: ${reason}`;
-      this.opts.onHung?.({ soft: false, reason: full, idleMs });
-      this.opts.onError(full);
-      // Grok abort sem output em resume: limpa sessionId pra próximo turno
-      // não re-travar no mesmo state (finishGrokTurn faria isso no close).
-      if (this.opts.cliRunner === "grok" && this.messageSession.sessionId) {
-        this.opts.log("warn", `[hang:${this.info.name}] limpando sessionId grok após hard recover`);
+
+      // CRÍTICO: invalidar epoch ANTES de liberar busy/drenar. Senão o
+      // finishGrokTurn tardio (close após SIGKILL) zera busy do próximo
+      // turno e o Grok fica mudo até restart manual (Claude→Grok intermitente).
+      this.messageSession.bumpEpoch();
+      this.messageSession.busy = false;
+
+      // Grok: limpa sessionId pra não re-travar no mesmo state zumbi.
+      if (this.opts.cliRunner === "grok") {
+        if (this.messageSession.sessionId) {
+          this.opts.log("warn", `[hang:${this.info.name}] limpando sessionId grok após hard recover`);
+        }
         this.messageSession.resetForRetry(this.messageSession.pendingSummary);
         this.info.sessionId = undefined;
         this.opts.onSessionId?.("");
       }
-      // Continua fila se houver mensagens pendentes
+
+      // Re-enfileira a mensagem em voo (1 retry). Sem isso a instrução
+      // Claude→Grok some e o agente fica idle sem processar nada.
+      const inflight = this.inflightPerMessage;
+      let retried = false;
+      if (inflight && inflight.attempt < 1) {
+        this.inflightPerMessage = { ...inflight, attempt: inflight.attempt + 1 };
+        this.messageSession.prepend({ content: inflight.content, images: inflight.images });
+        retried = true;
+        this.opts.log(
+          "warn",
+          `[hang:${this.info.name}] re-enfileirando mensagem após hard recover (attempt ${this.inflightPerMessage.attempt})`,
+        );
+      } else {
+        this.inflightPerMessage = null;
+      }
+      const full = retried
+        ? `[hang] turno abortado: ${reason} — reenviando a última mensagem automaticamente (1×)`
+        : `[hang] turno abortado: ${reason}` + (inflight ? " — retry esgotado; envie de novo se necessário" : "");
+      this.opts.onHung?.({ soft: false, reason: full, idleMs });
+      this.opts.onError(full);
+
+      this.touchActivity();
+      this.setState("idle");
+      // Continua fila (inclui re-fila acima)
       try { this.drainOcQueue(); } catch { /* */ }
     } finally {
       this.recoveringHung = false;

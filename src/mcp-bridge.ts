@@ -134,6 +134,13 @@ const TOOL_GROUP: Record<string, string> = {
   list_goals: "goals",
   get_credential: "credentials",
   list_webhooks: "webhooks", send_webhook: "webhooks",
+  // Explanation Board — opt-in por projeto (THE_DUDES_FEATURES=board)
+  board_get: "board", board_clear: "board", board_set: "board",
+  board_upsert_block: "board", board_remove_block: "board",
+  board_focus: "board", board_set_step: "board", board_play: "board", board_pause: "board",
+  board_say: "board", board_draw: "board", board_remove_annotation: "board",
+  board_clear_drawings: "board",
+  board_list: "board", board_create: "board", board_switch: "board", board_delete: "board",
   // approve_action permanece SEMPRE registrado (permission-prompt do claude).
 };
 const _origTool = server.tool.bind(server);
@@ -1000,6 +1007,355 @@ server.tool(
       return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
     }
   }
+);
+
+// --- Explanation Board ---------------------------------------------------
+// Quadro visual em tempo real. Ensine passo a passo: upsert → focus → set_step / play.
+
+server.tool(
+  "board_get",
+  "Read the ACTIVE Explanation Board (title, blocks, focus, playhead, annotations) + list of all boards. Call before editing.",
+  {},
+  async () => {
+    try {
+      const r = await postJSON("board_get", {});
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            activeBoardId: r.activeBoardId,
+            boards: r.boards,
+            board: r.board ?? r,
+          }, null, 2),
+        }],
+      };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "board_list",
+  "List all explanation boards in the project (id, title, blockCount) and which is active.",
+  {},
+  async () => {
+    try {
+      const r = await postJSON("board_list", {});
+      return { content: [{ type: "text", text: JSON.stringify(r, null, 2) }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "board_create",
+  `DEFAULT for any NEW explanation / new topic / "explica X" when another board already has content.
+Creates a NEW empty board, switches to it, KEEPS previous boards. Do NOT use board_clear to start a new topic.`,
+  { title: z.string().optional().describe("Short topic title for the new board") },
+  async ({ title }) => {
+    try {
+      const r = await postJSON("board_create", { title });
+      if (r.error) return { content: [{ type: "text", text: r.error }], isError: true };
+      return {
+        content: [{
+          type: "text",
+          text: `created board id=${r.board?.id ?? "?"} title=${r.board?.title ?? title ?? ""} (active) — previous boards kept`,
+        }],
+      };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "board_switch",
+  "Switch the active board (UI + further board_* ops apply to it).",
+  { id: z.string().describe("Board id from board_list / board_get") },
+  async ({ id }) => {
+    try {
+      const r = await postJSON("board_switch", { id });
+      if (r.error) return { content: [{ type: "text", text: r.error }], isError: true };
+      return { content: [{ type: "text", text: `active board → ${id} (${r.board?.title ?? ""})` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "board_delete",
+  "Delete a board by id. If it is the last board, it is cleared instead. Switches to another board if you delete the active one.",
+  { id: z.string() },
+  async ({ id }) => {
+    try {
+      const r = await postJSON("board_delete", { id });
+      if (r.error) return { content: [{ type: "text", text: r.error }], isError: true };
+      return { content: [{ type: "text", text: `deleted ${id}; active=${r.activeBoardId ?? r.board?.id}` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "board_clear",
+  `Wipe the ACTIVE board's blocks/drawings. DO NOT use this to start a new explanation — use board_create instead.
+Only when the human explicitly asks to empty the current board. If the active board has content, the server may open a new board to preserve history.`,
+  {},
+  async () => {
+    try {
+      const r = await postJSON("board_clear", {});
+      const op = r.board?.lastOp === "create"
+        ? `opened NEW board (previous preserved) id=${r.board?.id ?? "?"} title=${r.board?.title ?? ""}`
+        : `board cleared (rev ${r.board?.revision ?? "?"}) id=${r.board?.id ?? "?"}`;
+      return { content: [{ type: "text", text: op }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "board_set",
+  "Set the ACTIVE board title (live on the Quadro tab).",
+  { title: z.string().describe("Short title") },
+  async ({ title }) => {
+    try {
+      const r = await postJSON("board_set", { title });
+      return { content: [{ type: "text", text: `board title → ${r.board?.title ?? title}` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "board_upsert_block",
+  `Add/replace a block. The human sees updates LIVE on the Quadro tab.
+Kinds:
+- markdown: body = markdown
+- mermaid: body = mermaid source
+- callout: body + tone info|warn|ok|err
+- chart: chart = { type, labels, series }
+- steps | flow: steps = [{ label, detail? }] — animated teaching flow (use with board_set_step / board_play)
+Reuse the same id to update a block in place while you explain. focus defaults true (scrolls UI to it).
+Optional say: spoken aloud via TTS if the agent has voice enabled.`,
+  {
+    id: z.string().optional().describe("Stable id to update in place, e.g. flow-main"),
+    kind: z.enum(["markdown", "mermaid", "chart", "callout", "steps", "flow"]),
+    title: z.string().optional(),
+    body: z.string().optional(),
+    tone: z.enum(["info", "warn", "ok", "err"]).optional(),
+    order: z.number().optional(),
+    focus: z.boolean().optional().describe("Scroll UI to this block (default true)"),
+    say: z.string().optional().describe("Short spoken line (TTS) while showing this block"),
+    steps: z
+      .array(z.object({
+        id: z.string().optional(),
+        label: z.string(),
+        detail: z.string().optional(),
+      }))
+      .optional()
+      .describe("For kind steps|flow"),
+    chart: z
+      .object({
+        type: z.enum(["bar", "line", "pie"]),
+        labels: z.array(z.string()),
+        series: z.array(z.object({ name: z.string(), values: z.array(z.number()) })),
+      })
+      .optional(),
+  },
+  async (args) => {
+    try {
+      const r = await postJSON("board_upsert_block", args);
+      if (r.error) return { content: [{ type: "text", text: r.error }], isError: true };
+      const n = r.board?.blocks?.length ?? 0;
+      const id = args.id ?? r.board?.focusBlockId ?? "?";
+      return {
+        content: [{
+          type: "text",
+          text: `upserted ${args.kind} id=${id} rev=${r.board?.revision ?? "?"} blocks=${n}`,
+        }],
+      };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "board_remove_block",
+  "Remove a block by id.",
+  { id: z.string() },
+  async ({ id }) => {
+    try {
+      const r = await postJSON("board_remove_block", { id });
+      return { content: [{ type: "text", text: `removed ${id} (rev ${r.board?.revision ?? "?"})` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "board_focus",
+  "Highlight + scroll the UI to a block while you talk about it (real-time teaching). Optional say → TTS.",
+  {
+    blockId: z.string().describe("Block id"),
+    say: z.string().optional().describe("Short spoken line (TTS) about this block"),
+  },
+  async ({ blockId, say }) => {
+    try {
+      const r = await postJSON("board_focus", { blockId, say });
+      if (r.error) return { content: [{ type: "text", text: r.error }], isError: true };
+      return { content: [{ type: "text", text: `focus → ${blockId}` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "board_set_step",
+  "Point the playhead at a step in a steps/flow block (sync animation with your explanation). Auto-narrates label+detail via TTS unless you pass say (or empty to skip is not supported — pass say to override).",
+  {
+    blockId: z.string(),
+    stepIndex: z.number().describe("0-based step index"),
+    playing: z.boolean().optional().describe("Keep autoplay on/off"),
+    say: z.string().optional().describe("Override spoken text for this step (default: label + detail)"),
+  },
+  async ({ blockId, stepIndex, playing, say }) => {
+    try {
+      const r = await postJSON("board_set_step", { blockId, stepIndex, playing, say });
+      if (r.error) return { content: [{ type: "text", text: r.error }], isError: true };
+      return { content: [{ type: "text", text: `step ${stepIndex} on ${blockId}` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "board_play",
+  "Auto-animate a steps/flow block (cycles steps for the human). Prefer board_set_step when explaining verbally in sync.",
+  {
+    blockId: z.string(),
+    intervalMs: z.number().optional().describe("ms per step, default 1800"),
+    from: z.number().optional().describe("start step index"),
+  },
+  async ({ blockId, intervalMs, from }) => {
+    try {
+      const r = await postJSON("board_play", { blockId, intervalMs, from });
+      if (r.error) return { content: [{ type: "text", text: r.error }], isError: true };
+      return { content: [{ type: "text", text: `playing ${blockId}` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "board_pause",
+  "Pause steps/flow autoplay on the board.",
+  {},
+  async () => {
+    try {
+      await postJSON("board_pause", {});
+      return { content: [{ type: "text", text: "board paused" }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "board_say",
+  "Speak a short line via the human's TTS (agent voice must be ON). Use while pointing at the board — does not change blocks. Prefer short spoken sentences (1–3).",
+  { text: z.string().describe("Spoken text (plain, short)") },
+  async ({ text }) => {
+    try {
+      const r = await postJSON("board_say", { text });
+      if (r.error) return { content: [{ type: "text", text: r.error }], isError: true };
+      return { content: [{ type: "text", text: `said (rev ${r.board?.revision ?? "?"})` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "board_draw",
+  `Draw on the shared Quadro (bidirectional: you=orange, human=blue).
+
+**PREFERRED (no blind coords):** aroundBlock=true + blockId — UI hugs that block.
+Kinds: ellipse | rect | arrow | pen | pin | text
+
+Free geometry (only if you know layout): points NORMALIZED 0–1 on board surface
+- ellipse|rect: [topLeft, bottomRight]
+- arrow: [from, to] · pen: path · pin|text: [anchor] + label
+
+Human marks arrive as [board mark] messages and in board_get.annotations (author=human).
+When replying to a human mark, prefer aroundBlock on the same blockId.`,
+  {
+    kind: z.enum(["rect", "ellipse", "arrow", "pen", "pin", "text"]),
+    points: z.array(z.object({ x: z.number(), y: z.number() })).optional()
+      .describe("Board-normalized 0–1; omit when aroundBlock=true"),
+    blockId: z.string().optional().describe("Block id (required if aroundBlock)"),
+    aroundBlock: z.boolean().optional()
+      .describe("true = UI anchors mark on the block DOM (recommended)"),
+    label: z.string().optional().describe("Caption / note on the mark"),
+    strokeWidth: z.number().optional(),
+    id: z.string().optional().describe("Stable id to replace a previous mark"),
+  },
+  async (args) => {
+    try {
+      const r = await postJSON("board_draw", args);
+      if (r.error) return { content: [{ type: "text", text: r.error }], isError: true };
+      const a = r.annotation;
+      return {
+        content: [{
+          type: "text",
+          text: `drew ${args.kind} id=${a?.id ?? args.id ?? "?"} author=agent color=orange`
+            + ` anchor=${a?.anchor ?? "board"} blockId=${a?.blockId ?? args.blockId ?? "—"}`
+            + ` rev=${r.board?.revision ?? "?"}`,
+        }],
+      };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "board_remove_annotation",
+  "Remove one drawing/mark by id.",
+  { id: z.string() },
+  async ({ id }) => {
+    try {
+      const r = await postJSON("board_remove_annotation", { id });
+      if (r.error) return { content: [{ type: "text", text: r.error }], isError: true };
+      return { content: [{ type: "text", text: `removed annotation ${id}` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "board_clear_drawings",
+  "Clear all drawings/marks on the board (keeps blocks).",
+  {},
+  async () => {
+    try {
+      const r = await postJSON("board_clear_drawings", {});
+      return { content: [{ type: "text", text: `drawings cleared rev=${r.board?.revision ?? "?"}` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
+    }
+  },
 );
 
 const transport = new StdioServerTransport();
