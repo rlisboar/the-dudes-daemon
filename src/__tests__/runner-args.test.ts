@@ -37,3 +37,15 @@ test("grok plan, compact and thinking policies are mutually consistent", () => {
   assert.equal(xhigh[effortIdx + 1], "high");
   assert.ok(!xhigh.includes("xhigh"));
 });
+
+test("grok leader socket isolates the agent when informed", () => {
+  // Sem socket: cai no leader compartilhado de ~/.grok (comportamento do CLI).
+  const shared = grokHeadlessArgs({ prompt, outputFormat: "json", workspaceRoot: "/repo" });
+  assert.ok(!shared.includes("--leader-socket"));
+  const isolated = grokHeadlessArgs({
+    prompt, outputFormat: "json", workspaceRoot: "/repo", leaderSocket: "/tmp/td-grok/abc.sock",
+  });
+  const idx = isolated.indexOf("--leader-socket");
+  assert.ok(idx >= 0);
+  assert.equal(isolated[idx + 1], "/tmp/td-grok/abc.sock");
+});

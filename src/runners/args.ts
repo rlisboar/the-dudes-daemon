@@ -50,6 +50,10 @@ export interface GrokHeadlessArgs extends OneShotArgs {
   collectThinking?: boolean;
   planMode?: boolean;
   forCompact?: boolean;
+  /** Socket do leader POR AGENTE (ver RunnerRuntimeFiles.grokLeaderSocket).
+   *  Sem isto todos os agentes dividem `~/.grok/leader.sock` — inclusive com
+   *  o `grok` interativo do usuário e com outro daemon na mesma máquina. */
+  leaderSocket?: string;
 }
 
 export function grokHeadlessArgs(input: GrokHeadlessArgs): string[] {
@@ -63,6 +67,7 @@ export function grokHeadlessArgs(input: GrokHeadlessArgs): string[] {
     "--trust",
     "--cwd", input.workspaceRoot,
   ];
+  if (input.leaderSocket) args.push("--leader-socket", input.leaderSocket);
   if (input.model) args.push("-m", input.model);
   const effort = grokThinkingEffort(input.effort, !!input.collectThinking, !!input.forCompact);
   if (effort) args.push("--effort", effort);

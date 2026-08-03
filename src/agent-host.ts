@@ -511,7 +511,18 @@ export class AgentHost {
 
   send_message(agentId: string, content: string, images?: ImageAttachment[]) {
     const e = this.entries.get(agentId);
-    if (!e?.runner) return;
+    if (!e?.runner) {
+      // Drop SILENCIOSO era o pior caso de diagnóstico: a mensagem sumia sem
+      // log e sem erro, e o chat ficava esperando resposta de um agente que
+      // não tem runner (exit não observado pelo server, reconfig no meio).
+      this.log("warn", `send_message para ${agentId} sem runner ativo (entry=${e ? "existe" : "ausente"}) — mensagem descartada`);
+      this.send({
+        type: "agent:error",
+        agentId,
+        message: "mensagem não entregue: o runner deste agente não está ativo no daemon — pare e inicie o agente",
+      });
+      return;
+    }
     e.runner.pushUserMessage(content, images);
   }
 

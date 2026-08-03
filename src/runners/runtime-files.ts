@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -50,6 +51,28 @@ export class RunnerRuntimeFiles {
 
   grokHome(): string {
     return path.join(this.input.home ?? os.homedir(), ".grok");
+  }
+
+  /**
+   * Socket do "leader" do Grok, POR AGENTE.
+   *
+   * O CLI roda um processo leader compartilhado por GROK_HOME
+   * (`~/.grok/leader.sock`) e todo cliente headless fala com ele. Com um
+   * leader só, os turnos de TODOS os agentes — mais o `grok` interativo do
+   * usuário e o de um segundo daemon na mesma máquina — dependem do mesmo
+   * processo: se ele trava, os clientes ficam esperando o socket sem
+   * consumir CPU e sem escrever nada (o hang mudo que só o restart resolvia,
+   * porque o SIGKILL do watchdog mata o CLIENTE, nunca o leader).
+   *
+   * Path curto no tmpdir do sistema de propósito: sockets Unix têm limite de
+   * ~104 bytes no macOS e o tmpdir por agente já é longo.
+   */
+  grokLeaderSocket(): string {
+    const parent = path.join(this.input.tempRoot ?? os.tmpdir(), "td-grok");
+    mkdirSync(parent, { recursive: true, mode: 0o700 });
+    try { chmodSync(parent, 0o700); } catch {}
+    const slug = createHash("sha1").update(this.input.agentId).digest("hex").slice(0, 10);
+    return path.join(parent, `${slug}.sock`);
   }
 
   crushDataDir(): string {

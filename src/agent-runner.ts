@@ -201,6 +201,10 @@ export class AgentRunner {
    *  quando a falha é determinística (sessão acima do hard cap da API). */
   /** Guard de reentrância do compactContext. */
   private compacting = false;
+  /** Desde quando `compacting` está ligado. O watchdog fica DESARMADO durante
+   *  o compact; sem teto, um await que não resolve deixa a fila parada e o
+   *  agente mudo até o usuário parar/iniciar. */
+  private compactingSince: number | null = null;
   /** Guard de reentrância do clearContext — simétrico ao `compacting`: sem
    *  ele, clear durante clear (ou compact durante clear) roda dois
    *  killClaudeForRestart+startClaude em paralelo → processo claude órfão. */
@@ -258,6 +262,12 @@ export class AgentRunner {
   private toolsInFlightSince: number | null = null;
   /** Cap de quanto tempo toolsInFlight pode bloquear o hang watch sem I/O. */
   private static readonly TOOLS_IN_FLIGHT_MAX_MS = 20 * 60_000;
+  /** Teto do compact. Acima disso o watchdog assume que travou e libera a
+   *  fila — folga sobre o pior caso legítimo (one-shot 300s + summarize). */
+  private static readonly COMPACT_STUCK_MS = 15 * 60_000;
+  /** Intervalo mínimo entre tentativas de destravar a fila (ver tickHangWatch). */
+  private static readonly QUEUE_HEAL_INTERVAL_MS = 30_000;
+  private lastQueueHealAt = 0;
 
   constructor(info: AgentInfo, private opts: AgentRunnerOptions) {
     this.info = info;
@@ -2277,6 +2287,7 @@ export class AgentRunner {
       planMode: this.info.planMode,
       sessionId: opts.resume,
       forCompact: opts.forCompact,
+      leaderSocket: this.runtimeFiles.grokLeaderSocket(),
     });
   }
 
@@ -2418,6 +2429,13 @@ export class AgentRunner {
     }
     this.ocActiveProc = proc;
     const grokTurnStartedAt = Date.now();
+    // Marco de INÍCIO do turno. Sem ele o log só tinha o fim (soft hang aos
+    // 92s, SIGKILL aos 720s) e não dava pra distinguir "CLI subiu e ficou
+    // mudo" de "turno nem começou" na hora de investigar silêncio em prod.
+    this.opts.log(
+      "info",
+      `[grok:${this.info.name}] turno iniciado pid=${proc.pid ?? "?"} session=${this.messageSession.sessionId?.slice(0, 8) ?? "nova"} firstTurn=${firstTurn} bytes=${message.length}`,
+    );
 
     // Watchdog: se o CLI não sair em GROK_TURN_TIMEOUT_MS, mata e libera
     // a fila (sintoma real: resume + prompt enorme fica em 0% CPU por horas).
@@ -3176,10 +3194,12 @@ export class AgentRunner {
       return;
     }
     this.compacting = true;
+    this.compactingSince = Date.now();
     try {
       await this.compactContextInner(saveMemory);
     } finally {
       this.compacting = false;
+      this.compactingSince = null;
       // A fila oc fica pausada durante o compact (drainOcQueue checa
       // `compacting`) — mensagens chegadas no meio precisam drenar agora.
       if (this.opts.cliRunner !== "claude") this.drainOcQueue();
@@ -3640,10 +3660,44 @@ export class AgentRunner {
 
   private tickHangWatch(): void {
     if (this.stopped || this.recoveringHung) return;
-    // compacting preso: desbloqueia a fila (senão mensagens somem pra sempre)
+    // compacting preso: desbloqueia a fila (senão mensagens somem pra sempre).
+    // Este teto era só um comentário — o código apenas retornava, então um
+    // await que nunca resolve no compact desarmava o watchdog E travava a
+    // fila: agente mudo até parar/iniciar, sem UMA linha de log.
     if (this.compacting) {
-      // compact tem timeout próprio nos one-shots; se passar 15min, força liberar
-      // (defesa se waitOcIdle/fork travar sem finally).
+      const since = this.compactingSince;
+      if (since != null && Date.now() - since >= AgentRunner.COMPACT_STUCK_MS) {
+        this.opts.log(
+          "warn",
+          `[hang:${this.info.name}] compact preso há ${Math.round((Date.now() - since) / 1000)}s — liberando flag e drenando fila`,
+        );
+        this.compacting = false;
+        this.compactingSince = null;
+        this.opts.onError("[ctx] compact travou — liberado automaticamente; a fila voltou a rodar");
+        if (this.opts.cliRunner !== "claude") this.drainOcQueue();
+      }
+      return;
+    }
+    // Fila órfã: mensagens enfileiradas, nenhum turno em voo e nada as
+    // drenando. Qualquer early-return que erre o drain (ou exceção engolida)
+    // deixava o agente mudo com as mensagens paradas — o watchdog nem
+    // acordava, porque sem busy `isInTurn()` é false. Auto-cura antes disso.
+    // Throttle: se o drain falha na origem (CLI ausente, systemPrompt cifrado)
+    // a fila continua cheia e um retry a cada tick viraria flood de log.
+    if (
+      isPerMessageRunner(this.opts.cliRunner)
+      && !this.messageSession.busy
+      && this.messageSession.queuedCount() > 0
+    ) {
+      const now = Date.now();
+      if (now - this.lastQueueHealAt >= AgentRunner.QUEUE_HEAL_INTERVAL_MS) {
+        this.lastQueueHealAt = now;
+        this.opts.log(
+          "warn",
+          `[hang:${this.info.name}] fila com ${this.messageSession.queuedCount()} msg(s) parada sem turno — drenando`,
+        );
+        this.drainOcQueue();
+      }
       return;
     }
     if (!this.isInTurn()) {
