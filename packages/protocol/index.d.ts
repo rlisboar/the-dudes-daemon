@@ -6,6 +6,16 @@ export type CliRunner = "claude" | "opencode" | "gemini" | "codex" | "crush" | "
 export type ProjectMemberRole = "admin" | "member";
 
 export declare const MAX_WIRE_MESSAGE_BYTES: number;
+export declare const MAX_DAEMON_WIRE_MESSAGE_BYTES: number;
+export declare const MAX_ATTACHMENT_BYTES: number;
+export declare const MAX_ATTACHMENTS_TOTAL_BYTES: number;
+export declare const WIRE_ENVELOPE_HEADROOM_BYTES: number;
+export declare function base64WireCost(decodedBytes: number): number;
+export declare class WireMessageTooLargeError extends Error {
+  readonly bytes: number;
+  readonly maxBytes: number;
+  constructor(bytes: number, maxBytes: number);
+}
 export declare const wireEnvelopeSchema: z.ZodObject<
   { type: z.ZodString },
   "passthrough",

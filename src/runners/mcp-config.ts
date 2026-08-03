@@ -18,7 +18,9 @@ export function buildBridgeEnv(input: {
   agentId: string; agentName: string; orchestratorUrl: string; tokenFile: string;
   features?: Record<string, string>; socketPath?: string;
 }): Record<string, string> {
-  const env = {
+  // Anotado: sem isso o TS infere o tipo exato do literal e recusa a
+  // atribuição condicional de THE_DUDES_BRIDGE_SOCKET logo abaixo.
+  const env: Record<string, string> = {
     THE_DUDES_AGENT_ID: input.agentId,
     THE_DUDES_AGENT_NAME: input.agentName,
     THE_DUDES_ORCH_URL: input.orchestratorUrl,

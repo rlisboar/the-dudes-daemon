@@ -1,4 +1,4 @@
-import type { ChildProcess, ChildProcessWithoutNullStreams } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import http, { type ClientRequest } from "node:http";
 import { terminateWithEscalation } from "./process-lifecycle.js";
 
@@ -67,7 +67,9 @@ export class OpenCodeTransport {
   private stopped = false;
 
   constructor(private readonly input: {
-    spawnServer: () => ChildProcessWithoutNullStreams;
+    // ChildProcess (não ...WithoutNullStreams): o serve sobe com
+    // stdio ['ignore','pipe','pipe'], ou seja stdin nulo por construção.
+    spawnServer: () => ChildProcess;
     streamEvents: boolean;
     onReady?: (url: string) => void;
     onExit?: (code: number | null) => void;
@@ -109,10 +111,18 @@ export class OpenCodeTransport {
         if (this.input.streamEvents) this.startEventStream();
         resolve();
       };
-      process.stdout.setEncoding("utf8");
-      process.stderr.setEncoding("utf8");
-      process.stdout.on("data", onData);
-      process.stderr.on("data", onData);
+      const { stdout, stderr } = process;
+      if (!stdout || !stderr) {
+        clearTimeout(bootTimer);
+        settled = true;
+        terminateWithEscalation(process);
+        reject(new Error("opencode serve: stdout/stderr não foram pipeados"));
+        return;
+      }
+      stdout.setEncoding("utf8");
+      stderr.setEncoding("utf8");
+      stdout.on("data", onData);
+      stderr.on("data", onData);
       process.once("exit", (code) => {
         clearTimeout(bootTimer);
         if (this.serverProcess === process) {

@@ -8,6 +8,14 @@
       "types": "./index.d.ts",
       "browser": "./index.browser.js",
       "default": "./index.js"
+    },
+    "./wire": {
+      "types": "./wire.d.ts",
+      "default": "./wire.js"
+    },
+    "./commands": {
+      "types": "./commands.d.ts",
+      "default": "./commands.js"
     }
   },
   "scripts": {

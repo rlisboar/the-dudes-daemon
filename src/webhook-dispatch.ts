@@ -263,7 +263,9 @@ export async function dispatchWebhook(args: {
     const { safeFetch } = await import("./ssrf-guard.js");
     const ctrl = new AbortController();
     const tm = setTimeout(() => ctrl.abort(), 10_000);
-    let resp: Response;
+    // Tipo derivado do próprio safeFetch: ele devolve a Response da undici,
+    // que não é a Response global do DOM (falta `bytes`, entre outras).
+    let resp: Awaited<ReturnType<typeof safeFetch>>;
     try {
       resp = await safeFetch(args.url, { method: "POST", headers, body: payload, signal: ctrl.signal }, { maxRedirects: 0 });
     } catch (e) {

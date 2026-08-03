@@ -1,10 +1,49 @@
 import { z } from "zod";
 
-export const MAX_WIRE_MESSAGE_BYTES = 8 * 1024 * 1024;
+/* ---------- orçamento de tamanho do canal ----------
+ *
+ * Fonte única dos tetos de cada salto (web → orch → daemon). Antes cada
+ * camada tinha seu próprio número e eles não fechavam: o cliente montava
+ * até 20MB de anexo, o frame WS aceitava 32MB, e o parser cortava em 8MB
+ * — então uma mensagem com 2 imagens sumia sem erro nenhum (o `catch` do
+ * dispatch engolia). O mesmo furo existia no daemon.
+ *
+ * A invariante entre eles é verificada em index.test.js; mudar um número
+ * aqui sem mudar os outros quebra o teste em vez de virar drop silencioso
+ * em produção.
+ */
+
+/** Teto do frame no canal web ↔ orchestrator. */
+export const MAX_WIRE_MESSAGE_BYTES = 32 * 1024 * 1024;
+/** Teto do frame no canal orchestrator ↔ daemon. Igual ao do web porque o
+ *  orchestrator repassa `agent:send` com os anexos intactos. */
+export const MAX_DAEMON_WIRE_MESSAGE_BYTES = 32 * 1024 * 1024;
+/** Teto de UM anexo, em bytes decodificados (o que o `File.size` reporta). */
+export const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
+/** Teto da soma dos anexos de uma mensagem, em bytes decodificados. */
+export const MAX_ATTACHMENTS_TOTAL_BYTES = 20 * 1024 * 1024;
+/** Folga reservada pro resto do envelope (texto, prefixo de sistema, IDs). */
+export const WIRE_ENVELOPE_HEADROOM_BYTES = 1024 * 1024;
+
+/** Custo no fio de `decodedBytes` depois do base64 (expande 4/3, com padding). */
+export function base64WireCost(decodedBytes) {
+  return Math.ceil(decodedBytes / 3) * 4;
+}
 
 export const wireEnvelopeSchema = z.object({
   type: z.string().min(1).max(100),
 }).passthrough();
+
+/** Erro distinguível de "grande demais" — o caller precisa separar isso de
+ *  JSON malformado pra avisar o usuário em vez de descartar em silêncio. */
+export class WireMessageTooLargeError extends Error {
+  constructor(bytes, maxBytes) {
+    super(`wire message exceeds ${maxBytes} bytes (got ${bytes})`);
+    this.name = "WireMessageTooLargeError";
+    this.bytes = bytes;
+    this.maxBytes = maxBytes;
+  }
+}
 
 function byteLength(raw) {
   if (typeof raw === "string") return new TextEncoder().encode(raw).byteLength;
@@ -14,7 +53,8 @@ function byteLength(raw) {
 
 export function parseWireMessage(raw, options = {}) {
   const maxBytes = options.maxBytes ?? MAX_WIRE_MESSAGE_BYTES;
-  if (byteLength(raw) > maxBytes) throw new Error(`wire message exceeds ${maxBytes} bytes`);
+  const bytes = byteLength(raw);
+  if (bytes > maxBytes) throw new WireMessageTooLargeError(bytes, maxBytes);
   const decoded = JSON.parse(typeof raw === "string" ? raw : new TextDecoder().decode(raw));
   const message = wireEnvelopeSchema.parse(decoded);
   if (options.allowedTypes && !options.allowedTypes.has(message.type)) {

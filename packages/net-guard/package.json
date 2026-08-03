@@ -1,0 +1,19 @@
+{
+  "name": "@the-dudes/net-guard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    }
+  },
+  "scripts": {
+    "lint": "eslint index.js --max-warnings=0",
+    "test": "node --test *.test.js"
+  },
+  "dependencies": {
+    "undici": "^6.21.0"
+  }
+}

@@ -14,7 +14,7 @@ import { compatibleSessionId } from "./runners/index.js";
 // Works in both CJS bundle (where __dirname is native) and ESM dev (tsx)
 // where we fall back to the process entry script.
 const baseDir: string = (() => {
-  // @ts-expect-error — __dirname only exists in the bundled CJS build
+  // __dirname só existe no bundle CJS; em ESM (tsx) o typeof cai no else.
   if (typeof __dirname !== "undefined") return __dirname as string;
   const entry = process.argv[1] || ".";
   return path.dirname(path.resolve(entry));

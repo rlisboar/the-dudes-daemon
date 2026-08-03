@@ -1096,7 +1096,7 @@ export class AgentRunner {
       orchestratorUrl: this.opts.orchestratorUrl,
       tokenFile: this.runtimeFiles.tokenFile(),
       features: this.featuresEnv(),
-      socketPath: this.opts.bridgeSocketPath,
+      socketPath: this.opts.bridgeSocketPath ?? undefined,
     });
   }
 
@@ -1262,7 +1262,7 @@ export class AgentRunner {
       agentId: this.info.id,
       agentName: this.info.name,
       orchestratorUrl: this.opts.orchestratorUrl,
-      bridgeSocketPath: this.opts.bridgeSocketPath,
+      bridgeSocketPath: this.opts.bridgeSocketPath ?? undefined,
       claudeConfigDir: this.opts.cliRunner === "claude" ? this.resolveClaudeConfigDir() : undefined,
       opencodeConfigPath: this.opts.cliRunner === "opencode" ? this.runtimeFiles.openCodeConfigPath() : undefined,
     });

@@ -16,17 +16,19 @@
   "scripts": {
     "dev": "tsx watch src/main.ts",
     "start": "node dist/daemon.cjs",
-    "build": "node scripts/build.mjs",
+    "build": "npm run typecheck && node scripts/build.mjs",
     "build:legacy": "npm run build:daemon && npm run build:bridge",
     "build:daemon": "esbuild src/main.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/daemon.cjs --banner:js=\"#!/usr/bin/env node\"",
     "build:bridge": "esbuild src/mcp-bridge.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/mcp-bridge.cjs",
     "lint": "eslint src --max-warnings=0",
-    "test": "node --import tsx --test \"src/**/*.test.ts\""
+    "test": "node --import tsx --test \"src/**/*.test.ts\"",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@the-dudes/protocol": "file:packages/protocol",
     "@modelcontextprotocol/sdk": "^1.0.4",
     "@sentry/node": "^10.52.0",
+    "@the-dudes/net-guard": "file:packages/net-guard",
+    "@the-dudes/protocol": "file:packages/protocol",
     "undici": "^6.21.0",
     "ws": "^8.18.0",
     "zod": "^3.23.8"
@@ -34,7 +36,7 @@
   "devDependencies": {
     "@types/node": "^22.7.4",
     "@types/ws": "^8.5.12",
-    "esbuild": "0.24.2",
+    "esbuild": "0.28.1",
     "tsx": "^4.19.1",
     "typescript": "^5.6.2"
   }

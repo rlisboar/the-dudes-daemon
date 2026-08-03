@@ -8,7 +8,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { WebSocket } from "ws";
-import { parseWireMessage } from "@the-dudes/protocol";
+import { MAX_DAEMON_WIRE_MESSAGE_BYTES, WireMessageTooLargeError, parseWireMessage } from "@the-dudes/protocol";
 import { AgentHost } from "./agent-host.js";
 import { assertWorkspaceScoped, autoWorkspaceCwd, describeGitRoots, ensureWritableDir, expandBasePath, isInsideRoot, validateBasePath, validateGitHash, validateGitRef } from "./workspace.js";
 import { buildGraph, graphMtime, graphPath, hasSemanticMarker, loadGraphJsonForUi, needsSemanticUpdate } from "./graph-indexer.js";
@@ -253,7 +253,7 @@ class DaemonClient {
       // Force IPv4 to avoid EHOSTUNREACH on dual-stack hosts where the
       // resolver hands the underlying http(s) agent an unreachable v6 path.
       family: 4,
-      maxPayload: 32 * 1024 * 1024,
+      maxPayload: MAX_DAEMON_WIRE_MESSAGE_BYTES,
       handshakeTimeout: 15_000,
       // perMessageDeflate=false: 4G/lossy networks corrompem stream do
       // deflate (pacote perdido invalida sliding window do compress).
@@ -330,7 +330,18 @@ class DaemonClient {
 
     ws.on("message", (raw: Buffer) => {
       let msg: FromOrch;
-      try { msg = parseWireMessage<FromOrch>(raw.toString()); } catch { return; }
+      try {
+        msg = parseWireMessage<FromOrch>(raw.toString(), { maxBytes: MAX_DAEMON_WIRE_MESSAGE_BYTES });
+      } catch (e) {
+        // O default do parser era 8MB enquanto o socket aceitava 32MB: um
+        // `agent:send` com imagens era descartado aqui em silêncio e o
+        // agente simplesmente nunca recebia o prompt. Agora o teto bate com
+        // o do socket, e o que ainda estourar aparece no log.
+        if (e instanceof WireMessageTooLargeError) {
+          log("warn", `mensagem do orchestrator grande demais (${e.bytes}B > ${e.maxBytes}B) — descartada`);
+        }
+        return;
+      }
       // Tracka maior seq visto pra resume no próximo reconnect. Server
       // injeta seq em cada msg via sendDaemon. Replay duplica msgs com
       // seq <= lastSeen — handle natural cobre (correlationId match
