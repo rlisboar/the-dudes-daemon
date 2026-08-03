@@ -590,6 +590,7 @@ class DaemonClient {
         this.host.stop(msg.agentId);
         return;
       case "agent:send": {
+        log("info", `agent:send recebido agent=${msg.agentId} bytes=${String(msg.content ?? "").length} imgs=${(msg.images ?? []).length}`);
         let content: string;
         const dropMissingKey = () => {
           log("warn", `agent:send to ${msg.agentId} encrypted but project key not held — dropping`);

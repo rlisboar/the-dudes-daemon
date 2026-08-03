@@ -30,6 +30,15 @@ test("OpenCode normalizes session, completed tools and step usage", () => {
   assert.deepEqual(parseOpenCodeTurnEvent({ type: "text", sessionID: "ses_1", part: { text: " hi " } }), [{ type: "session", sessionId: "ses_1" }, { type: "text", text: "hi" }]);
   assert.deepEqual(parseOpenCodeTurnEvent({ type: "tool_use", part: { tool: "read", state: { status: "completed", input: { path: "a" } } } }), [{ type: "tool", name: "read", input: { path: "a" } }]);
   assert.deepEqual(parseOpenCodeTurnEvent({ type: "tool", part: { state: { status: "pending" } } }), []);
+  // `running` já traz input resolvido — é o que faz o RUN aparecer ao vivo.
+  assert.deepEqual(
+    parseOpenCodeTurnEvent({ type: "tool", part: { id: "prt_1", tool: "bash", state: { status: "running", input: { command: "ls" } } } }),
+    [{ type: "tool", name: "bash", input: { command: "ls" }, id: "prt_1" }],
+  );
+  assert.deepEqual(parseOpenCodeTurnEvent({ type: "reasoning", part: { text: " pensando " } }), [{ type: "thought", text: "pensando" }]);
+  // synthetic/ignored não são fala do modelo (resumo do compact, part descartada).
+  assert.deepEqual(parseOpenCodeTurnEvent({ type: "text", part: { text: "resumo", synthetic: true } }), []);
+  assert.deepEqual(parseOpenCodeTurnEvent({ type: "text", part: { text: "lixo", ignored: true } }), []);
   assert.deepEqual(parseOpenCodeTurnEvent({ type: "step_finish", part: { tokens: { input: 9, output: 2, cache: { write: 1, read: 3 } } } }), [{ type: "usage", input: 9, output: 2, cacheCreate: 1, cacheRead: 3, cumulative: false }]);
 });
 

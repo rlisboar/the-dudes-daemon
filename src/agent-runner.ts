@@ -42,7 +42,7 @@ import { PerMessageSessionState } from "./runners/message-session.js";
 import { buildAgentContext, buildInitialMessage, buildSystemPromptHeader, buildWorkspacePrompt } from "./runners/prompts.js";
 import { claudeThinkingEffort, codexEffort, providerModelParts, resolveContextLimit } from "./runners/model-policy.js";
 import { classifyRunnerFailure, isAbortedFailure, isApiErrorMessage, isAuthenticationFailure, isLoopStopMessage, isMissingSessionFailure as isMissingSessionMessage } from "./runners/error-classifier.js";
-import { appendFileImagePrompt, buildClaudeUserContent, buildOpenCodeParts, codexImageArgs, imageExtension } from "./runners/attachments.js";
+import { appendFilePrompt, appendPathAttachmentPrompt, attachmentExtension, buildClaudeUserContent, buildOpenCodeParts, codexImageArgs, imageExtension, isInlineImage, safeAttachmentName } from "./runners/attachments.js";
 export {
   extractOneShotText,
   grokSignalsPath,
@@ -285,12 +285,17 @@ export class AgentRunner {
         { cwd: this.opts.workspaceRoot, env: this.buildEnv(), stdio: ["ignore", "pipe", "pipe"] },
         this.opts.dropTo ?? null,
       ),
-      streamEvents: !opts.autoApprove,
+      // Stream SEMPRE ligado: era `!autoApprove` (só pra receber
+      // permission.asked), então com auto-approve — o modo comum — nada
+      // chegava até o POST /message retornar e a UI ficava muda o turno
+      // inteiro. É por aqui que saem RUNs, reasoning e usage ao vivo.
+      streamEvents: true,
       onReady: (url) => this.opts.log("info", `[cli:${this.info.id}:opencode] serve ready ${url}`),
       onExit: (code) => this.opts.log("warn", `[cli:${this.info.id}:opencode] serve exited (code ${code})`),
       onEvent: (event) => {
-        const value = event as { type?: string; properties?: unknown };
-        if (value?.type === "permission.asked") void this.ocHandlePermissionAsked(value.properties ?? {});
+        const value = event as { type?: string; properties?: any };
+        if (value?.type === "permission.asked") { void this.ocHandlePermissionAsked(value.properties ?? {}); return; }
+        if (value?.type === "message.part.updated") this.ocHandleStreamPart(value.properties ?? {});
       },
     });
     if (isPerMessageRunner(opts.cliRunner) && opts.resumeSessionId) {
@@ -1613,7 +1618,15 @@ export class AgentRunner {
   private static readonly OC_EMPTY_RETRIES = 1;
 
   private async runOpenCodeMessageAttached(content: string, images?: ImageAttachment[], retry = 0) {
-    if (this.stopped || !this.openCodeTransport.ready()) return;
+    // Descarte silencioso: sem este log não dá pra distinguir "mensagem nunca
+    // chegou" de "chegou e morreu aqui" — que é o sintoma de ficar mudo.
+    if (this.stopped || !this.openCodeTransport.ready()) {
+      this.opts.log(
+        "warn",
+        `[cli:${this.info.id}:opencode] mensagem DESCARTADA — stopped=${this.stopped} transportReady=${this.openCodeTransport.ready()}`,
+      );
+      return;
+    }
     // Coleta a janela real do catálogo em paralelo ao turno (idempotente).
     void this.fetchOcCatalogLimit();
     this.ocRunSawOutput = false;
@@ -1663,7 +1676,9 @@ export class AgentRunner {
     // models (ex: deepseek-v4-pro) → agente mudo. O serve retorna a message
     // completa {info, parts:[step-start, reasoning, text, tool, step-finish]}.
     // Imagens viram FilePartInput com data-URL (opencode aceita inline; sem temp).
-    const parts = buildOpenCodeParts(message, images);
+    const anexosOc = this.attachNonImageFiles(message, images);
+    const parts = buildOpenCodeParts(anexosOc.content, images);
+    this.scheduleAttachmentCleanup(anexosOc.cleanup);
     let resp: any;
     try {
       resp = await this.ocServeFetch(
@@ -1712,10 +1727,18 @@ export class AgentRunner {
     if (!this.messageSession.owns(turnEpoch, turnSession)) return;
     // Serve pode responder 200 com o erro do provider embutido em info.error
     // (nunca passa pelas parts) — cobre a variante que o reject do POST não vê.
+    // Erro do provider vem DENTRO de um 200 do serve. Ele era extraído aqui e
+    // entregue só ao checkContextFullError — qualquer erro que não fosse
+    // "contexto cheio" (403 prompt injection, 401 chave, 429 cota) era
+    // descartado, e o turno terminava mudo. O caminho do claude (ver ~1222) já
+    // fazia checkContextFullError + onError; aqui faltava o segundo.
     const infoErr = resp?.info?.error;
     if (infoErr) {
       const im = typeof infoErr === "string" ? infoErr : String(infoErr?.data?.message ?? infoErr?.message ?? JSON.stringify(infoErr));
       this.checkContextFullError(im);
+      const status = infoErr?.data?.statusCode;
+      const nome = infoErr?.name ? `${infoErr.name}: ` : "";
+      this.opts.onError(`opencode: ${nome}${status ? `${status} — ` : ""}${im}`);
     }
     // O POST /message só retorna a ÚLTIMA mensagem do assistant; as tool calls
     // ficam em mensagens INTERMEDIÁRIAS do loop (uma msg por step). Busca TODAS
@@ -1728,7 +1751,10 @@ export class AgentRunner {
     if (!this.messageSession.owns(turnEpoch, turnSession)) return;
     this.ocActiveProc = null;
     this.messageSession.busy = false;
-    if (!this.ocRunSawOutput && retry < AgentRunner.OC_EMPTY_RETRIES) {
+    // "resposta vazia" só descreve turno SEM erro conhecido. Com erro já
+    // reportado acima, repetir isso escondia a causa atrás de um palpite
+    // ("provável flap") — e retentar 401/403 só queima chamada.
+    if (!this.ocRunSawOutput && !infoErr && retry < AgentRunner.OC_EMPTY_RETRIES) {
       this.opts.onError(`opencode: resposta vazia (provável flap do provider) — retry ${retry + 1}/${AgentRunner.OC_EMPTY_RETRIES}`);
       this.messageSession.restoreFirstTurn(firstTurnSnapshot);
       this.messageSession.busy = true;
@@ -1861,6 +1887,42 @@ export class AgentRunner {
     this.applyOpenCodeEvents(p);
   }
 
+  /**
+   * Part chegando pelo SSE `/event` do serve (`message.part.updated`) — é o
+   * que faz RUN, reasoning e usage aparecerem DURANTE o turno; antes tudo
+   * esperava o POST /message retornar.
+   *
+   * Filtros que importam:
+   *  - sessão: o serve é por agente, mas o compact resume num FORK e o
+   *    one-shot roda em sessão própria — part de outra sessão não pode
+   *    "falar" na conversa (nem mover a sessão corrente);
+   *  - texto/reasoning sem `time.end`: a part ainda cresce (o serve reenvia o
+   *    texto ACUMULADO a cada delta) e a UI cria uma mensagem por emissão —
+   *    emitir antes do fim publicaria o mesmo bloco várias vezes;
+   *  - dedup no MESMO `ocSeenPartIds` que o POST final consulta: o que sai
+   *    aqui não sai duas vezes lá.
+   */
+  private ocHandleStreamPart(props: any): void {
+    const part = props?.part;
+    const sid = part?.sessionID ?? props?.sessionID;
+    if (!part || !sid || sid !== this.messageSession.sessionId) return;
+    // Sinal de vida pro watchdog: sem stream, um turno longo em tools ficava
+    // sem nenhum toque de atividade e batia no limiar de hang.
+    this.touchActivity();
+    const type = String(part.type ?? "");
+    if ((type === "text" || type === "reasoning") && !part.time?.end) return;
+    // Tool começa em `pending` (sem input resolvido): o parser não emite nada
+    // aí, e marcar o id como visto agora enterraria o `running` que vem logo
+    // depois — a tool nunca apareceria.
+    if (type.startsWith("tool") && String(part.state?.status ?? "") === "pending") return;
+    const id = typeof part.id === "string" ? part.id : undefined;
+    if (id) {
+      if (this.ocSeenPartIds.has(id)) return;
+      this.ocSeenPartIds.add(id);
+    }
+    this.ocDispatchPart(part);
+  }
+
   private applyOpenCodeEvents(raw: unknown): void {
     for (const event of parseOpenCodeTurnEvent(raw)) {
       if (event.type === "session") {
@@ -1876,6 +1938,11 @@ export class AgentRunner {
         this.ocRunSawOutput = true;
         this.opts.onToolUse(event.name, event.input);
         this.setState("thinking");
+      } else if (event.type === "thought") {
+        // ReasoningPart: mesmo canal do extended thinking do claude e do
+        // `thought` do grok — gated por collectThinking.
+        this.setState("thinking");
+        if (this.info.collectThinking) this.opts.onThinkingText?.(event.text);
       } else if (event.type === "usage") {
         const delta: AgentUsage = {
           input: event.input,
@@ -1915,12 +1982,12 @@ export class AgentRunner {
     if (firstTurn) {
       message = this.initialMessage(content, pendingSummary);
     }
-    // Imagens: gemini lê arquivos referenciados por @<path> no prompt.
+    // Anexos: gemini lê arquivos referenciados por @<path> no prompt.
     let imgCleanup = () => {};
     if (images && images.length) {
-      const { paths, cleanup } = this.writeImageTempFiles(images);
+      const { files, cleanup } = this.writeAttachmentFiles(images);
       imgCleanup = cleanup;
-      message = appendFileImagePrompt(message, paths, "gemini");
+      message = appendPathAttachmentPrompt(message, files, "gemini");
     }
     this.traceCli("gemini", "argv", message);
 
@@ -2066,7 +2133,6 @@ export class AgentRunner {
     let message = content;
     const firstTurnSnapshot = this.messageSession.consumeFirstTurnIfNeeded();
     if (firstTurnSnapshot.firstTurn) message = this.initialMessage(content, firstTurnSnapshot.pendingSummary);
-    this.traceCli("codex", "argv", message);
 
     const configArgs = this.buildCodexConfigArgs();
     const commonFlags = [
@@ -2081,13 +2147,18 @@ export class AgentRunner {
     ];
 
     // Imagens: codex aceita `-i <FILE>` (repetido). Grava temp e anexa.
+    // `-i` é SÓ imagem — PDF/txt por ali o codex recusa; esses vão por
+    // caminho no prompt, pra tool de leitura dele abrir.
     let imgCleanup = () => {};
     let imageArgs: string[] = [];
     if (images && images.length) {
-      const { paths, cleanup } = this.writeImageTempFiles(images);
+      const { files, cleanup } = this.writeAttachmentFiles(images);
       imgCleanup = cleanup;
-      imageArgs = codexImageArgs(paths);
+      imageArgs = codexImageArgs(files.filter((f) => f.inline).map((f) => f.path));
+      message = appendFilePrompt(message, files.filter((f) => !f.inline));
     }
+    // Trace depois dos anexos: o que vai no argv é o prompt já com os paths.
+    this.traceCli("codex", "argv", message);
 
     const args = this.messageSession.sessionId
       ? ["exec", "resume", ...commonFlags, this.messageSession.sessionId, ...imageArgs, message]
@@ -2308,12 +2379,12 @@ export class AgentRunner {
       this.messageSession.firstTurn = false;
     }
 
-    // Imagens: grava temp e referencia por path (tool read_file do Grok).
+    // Anexos: grava temp e referencia por path (tool read_file do Grok).
     let imgCleanup = () => {};
     if (images && images.length) {
-      const { paths, cleanup } = this.writeImageTempFiles(images);
+      const { files, cleanup } = this.writeAttachmentFiles(images);
       imgCleanup = cleanup;
-      message = appendFileImagePrompt(message, paths, "grok");
+      message = appendPathAttachmentPrompt(message, files, "grok");
     }
 
     // Prime do dedupe de tool_calls: em resume de sessão com histórico,
@@ -2728,13 +2799,13 @@ export class AgentRunner {
     if (firstTurn) {
       message = this.initialMessage(content, pendingSummary);
     }
-    // Imagens: crush run não tem flag de attachment — grava temp e referencia
-    // por path no prompt (a tool `view` do crush lê imagem do disco).
+    // Anexos: crush run não tem flag de attachment — grava temp e referencia
+    // por path no prompt (a tool `view` do crush lê o arquivo do disco).
     let imgCleanup = () => {};
     if (images && images.length) {
-      const { paths, cleanup } = this.writeImageTempFiles(images);
+      const { files, cleanup } = this.writeAttachmentFiles(images);
       imgCleanup = cleanup;
-      message = appendFileImagePrompt(message, paths, "crush");
+      message = appendPathAttachmentPrompt(message, files, "crush");
     }
     this.traceCli("crush", "argv", message);
 
@@ -2896,13 +2967,56 @@ export class AgentRunner {
     }
   }
 
-  /** Grava imagens (base64) em arquivos temp no tmpdir do agente — pros runners
-   *  per-message que aceitam imagem por caminho de arquivo (codex `-i`, gemini
-   *  `@path`). Retorna paths + cleanup. opencode usa data-URL inline (não temp). */
-  private writeImageTempFiles(images: ImageAttachment[]): { paths: string[]; cleanup: () => void } {
-    const result = this.runtimeFiles.writeImages(images, imageExtension);
-    for (const error of result.errors) this.opts.log("warn", `[cli:${this.info.id}] falha gravando imagem temp: ${error.message}`);
-    return { paths: result.paths, cleanup: result.cleanup };
+  /** Anexo já gravado em disco: `inline` marca o que o modelo também aceita
+   *  no payload (imagem raster) — o resto só existe como arquivo. */
+  private static readonly ATTACHMENT_TTL_MS = 30 * 60_000;
+
+  /** Grava anexos (base64) em arquivos temp no tmpdir do agente — pros runners
+   *  per-message que recebem por caminho (codex `-i`, gemini `@path`) e pro
+   *  não-imagem do claude/opencode, que mandam imagem inline mas não arquivo. */
+  private writeAttachmentFiles(
+    items: ImageAttachment[],
+  ): { files: Array<{ path: string; name: string; inline: boolean }>; cleanup: () => void } {
+    const result = this.runtimeFiles.writeImages(
+      items,
+      imageExtension,
+      (a, i, nonce) =>
+        isInlineImage(a)
+          ? `img-${nonce}-${i}.${imageExtension(a.mimeType)}`
+          // Nome original preservado: é o que o agente lê no prompt.
+          : `${nonce}-${safeAttachmentName((a as ImageAttachment).name, `anexo-${i}.${attachmentExtension(a as ImageAttachment)}`)}`,
+    );
+    for (const error of result.errors) this.opts.log("warn", `[cli:${this.info.id}] falha gravando anexo temp: ${error.message}`);
+    // `written` traz o índice de origem — `paths` sozinho desalinha os nomes
+    // quando uma gravação falha no meio.
+    const files = result.written.map(({ index, path: filePath }) => ({
+      path: filePath,
+      name: items[index]?.name ?? filePath.split("/").pop() ?? "anexo",
+      inline: isInlineImage(items[index] ?? { mimeType: "" }),
+    }));
+    return { files, cleanup: result.cleanup };
+  }
+
+  /**
+   * Anexo temp não pode sumir junto com o turno: o agente lê o arquivo quando
+   * chega na tool (fila, aprovação, thinking longo), não quando a mensagem
+   * entra. `unref` pra o timer pendente não segurar o shutdown do daemon.
+   */
+  private scheduleAttachmentCleanup(cleanup: () => void): void {
+    const timer = setTimeout(cleanup, AgentRunner.ATTACHMENT_TTL_MS);
+    timer.unref?.();
+  }
+
+  /**
+   * Grava só os anexos NÃO-imagem e devolve o trecho de prompt que os
+   * referencia. Para claude/opencode, que mandam imagem inline: sem isto o
+   * arquivo era filtrado do payload e sumia sem erro nenhum.
+   */
+  private attachNonImageFiles(content: string, images?: ImageAttachment[]): { content: string; cleanup: () => void } {
+    const arquivos = (images ?? []).filter((a) => !isInlineImage(a));
+    if (!arquivos.length) return { content, cleanup: () => {} };
+    const { files, cleanup } = this.writeAttachmentFiles(arquivos);
+    return { content: appendFilePrompt(content, files), cleanup };
   }
 
   private drainOcQueue() {
@@ -2964,7 +3078,10 @@ export class AgentRunner {
       this.opts.log("info", `[cli:${this.info.id}:claude] buffered message during restart (queued=${this.pendingMessages.length})`);
       return;
     }
-    const messageContent = buildClaudeUserContent(content, images);
+    // Não-imagem não cabe no payload inline do claude — vai por arquivo.
+    const anexos = this.attachNonImageFiles(content, images);
+    const messageContent = buildClaudeUserContent(anexos.content, images);
+    this.scheduleAttachmentCleanup(anexos.cleanup);
     const line = JSON.stringify({
       type: "user",
       message: { role: "user", content: messageContent },

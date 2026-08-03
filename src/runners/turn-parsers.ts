@@ -71,11 +71,26 @@ export function parseOpenCodeTurnEvent(raw: unknown): NormalizedTurnEvent[] {
   if (typeof event.sessionID === "string" && event.sessionID) out.push({ type: "session", sessionId: event.sessionID });
   const part = record(event.part) ?? event;
   const type = String(event.type ?? part.type ?? "").replace(/-/g, "_");
-  if (type === "text" && typeof part.text === "string" && part.text.trim()) out.push({ type: "text", text: part.text.trim() });
-  else if (["tool", "tool_use", "tool_call"].includes(type)) {
+  if (type === "text" && typeof part.text === "string" && part.text.trim()) {
+    // TextPart tem `synthetic` (texto que o próprio opencode injeta — resumo
+    // do compact, avisos) e `ignored` (part que ele descartou): nenhum dos
+    // dois é fala do modelo, e o resumo ecoado vira mensagem duplicada.
+    if (!part.synthetic && !part.ignored) out.push({ type: "text", text: part.text.trim() });
+  } else if (type === "reasoning" && typeof part.text === "string" && part.text.trim()) {
+    out.push({ type: "thought", text: part.text.trim() });
+  } else if (["tool", "tool_use", "tool_call"].includes(type)) {
     const state = record(part.state);
-    if (!state?.status || state.status === "completed" || state.status === "error") {
-      out.push({ type: "tool", name: String(part.tool ?? part.name ?? state?.name ?? ""), input: state?.input ?? part.input ?? {} });
+    // ToolState: pending → running → completed|error. `pending` ainda não tem
+    // o input resolvido (só o raw), então o RUN sairia sem argumentos; de
+    // `running` em diante já dá pra mostrar a tool ao vivo.
+    if (!state?.status || ["running", "completed", "error"].includes(String(state.status))) {
+      const id = typeof part.id === "string" && part.id ? part.id : undefined;
+      out.push({
+        type: "tool",
+        name: String(part.tool ?? part.name ?? state?.name ?? ""),
+        input: state?.input ?? part.input ?? {},
+        ...(id ? { id } : {}),
+      });
     }
   } else if (type === "step_start") out.push({ type: "result" });
   else if (type === "step_finish") {

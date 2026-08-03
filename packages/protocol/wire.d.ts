@@ -485,9 +485,19 @@ export interface CredentialPublic {
   agentAccess?: boolean;
 }
 
+/**
+ * Anexo de mensagem de chat.
+ *
+ * O nome é histórico: começou só com imagem, hoje carrega qualquer arquivo.
+ * A distinção importa no daemon — IMAGEM vai inline pro modelo (visão), e
+ * qualquer outra coisa é gravada em disco e referenciada por caminho no
+ * prompt. Mandar um PDF como `type: "image"` quebra o runner.
+ */
 export interface ImageAttachment {
   mimeType: string;
   base64: string;
+  /** Nome original do arquivo. Ausente em anexos antigos (só imagem colada). */
+  name?: string;
 }
 
 export interface Task {

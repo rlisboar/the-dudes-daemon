@@ -41,6 +41,22 @@ test("runtime files provide stable runner homes and clean temporary images", () 
     first.cleanup();
     assert.equal(first.paths.length, 1);
     assert.throws(() => statSync(first.paths[0]));
+
+    // Gravação que falha no meio: `written` guarda o índice de origem, senão
+    // o chamador casa o path do 3º anexo com o nome do 2º.
+    const parcial = files.writeImages(
+      [
+        { mimeType: "image/png", base64: "aGk=" },
+        { mimeType: "image/png", base64: "aGk=" },
+        { mimeType: "image/png", base64: "aGk=" },
+      ],
+      () => "png",
+      (_img, i) => (i === 1 ? "inexistente/x.png" : `ok-${i}.png`),
+    );
+    assert.equal(parcial.errors.length, 1);
+    assert.deepEqual(parcial.written.map((w) => w.index), [0, 2]);
+    assert.deepEqual(parcial.written.map((w) => w.path), parcial.paths);
+    parcial.cleanup();
   } finally {
     files.cleanup();
     rmSync(root, { recursive: true, force: true });

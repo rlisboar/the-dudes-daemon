@@ -64,21 +64,42 @@ export class RunnerRuntimeFiles {
     return dir;
   }
 
-  writeImages(images: RuntimeImage[], extensionFor: (mimeType: string) => string) {
+  /**
+   * Grava anexos em arquivo temporário.
+   *
+   * `nameFor` decide o nome final: para imagem colada segue `img-<nonce>-<i>`,
+   * mas arquivo anexado preserva o nome original (sanitizado) — é o que o
+   * agente vê no prompt, e `anexo-3.bin` não diz nada sobre o conteúdo.
+   *
+   * `written` carrega o índice do anexo de origem: `paths` pula os que
+   * falharam, então casar `paths[i]` com `images[i]` desloca os nomes a
+   * partir da primeira falha.
+   */
+  writeImages(
+    images: RuntimeImage[],
+    extensionFor: (mimeType: string) => string,
+    nameFor?: (image: RuntimeImage, index: number, nonce: string) => string,
+  ) {
     const paths: string[] = [];
+    const written: Array<{ index: number; path: string }> = [];
     const errors: Error[] = [];
     const nonce = `${Date.now()}-${process.pid}-${this.imageSequence++}`;
     images.forEach((image, index) => {
-      const filePath = path.join(this.tempDir(), `img-${nonce}-${index}.${extensionFor(image.mimeType)}`);
+      const nome = nameFor
+        ? nameFor(image, index, nonce)
+        : `img-${nonce}-${index}.${extensionFor(image.mimeType)}`;
+      const filePath = path.join(this.tempDir(), nome);
       try {
         writeFileSync(filePath, Buffer.from(image.base64, "base64"), { mode: 0o600 });
         paths.push(filePath);
+        written.push({ index, path: filePath });
       } catch (error) {
         errors.push(error instanceof Error ? error : new Error(String(error)));
       }
     });
     return {
       paths,
+      written,
       errors,
       cleanup: () => {
         for (const filePath of paths) {

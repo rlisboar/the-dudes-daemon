@@ -47,6 +47,8 @@ export interface AgentInfo {
 export interface ImageAttachment {
   mimeType: string;
   base64: string;
+  /** Nome original. Imagem só colada não tem; arquivo anexado tem. */
+  name?: string;
 }
 
 export interface RepoSummary {
