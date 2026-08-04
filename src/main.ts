@@ -1,5 +1,6 @@
 import { healthSnapshot, recentLogs, recordLog, recordWsRtt } from "./health-monitor.js";
 import { turnGateStats } from "./runners/turn-gate.js";
+import { checkAndApplyUpdate } from "./self-update.js";
 import { WIRE_PROTOCOL_VERSION } from "@the-dudes/protocol/wire-version";
 import { initSentry, capture, captureWarn, breadcrumb, setTag, flush as flushSentry } from "./sentry.js";
 initSentry(); // gated em SENTRY_DSN_DAEMON / SENTRY_DSN; no-op sem env
@@ -27,7 +28,9 @@ import { ModelDiscovery } from "./model-discovery.js";
 import { parseGitPorcelain } from "./git-status.js";
 import { applyMemoryCharBudget } from "./memory-utils.js";
 
-const VERSION = "0.1.0";
+// Embutida no build a partir do package.json (ver build.mjs); fallback pro
+// modo dev (tsx direto, sem define).
+const VERSION = process.env.DAEMON_PKG_VERSION ?? "0.0.0-dev";
 
 function runningBinaryHash(): string | undefined {
   try { return createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"); }
@@ -333,6 +336,7 @@ class DaemonClient {
       }
       this.startPing();
       this.startHeartbeat();
+      this.scheduleSelfUpdate();
     });
 
     ws.on("message", (raw: Buffer) => {
@@ -1779,6 +1783,31 @@ class DaemonClient {
       this.sendHealth();
     }, DaemonClient.HEARTBEAT_INTERVAL_MS);
   }
+  private selfUpdateTimer: NodeJS.Timeout | null = null;
+
+  /**
+   * Self-update assinado: 2min após conectar (não no boot — deixa o canal
+   * estabilizar) e depois a cada hora. Opt-out: THE_DUDES_SELF_UPDATE=0.
+   * Só troca binário com assinatura Ed25519 válida; ver self-update.ts.
+   */
+  private scheduleSelfUpdate() {
+    if (process.env.THE_DUDES_SELF_UPDATE === "0") return;
+    if (this.selfUpdateTimer) return;
+    const rodar = () => {
+      void checkAndApplyUpdate({
+        orchBase: this.orchUrl,
+        selfPath: process.argv[1] ?? "",
+        runningHash: runningBinaryHash(),
+        log,
+        underLauncher: process.env.THE_DUDES_LAUNCHER === "1",
+      });
+    };
+    const primeira = setTimeout(rodar, 2 * 60_000);
+    primeira.unref?.();
+    this.selfUpdateTimer = setInterval(rodar, 60 * 60_000);
+    this.selfUpdateTimer.unref?.();
+  }
+
   /** Snapshot de saúde → server → UI. Falha silenciosa se o canal caiu. */
   private sendHealth() {
     try {

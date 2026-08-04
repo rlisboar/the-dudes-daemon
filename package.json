@@ -1,6 +1,6 @@
 {
   "name": "@the-dudes/daemon",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "the-dudes daemon — roda agentes CLI (claude, codex, gemini, opencode) na sua máquina sob orquestração remota, com E2EE e aprovação manual.",
   "license": "Apache-2.0",
