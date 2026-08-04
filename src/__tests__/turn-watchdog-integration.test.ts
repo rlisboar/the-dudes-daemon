@@ -17,10 +17,10 @@ describe("hang detection scenario (Grok)", () => {
     const clock = createActivityClock(0);
     const events: string[] = [];
 
-    // 0–89s: ok
-    assert.equal(hangPhase(89_000, t), "ok");
+    // abaixo de soft: ok
+    assert.equal(hangPhase(t.softMs - 1, t), "ok");
 
-    // 90s: soft once
+    // soft uma vez
     assert.equal(hangPhase(t.softMs, t), "soft");
     if (!clock.softReported) {
       clock.softReported = true;
@@ -50,11 +50,12 @@ describe("hang detection scenario (Grok)", () => {
     assert.ok(t.deadProcMs <= 20_000);
   });
 
-  it("grok hard is well under the 12min turn hard-timeout", () => {
-    // Hang watch deve matar busy ANTES do armHardTimeout de 12min —
-    // senão mtime de sessão mantinha o agente mudo por tempo demais.
+  it("grok hard is ≤120s (aceitável; armHardTimeout 12min é só backstop)", () => {
+    // T-009: detecção ≤120s. hard 4min era longo demais sob thrash e ainda
+    // assim não disparava se activity contasse bytes brutos.
     const t = hangThresholds("grok");
-    assert.ok(t.hardMs <= 5 * 60_000);
-    assert.ok(t.hardMs >= 2 * 60_000);
+    assert.ok(t.hardMs <= 120_000, `hardMs=${t.hardMs} > 120s`);
+    assert.ok(t.hardMs > t.softMs);
+    assert.ok(t.softMs <= 90_000);
   });
 });

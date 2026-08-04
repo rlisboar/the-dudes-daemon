@@ -119,12 +119,18 @@ export function decryptWithDaemonKey(wrappedB64: string): Buffer {
   );
 }
 
-/* ---------- project AES-256 keys: RAM + wrap persistido ---------- */
+/* ---------- project AES-256 keys: RAM + wrap + key ring persistidos ---------- */
 
-const projectKeys = new Map<string, Buffer>(); // projectId → 32-byte raw key
+const projectKeys = new Map<string, Buffer>(); // projectId → 32-byte raw key (ativa)
+/** Chaves antigas decifradas, mais recente primeiro — fallback de leitura
+ *  pós-rotação (paridade com projectKeysOld do web / maybeDecrypt). */
+const projectKeysOld = new Map<string, Buffer[]>();
+/** Entradas opacas do ring (e2e:), mais antiga primeiro — o mesmo formato
+ *  que project_keys:current.keyRing entrega. Persistidas cifradas. */
+const projectKeyRingEntries = new Map<string, string[]>();
 
 /**
- * Persistência dos wraps em disco.
+ * Persistência dos wraps (+ ring) em disco.
  *
  * A chave vivia SÓ em memória, e o relay tem fallback documentado: sem chave,
  * o conteúdo sobe em texto claro. Sequência real: daemon reinicia → chave some
@@ -136,42 +142,148 @@ const projectKeys = new Map<string, Buffer>(); // projectId → 32-byte raw key
  * chega pela rede. Quem lê este arquivo precisa também da privkey, que mora ao
  * lado com a mesma permissão (0600): nenhuma superfície nova além da que o
  * daemon-key.pem já expõe.
+ *
+ * Formato do arquivo (retrocompatível):
+ *   { "<projectId>": "<wrappedB64>" }
+ *   { "<projectId>": { "wrap": "<wrappedB64>", "keyRing": ["e2e:…", …] } }
+ * String pura = só wrap (formato legado). O keyRing é a cadeia opaca do
+ * server — cada entrada já é AES-GCM; sem a chave ativa (e a privkey do
+ * daemon pra abrir o wrap) o ring não revela nada.
  */
 const PROJECT_KEYS_PATH = process.env.THE_DUDES_PROJECT_KEYS_PATH
   ?? join(homedir(), ".the-dudes", "project-keys.json");
 
-function readPersistedWraps(): Record<string, string> {
+interface PersistedProjectKey {
+  wrap: string;
+  keyRing?: string[];
+}
+
+type PersistedStore = Record<string, string | PersistedProjectKey>;
+
+function parsePersistedEntry(v: unknown): PersistedProjectKey | null {
+  if (typeof v === "string" && v.length > 0) return { wrap: v };
+  if (v && typeof v === "object" && typeof (v as PersistedProjectKey).wrap === "string") {
+    const o = v as PersistedProjectKey;
+    const keyRing = Array.isArray(o.keyRing)
+      ? o.keyRing.filter((e): e is string => typeof e === "string" && e.startsWith("e2e:"))
+      : undefined;
+    return { wrap: o.wrap, keyRing: keyRing?.length ? keyRing : undefined };
+  }
+  return null;
+}
+
+function readPersistedStore(): PersistedStore {
   try {
     if (!existsSync(PROJECT_KEYS_PATH)) return {};
-    const raw = JSON.parse(readFileSync(PROJECT_KEYS_PATH, "utf8")) as Record<string, string>;
+    const raw = JSON.parse(readFileSync(PROJECT_KEYS_PATH, "utf8")) as PersistedStore;
     return raw && typeof raw === "object" ? raw : {};
   } catch {
     return {};
   }
 }
 
-function persistWrap(projectId: string, wrappedB64: string): void {
+function writePersistedStore(all: PersistedStore): void {
+  mkdirSync(dirname(PROJECT_KEYS_PATH), { recursive: true, mode: 0o700 });
+  writeFileSync(PROJECT_KEYS_PATH, JSON.stringify(all, null, 2), { mode: 0o600 });
+  try { chmodSync(PROJECT_KEYS_PATH, 0o600); } catch { /* best-effort */ }
+}
+
+function persistProjectCrypto(projectId: string, wrappedB64: string): void {
   try {
-    const all = readPersistedWraps();
-    if (all[projectId] === wrappedB64) return;
-    all[projectId] = wrappedB64;
-    mkdirSync(dirname(PROJECT_KEYS_PATH), { recursive: true, mode: 0o700 });
-    writeFileSync(PROJECT_KEYS_PATH, JSON.stringify(all, null, 2), { mode: 0o600 });
-    chmodSync(PROJECT_KEYS_PATH, 0o600);
+    const all = readPersistedStore();
+    const ring = projectKeyRingEntries.get(projectId);
+    const next: string | PersistedProjectKey =
+      ring && ring.length > 0
+        ? { wrap: wrappedB64, keyRing: ring }
+        : wrappedB64;
+    const prev = all[projectId];
+    if (JSON.stringify(prev) === JSON.stringify(next)) return;
+    all[projectId] = next;
+    writePersistedStore(all);
   } catch (e) {
     console.warn(`[the-dudes] falha ao persistir project key wrap de ${projectId}:`, (e as Error).message);
   }
 }
 
+function wipeOldKeys(projectId: string): void {
+  const old = projectKeysOld.get(projectId);
+  if (old) {
+    for (const k of old) k.fill(0);
+    projectKeysOld.delete(projectId);
+  }
+  projectKeyRingEntries.delete(projectId);
+}
+
+/** Decifra a cadeia do key ring a partir da chave ativa (de trás pra frente).
+ *  Retorna quantas entradas abriram. Paridade com importProjectKeyRing do web. */
+export function importProjectKeyRing(projectId: string, entries: string[] | undefined): number {
+  if (!entries?.length) return 0;
+  const ativa = projectKeys.get(projectId) ?? keyFor(projectId);
+  if (!ativa) return 0;
+  const antigas: Buffer[] = [];
+  let chave: Buffer = ativa;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i]!;
+    try {
+      const rawB64 = decryptWithRawKey(entry, chave);
+      if (rawB64 == null) break;
+      const antiga = Buffer.from(rawB64, "base64");
+      if (antiga.length !== 32) {
+        console.warn(`[the-dudes] key ring: entrada ${i} de ${projectId} tem tamanho ${antiga.length}`);
+        break;
+      }
+      antigas.push(antiga); // mais recente primeiro
+      chave = antiga;
+    } catch {
+      console.warn(`[the-dudes] key ring: entrada ${i} de ${projectId} não abriu — histórico anterior fica ilegível`);
+      break;
+    }
+  }
+  // Limpa buffers anteriores antes de substituir.
+  const prev = projectKeysOld.get(projectId);
+  if (prev) for (const k of prev) k.fill(0);
+  if (antigas.length) {
+    projectKeysOld.set(projectId, antigas);
+    projectKeyRingEntries.set(projectId, [...entries]);
+  } else {
+    projectKeysOld.delete(projectId);
+    projectKeyRingEntries.delete(projectId);
+  }
+  return antigas.length;
+}
+
+/** Promove a chave ativa atual a entrada do ring, cifrada com a nova.
+ *  Cobre rotação online (daemon ainda tinha a antiga em RAM).
+ *  NÃO zera o buffer em projectKeys — o caller substitui a entrada. */
+function promoteActiveToRing(projectId: string, newKey: Buffer): void {
+  const old = projectKeys.get(projectId);
+  if (!old || old.equals(newKey)) return;
+  const oldCopy = Buffer.from(old);
+  const entry = encryptWithRawKey(oldCopy.toString("base64"), newKey);
+  if (!entry) return;
+  const entries = projectKeyRingEntries.get(projectId) ?? [];
+  entries.push(entry);
+  projectKeyRingEntries.set(projectId, entries);
+  const antigas = projectKeysOld.get(projectId) ?? [];
+  // oldCopy vira a mais recente das antigas; as anteriores já estavam no map
+  antigas.unshift(oldCopy);
+  projectKeysOld.set(projectId, antigas);
+}
+
 /** Repõe a chave da RAM a partir do wrap em disco. true se recuperou. */
 function restoreFromDisk(projectId: string): boolean {
-  const wrapped = readPersistedWraps()[projectId];
-  if (!wrapped) return false;
+  const entry = parsePersistedEntry(readPersistedStore()[projectId]);
+  if (!entry) return false;
   try {
-    const raw = decryptWithDaemonKey(wrapped);
+    const raw = decryptWithDaemonKey(entry.wrap);
     if (raw.length !== 32) return false;
     projectKeys.set(projectId, raw);
-    console.info(`[the-dudes] project key de ${projectId} restaurada do disco`);
+    if (entry.keyRing?.length) {
+      const n = importProjectKeyRing(projectId, entry.keyRing);
+      console.info(`[the-dudes] project key de ${projectId} restaurada do disco (ring: ${n} antiga(s))`);
+    } else {
+      console.info(`[the-dudes] project key de ${projectId} restaurada do disco`);
+    }
     return true;
   } catch (e) {
     console.warn(`[the-dudes] wrap persistido de ${projectId} não abre (keypair trocou?):`, (e as Error).message);
@@ -186,18 +298,38 @@ function keyFor(projectId: string): Buffer | null {
   return restoreFromDisk(projectId) ? projectKeys.get(projectId) ?? null : null;
 }
 
-/** @returns true se a key foi unwrapada e cacheada com sucesso. */
-export function rememberProjectKey(projectId: string, wrappedB64: string): boolean {
+/**
+ * Unwrap RSA da chave ativa e cacheia. Opcionalmente importa o key ring
+ * (cadeia de project_keys:current.keyRing — mais antiga primeiro).
+ * Se a chave ativa muda e a anterior ainda estava em RAM, promove-a ao
+ * ring automaticamente (rotação online sem precisar do blob do server).
+ *
+ * @returns true se a key ativa foi unwrapada e cacheada com sucesso.
+ */
+export function rememberProjectKey(
+  projectId: string,
+  wrappedB64: string,
+  keyRing?: string[],
+): boolean {
   try {
     const raw = decryptWithDaemonKey(wrappedB64);
     if (raw.length !== 32) {
       console.warn(`[the-dudes] unexpected project key length ${raw.length} for ${projectId}`);
       return false;
     }
+    // Se já havia outra chave em RAM, ela vira entrada do ring antes de
+    // ser substituída — cobre o caso em que o web só reenvia a ativa.
+    const prev = projectKeys.get(projectId);
+    promoteActiveToRing(projectId, raw);
     projectKeys.set(projectId, raw);
-    // O wrap que chegou pela rede vai pro disco: é o que impede o fallback
-    // plaintext do relay depois de um restart do daemon.
-    persistWrap(projectId, wrappedB64);
+    if (prev && !prev.equals(raw)) prev.fill(0);
+    if (keyRing?.length) {
+      // Ring do server é a fonte autoritativa da cadeia completa.
+      importProjectKeyRing(projectId, keyRing);
+    }
+    // O wrap (+ ring opaco) vai pro disco: impede fallback plaintext e
+    // preserva leitura de histórico pós-restart.
+    persistProjectCrypto(projectId, wrappedB64);
     return true;
   } catch (e) {
     console.warn(`[the-dudes] failed to unwrap project key for ${projectId}:`, (e as Error).message);
@@ -209,6 +341,12 @@ export function getProjectKey(projectId: string): Buffer | null {
   return keyFor(projectId);
 }
 
+/** Nº de chaves antigas em RAM pro projeto (debug/testes). */
+export function countOldProjectKeys(projectId: string): number {
+  keyFor(projectId); // force restore
+  return projectKeysOld.get(projectId)?.length ?? 0;
+}
+
 /** Forget a project key — call when daemon disconnects from a project
  *  or on shutdown to minimize the window the symmetric key sits in
  *  RAM. */
@@ -218,15 +356,16 @@ export function forgetProjectKey(projectId: string): void {
     k.fill(0);
     projectKeys.delete(projectId);
   }
+  wipeOldKeys(projectId);
   credPlaintexts.delete(projectId);
   // Desconectar de UM projeto é remoção deliberada → o wrap sai do disco
   // também. (O shutdown usa forgetAllProjectKeys, que preserva o disco — é
   // exatamente a persistência que evita o fallback plaintext pós-restart.)
   try {
-    const all = readPersistedWraps();
+    const all = readPersistedStore();
     if (all[projectId]) {
       delete all[projectId];
-      writeFileSync(PROJECT_KEYS_PATH, JSON.stringify(all, null, 2), { mode: 0o600 });
+      writePersistedStore(all);
     }
   } catch { /* best effort */ }
 }
@@ -236,13 +375,14 @@ export function forgetProjectKey(projectId: string): void {
  *  relay recusa? Não — cai em plaintext. Por isso o número aparece na UI. */
 export function countUsableProjectKeys(): number {
   const ids = new Set(projectKeys.keys());
-  for (const id of Object.keys(readPersistedWraps())) ids.add(id);
+  for (const id of Object.keys(readPersistedStore())) ids.add(id);
   return ids.size;
 }
 
 export function forgetAllProjectKeys(): void {
   for (const k of projectKeys.values()) k.fill(0);
   projectKeys.clear();
+  for (const id of [...projectKeysOld.keys()]) wipeOldKeys(id);
   credPlaintexts.clear();
 }
 
@@ -294,12 +434,9 @@ export function redactCredentialsDeep(projectId: string, value: unknown): unknow
 
 const E2E_PREFIX = "e2e:";
 
-/** Encrypt a UTF-8 string with the project AES-256 key. Returns
- *  "e2e:" + base64(iv || ciphertext || tag) — same wire format the web
- *  client uses, so values round-trip transparently. */
-export function encryptForProject(plain: string, projectId: string): string | null {
-  const key = keyFor(projectId);
-  if (!key) return null;
+/** Cifra UTF-8 com uma AES-256 raw (mesmo wire format e2e: do web). */
+function encryptWithRawKey(plain: string, key: Buffer): string | null {
+  if (key.length !== 32) return null;
   const iv = randomBytes(12);
   const cipher = createCipheriv("aes-256-gcm", key, iv);
   const ct = Buffer.concat([cipher.update(plain, "utf8"), cipher.final()]);
@@ -307,31 +444,56 @@ export function encryptForProject(plain: string, projectId: string): string | nu
   return E2E_PREFIX + Buffer.concat([iv, ct, tag]).toString("base64");
 }
 
-/** Decrypt an "e2e:"-prefixed base64 blob back to UTF-8. Pass-through if
- *  the value isn't prefixed (legacy plain). Returns null if we don't
- *  hold the key for this project (caller must handle fallback). */
-export function decryptForProject(stored: string, projectId: string): string | null {
+/** Decifra blob e2e: com uma AES-256 raw. null se auth fail / formato ruim. */
+function decryptWithRawKey(stored: string, key: Buffer): string | null {
   if (!stored.startsWith(E2E_PREFIX)) return stored;
-  const key = keyFor(projectId);
-  if (!key) return null;
+  if (key.length !== 32) return null;
   try {
     const all = Buffer.from(stored.slice(E2E_PREFIX.length), "base64");
+    if (all.length < 12 + 16) return null;
     const iv = all.subarray(0, 12);
     const tag = all.subarray(all.length - 16);
     const ct = all.subarray(12, all.length - 16);
     const decipher = createDecipheriv("aes-256-gcm", key, iv);
     decipher.setAuthTag(tag);
     return Buffer.concat([decipher.update(ct), decipher.final()]).toString("utf8");
-  } catch (e) {
-    // AES-GCM auth fail = ESTE blob não bate com a key em memória.
-    // Causa comum: system prompt/memory cifrado com key antiga (rotação)
-    // enquanto a key atual é válida para o resto do projeto. NÃO apagar a
-    // project key — um único blob stale mataria decrypt de TODOS os
-    // agentes/mensagens do projeto. A key só se atualiza via
-    // project_key:for_daemon (rememberProjectKey).
-    console.warn(`[the-dudes] decrypt failed for ${projectId}:`, (e as Error).message);
+  } catch {
     return null;
   }
+}
+
+/** Encrypt a UTF-8 string with the project AES-256 key. Returns
+ *  "e2e:" + base64(iv || ciphertext || tag) — same wire format the web
+ *  client uses, so values round-trip transparently. */
+export function encryptForProject(plain: string, projectId: string): string | null {
+  const key = keyFor(projectId);
+  if (!key) return null;
+  return encryptWithRawKey(plain, key);
+}
+
+/** Decrypt an "e2e:"-prefixed base64 blob back to UTF-8. Pass-through if
+ *  the value isn't prefixed (legacy plain). Returns null if we don't
+ *  hold any key (ativa ou ring) capaz de abrir o blob.
+ *
+ *  Fallback do key ring: tenta a ativa e depois as antigas (mais recente
+ *  primeiro) — paridade com maybeDecrypt do web. Sem isso, rotação tornava
+ *  histórico pré-rotação ilegível no MCP bridge. */
+export function decryptForProject(stored: string, projectId: string): string | null {
+  if (!stored.startsWith(E2E_PREFIX)) return stored;
+  const key = keyFor(projectId);
+  if (!key) return null;
+  const plain = decryptWithRawKey(stored, key);
+  if (plain != null) return plain;
+  // AES-GCM auth fail na ativa = blob de era anterior OU lixo. Tenta o ring
+  // antes de desistir. NÃO apagar a project key — um único blob stale mataria
+  // decrypt de TODOS os agentes/mensagens do projeto.
+  const antigas = projectKeysOld.get(projectId) ?? [];
+  for (const antiga of antigas) {
+    const p = decryptWithRawKey(stored, antiga);
+    if (p != null) return p;
+  }
+  console.warn(`[the-dudes] decrypt failed for ${projectId}: nenhuma chave do ring abriu o blob`);
+  return null;
 }
 
 export function hasProjectKey(projectId: string): boolean {

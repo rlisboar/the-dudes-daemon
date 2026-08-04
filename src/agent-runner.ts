@@ -124,7 +124,12 @@ export interface AgentRunnerOptions {
   log: (level: "info" | "warn" | "error", msg: string) => void;
   cliLog: (level: "info" | "warn" | "error", msg: string) => void;
   onState: (state: AgentRuntimeState) => void;
-  onAssistantText: (text: string) => void;
+  /**
+   * Entrega texto do agente ao server. Se retornar `false`, o WS não
+   * aceitou o frame (socket morto/backpressure) — o runner trata como
+   * falha de entrega fim-a-fim (T-009 hipótese WAN).
+   */
+  onAssistantText: (text: string) => boolean | void;
   onToolUse: (tool: string, input: unknown) => void;
   /** Extended-thinking text from Claude (only when info.collectThinking === true). */
   onThinkingText?: (text: string, opts?: { redacted?: boolean }) => void;
@@ -238,10 +243,17 @@ export class AgentRunner {
    *  perde dispatches feitos no meio do clearContext/compact. */
   private pendingMessages: Array<{ content: string; images?: ImageAttachment[] }> = [];
 
-  /** Hang watchdog: last I/O / tool / state activity (0 tokens). */
+  /** Hang watchdog: última atividade SEMÂNTICA (eventos parseados / tools / state).
+   *  NÃO bytes brutos de stdout/stderr — ver touchActivity + runGrokMessage. */
   private activityClock: TurnActivityClock = createActivityClock();
   private hangWatchTimer: NodeJS.Timeout | null = null;
   private recoveringHung = false;
+  /**
+   * Release do turn-gate do turno per-message em voo. O 'close' do processo
+   * costuma liberar; hard recover (SIGKILL sem close) PRECISA chamar isto
+   * senão o slot fica preso até MAX_HOLD_MS (15min) e a fila congela.
+   */
+  private activeTurnRelease: (() => void) | null = null;
   /**
    * Mensagem per-message (grok/etc) em execução — re-enfileirada 1x no
    * hard hang recover. Sem isso a instrução Claude→Grok some e o Grok
@@ -781,6 +793,8 @@ export class AgentRunner {
         if (emit) {
           this.opts.onToolUse(call.name, call.input);
           emittedTool = true;
+          // Poll 3s de chat_history: tool em andamento sem stream JSON.
+          this.noteGrokToolInFlight();
           // Volta pra thinking/sending: o stream pode ter marcado "speaking"
           // com text intermediário, mas o agente ainda está no tool-loop.
           this.setState(call.name.includes("send_message") ? "sending" : "thinking");
@@ -2410,6 +2424,9 @@ export class AgentRunner {
     // 'close' do processo; o guard interno do gate cobre o "close não veio".
     const releaseSlot = await acquireTurnSlot(`grok:${this.info.name}`, this.opts.log);
     if (this.stopped || !this.messageSession.owns(epoch0)) { releaseSlot(); return; }
+    // Guarda o release pro hard recover: close pós-SIGKILL não é garantido
+    // (netos herdam pipes) e sem isto o slot trava a fila por até 15min.
+    this.activeTurnRelease = releaseSlot;
     recordTurnStart("grok");
     const grokTurnT0 = Date.now();
     this.writeGrokConfig();
@@ -2457,7 +2474,7 @@ export class AgentRunner {
         stdio: ["ignore", "pipe", "pipe"],
       }, this.opts.dropTo ?? null);
     } catch (e) {
-      releaseSlot();
+      this.releaseActiveTurnSlot();
       imgCleanup();
       this.messageSession.busy = false;
       this.opts.onError(`grok spawn falhou: ${(e as Error).message}`);
@@ -2466,7 +2483,7 @@ export class AgentRunner {
       return;
     }
     proc.once("close", (code: number | null) => {
-      releaseSlot();
+      this.releaseActiveTurnSlot();
       recordTurnEnd("grok", Date.now() - grokTurnT0, code === 0);
     });
     this.ocActiveProc = proc;
@@ -2478,6 +2495,9 @@ export class AgentRunner {
       "info",
       `[grok:${this.info.name}] turno iniciado pid=${proc.pid ?? "?"} session=${this.messageSession.sessionId?.slice(0, 8) ?? "nova"} firstTurn=${firstTurn} bytes=${message.length}`,
     );
+    // Zera o relógio de hang no spawn — o acquireTurnSlot pode ter esperado
+    // na fila e o setState("thinking") anterior não reflete o início real.
+    this.touchActivity();
 
     // Watchdog: se o CLI não sair em GROK_TURN_TIMEOUT_MS, mata e libera
     // a fila (sintoma real: resume + prompt enorme fica em 0% CPU por horas).
@@ -2532,12 +2552,17 @@ export class AgentRunner {
     let errFromJson = "";
     let emittedAny = false;
 
-    const ingestLine = (line: string) => {
-      if (!line.startsWith("{") || !this.messageSession.owns(epoch)) return;
+    /** @returns true se parseou ≥1 evento semântico (conta pro hang watch). */
+    const ingestLine = (line: string): boolean => {
+      if (!line.startsWith("{") || !this.messageSession.owns(epoch)) return false;
       try {
+        let sawSemantic = false;
         for (const event of parseGrokStreamEvent(JSON.parse(line))) {
+          sawSemantic = true;
           if (event.type === "text") {
             fullText += event.text;
+            // Texto de assistant após tools = tool loop andou; libera proteção.
+            if (event.text.trim()) this.clearGrokToolsInFlight();
             // Mantém thinking: texto é bufferizado; "speaking" só no emitOnce.
           } else if (event.type === "thought") {
             fullThought += event.text;
@@ -2552,40 +2577,57 @@ export class AgentRunner {
                 this.opts.onToolUse(event.name, event.input);
               }
             }
+            // Tools longas (shell/MCP) podem ficar >120s sem novo evento
+            // semântico — sem toolsInFlight o hard hang mata o turno legítimo
+            // (QA T-009 critério 5). Marca em voo; result/text zera.
+            this.noteGrokToolInFlight();
             this.setState(
               event.name.includes("send_message") ? "sending" : "thinking",
             );
           } else if (event.type === "session") endSessionId = event.sessionId;
-          else if (event.type === "result") sawEnd = true;
-          else if (event.type === "error") {
+          else if (event.type === "result") {
+            sawEnd = true;
+            this.clearGrokToolsInFlight();
+          } else if (event.type === "error") {
             errFromJson = event.message;
             this.checkContextFullError(event.message);
           }
         }
-      } catch { /* linha incompleta / ruído */ }
+        // text/result/session não passam por setState — ainda assim são progresso.
+        if (sawSemantic) this.touchActivity();
+        return sawSemantic;
+      } catch { /* linha incompleta / ruído */ return false; }
     };
 
-    /** Emite no máximo 1 agent_to_user por turno. */
-    const emitOnce = () => {
-      if (!this.messageSession.owns(epoch) || emittedAny) return;
+    /** Emite no máximo 1 agent_to_user por turno. @returns false se WS dropou. */
+    const emitOnce = (): boolean => {
+      if (!this.messageSession.owns(epoch) || emittedAny) return true;
       if (fullThought && this.info.collectThinking && this.opts.onThinkingText) {
         this.opts.onThinkingText(fullThought);
       }
       const t = fullText.trim();
       if (t) {
         this.setState("speaking");
-        this.opts.onAssistantText(t);
+        const ok = this.opts.onAssistantText(t);
         emittedAny = true;
+        // false explícito = canal WS não aceitou (mudo WAN sem hang de processo).
+        if (ok === false) {
+          this.handleUndeliveredTurnResult("agent:text não entregue ao server (WS down/backpressure)");
+          return false;
+        }
       }
       // Billing real vem do turn_completed em finishGrokTurn (usage do loop).
       // Char-estimate só como fallback se updates.jsonl não tiver usage.
       // Ocupação da janela: signals.json / _meta.totalTokens — NUNCA usage.totalTokens.
+      return true;
     };
 
     proc.stdout!.setEncoding("utf8");
     proc.stderr!.setEncoding("utf8");
+    // Hang watch NÃO reseta em bytes brutos: sob swap thrash o CLI cospe
+    // stderr/stdout sem evento útil e o soft/hard nunca disparavam (prod
+    // 2026-08-04: zero linhas [hang] no log). Só ingestLine semântico conta.
     proc.stdout!.on("data", (chunk: string) => {
-      this.touchActivity();
       this.traceCli("grok", "stdout", chunk);
       buf += chunk;
       let idx: number;
@@ -2598,7 +2640,6 @@ export class AgentRunner {
     proc.stderr!.on("data", (chunk: string) => {
       const msg = chunk.trim();
       if (!msg) return;
-      this.touchActivity();
       this.traceCli("grok", "stderr", msg);
       errOut += chunk;
       this.checkContextFullError(msg);
@@ -3653,10 +3694,60 @@ export class AgentRunner {
 
   private touchActivity(): void {
     touchActivityClock(this.activityClock);
-    // Soft hang anterior: qualquer I/O/stream limpa o visual "stalled".
+    // Soft hang anterior: progresso semântico limpa o visual "stalled".
     if (this.currentState === "stalled") {
       this.setState("thinking");
     }
+  }
+
+  /** Idempotente — close e hard recover podem chamar os dois. */
+  private releaseActiveTurnSlot(): void {
+    const r = this.activeTurnRelease;
+    this.activeTurnRelease = null;
+    try { r?.(); } catch { /* release do gate é best-effort */ }
+  }
+
+  /** Grok: tool_call abriu — protege hang watch até result/text/teto. */
+  private noteGrokToolInFlight(): void {
+    if (this.toolsInFlight === 0) this.toolsInFlightSince = Date.now();
+    this.toolsInFlight++;
+    this.touchActivity();
+  }
+
+  private clearGrokToolsInFlight(): void {
+    if (this.toolsInFlight === 0) return;
+    this.toolsInFlight = 0;
+    this.toolsInFlightSince = null;
+  }
+
+  /**
+   * CLI terminou com texto, mas o frame agent:text não saiu no WS.
+   * Sem isto o agente fica idle “mudo” sem watchdog (hipótese WAN T-009):
+   * processo OK, busy=false, user sem resposta até restart.
+   * Re-enfileira a mensagem em voo 1× e telemetra como hard recover.
+   */
+  private handleUndeliveredTurnResult(reason: string): void {
+    recordHardRecover(this.opts.cliRunner);
+    const line = `[hang:${this.info.name}] DELIVERY recover: ${reason} (runner=${this.opts.cliRunner})`;
+    this.opts.log("warn", line);
+    const inflight = this.inflightPerMessage;
+    let retried = false;
+    if (inflight && inflight.attempt < 1) {
+      this.inflightPerMessage = { ...inflight, attempt: inflight.attempt + 1 };
+      this.messageSession.prepend({ content: inflight.content, images: inflight.images });
+      retried = true;
+      this.opts.log(
+        "warn",
+        `[hang:${this.info.name}] re-enfileirando após falha de entrega WS (attempt ${this.inflightPerMessage.attempt})`,
+      );
+    } else {
+      this.inflightPerMessage = null;
+    }
+    const full = retried
+      ? `[hang] ${reason} — reenviando a última mensagem (1×); o texto também fica na fila outbound se o socket voltar`
+      : `[hang] ${reason} — retry esgotado; texto crítico fica na fila outbound até reconnect`;
+    this.opts.onHung?.({ soft: false, reason: full, idleMs: 0 });
+    this.opts.onError(full);
   }
 
   private startHangWatch(): void {
@@ -3756,28 +3847,24 @@ export class AgentRunner {
     const t = hangThresholds(runner);
     const now = Date.now();
 
-    // Tools em execução (Claude continuous): silêncio de stream é esperado
-    // por um tempo. NÃO resetar idle a cada tick (bug clássico: toolsInFlight
-    // preso ou MCP travado → idle nunca sobe → soft/hard nunca disparam →
-    // agente mudo até restart manual). Só "confia" em toolsInFlight enquanto
-    // o relógio de tools não passou do teto E ainda há I/O recente.
+    // Tools em execução (Claude continuous + Grok tool loop): silêncio de
+    // stream é esperado por minutos (shell, MCP, peer wait). softMs do grok
+    // é 60s — se usássemos softMs pra derrubar toolsInFlight, tool legítima
+    // de 2–10min sofria hard recover (QA T-009 critério 5). Protege até
+    // TOOLS_IN_FLIGHT_MAX_MS; só então assume tool_result perdido.
     if (this.toolsInFlight > 0) {
       const toolsAge = this.toolsInFlightSince != null ? now - this.toolsInFlightSince : 0;
-      const idleSinceIo = now - this.activityClock.lastActivityAt;
-      // MCP/tool travado: sem I/O por softMs E tools abertos por > softMs →
-      // zera contador e segue pro hang normal (pode hard-recover).
-      if (idleSinceIo >= t.softMs || toolsAge >= AgentRunner.TOOLS_IN_FLIGHT_MAX_MS) {
+      if (toolsAge >= AgentRunner.TOOLS_IN_FLIGHT_MAX_MS) {
         this.opts.log(
           "warn",
-          `[hang:${this.info.name}] toolsInFlight=${this.toolsInFlight} sem I/O há ${Math.round(idleSinceIo / 1000)}s ` +
-            `(toolsAge=${Math.round(toolsAge / 1000)}s) — forçando contagem a 0 (tool_result perdido ou MCP travado)`,
+          `[hang:${this.info.name}] toolsInFlight=${this.toolsInFlight} aberto há ${Math.round(toolsAge / 1000)}s ` +
+            `(teto ${AgentRunner.TOOLS_IN_FLIGHT_MAX_MS / 60000}min) — forçando 0 (tool_result perdido ou MCP travado)`,
         );
         this.toolsInFlight = 0;
         this.toolsInFlightSince = null;
         // não return — cai no hangPhase abaixo
       } else {
-        // tools ainda legítimas: não marca soft, mas NÃO touchActivity
-        // (idle real de stream continua contando)
+        // tools legítimas: não soft/hard; idle semântico NÃO mata o turno
         if (this.currentState === "stalled") this.setState("thinking");
         return;
       }
@@ -3839,7 +3926,7 @@ export class AgentRunner {
     }
   }
 
-  /** Hard recover: mata turno, libera busy, avisa server (mission abort). */
+  /** Hard recover: mata turno, libera busy + turn-gate, avisa server. */
   private recoverHungTurn(reason: string, idleMs: number): void {
     if (this.recoveringHung || this.stopped) return;
     this.recoveringHung = true;
@@ -3847,7 +3934,7 @@ export class AgentRunner {
     try {
       this.opts.log(
         "warn",
-        `[hang:${this.info.name}] HARD recover: ${reason} (runner=${this.opts.cliRunner})`,
+        `[hang:${this.info.name}] HARD recover: ${reason} (runner=${this.opts.cliRunner} idleMs=${Math.round(idleMs)})`,
       );
       killProcess(this.ocActiveProc, "SIGKILL");
       killProcess(this.oneShotProc, "SIGKILL");
@@ -3859,6 +3946,8 @@ export class AgentRunner {
       this.toolsInFlightSince = null;
       this.activityClock.softReported = false;
       this.activityClock.deadSince = null;
+      // Slot do gate ANTES de drain: senão a re-fila espera em si mesma.
+      this.releaseActiveTurnSlot();
 
       // CRÍTICO: invalidar epoch ANTES de liberar busy/drenar. Senão o
       // finishGrokTurn tardio (close após SIGKILL) zera busy do próximo

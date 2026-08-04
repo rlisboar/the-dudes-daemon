@@ -84,7 +84,8 @@ export class AgentHost {
   }
 
   constructor(
-    private send: (msg: FromDaemon) => void,
+    /** Retorna false se o frame não foi entregue ao socket (WS down/backpressure). */
+    private send: (msg: FromDaemon) => boolean | void,
     private dropTo: DropTarget | null = null,
     private bridgeSocketPath: string | null = null,
     private cliCommands: ResolvedCliCommands,
@@ -94,6 +95,12 @@ export class AgentHost {
     private log: (level: "info" | "warn" | "error", msg: string) => void = () => {},
     private cliLog: (level: "info" | "warn" | "error", msg: string) => void = () => {},
   ) {}
+
+  /** true se o canal aceitou o frame (void legado = assume ok). */
+  private deliver(msg: FromDaemon): boolean {
+    const r = this.send(msg);
+    return r !== false;
+  }
 
   /** Returns the project ID this agent is spawned into, or null if the
    *  agent isn't tracked locally (e.g. message destined for an agent on
@@ -395,9 +402,9 @@ export class AgentHost {
       verboseHumanIo: this.verboseHumanIo,
       log: this.log,
       cliLog: this.cliLog,
-      onState: (state) => this.send({ type: "agent:state", agentId: msg.agent.id, state }),
+      onState: (state) => { this.deliver({ type: "agent:state", agentId: msg.agent.id, state }); },
       onHung: (info) => {
-        this.send({
+        this.deliver({
           type: "agent:hung",
           agentId: msg.agent.id,
           soft: info.soft,
@@ -413,61 +420,66 @@ export class AgentHost {
         // (legacy/pre-bootstrap) cai pro plaintext já redatado.
         const red = msg.projectId ? redactCredentials(msg.projectId, text) : text;
         const enc = msg.projectId ? encryptForProject(red, msg.projectId) : null;
-        this.send({ type: "agent:text", agentId: msg.agent.id, text: enc ?? red });
+        const ok = this.deliver({ type: "agent:text", agentId: msg.agent.id, text: enc ?? red });
         // Espelho Telegram: encaminha a MESMA resposta (em claro, já redatada)
         // pro chat vinculado. Server é E2EE-cego, por isso o mirror é aqui.
         const mirror = this.entries.get(msg.agent.id)?.telegramMirror;
         if (mirror && red.trim()) void this.mirrorToTelegram(mirror, red);
+        return ok;
       },
-      onToolUse: (toolName, input) => this.send({
-        type: "agent:tool_use",
-        agentId: msg.agent.id,
-        toolName,
-        // tool_use.input vai cru pro server (não cifrado); redact aqui as
-        // credenciais conhecidas (ex `curl -H "Authorization: Bearer <cred>"`).
-        input: msg.projectId ? redactCredentialsDeep(msg.projectId, input) : input,
-      }),
+      onToolUse: (toolName, input) => {
+        this.deliver({
+          type: "agent:tool_use",
+          agentId: msg.agent.id,
+          toolName,
+          // tool_use.input vai cru pro server (não cifrado); redact aqui as
+          // credenciais conhecidas (ex `curl -H "Authorization: Bearer <cred>"`).
+          input: msg.projectId ? redactCredentialsDeep(msg.projectId, input) : input,
+        });
+      },
       onThinkingText: (text, thinkOpts) => {
         const red = msg.projectId ? redactCredentials(msg.projectId, text) : text;
         const enc = msg.projectId ? encryptForProject(red, msg.projectId) : null;
-        this.send({ type: "agent:thinking", agentId: msg.agent.id, text: enc ?? red, redacted: !!thinkOpts?.redacted });
+        this.deliver({ type: "agent:thinking", agentId: msg.agent.id, text: enc ?? red, redacted: !!thinkOpts?.redacted });
       },
-      onSessionId: (sid) => this.send({ type: "agent:session", agentId: msg.agent.id, sessionId: sid }),
-      onUsageDelta: (delta) => this.send({ type: "agent:usage_delta", agentId: msg.agent.id, delta }),
+      onSessionId: (sid) => { this.deliver({ type: "agent:session", agentId: msg.agent.id, sessionId: sid }); },
+      onUsageDelta: (delta) => { this.deliver({ type: "agent:usage_delta", agentId: msg.agent.id, delta }); },
       onSessionInvalid: () => {
-        this.send({
+        this.deliver({
           type: "agent:error",
           agentId: msg.agent.id,
           message: "[ctx] sessão anterior não encontrada — iniciando sessão nova",
         });
       },
-      onContextUsage: (used, limit) => this.send({ type: "agent:context", agentId: msg.agent.id, used, limit }),
-      onContextWarning: (used, limit) => this.send({ type: "agent:context_warning", agentId: msg.agent.id, used, limit }),
-      onContextFull: () => this.send({ type: "agent:context_full", agentId: msg.agent.id }),
+      onContextUsage: (used, limit) => { this.deliver({ type: "agent:context", agentId: msg.agent.id, used, limit }); },
+      onContextWarning: (used, limit) => { this.deliver({ type: "agent:context_warning", agentId: msg.agent.id, used, limit }); },
+      onContextFull: () => { this.deliver({ type: "agent:context_full", agentId: msg.agent.id }); },
       projectId: msg.projectId,
-      onGraphStatus: (status, info) => this.send({
-        type: "graph:status",
-        projectId: msg.projectId,
-        status,
-        nodeCount: info?.nodeCount,
-        edgeCount: info?.edgeCount,
-        error: info?.error,
-        progress: info?.progress,
-        phase: info?.phase,
-        indexMtime: info?.indexMtime,
-        stale: info?.stale,
-        graphifyAvailable: info?.graphifyAvailable,
-        graphifyMcpAvailable: info?.graphifyMcpAvailable,
-        docsPending: info?.docsPending,
-        hasSemantic: info?.hasSemantic,
-      }),
+      onGraphStatus: (status, info) => {
+        this.deliver({
+          type: "graph:status",
+          projectId: msg.projectId,
+          status,
+          nodeCount: info?.nodeCount,
+          edgeCount: info?.edgeCount,
+          error: info?.error,
+          progress: info?.progress,
+          phase: info?.phase,
+          indexMtime: info?.indexMtime,
+          stale: info?.stale,
+          graphifyAvailable: info?.graphifyAvailable,
+          graphifyMcpAvailable: info?.graphifyMcpAvailable,
+          docsPending: info?.docsPending,
+          hasSemantic: info?.hasSemantic,
+        });
+      },
       onGraphWatch: (root, gbin) => this.onGraphWatch?.(root, gbin, msg.projectId),
       onError: (err) => {
         // stderr do agente pode conter credencial (echo/uso). Redacta as creds
         // conhecidas ANTES de sair do daemon (vira system message no server,
         // server-visível por design — então redact, não cifra).
         const message = msg.projectId ? redactCredentials(msg.projectId, String(err ?? "")) : String(err ?? "");
-        this.send({ type: "agent:error", agentId: msg.agent.id, message });
+        this.deliver({ type: "agent:error", agentId: msg.agent.id, message });
       },
       onExit: (code) => {
         const e = this.entries.get(msg.agent.id);
@@ -479,8 +491,8 @@ export class AgentHost {
           return;
         }
         if (e) e.runner = null;
-        this.send({ type: "agent:exit", agentId: msg.agent.id, code });
-        this.send({ type: "agent:running", agentId: msg.agent.id, running: false });
+        this.deliver({ type: "agent:exit", agentId: msg.agent.id, code });
+        this.deliver({ type: "agent:running", agentId: msg.agent.id, running: false });
         breadcrumb("agent", "exit", { agentId: msg.agent.id, code, runner: cliRunner });
         // Exit code 0 = normal; null = signal kill (provavelmente intencional);
         // resto = crash inesperado, vale capture.

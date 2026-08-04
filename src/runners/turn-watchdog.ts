@@ -16,12 +16,13 @@ export interface HangThresholds {
 
 export function hangThresholds(runner?: string): HangThresholds {
   if (runner === "grok") {
-    // Headless: pior caso busy sem stream — soft cedo.
-    // hard 4min: armHardTimeout do turno ainda é 12min, mas se o processo
-    // escreve arquivos de sessão sem stdout, o hang watch precisa matar
-    // antes (senão busy preso até restart). 4min cobre tool loops longos
-    // com stdout ocasional (cada chunk reseta idle).
-    return { softMs: 90_000, hardMs: 4 * 60_000, deadProcMs: 12_000 };
+    // Headless + swap thrash: o CLI pode ficar minutos emitindo stderr/stdout
+    // de ruído (spinner, logs) sem NENHUM evento semântico (text/tool/result).
+    // Se o activity clock contar bytes brutos, soft/hard NUNCA disparam —
+    // medido em prod 2026-08-04: turno 21:00:10 sem UMA linha [hang] no log.
+    // hard ≤120s: aceitável pro user e critério de aceite T-009; soft avisa
+    // antes. armHardTimeout de 12min continua como backstop absoluto.
+    return { softMs: 60_000, hardMs: 120_000, deadProcMs: 12_000 };
   }
   if (runner === "opencode") {
     return { softMs: 180_000, hardMs: 10 * 60_000, deadProcMs: 20_000 };
@@ -56,4 +57,16 @@ export function touchActivityClock(clock: TurnActivityClock, now = Date.now()): 
   clock.lastActivityAt = now;
   clock.softReported = false;
   clock.deadSince = null;
+}
+
+/**
+ * Enquanto há tool em voo e ainda dentro do teto, o hang watch NÃO deve
+ * hard-recover (shell/MCP longos). Exportada pra teste (T-009 critério 5).
+ */
+export function toolsInFlightBlocksHang(
+  toolsInFlight: number,
+  toolsAgeMs: number,
+  maxMs: number,
+): boolean {
+  return toolsInFlight > 0 && toolsAgeMs < maxMs;
 }

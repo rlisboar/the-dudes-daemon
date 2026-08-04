@@ -1,5 +1,11 @@
 import { healthSnapshot, recentLogs, recordLog, recordWsRtt } from "./health-monitor.js";
 import { turnGateStats } from "./runners/turn-gate.js";
+import {
+  channelCanSend,
+  createOutboundQueue,
+  flushOutboundQueue,
+  trySendOutbound,
+} from "./runners/outbound-delivery.js";
 import { checkAndApplyUpdate } from "./self-update.js";
 import { WIRE_PROTOCOL_VERSION } from "@the-dudes/protocol/wire-version";
 import { initSentry, capture, captureWarn, breadcrumb, setTag, flush as flushSentry } from "./sentry.js";
@@ -334,6 +340,8 @@ class DaemonClient {
       for (const { id, token } of this.host.listAgentTokens()) {
         this.send({ type: "agent:token_resync", agentId: id, token });
       }
+      // Reenvia agent:text/error que caíram durante o buraco de WS (T-009).
+      this.flushOutboundQueue();
       this.startPing();
       this.startHeartbeat();
       this.scheduleSelfUpdate();
@@ -1728,10 +1736,63 @@ class DaemonClient {
     }
   }
 
-  private send(obj: FromDaemon) {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(obj));
+  /**
+   * Outbound WS. Retorna true se o frame foi entregue ao socket OPEN.
+   * Críticas (agent:text/error/hung/exit) que falham entram na fila e
+   * são reenviadas no próximo open — senão o CLI termina, busy=false e
+   * o user nunca vê a resposta (mudo sem watchdog; hipótese T-009 WAN).
+   */
+  private outboundQueue = createOutboundQueue(80);
+  private static readonly WS_MAX_BUFFERED = 4 * 1024 * 1024;
+
+  private send(obj: FromDaemon): boolean {
+    const json = JSON.stringify(obj);
+    const ws = this.ws;
+    const can = channelCanSend(
+      ws
+        ? {
+            readyState: ws.readyState,
+            openState: WebSocket.OPEN,
+            bufferedAmount: ws.bufferedAmount,
+          }
+        : null,
+      DaemonClient.WS_MAX_BUFFERED,
+    );
+    const ok = trySendOutbound({
+      msg: obj as { type: string },
+      json,
+      canSend: can,
+      send: (j) => { this.ws!.send(j); },
+      queue: this.outboundQueue,
+    });
+    if (!ok) {
+      log(
+        "warn",
+        `outbound drop type=${(obj as { type: string }).type} ` +
+          `(ws=${ws ? ws.readyState : "null"} buffered=${ws?.bufferedAmount ?? 0} ` +
+          `queued=${this.outboundQueue.items.length})`,
+      );
     }
+    return ok;
+  }
+
+  private flushOutboundQueue(): void {
+    const n = flushOutboundQueue({
+      queue: this.outboundQueue,
+      canSend: () =>
+        channelCanSend(
+          this.ws
+            ? {
+                readyState: this.ws.readyState,
+                openState: WebSocket.OPEN,
+                bufferedAmount: this.ws.bufferedAmount,
+              }
+            : null,
+          DaemonClient.WS_MAX_BUFFERED,
+        ),
+      send: (j) => { this.ws!.send(j); },
+    });
+    if (n > 0) log("info", `outbound flush: ${n} msg(s) reenviada(s) após reconnect`);
   }
 
   private startPing() {
