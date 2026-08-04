@@ -1101,7 +1101,16 @@ export class AgentRunner {
     // board/graph são opt-in (default off) — só entram se true explícito
     if (f.graph === true) on.push("graph");
     if (f.board === true) on.push("board");
-    return { THE_DUDES_FEATURES: on.join(",") };
+    // O bridge precisa saber a linguagem pra descrever a tool e validar o
+    // kind — sem isso o agente escreveria mermaid num projeto configurado
+    // pra d2 e o bloco chegaria na UI sem renderer.
+    const lang = f.diagramLanguage === "d2" ? "d2" : "mermaid";
+    const env: Record<string, string> = { THE_DUDES_FEATURES: on.join(","), THE_DUDES_DIAGRAM_LANG: lang };
+    if (f.boardMode === "html") {
+      env.THE_DUDES_BOARD_MODE = "html";
+      env.THE_DUDES_BOARD_HTML_LEVEL = f.boardHtmlLevel ?? "normal";
+    }
+    return env;
   }
 
   private bridgeEnv(): Record<string, string> {

@@ -117,6 +117,20 @@ const server = new McpServer({ name: "the-dudes", version: "0.1.0" });
 // sempre registrados. Monkey-patch em server.tool: gateia por NOME, sem
 // tocar nos 21 call sites abaixo.
 const _featuresRaw = process.env.THE_DUDES_FEATURES;
+/** Linguagem de diagrama do projeto (daemon escreve no env junto das
+ *  features). Entra na descrição da tool pra o agente não escrever mermaid
+ *  num projeto que só renderiza d2 — o bloco chegaria sem renderer. */
+const DIAGRAM_LANG: "mermaid" | "d2" = process.env.THE_DUDES_DIAGRAM_LANG === "d2" ? "d2" : "mermaid";
+/** Modo do quadro. `html` = a página inteira é o quadro; `blocks` = markdown
+ *  + diagrama. Exclusivos: o enum abaixo oferece só o que o modo permite, e o
+ *  server recusa o que escapar. */
+const BOARD_MODE: "blocks" | "html" = process.env.THE_DUDES_BOARD_MODE === "html" ? "html" : "blocks";
+/** Requinte da página no modo html — muda o que a tool autoriza (script,
+ *  three.js) e o quanto o agente deve investir. */
+const HTML_LEVEL: "basic" | "normal" | "quality" =
+  process.env.THE_DUDES_BOARD_HTML_LEVEL === "basic" ? "basic"
+  : process.env.THE_DUDES_BOARD_HTML_LEVEL === "quality" ? "quality"
+  : "normal";
 const _enabledGroups = _featuresRaw === undefined
   ? null
   : new Set(_featuresRaw.split(",").map((s) => s.trim()).filter(Boolean));
@@ -1134,18 +1148,47 @@ server.tool(
 
 server.tool(
   "board_upsert_block",
-  `Add/replace a block. The human sees updates LIVE on the Quadro tab.
+  (BOARD_MODE === "html"
+    // Modo html: a lista de kinds tem UM item. Descrever markdown/chart/steps
+    // aqui contradiria o enum (que só aceita "html") — e o agente acredita no
+    // texto antes de bater no erro de validação.
+    ? `Replace THE page of the Quadro. This project's board is a single HTML document that you write end to end.
+- kind: "html" (the only one here)
+- body: a full HTML document. ${HTML_LEVEL === "basic"
+    ? "Level BASIC: HTML + CSS only, no <script>. Layout, tables, CSS-only diagrams."
+    : HTML_LEVEL === "quality"
+    ? "Level QUALITY: HTML + CSS + JS + three.js (import * as THREE from \"three\" — import map injected). Rich, animated, modern — still a lesson, not a demo."
+    : "Level NORMAL: HTML + CSS + JS. Light animation and charts you draw (SVG/canvas)."}
+- Style with the host palette: var(--bg) var(--panel) var(--elevated) var(--border) var(--text) var(--muted) var(--accent) var(--ok) var(--warn) var(--err). Do not invent a colour scheme.
+- Every call REPLACES the page: rewrite the whole document, keep the same id. Do not split across blocks.
+- It is displayed WHOLE: the frame grows to your content's height and the human scrolls the board. No inner scrollbar, no fullscreen.
+- Use the FULL WIDTH you are given (the board may be set to the whole screen). No narrow centred column; lay cards/comparisons/diagrams side by side with grid auto-fit so it reflows on smaller widths.
+- Sandboxed iframe: no access to the app, its session or storage.
+- Give anything you may want to point at a stable id (e.g. id="step-2") so marks can target it precisely.
+Optional say: spoken aloud via TTS if the agent has voice enabled.`
+    : `Add/replace a block. The human sees updates LIVE on the Quadro tab.
 Kinds:
 - markdown: body = markdown
-- mermaid: body = mermaid source
+- ${DIAGRAM_LANG}: body = ${DIAGRAM_LANG} source — THIS project's diagram language${DIAGRAM_LANG === "d2" ? " (d2lang.com)" : ""}, raw (no \`\`\` fences)
 - callout: body + tone info|warn|ok|err
 - chart: chart = { type, labels, series }
 - steps | flow: steps = [{ label, detail? }] — animated teaching flow (use with board_set_step / board_play)
 Reuse the same id to update a block in place while you explain. focus defaults true (scrolls UI to it).
-Optional say: spoken aloud via TTS if the agent has voice enabled.`,
+Optional say: spoken aloud via TTS if the agent has voice enabled.`),
   {
     id: z.string().optional().describe("Stable id to update in place, e.g. flow-main"),
-    kind: z.enum(["markdown", "mermaid", "chart", "callout", "steps", "flow"]),
+    // O enum oferece SÓ a linguagem de diagrama do projeto. Deixar as duas
+    // disponíveis não resolvia: o modelo lê "mermaid" na lista e vai de
+    // mermaid por hábito, por mais que a descrição e o system prompt peçam
+    // d2. Aqui a escolha errada nem existe — e se ele tentar, o zod recusa
+    // com o nome do kind válido, que é feedback direto pro agente.
+    kind: BOARD_MODE === "html"
+      // Modo HTML: o quadro É a página. Deixar markdown no enum reabriria a
+      // mistura que o modo existe pra evitar.
+      ? z.enum(["html"])
+      : (DIAGRAM_LANG === "d2"
+          ? z.enum(["markdown", "d2", "chart", "callout", "steps", "flow"])
+          : z.enum(["markdown", "mermaid", "chart", "callout", "steps", "flow"])),
     title: z.string().optional(),
     body: z.string().optional(),
     tone: z.enum(["info", "warn", "ok", "err"]).optional(),
@@ -1290,7 +1333,9 @@ server.tool(
   "board_draw",
   `Draw on the shared Quadro (bidirectional: you=orange, human=blue).
 
-**PREFERRED (no blind coords):** aroundBlock=true + blockId — UI hugs that block.
+${BOARD_MODE === "html"
+  ? "**PREFERRED in this project (html board):** selector = the id of the element you want to ring (e.g. #step-2). Blind pixel coords age badly — the page reflows and the ring drifts."
+  : "**PREFERRED (no blind coords):** aroundBlock=true + blockId — UI hugs that block."}
 Kinds: ellipse | rect | arrow | pen | pin | text
 
 Free geometry (only if you know layout): points NORMALIZED 0–1 on board surface
@@ -1298,12 +1343,16 @@ Free geometry (only if you know layout): points NORMALIZED 0–1 on board surfac
 - arrow: [from, to] · pen: path · pin|text: [anchor] + label
 
 Human marks arrive as [board mark] messages and in board_get.annotations (author=human).
-When replying to a human mark, prefer aroundBlock on the same blockId.`,
+${BOARD_MODE === "html" ? "When replying to a human mark, reuse the selector the message gives you (TARGET ELEMENT) — same element, not the whole page." : "When replying to a human mark, prefer aroundBlock on the same blockId."}`,
   {
     kind: z.enum(["rect", "ellipse", "arrow", "pen", "pin", "text"]),
     points: z.array(z.object({ x: z.number(), y: z.number() })).optional()
       .describe("Board-normalized 0–1; omit when aroundBlock=true"),
     blockId: z.string().optional().describe("Block id (required if aroundBlock)"),
+    selector: z.string().optional()
+      .describe(BOARD_MODE === "html"
+        ? "CSS selector of the element INSIDE your html (e.g. #step-2). Preferred here: the UI resolves it to the live rect, so the ring lands exactly on the element even after reflow."
+        : "CSS selector (html board mode only)"),
     aroundBlock: z.boolean().optional()
       .describe("true = UI anchors mark on the block DOM (recommended)"),
     label: z.string().optional().describe("Caption / note on the mark"),

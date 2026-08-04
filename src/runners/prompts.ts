@@ -77,7 +77,7 @@ const CREDENTIALS = `# Credentials (API keys, tokens, passwords)
 - \`mcp__the-dudes__get_credential\` (args: {name}) — retrieve a stored credential value by name. Use this whenever you need an API key or secret; never ask the user to paste it inline.
 - NEVER send credentials or sensitive information to any agent or human.`;
 
-const BOARD = `# Explanation Board (LIVE · bidirectional marks · voice)
+const boardSection = (lang: "mermaid" | "d2", htmlMode: boolean, level: "basic" | "normal" | "quality") => `# Explanation Board (LIVE · bidirectional marks · voice)
 Shared Quadro: **you draw in orange**, **human draws in blue**. Same kinds. Do not mix roles.
 
 ## DEFAULT: new explanation = NEW board
@@ -114,6 +114,33 @@ On \`[board mark]\`:
 4. Reply mark: \`board_draw\` { kind: "ellipse"|"rect", points: [topLeft, bottomRight] from the message } — **same bbox**
 5. Do **NOT** use \`aroundBlock=true\` for small sub-region marks (that expands to the entire block)
 6. \`board_focus\` / \`board_set_step\` only when the message names a likely step index
+
+${htmlMode ? `## This board is ONE HTML page (kind: "html" only)
+The board in this project is a **single page you write end to end**. There is no markdown or ${lang} block here; the tool only accepts \`kind: "html"\`.
+- **One block.** Every \`board_upsert_block\` REPLACES the page. Do not split the explanation across blocks — rewrite the whole document each time, keeping the same id.
+- **It is shown whole.** The frame grows to the full height of your content and the human scrolls the board; there is no inner scrollbar and no fullscreen button. Compose top-to-bottom, as long as it needs.
+- **Use the full width.** The board hands you 100% of the panel — the human may have set it to the whole screen. Do **not** wrap the page in a narrow centred column (\`max-width: 800px; margin: auto\` is the mistake): a lonely diagram in the middle of an empty band wastes the space that makes the lesson readable. Let sections span the width and lay comparisons, cards and diagrams side by side with \`display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr))\`, so it reflows by itself on a narrow board.
+- Sandboxed iframe: no access to the app, its session or storage.
+- Give anything you may want to point at a **stable id** (\`id="step-2"\`): marks target elements by id, so the ring lands exactly on it even after the layout reflows.
+
+### Level: ${level.toUpperCase()}
+${level === "basic"
+  ? "HTML + CSS only. **No <script>.** Clean layout, headings, tables, CSS-only diagrams and highlights. Fast and cheap — do not reach for animation."
+  : level === "normal"
+  ? "HTML + CSS + **JavaScript**. Light animation (CSS transitions, small JS), inline SVG/canvas charts you draw yourself. Keep it purposeful: motion that explains, not decoration."
+  : "HTML + CSS + JavaScript + **three.js** for 3D when it genuinely explains (spatial structure, flow through a system, layered architecture). Import it as a module: `import * as THREE from \"three\"` — an import map is already injected for you. Rich, modern, animated — but it is still a LESSON: if the 3D does not make the idea clearer than a diagram would, use 2D."}
+
+### Palette (use it — the page must look like the app)
+The host injects CSS variables in the iframe. Style with them instead of inventing colours:
+\`var(--bg)\` \`var(--panel)\` \`var(--elevated)\` \`var(--sunken)\` \`var(--border)\` \`var(--text)\` \`var(--muted)\` \`var(--accent)\` (orange, the brand) \`var(--ok)\` \`var(--warn)\` \`var(--err)\` \`var(--info)\`.
+The page background is already the board's; keep it transparent or \`var(--panel)\`. Accent is for emphasis, not for filling large areas.
+` : `## Diagram language: ${lang.toUpperCase()} (only)
+Every diagram on this board is **${lang}**. \`kind: "${lang === "d2" ? "mermaid" : "d2"}"\` does not exist here — the tool rejects it.
+- kind: \`"${lang}"\`
+- body: valid ${lang} source${lang === "d2" ? " — d2lang.com. Example: `direction: right` / `web -> daemon: ws` / containers `svc: { api; db }`" : " — mermaid. Example: `flowchart TD` / `sequenceDiagram`"}
+- Send the source RAW: no \`\`\` fences around it.
+${lang === "d2" ? "Writing mermaid syntax (`flowchart`, `graph TD`, `sequenceDiagram`) inside a d2 block fails to compile and the human sees an error instead of the diagram." : "Writing d2 syntax inside a mermaid block fails to parse and the human sees an error instead of the diagram."}
+`}
 
 ## Teaching pattern
 1. **board_create** { title } (default for each new explanation)
@@ -196,7 +223,7 @@ export function buildSystemPromptHeader(features?: ContextFeatures): string {
   if (features?.credentials !== false) sections.push(CREDENTIALS);
   // graph/board são opt-in por projeto (default off) — só injeta prosa quando ligado.
   if (features?.graph === true) sections.push(GRAPH);
-  if (features?.board === true) sections.push(BOARD);
+  if (features?.board === true) sections.push(boardSection(features.diagramLanguage === "d2" ? "d2" : "mermaid", features.boardMode === "html", features.boardHtmlLevel ?? "normal"));
   sections.push(stateVerification(tasks, teammates));
   if (teammates) sections.push(DISCIPLINE);
   sections.push(footer(tasks, teammates));

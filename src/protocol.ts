@@ -133,6 +133,15 @@ export interface ContextFeatures {
   graph?: boolean;
   /** Explanation Board — tools board_* + prosa no system prompt. Opt-in. */
   board?: boolean;
+  /** Linguagem de diagrama que o agente deve escrever no quadro. Viaja junto
+   *  das features porque é a mesma decisão de projeto e o mesmo caminho até o
+   *  bridge/system prompt. Ausente = mermaid (comportamento histórico). */
+  diagramLanguage?: "mermaid" | "d2";
+  /** Modo do quadro: `blocks` (markdown+diagrama) ou `html` (página inteira).
+   *  Exclusivos — ver Project.boardMode no protocolo do server. */
+  boardMode?: "blocks" | "html";
+  /** Requinte da página no modo html: basic | normal | quality. */
+  boardHtmlLevel?: "basic" | "normal" | "quality";
 }
 
 export interface MemoryInjectionEntry {

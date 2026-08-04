@@ -273,6 +273,25 @@ export interface Project {
   graphEnabled?: boolean;
   /** Explanation Board — tools board_* + aba Quadro. Lean: novos nascem off. */
   boardEnabled?: boolean;
+  /** Linguagem de diagrama do quadro (default mermaid). */
+  diagramLanguage?: DiagramLanguage;
+  /**
+   * Modo do quadro — os dois caminhos são EXCLUSIVOS, não se misturam:
+   *
+   * - `blocks` (default, barato): markdown + diagrama (mermaid|d2) + chart,
+   *   callout, steps/flow. Renderiza rápido, custa poucos tokens.
+   * - `html` (rico, caro): o agente escreve a página inteira — HTML, CSS e
+   *   JS — em iframe sandbox sem same-origin. Mais expressivo e mais caro
+   *   de gerar.
+   *
+   * Misturar os dois deixava o agente escolhendo caso a caso e o resultado
+   * saía inconsistente: metade markdown pobre, metade página rica.
+   */
+  boardMode?: BoardMode;
+  /** Requinte da página no modo html (default `normal`). */
+  boardHtmlLevel?: BoardHtmlLevel;
+  /** Largura útil do quadro (default `small`). */
+  boardWidth?: BoardWidth;
 }
 
 export interface ProjectMember {
@@ -600,7 +619,37 @@ export interface PermissionRequest {
  * Quadro visual que o agent preenche via MCP (tempo real).
  * Ops tipadas (não HTML livre). Persistido em Postgres (explanation_boards).
  */
-export type BoardBlockKind = "markdown" | "mermaid" | "chart" | "callout" | "steps" | "flow";
+/**
+ * `mermaid` e `d2` são o MESMO papel (diagrama por texto) com sintaxes
+ * incompatíveis. O kind vem no bloco — e não da configuração do projeto — pra
+ * que um quadro antigo continue renderizando depois que alguém troca a
+ * preferência, e pra que o renderer não precise adivinhar a linguagem.
+ */
+export type BoardBlockKind = "markdown" | "mermaid" | "d2" | "html" | "chart" | "callout" | "steps" | "flow";
+
+/** Linguagem de diagrama que o agente é instruído a usar no quadro. */
+export type DiagramLanguage = "mermaid" | "d2";
+
+/** Ver `Project.boardMode`. */
+export type BoardMode = "blocks" | "html";
+
+/**
+ * Requinte da página no modo `html` — quanto o agente investe (e gasta) para
+ * explicar:
+ *
+ * - `basic`   HTML + CSS. Rápido e barato.
+ * - `normal`  + JavaScript: animação leve e gráficos.
+ * - `quality` + three.js: página rica, animação intuitiva, gráfico moderno —
+ *             sem virar demo técnica: o objetivo continua sendo explicar.
+ */
+export type BoardHtmlLevel = "basic" | "normal" | "quality";
+
+/**
+ * Largura útil do quadro. `small` é o texto em coluna de leitura (720px, o
+ * histórico); as maiores existem porque uma página HTML com diagrama e
+ * gráfico lado a lado sufoca nessa medida.
+ */
+export type BoardWidth = "small" | "medium" | "large";
 
 export interface BoardChartSpec {
   type: "bar" | "line" | "pie";
@@ -679,8 +728,20 @@ export interface BoardAnnotation {
   /**
    * board = free geometry (humano arrasta; agent com points).
    * block = encaixa no bloco (agent aroundBlock / highlight).
+   * element = ancorado num elemento DENTRO do HTML do modo `html`, via
+   *   `selector`. A geometria é recalculada a cada layout, então a marca
+   *   continua exatamente sobre o elemento mesmo se a página reflui.
    */
-  anchor?: "board" | "block";
+  anchor?: "board" | "block" | "element";
+  /**
+   * Seletor CSS do alvo dentro do bloco html (ex.: `#step-2`).
+   *
+   * É o que dá PRECISÃO no modo html: pixels soltos sobre um iframe
+   * envelhecem no primeiro reflow, e o agente não tem como adivinhar
+   * coordenadas de uma página que o navegador acabou de diagramar. Ele
+   * aponta o id que ele mesmo escreveu; a UI resolve o retângulo.
+   */
+  selector?: string;
   /** rect/ellipse: [tl, br]; arrow: [from, to]; pen: path; pin/text: [anchor]. */
   points: BoardPoint[];
   color: string;
@@ -1030,7 +1091,7 @@ export type ServerEvent =
   | { type: "credential:revealed"; id: string; value: string }
   | { type: "permission:request"; req: PermissionRequest }
   | { type: "permission:resolved"; requestId: string; allow: boolean }
-  | { type: "config"; autoApprove: boolean; loopProtection: "reactive" | "preventive"; loopLimitEnabled?: boolean; loopLimit?: number; loopPairLimit?: number; loopPairWindowMs?: number; memoryEnabled?: boolean; memoryMaxPinned?: number; tasksEnabled?: boolean; teammatesEnabled?: boolean; goalsEnabled?: boolean; credentialsEnabled?: boolean; webhooksEnabled?: boolean; graphEnabled?: boolean; boardEnabled?: boolean; autoRetryEnabled?: boolean; autoRetrySeconds?: number }
+  | { type: "config"; autoApprove: boolean; loopProtection: "reactive" | "preventive"; loopLimitEnabled?: boolean; loopLimit?: number; loopPairLimit?: number; loopPairWindowMs?: number; memoryEnabled?: boolean; memoryMaxPinned?: number; tasksEnabled?: boolean; teammatesEnabled?: boolean; goalsEnabled?: boolean; credentialsEnabled?: boolean; webhooksEnabled?: boolean; graphEnabled?: boolean; boardEnabled?: boolean; diagramLanguage?: DiagramLanguage; boardMode?: BoardMode; boardHtmlLevel?: BoardHtmlLevel; boardWidth?: BoardWidth; autoRetryEnabled?: boolean; autoRetrySeconds?: number }
   | { type: "graph:status"; status: "idle" | "building" | "ready" | "error"; nodeCount?: number; edgeCount?: number; error?: string; inputTokens?: number; outputTokens?: number; lastIndexedAt?: number; progress?: number; phase?: string; indexMtime?: number; stale?: boolean; graphifyAvailable?: boolean; graphifyMcpAvailable?: boolean; docsPending?: boolean; hasSemantic?: boolean }
   | { type: "graph:data"; json?: string; error?: string }
   | { type: "usage_breakdown"; byUser: { userId: string; input: number; output: number }[]; byModel: { model: string; input: number; output: number }[]; from?: string; to?: string }
@@ -1156,6 +1217,14 @@ export type ClientCommand =
       loopPairWindowMs?: number;
       fileLocking?: boolean;
       agentWorktrees?: boolean;
+      /** Linguagem de diagrama do quadro (mermaid | d2). */
+      diagramLanguage?: DiagramLanguage;
+      /** Modo do quadro: blocos (markdown+diagrama) ou HTML rico. */
+      boardMode?: BoardMode;
+      /** Requinte da página HTML (basic | normal | quality). */
+      boardHtmlLevel?: BoardHtmlLevel;
+      /** Largura útil do quadro (small | medium | large). */
+      boardWidth?: BoardWidth;
       /** A UI já mandava isto e o server já persistia (`collect_thinking`),
        *  mas só o tipo do web declarava. */
       collectThinking?: boolean;
@@ -1256,6 +1325,8 @@ export type ClientCommand =
         id?: string;
         kind: "rect" | "ellipse" | "arrow" | "pen" | "pin" | "text";
         blockId?: string;
+        /** Elemento alvo dentro do bloco html (ver BoardAnnotation.selector). */
+        selector?: string;
         points: { x: number; y: number }[];
         aroundBlock?: boolean;
         color?: string;

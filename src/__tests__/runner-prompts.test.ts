@@ -66,3 +66,55 @@ test("initial message adds exactly one user-content separator and omits empty su
   });
   assert.equal(message, "Header\n\n# Your role\nBuilder\n\nBuild.\n\n# Workspace\nWork\n\n---\n\nDo it");
 });
+
+test("board prose commits to ONE mode: blocks with a single diagram language, or HTML", () => {
+  const mermaid = buildSystemPromptHeader({ board: true });
+  assert.ok(mermaid.includes("Diagram language: MERMAID"));
+  assert.ok(mermaid.includes('`kind: "d2"` does not exist here'));
+  assert.ok(!mermaid.includes("This board is HTML"), "modo blocks não pode citar HTML");
+
+  const d2 = buildSystemPromptHeader({ board: true, diagramLanguage: "d2" });
+  assert.ok(d2.includes("Diagram language: D2"));
+  assert.ok(d2.includes("d2lang.com"));
+  assert.ok(d2.includes('`kind: "mermaid"` does not exist here'));
+  // A cerca de markdown quebrava o compilador — o prompt precisa dizer.
+  assert.ok(d2.includes("no ```"));
+
+  const html = buildSystemPromptHeader({ board: true, boardMode: "html" });
+  assert.ok(html.includes("This board is ONE HTML page"));
+  assert.ok(html.includes("REPLACES the page"), "precisa dizer que é página única");
+  assert.ok(html.includes("shown whole"), "precisa dizer que aparece inteira");
+  // Sem isto o agente escreve uma coluna estreita centralizada e sobra
+  // faixa vazia dos dois lados.
+  assert.ok(html.includes("Use the full width"), "precisa mandar usar a largura");
+  assert.ok(html.includes("auto-fit"), "precisa dar a receita de grid responsivo");
+  assert.ok(html.includes("stable id"));
+  // Modo exclusivo: nada de markdown/diagrama competindo com a página.
+  assert.ok(!html.includes("Diagram language:"), "modo html não pode citar diagrama");
+
+  assert.ok(!buildSystemPromptHeader({ board: false, boardMode: "html" }).includes("This board is ONE HTML page"));
+});
+
+test("html level decides what the page may use, and the palette is always given", () => {
+  const basic = buildSystemPromptHeader({ board: true, boardMode: "html", boardHtmlLevel: "basic" });
+  assert.ok(basic.includes("Level: BASIC"));
+  assert.ok(basic.includes("No <script>"), "básico não autoriza script");
+  assert.ok(!basic.includes("three.js"), "básico não pode citar three");
+
+  const normal = buildSystemPromptHeader({ board: true, boardMode: "html" });
+  assert.ok(normal.includes("Level: NORMAL"));
+  assert.ok(normal.includes("JavaScript"));
+  assert.ok(!normal.includes("three.js"), "normal para no JS");
+
+  const quality = buildSystemPromptHeader({ board: true, boardMode: "html", boardHtmlLevel: "quality" });
+  assert.ok(quality.includes("Level: QUALITY"));
+  assert.ok(quality.includes("three.js"));
+  // O 3D é meio, não fim — o prompt precisa segurar isso.
+  assert.ok(quality.includes("still a LESSON"));
+
+  // Paleta em todos: sem ela cada página inventa um esquema de cor.
+  for (const h of [basic, normal, quality]) {
+    assert.ok(h.includes("var(--accent)"), "faltou a paleta");
+    assert.ok(h.includes("Palette"));
+  }
+});

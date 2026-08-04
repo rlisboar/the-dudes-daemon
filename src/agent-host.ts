@@ -247,6 +247,13 @@ export class AgentHost {
       this.send({ type: "agent:running", agentId: msg.agent.id, running: false });
       return;
     }
+    // Features no log: quando o agente "ignora" uma capacidade, a primeira
+    // pergunta é se ela chegou até ele — sem isto não havia como saber.
+    if (msg.features) {
+      const f = msg.features;
+      const on = Object.entries(f).filter(([, v]) => v === true).map(([k]) => k);
+      this.log("info", `agent ${msg.agent.id} features: ${on.join(",") || "none"} diagram=${f.diagramLanguage ?? "mermaid"}`);
+    }
     this.log("info", `agent ${msg.agent.id} cwd resolvido=${cwd}${wsRoot ? ` (root=${wsRoot})` : ""}`);
     if (!fs.existsSync(cwd)) {
       this.send({
