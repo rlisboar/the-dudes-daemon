@@ -9,6 +9,7 @@ import { spawnDropped, type DropTarget } from "./privileges.js";
 import type { ResolvedCliCommands } from "./cli-config.js";
 import { resolvePython3 } from "./cli-config.js";
 import { buildGraph, graphExists, graphMtime, graphPath, hasSemanticMarker, needsSemanticUpdate } from "./graph-indexer.js";
+import { acquireTurnSlot } from "./runners/turn-gate.js";
 import { isPerMessageRunner, runnerAdapter } from "./runners/index.js";
 import { claudeOneShotArgs, codexOneShotArgs, crushOneShotArgs, geminiOneShotArgs, grokHeadlessArgs, opencodeOneShotArgs } from "./runners/args.js";
 import { buildBaseRunnerEnv, buildBridgeAwareEnv, buildGeminiEnv, buildGrokEnv } from "./runners/env.js";
@@ -549,7 +550,14 @@ export class AgentRunner {
   }
 
   async runOneShot(prompt: string): Promise<string> {
-    return new Promise((resolve) => {
+    if (this.stopped) return "";
+    // Semáforo global: N turnos de CLI simultâneos = N×~120MB; ver turn-gate.
+    const releaseSlot = await acquireTurnSlot(`${this.opts.cliRunner}:${this.info.name}`, this.opts.log);
+    if (this.stopped) { releaseSlot(); return ""; }
+    return new Promise<string>((resolveRaw) => {
+      // Todo caminho de saída passa pelo resolve → o slot volta junto.
+      // (Promise ignora resolve duplo e o release é idempotente.)
+      const resolve = (v: string) => { releaseSlot(); resolveRaw(v); };
       // stop() antes do spawn: sem o check, o one-shot nasce DEPOIS do
       // emitExit (que apagou o tmpdir) e roda órfão consumindo API.
       if (this.stopped) { resolve(""); return; }
@@ -2378,12 +2386,18 @@ export class AgentRunner {
       return;
     }
     // Rastreia inflight pra re-fila no hard recover (hang / SIGKILL sem close).
+    const epoch0 = this.messageSession.epoch;
     const prevAttempt =
       this.inflightPerMessage?.content === content
         ? this.inflightPerMessage.attempt
         : 0;
     this.inflightPerMessage = { content, images, attempt: prevAttempt };
     this.setState("thinking");
+    // Mesmo semáforo do runOneShot: turnos grok de resume são o caso medido
+    // (4 simultâneos × ~120MB com swap saturado). O release fica amarrado ao
+    // 'close' do processo; o guard interno do gate cobre o "close não veio".
+    const releaseSlot = await acquireTurnSlot(`grok:${this.info.name}`, this.opts.log);
+    if (this.stopped || !this.messageSession.owns(epoch0)) { releaseSlot(); return; }
     this.writeGrokConfig();
 
     let message = content;
@@ -2429,6 +2443,7 @@ export class AgentRunner {
         stdio: ["ignore", "pipe", "pipe"],
       }, this.opts.dropTo ?? null);
     } catch (e) {
+      releaseSlot();
       imgCleanup();
       this.messageSession.busy = false;
       this.opts.onError(`grok spawn falhou: ${(e as Error).message}`);
@@ -2436,6 +2451,7 @@ export class AgentRunner {
       this.drainOcQueue();
       return;
     }
+    proc.once("close", releaseSlot);
     this.ocActiveProc = proc;
     const grokTurnStartedAt = Date.now();
     // Marco de INÍCIO do turno. Sem ele o log só tinha o fim (soft hang aos

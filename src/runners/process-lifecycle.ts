@@ -4,9 +4,21 @@ export function processAlive(process: ChildProcess | null | undefined): process 
   return !!process && process.exitCode === null && process.signalCode === null;
 }
 
-export function killProcess(process: ChildProcess | null | undefined, signal: NodeJS.Signals = "SIGKILL"): boolean {
-  if (!processAlive(process)) return false;
-  try { return process.kill(signal); } catch { return false; }
+export function killProcess(child: ChildProcess | null | undefined, signal: NodeJS.Signals = "SIGKILL"): boolean {
+  if (!processAlive(child)) return false;
+  // Grupo primeiro: spawnDropped usa `detached: true`, então o filho é líder
+  // de um process group próprio e `kill(-pid)` alcança wrapper E netos (o CLI
+  // real atrás do setpriv/pty). Se o processo NÃO for líder (spawn direto fora
+  // do spawnDropped), não existe grupo com esse pgid → ESRCH → cai no kill
+  // individual de sempre. Nunca atinge o grupo do daemon: o pgid usado é o pid
+  // do filho, não o nosso.
+  if (child.pid) {
+    try {
+      process.kill(-child.pid, signal);
+      return true;
+    } catch { /* ESRCH/EPERM → individual */ }
+  }
+  try { return child.kill(signal); } catch { return false; }
 }
 
 export function terminateWithEscalation(process: ChildProcess | null | undefined, graceMs = 1_500): () => void {

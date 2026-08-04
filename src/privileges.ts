@@ -175,6 +175,16 @@ export function spawnDropped(
   opts: SpawnOptions,
   drop: DropTarget | null,
 ): ChildProcess {
+  /*
+   * `detached: true` em TODO spawn de CLI: cria um process group novo com o
+   * filho como líder, e é o que permite ao kill alcançar a árvore inteira
+   * (`kill(-pid)` em process-lifecycle). Sem isso, o SIGKILL ia só no filho
+   * direto — o wrapper (setpriv, pty do opencode) morria e o CLI real
+   * sobrevivia segurando os pipes: 'close' nunca vinha, o turno ficava
+   * "busy preso" e a sessão era descartada com 40-50KB de contexto reenviado.
+   * Medido em produção: 3 hard recovers num dia, todos com "close não veio".
+   */
+  opts = { ...opts, detached: true };
   if (!drop) {
     return spawn(cmd, args, opts);
   }

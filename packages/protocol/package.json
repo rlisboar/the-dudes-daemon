@@ -16,6 +16,10 @@
     "./commands": {
       "types": "./commands.d.ts",
       "default": "./commands.js"
+    },
+    "./e2ee-fields": {
+      "types": "./e2ee-fields.d.ts",
+      "default": "./e2ee-fields.js"
     }
   },
   "scripts": {

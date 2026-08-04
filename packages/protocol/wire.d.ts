@@ -1176,7 +1176,18 @@ export type ServerEvent =
   | { type: "crypto:rotated" }
   | { type: "crypto:reset_done" }
   | { type: "crypto:error"; message: string }
-  | { type: "project_keys:current"; projectId: string; wrappedProjectKey: string | null }
+  | {
+      type: "project_keys:current"; projectId: string; wrappedProjectKey: string | null;
+      /**
+       * Cadeia de chaves antigas, da mais antiga pra mais nova. Cada entrada é
+       * a chave AES ANTERIOR cifrada (AES-GCM, formato "e2e:") com a chave que
+       * a substituiu — o server nunca vê plaintext de chave nenhuma. O cliente
+       * decifra de trás pra frente a partir da ativa e usa as antigas como
+       * fallback de leitura: sem isso, rotacionar a chave tornava TODO o
+       * histórico ilegível pra sempre.
+       */
+      keyRing?: string[];
+    }
   | { type: "project_keys:rotated"; projectId: string }
   | { type: "totp:status"; enabled: boolean; setupAt: string | null; hasRecoveryCodes: boolean; recoveryCodesRemaining: number }
   | { type: "totp:setup_pending"; secret: string; provisioningUri: string }
@@ -1511,7 +1522,11 @@ export type ClientCommand =
   | { type: "crypto:reset_with_recovery"; wrappedPrivateKey: string; wrappedPrivateKeyRecovery: string; kekSalt: string; recoveryCodeHash: string; oldRecoveryCodeHash?: string }
   /** Só em dev (THE_DUDES_DEV_LOGIN=1 + user dev@local.test). Limpa identidade E2EE. */
   | { type: "crypto:dev_reset" }
-  | { type: "project_keys:rotate"; projectId: string; wraps: Array<{ userId: string; wrappedProjectKey: string }> }
+  | {
+      type: "project_keys:rotate"; projectId: string; wraps: Array<{ userId: string; wrappedProjectKey: string }>;
+      /** Chave ATUAL cifrada com a NOVA (vira entrada do key ring — ver project_keys:current). */
+      ringEntry?: string;
+    }
   | { type: "totp:status" }
   | { type: "totp:setup_init" }
   | { type: "totp:setup_confirm"; code: string }

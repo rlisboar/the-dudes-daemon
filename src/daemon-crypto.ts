@@ -119,9 +119,72 @@ export function decryptWithDaemonKey(wrappedB64: string): Buffer {
   );
 }
 
-/* ---------- in-memory cache of project AES-256 keys ---------- */
+/* ---------- project AES-256 keys: RAM + wrap persistido ---------- */
 
 const projectKeys = new Map<string, Buffer>(); // projectId → 32-byte raw key
+
+/**
+ * Persistência dos wraps em disco.
+ *
+ * A chave vivia SÓ em memória, e o relay tem fallback documentado: sem chave,
+ * o conteúdo sobe em texto claro. Sequência real: daemon reinicia → chave some
+ * → spawn espera um pouco e prossegue mesmo assim → TODO o tráfego dos agentes
+ * (mensagens, memórias, quadro) chega ao server em plaintext até alguém abrir
+ * o web com o cofre destravado. A promessa E2EE quebrava em silêncio.
+ *
+ * Aqui fica o blob JÁ EMBRULHADO com a RSA do daemon — o mesmo formato que
+ * chega pela rede. Quem lê este arquivo precisa também da privkey, que mora ao
+ * lado com a mesma permissão (0600): nenhuma superfície nova além da que o
+ * daemon-key.pem já expõe.
+ */
+const PROJECT_KEYS_PATH = process.env.THE_DUDES_PROJECT_KEYS_PATH
+  ?? join(homedir(), ".the-dudes", "project-keys.json");
+
+function readPersistedWraps(): Record<string, string> {
+  try {
+    if (!existsSync(PROJECT_KEYS_PATH)) return {};
+    const raw = JSON.parse(readFileSync(PROJECT_KEYS_PATH, "utf8")) as Record<string, string>;
+    return raw && typeof raw === "object" ? raw : {};
+  } catch {
+    return {};
+  }
+}
+
+function persistWrap(projectId: string, wrappedB64: string): void {
+  try {
+    const all = readPersistedWraps();
+    if (all[projectId] === wrappedB64) return;
+    all[projectId] = wrappedB64;
+    mkdirSync(dirname(PROJECT_KEYS_PATH), { recursive: true, mode: 0o700 });
+    writeFileSync(PROJECT_KEYS_PATH, JSON.stringify(all, null, 2), { mode: 0o600 });
+    chmodSync(PROJECT_KEYS_PATH, 0o600);
+  } catch (e) {
+    console.warn(`[the-dudes] falha ao persistir project key wrap de ${projectId}:`, (e as Error).message);
+  }
+}
+
+/** Repõe a chave da RAM a partir do wrap em disco. true se recuperou. */
+function restoreFromDisk(projectId: string): boolean {
+  const wrapped = readPersistedWraps()[projectId];
+  if (!wrapped) return false;
+  try {
+    const raw = decryptWithDaemonKey(wrapped);
+    if (raw.length !== 32) return false;
+    projectKeys.set(projectId, raw);
+    console.info(`[the-dudes] project key de ${projectId} restaurada do disco`);
+    return true;
+  } catch (e) {
+    console.warn(`[the-dudes] wrap persistido de ${projectId} não abre (keypair trocou?):`, (e as Error).message);
+    return false;
+  }
+}
+
+/** RAM primeiro; disco como retaguarda pós-restart. */
+function keyFor(projectId: string): Buffer | null {
+  const k = projectKeys.get(projectId);
+  if (k) return k;
+  return restoreFromDisk(projectId) ? projectKeys.get(projectId) ?? null : null;
+}
 
 /** @returns true se a key foi unwrapada e cacheada com sucesso. */
 export function rememberProjectKey(projectId: string, wrappedB64: string): boolean {
@@ -132,6 +195,9 @@ export function rememberProjectKey(projectId: string, wrappedB64: string): boole
       return false;
     }
     projectKeys.set(projectId, raw);
+    // O wrap que chegou pela rede vai pro disco: é o que impede o fallback
+    // plaintext do relay depois de um restart do daemon.
+    persistWrap(projectId, wrappedB64);
     return true;
   } catch (e) {
     console.warn(`[the-dudes] failed to unwrap project key for ${projectId}:`, (e as Error).message);
@@ -140,7 +206,7 @@ export function rememberProjectKey(projectId: string, wrappedB64: string): boole
 }
 
 export function getProjectKey(projectId: string): Buffer | null {
-  return projectKeys.get(projectId) ?? null;
+  return keyFor(projectId);
 }
 
 /** Forget a project key — call when daemon disconnects from a project
@@ -153,6 +219,16 @@ export function forgetProjectKey(projectId: string): void {
     projectKeys.delete(projectId);
   }
   credPlaintexts.delete(projectId);
+  // Desconectar de UM projeto é remoção deliberada → o wrap sai do disco
+  // também. (O shutdown usa forgetAllProjectKeys, que preserva o disco — é
+  // exatamente a persistência que evita o fallback plaintext pós-restart.)
+  try {
+    const all = readPersistedWraps();
+    if (all[projectId]) {
+      delete all[projectId];
+      writeFileSync(PROJECT_KEYS_PATH, JSON.stringify(all, null, 2), { mode: 0o600 });
+    }
+  } catch { /* best effort */ }
 }
 
 export function forgetAllProjectKeys(): void {
@@ -213,7 +289,7 @@ const E2E_PREFIX = "e2e:";
  *  "e2e:" + base64(iv || ciphertext || tag) — same wire format the web
  *  client uses, so values round-trip transparently. */
 export function encryptForProject(plain: string, projectId: string): string | null {
-  const key = projectKeys.get(projectId);
+  const key = keyFor(projectId);
   if (!key) return null;
   const iv = randomBytes(12);
   const cipher = createCipheriv("aes-256-gcm", key, iv);
@@ -227,7 +303,7 @@ export function encryptForProject(plain: string, projectId: string): string | nu
  *  hold the key for this project (caller must handle fallback). */
 export function decryptForProject(stored: string, projectId: string): string | null {
   if (!stored.startsWith(E2E_PREFIX)) return stored;
-  const key = projectKeys.get(projectId);
+  const key = keyFor(projectId);
   if (!key) return null;
   try {
     const all = Buffer.from(stored.slice(E2E_PREFIX.length), "base64");
@@ -250,7 +326,7 @@ export function decryptForProject(stored: string, projectId: string): string | n
 }
 
 export function hasProjectKey(projectId: string): boolean {
-  return projectKeys.has(projectId);
+  return projectKeys.has(projectId) || keyFor(projectId) !== null;
 }
 
 export function isE2eEncrypted(value: string | null | undefined): boolean {

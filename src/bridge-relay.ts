@@ -15,6 +15,66 @@ import { decryptForProject, encryptForProject, isE2eEncrypted, rememberCredentia
  * an outbound firewall app (Little Snitch / Lulu). Loopback Unix sockets
  * bypass these filters.
  */
+
+/**
+ * Cifra os campos de texto de um payload do bridge ANTES de subir pro server.
+ *
+ * Extraída do handler HTTP para ser testável: o teste de paridade
+ * (e2ee-parity.test.ts, daqui e do web) prova que esta função cifra exatamente
+ * os campos da lista canônica em `@the-dudes/protocol/e2ee-fields` — e que o
+ * web decifra os mesmos. Três bugs de produção nasceram dessa lacuna.
+ *
+ * Muta e devolve o próprio objeto.
+ */
+export function encryptBridgePayload(
+  kind: "send" | "memory_add" | "board",
+  json: Record<string, unknown>,
+  projectId: string,
+): Record<string, unknown> {
+  const cifra = (v: unknown): unknown => {
+    if (typeof v !== "string" || !v || isE2eEncrypted(v)) return v;
+    return encryptForProject(v, projectId) ?? v;
+  };
+  if (kind === "send") {
+    if (typeof json.content === "string") json.content = cifra(json.content);
+    return json;
+  }
+  if (kind === "memory_add") {
+    if (typeof json.title === "string" && typeof json.body === "string" && !json.contentHash) {
+      const norm = (s2: string) => s2.trim().toLowerCase().replace(/\s+/g, " ");
+      json.contentHash = createHash("sha256").update(`${norm(json.title)}\n${norm(json.body)}`).digest("hex");
+    }
+    if (typeof json.title === "string" && !isE2eEncrypted(json.title)) {
+      const enc = encryptForProject(json.title, projectId);
+      if (enc) { json.titleCipher = enc; delete json.title; }
+    }
+    if (typeof json.body === "string" && !isE2eEncrypted(json.body)) {
+      const enc = encryptForProject(json.body, projectId);
+      if (enc) { json.bodyCipher = enc; delete json.body; }
+    }
+    return json;
+  }
+  // board_*
+  for (const campo of ["title", "body", "say", "text", "label"]) {
+    if (campo in json) json[campo] = cifra(json[campo]);
+  }
+  if (Array.isArray(json.steps)) {
+    json.steps = (json.steps as Record<string, unknown>[]).map((st) =>
+      st && typeof st === "object" ? { ...st, label: cifra(st.label), detail: cifra(st.detail) } : st,
+    );
+  }
+  if (json.chart && typeof json.chart === "object") {
+    const c = json.chart as { labels?: unknown[]; series?: Record<string, unknown>[] };
+    if (Array.isArray(c.labels)) c.labels = c.labels.map(cifra);
+    if (Array.isArray(c.series)) {
+      c.series = c.series.map((se) =>
+        se && typeof se === "object" ? { ...se, name: cifra(se.name) } : se,
+      );
+    }
+  }
+  return json;
+}
+
 export class BridgeRelay {
   public readonly socketPath: string;
   private server: http.Server;
@@ -146,12 +206,8 @@ export class BridgeRelay {
         if (projectId) {
           try {
             const json = JSON.parse(body.toString("utf8"));
-            if (json && typeof json.content === "string" && !json.content.startsWith("e2e:")) {
-              const enc = encryptForProject(json.content, projectId);
-              if (enc) {
-                json.content = enc;
-                body = Buffer.from(JSON.stringify(json), "utf8");
-              }
+            if (json && typeof json === "object") {
+              body = Buffer.from(JSON.stringify(encryptBridgePayload("send", json, projectId)), "utf8");
             }
           } catch { /* not JSON or not the shape we expect; leave alone */ }
         }
@@ -166,66 +222,21 @@ export class BridgeRelay {
         if (projectId) {
           try {
             const json = JSON.parse(body.toString("utf8"));
-            // content_hash pra dedup exato (server cego). Normalização DEVE
-            // casar com web (`e2ee.ts memoryContentHash`): trim+lowercase+
-            // colapsa whitespace, title\nbody, sha-256 hex. Calculado ANTES
-            // de cifrar (precisa do plaintext).
-            if (json && typeof json.title === "string" && typeof json.body === "string" && !json.contentHash) {
-              const norm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
-              json.contentHash = createHash("sha256").update(`${norm(json.title)}\n${norm(json.body)}`).digest("hex");
+            if (json && typeof json === "object") {
+              body = Buffer.from(JSON.stringify(encryptBridgePayload("memory_add", json, projectId)), "utf8");
             }
-            if (json && typeof json.title === "string" && !isE2eEncrypted(json.title)) {
-              const enc = encryptForProject(json.title, projectId);
-              if (enc) { json.titleCipher = enc; delete json.title; }
-            }
-            if (json && typeof json.body === "string" && !isE2eEncrypted(json.body)) {
-              const enc = encryptForProject(json.body, projectId);
-              if (enc) { json.bodyCipher = enc; delete json.body; }
-            }
-            body = Buffer.from(JSON.stringify(json), "utf8");
           } catch { /* leave alone */ }
         }
       }
-      // E2EE do Quadro de explicação. O quadro era o ÚNICO conteúdo sensível
-      // que subia em texto claro — e, desde que passou a persistir em
-      // Postgres, ficava assim no banco. Como ele carrega explicação do código
-      // do usuário, é a mesma classe de segredo do chat.
-      //
-      // Cifra só os campos de TEXTO; a estrutura (kind, order, ids, tone,
-      // números do chart) segue em claro pro server continuar aplicando os
-      // limites estruturais que protegem ELE (48 blocos, 24 steps, 80
-      // anotações). Os limites por caractere passam a ser do escritor, que é
-      // quem tem o plaintext.
       const bm = parsed.pathname.match(/^\/api\/bridge\/([^/]+)\/(board_[a-z_]+)$/);
       if (bm) {
         const projectId = this.agentProjectLookup(bm[1]);
         if (projectId) {
           try {
             const json = JSON.parse(body.toString("utf8"));
-            const cifra = (v: unknown): unknown => {
-              if (typeof v !== "string" || !v || isE2eEncrypted(v)) return v;
-              return encryptForProject(v, projectId) ?? v;
-            };
-            for (const campo of ["title", "body", "say", "text", "label"]) {
-              if (campo in json) json[campo] = cifra(json[campo]);
+            if (json && typeof json === "object") {
+              body = Buffer.from(JSON.stringify(encryptBridgePayload("board", json, projectId)), "utf8");
             }
-            if (Array.isArray(json.steps)) {
-              json.steps = json.steps.map((st: Record<string, unknown>) =>
-                st && typeof st === "object"
-                  ? { ...st, label: cifra(st.label), detail: cifra(st.detail) }
-                  : st,
-              );
-            }
-            if (json.chart && typeof json.chart === "object") {
-              const c = json.chart as { labels?: unknown[]; series?: Record<string, unknown>[] };
-              if (Array.isArray(c.labels)) c.labels = c.labels.map(cifra);
-              if (Array.isArray(c.series)) {
-                c.series = c.series.map((se) =>
-                  se && typeof se === "object" ? { ...se, name: cifra(se.name) } : se,
-                );
-              }
-            }
-            body = Buffer.from(JSON.stringify(json), "utf8");
           } catch { /* leave alone */ }
         }
       }

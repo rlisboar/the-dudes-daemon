@@ -7,6 +7,7 @@ import { randomBytes, publicEncrypt, createPublicKey, constants } from "node:cry
 // Key path isolado ANTES do import (DEFAULT_KEY_PATH é resolvido no load do
 // módulo) — não polui ~/.the-dudes nem o CI.
 process.env.THE_DUDES_DAEMON_KEY_PATH = path.join(os.tmpdir(), `td-test-key-${process.pid}-${Date.now()}.pem`);
+process.env.THE_DUDES_PROJECT_KEYS_PATH = path.join(os.tmpdir(), `td-test-pkeys-${process.pid}-${Date.now()}.json`);
 const {
   getDaemonPublicKey, rememberProjectKey, getProjectKey, forgetProjectKey, hasProjectKey,
   encryptForProject, decryptForProject, isE2eEncrypted,
@@ -98,4 +99,22 @@ test("redactCredentialsDeep: recursivo em objeto/array", () => {
   });
   assert.ok(!JSON.stringify(out).includes("leaky-value-xyz"));
   assert.equal(out.b[1], 42); // não-strings intactos
+});
+
+test("persistência: chave sobrevive a 'restart' (RAM limpa, disco fica)", async () => {
+  // O bug real: daemon reiniciava, a chave morria com a RAM e o relay caía no
+  // fallback plaintext — tráfego de agente subia em claro até um web abrir.
+  const { forgetAllProjectKeys } = await import("../daemon-crypto.js");
+  const aes = provisionKey("proj-persist");
+  forgetAllProjectKeys(); // simula shutdown: zera RAM, preserva disco
+  const held = getProjectKey("proj-persist");
+  assert.ok(held, "chave não foi restaurada do disco após limpar a RAM");
+  assert.equal(held!.toString("hex"), aes.toString("hex"));
+  // encrypt também precisa funcionar direto do disco
+  forgetAllProjectKeys();
+  const ct = encryptForProject("pós-restart", "proj-persist");
+  assert.ok(ct?.startsWith("e2e:"), "encrypt caiu no fallback null pós-restart");
+  assert.equal(decryptForProject(ct!, "proj-persist"), "pós-restart");
+  forgetProjectKey("proj-persist"); // remoção deliberada limpa o disco
+  assert.equal(getProjectKey("proj-persist"), null, "forget deliberado deveria apagar o wrap do disco");
 });
