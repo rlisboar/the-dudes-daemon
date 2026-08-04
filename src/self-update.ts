@@ -23,7 +23,7 @@
  */
 
 import { verify as edVerify, createHash } from "node:crypto";
-import { readFileSync, renameSync, writeFileSync } from "node:fs";
+import { renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 /** Mesma pubkey Ed25519 do docker-entrypoint.sh — par da .signing/sign.key. */

@@ -685,12 +685,19 @@ class DaemonClient {
         return;
       }
       case "project_key:for_daemon": {
-        const ok = rememberProjectKey(msg.projectId, msg.wrappedProjectKey);
+        // keyRing opcional (T-007): cadeia project_key_ring mais-antiga→mais-nova.
+        const ring = Array.isArray(msg.keyRing) ? msg.keyRing : undefined;
+        const ok = rememberProjectKey(msg.projectId, msg.wrappedProjectKey, ring);
         if (!ok) {
           log("warn", `E2EE project key wrap rejeitado para ${msg.projectId} (RSA unwrap falhou)`);
           return;
         }
-        log("info", `received E2EE project key for ${msg.projectId}`);
+        const nRing = ring?.length ?? 0;
+        log(
+          "info",
+          `received E2EE project key for ${msg.projectId}` +
+            (nRing > 0 ? ` (keyRing: ${nRing} entrada(s))` : ""),
+        );
         // Flush spawns que esperavam a key.
         const pending = this.pendingSpawns.get(msg.projectId);
         if (pending?.length) {

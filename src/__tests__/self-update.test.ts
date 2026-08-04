@@ -18,7 +18,7 @@ import { checkAndApplyUpdate, verifyBundle } from "../self-update.js";
 const log = () => {};
 
 test("hash publicado igual ao rodando → nada a fazer", async () => {
-  const fetchFn = (async (url: string) => ({
+  const fetchFn = (async (_url: string) => ({
     ok: true,
     arrayBuffer: async () => Buffer.from("a".repeat(64) + "  daemon.cjs\n"),
   })) as unknown as typeof fetch;

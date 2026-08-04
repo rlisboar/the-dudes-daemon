@@ -51,6 +51,12 @@ export interface ProjectKeyForDaemon {
   /** RSA-OAEP-encrypted base64 of the AES-256 project key. Daemon
    *  decrypts with its private key and keeps in memory only. */
   wrappedProjectKey: string;
+  /**
+   * Cadeia de chaves antigas (project_key_ring), mais antiga → mais nova.
+   * Cada entrada é a chave anterior cifrada AES-GCM ("e2e:") com a seguinte.
+   * Opcional: sem o campo, só a ativa (retrocompat; auto-promote se antiga em RAM).
+   */
+  keyRing?: string[];
 }
 
 export interface DaemonWelcome {

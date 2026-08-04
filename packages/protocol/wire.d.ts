@@ -1579,7 +1579,17 @@ export type ClientCommand =
   | { type: "create_project_with_key"; project: { name: string }; wrappedProjectKey: string }
   | { type: "project_keys:enable_e2ee"; projectId: string; wrappedProjectKey: string }
   | { type: "daemon_public_key:get" }
-  | { type: "project_key:send_to_daemon"; projectId: string; wrappedProjectKey: string }
+  | {
+      type: "project_key:send_to_daemon";
+      projectId: string;
+      wrappedProjectKey: string;
+      /**
+       * Opcional. Em geral o server anexa o ring de project_key_ring ao
+       * repassar pro daemon (T-007) — o web não precisa enviar. Se presente,
+       * o server pode preferir este array (blobs e2e: opacos).
+       */
+      keyRing?: string[];
+    }
   | { type: "list_tts_summaries" }
   | { type: "save_tts_summary"; entry: { id: string; agentId?: string; agentName?: string; agentColor?: string; original: string; summary?: string; state: "ok" | "err" | "fallback"; error?: string } }
   | { type: "clear_tts_summaries" }

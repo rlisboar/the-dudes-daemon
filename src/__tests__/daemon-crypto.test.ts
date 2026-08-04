@@ -11,7 +11,7 @@ process.env.THE_DUDES_PROJECT_KEYS_PATH = path.join(os.tmpdir(), `td-test-pkeys-
 const {
   getDaemonPublicKey, rememberProjectKey, getProjectKey, forgetProjectKey, hasProjectKey,
   encryptForProject, decryptForProject, isE2eEncrypted,
-  importProjectKeyRing, countOldProjectKeys,
+  countOldProjectKeys,
   rememberCredentialPlaintext, redactCredentials, redactCredentialsDeep,
 } = await import("../daemon-crypto.js");
 const { createCipheriv } = await import("node:crypto");
@@ -196,15 +196,48 @@ test("key ring: restart preserva leitura de histórico antigo", async () => {
   forgetProjectKey("proj-ring-persist");
 });
 
+test("T-007 wire: RAM vazia + for_daemon com ring de 2 rotações decifra era mais antiga", async () => {
+  // Critério T-007: daemon que só recebe wrap+keyRing (sem chave antiga em RAM)
+  // deve decifrar conteúdo de eras anteriores — multi-rotação offline.
+  const { forgetAllProjectKeys } = await import("../daemon-crypto.js");
+  const k1 = randomBytes(32);
+  const k2 = randomBytes(32);
+  const k3 = randomBytes(32);
+  const msgK1 = encryptWithKey("era-antiga-offline", k1);
+  const ring = [ringEntry(k1, k2), ringEntry(k2, k3)];
+
+  // Simula restart: nenhuma chave em RAM; disco limpo.
+  forgetProjectKey("proj-wire-t007");
+  forgetAllProjectKeys();
+
+  // project_key:for_daemon com keyRing (o que o server passa após T-007)
+  provisionKey("proj-wire-t007", k3, ring);
+  assert.equal(
+    decryptForProject(msgK1, "proj-wire-t007"),
+    "era-antiga-offline",
+    "histórico de 2 rotações atrás ilegível com ring no for_daemon",
+  );
+  forgetProjectKey("proj-wire-t007");
+});
+
+test("T-007 wire: payload sem keyRing (retrocompat) ainda unwrapa a ativa", () => {
+  const k = provisionKey("proj-wire-retro"); // sem keyRing
+  const held = getProjectKey("proj-wire-retro");
+  assert.ok(held);
+  assert.equal(held!.toString("hex"), k.toString("hex"));
+  assert.equal(countOldProjectKeys("proj-wire-retro"), 0);
+  forgetProjectKey("proj-wire-retro");
+});
+
 test("key ring: auto-promote na rotação online (sem keyRing do server)", () => {
   // Daemon online durante rotação: só recebe a chave nova via
   // project_key:for_daemon; a antiga em RAM vira entrada do ring.
-  const k1 = provisionKey("proj-promote");
+  provisionKey("proj-promote");
   const msgK1 = encryptForProject("pré-rotação", "proj-promote")!;
   assert.equal(decryptForProject(msgK1, "proj-promote"), "pré-rotação");
 
   const k2 = randomBytes(32);
-  provisionKey("proj-promote", k2); // sem keyRing — promove k1
+  provisionKey("proj-promote", k2); // sem keyRing — promove a ativa anterior
   assert.ok(countOldProjectKeys("proj-promote") >= 1);
   assert.equal(decryptForProject(msgK1, "proj-promote"), "pré-rotação", "auto-promote falhou");
   // Conteúdo novo usa k2
