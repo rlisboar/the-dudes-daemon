@@ -20,6 +20,10 @@
     "./e2ee-fields": {
       "types": "./e2ee-fields.d.ts",
       "default": "./e2ee-fields.js"
+    },
+    "./wire-version": {
+      "types": "./wire-version.d.ts",
+      "default": "./wire-version.js"
     }
   },
   "scripts": {

@@ -24,6 +24,9 @@ export interface DaemonHello {
   os: string;
   hostname: string;
   version: string;
+  /** Versão do protocolo de fio (WIRE_PROTOCOL_VERSION). O server compara com
+   *  a dele: igual = compatíveis; ausente = daemon antigo. */
+  protocolVersion?: number;
   /** SPKI base64 of the daemon's RSA-OAEP-2048 public key. Web clients
    *  use this to wrap project keys for end-to-end transport without the
    *  server seeing the symmetric key. */

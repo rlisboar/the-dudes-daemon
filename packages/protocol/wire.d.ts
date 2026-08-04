@@ -976,6 +976,8 @@ export interface DaemonInfo {
   version: string;
   binaryHash?: string;
   updateAvailable?: boolean;
+  /** Versão do protocolo de fio declarada no hello (ausente = daemon antigo). */
+  protocolVersion?: number;
   lastSeen?: number;
   connectedAt?: number;
   /** graphify CLI (build) disponível no daemon. */
@@ -1049,7 +1051,21 @@ export type ServerEvent =
   | { type: "prefs_updated"; prefs: Record<string, unknown> }
   | { type: "auth"; user: UserPublic | null }
   | { type: "daemon:status"; status: DaemonStatus }
-  | { type: "daemon:health"; daemonName: string; health: DaemonHealth }
+  | {
+      type: "daemon:health"; daemonName: string; health: DaemonHealth;
+      /** Identidade e compatibilidade das duas pontas, avaliada pelo server. */
+      versions?: {
+        daemonVersion: string;
+        daemonBinaryHash?: string;
+        daemonProtocol?: number;
+        serverBuild: string;
+        serverProtocol: number;
+        /** daemonProtocol === serverProtocol; null quando o daemon não declara. */
+        compatible: boolean | null;
+        /** Binário rodando ≠ release publicado — atualização disponível. */
+        updateAvailable?: boolean;
+      };
+    }
   | { type: "daemon:logs"; daemonName: string; lines: DaemonLogLine[] }
   | { type: "daemon:statuses"; list: DaemonStatus[] }
   | { type: "daemon:verified"; userId: string }

@@ -1,5 +1,6 @@
 import { healthSnapshot, recentLogs, recordLog, recordWsRtt } from "./health-monitor.js";
 import { turnGateStats } from "./runners/turn-gate.js";
+import { WIRE_PROTOCOL_VERSION } from "@the-dudes/protocol/wire-version";
 import { initSentry, capture, captureWarn, breadcrumb, setTag, flush as flushSentry } from "./sentry.js";
 initSentry(); // gated em SENTRY_DSN_DAEMON / SENTRY_DSN; no-op sem env
 
@@ -306,6 +307,7 @@ class DaemonClient {
         os: process.platform,
         hostname: os.hostname(),
         version: VERSION,
+        protocolVersion: WIRE_PROTOCOL_VERSION,
         binaryHash: runningBinaryHash(),
         cryptoPublicKey,
         // Resume: server reenvia msgs com seq > lastSeenSeq do buffer
