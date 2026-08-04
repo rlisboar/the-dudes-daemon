@@ -59,6 +59,11 @@ interface Entry {
 
 export class AgentHost {
   private entries = new Map<string, Entry>();
+
+  /** Quantos agentes este daemon mantém vivos — indicador de saúde da UI. */
+  agentCount(): number {
+    return this.entries.size;
+  }
   private autoApproveDefault = false;
   /** Liga watch debounced do grafo (setado pelo DaemonClient). */
   onGraphWatch?: (workspaceRoot: string, graphifyBin: string, projectId?: string) => void;

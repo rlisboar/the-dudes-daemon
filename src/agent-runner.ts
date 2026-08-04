@@ -10,6 +10,7 @@ import type { ResolvedCliCommands } from "./cli-config.js";
 import { resolvePython3 } from "./cli-config.js";
 import { buildGraph, graphExists, graphMtime, graphPath, hasSemanticMarker, needsSemanticUpdate } from "./graph-indexer.js";
 import { acquireTurnSlot } from "./runners/turn-gate.js";
+import { recordHang, recordHardRecover, recordTurnEnd, recordTurnStart } from "./health-monitor.js";
 import { isPerMessageRunner, runnerAdapter } from "./runners/index.js";
 import { claudeOneShotArgs, codexOneShotArgs, crushOneShotArgs, geminiOneShotArgs, grokHeadlessArgs, opencodeOneShotArgs } from "./runners/args.js";
 import { buildBaseRunnerEnv, buildBridgeAwareEnv, buildGeminiEnv, buildGrokEnv } from "./runners/env.js";
@@ -554,10 +555,21 @@ export class AgentRunner {
     // Semáforo global: N turnos de CLI simultâneos = N×~120MB; ver turn-gate.
     const releaseSlot = await acquireTurnSlot(`${this.opts.cliRunner}:${this.info.name}`, this.opts.log);
     if (this.stopped) { releaseSlot(); return ""; }
+    recordTurnStart(this.opts.cliRunner);
+    const turnoT0 = Date.now();
     return new Promise<string>((resolveRaw) => {
       // Todo caminho de saída passa pelo resolve → o slot volta junto.
-      // (Promise ignora resolve duplo e o release é idempotente.)
-      const resolve = (v: string) => { releaseSlot(); resolveRaw(v); };
+      // (Promise ignora resolve duplo e o release é idempotente; a métrica
+      // usa o mesmo funil — saída vazia conta como falha do turno.)
+      let contabilizado = false;
+      const resolve = (v: string) => {
+        if (!contabilizado) {
+          contabilizado = true;
+          recordTurnEnd(this.opts.cliRunner, Date.now() - turnoT0, v.trim().length > 0);
+        }
+        releaseSlot();
+        resolveRaw(v);
+      };
       // stop() antes do spawn: sem o check, o one-shot nasce DEPOIS do
       // emitExit (que apagou o tmpdir) e roda órfão consumindo API.
       if (this.stopped) { resolve(""); return; }
@@ -2398,6 +2410,8 @@ export class AgentRunner {
     // 'close' do processo; o guard interno do gate cobre o "close não veio".
     const releaseSlot = await acquireTurnSlot(`grok:${this.info.name}`, this.opts.log);
     if (this.stopped || !this.messageSession.owns(epoch0)) { releaseSlot(); return; }
+    recordTurnStart("grok");
+    const grokTurnT0 = Date.now();
     this.writeGrokConfig();
 
     let message = content;
@@ -2451,7 +2465,10 @@ export class AgentRunner {
       this.drainOcQueue();
       return;
     }
-    proc.once("close", releaseSlot);
+    proc.once("close", (code: number | null) => {
+      releaseSlot();
+      recordTurnEnd("grok", Date.now() - grokTurnT0, code === 0);
+    });
     this.ocActiveProc = proc;
     const grokTurnStartedAt = Date.now();
     // Marco de INÍCIO do turno. Sem ele o log só tinha o fim (soft hang aos
@@ -3814,6 +3831,7 @@ export class AgentRunner {
     if (phase === "soft" && !this.activityClock.softReported) {
       this.activityClock.softReported = true;
       this.setState("stalled");
+      recordHang(runner);
       const msg = `[hang] sem atividade há ${Math.round(idleMs / 1000)}s (runner=${runner}) — aguardando…`;
       this.opts.log("warn", `${msg} agent=${this.info.name}`);
       this.opts.onError(msg);
@@ -3825,6 +3843,7 @@ export class AgentRunner {
   private recoverHungTurn(reason: string, idleMs: number): void {
     if (this.recoveringHung || this.stopped) return;
     this.recoveringHung = true;
+    recordHardRecover(this.opts.cliRunner);
     try {
       this.opts.log(
         "warn",

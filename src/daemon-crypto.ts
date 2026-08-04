@@ -231,6 +231,15 @@ export function forgetProjectKey(projectId: string): void {
   } catch { /* best effort */ }
 }
 
+/** Nº de projetos com chave utilizável (RAM + wraps em disco). Indicador de
+ *  saúde: 0 num daemon com agentes E2EE = tudo subindo... nada, porque o
+ *  relay recusa? Não — cai em plaintext. Por isso o número aparece na UI. */
+export function countUsableProjectKeys(): number {
+  const ids = new Set(projectKeys.keys());
+  for (const id of Object.keys(readPersistedWraps())) ids.add(id);
+  return ids.size;
+}
+
 export function forgetAllProjectKeys(): void {
   for (const k of projectKeys.values()) k.fill(0);
   projectKeys.clear();

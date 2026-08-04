@@ -995,6 +995,28 @@ export interface DaemonStatus {
   daemons: DaemonInfo[];
 }
 
+/** Saúde do daemon, medida pelo próprio daemon a cada heartbeat. */
+export interface DaemonHealth {
+  ts: number;
+  uptimeS: number;
+  memRssMb: number;
+  /** RTT do ping WS daemon↔orchestrator (ms); null antes da 1ª medição. */
+  wsRttMs: number | null;
+  turnGate: { active: number; queued: number; max: number };
+  turns: { started: number; ok: number; failed: number; hardRecovers: number; hangs: number };
+  turnP50Ms: number | null;
+  turnP95Ms: number | null;
+  byRunner: Record<string, { started: number; ok: number; failed: number; hardRecovers: number; hangs: number }>;
+  agentsRunning: number;
+  e2eeProjects: number;
+}
+
+export interface DaemonLogLine {
+  ts: number;
+  level: "info" | "warn" | "error";
+  msg: string;
+}
+
 export interface DaemonTokenPublic {
   id: string;
   label?: string;
@@ -1027,6 +1049,8 @@ export type ServerEvent =
   | { type: "prefs_updated"; prefs: Record<string, unknown> }
   | { type: "auth"; user: UserPublic | null }
   | { type: "daemon:status"; status: DaemonStatus }
+  | { type: "daemon:health"; daemonName: string; health: DaemonHealth }
+  | { type: "daemon:logs"; daemonName: string; lines: DaemonLogLine[] }
   | { type: "daemon:statuses"; list: DaemonStatus[] }
   | { type: "daemon:verified"; userId: string }
   | { type: "model_catalogs"; catalogs: RunnerModelCatalog[]; error?: string }
@@ -1532,6 +1556,7 @@ export type ClientCommand =
   | { type: "totp:setup_confirm"; code: string }
   | { type: "totp:disable"; code: string }
   | { type: "project_keys:get"; projectId: string }
+  | { type: "daemon:logs:get"; daemonName?: string; limit?: number }
   | { type: "project_keys:set_for_member"; projectId: string; userId: string; wrappedProjectKey: string }
   | { type: "project_keys:list_pending"; projectId: string }
   | { type: "user_public_key:get"; userId: string }

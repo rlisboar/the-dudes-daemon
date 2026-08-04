@@ -1,3 +1,5 @@
+import { healthSnapshot, recentLogs, recordLog, recordWsRtt } from "./health-monitor.js";
+import { turnGateStats } from "./runners/turn-gate.js";
 import { initSentry, capture, captureWarn, breadcrumb, setTag, flush as flushSentry } from "./sentry.js";
 initSentry(); // gated em SENTRY_DSN_DAEMON / SENTRY_DSN; no-op sem env
 
@@ -18,7 +20,7 @@ import { BridgeRelay } from "./bridge-relay.js";
 import { defaultDaemonConfigPath, formatCliStatus, loadDaemonCliConfig, mergeCliConfig, resolveCliCommands, type DaemonCliConfig, type ResolvedCliCommands } from "./cli-config.js";
 import type { FromDaemon, FromOrch } from "./protocol.js";
 import { runSummarizer } from "./summarizer-runner.js";
-import { decryptForProject, encryptForProject, forgetAllProjectKeys, getDaemonPublicKey, hasProjectKey, isE2eEncrypted, rememberProjectKey } from "./daemon-crypto.js";
+import { decryptForProject, encryptForProject, countUsableProjectKeys, forgetAllProjectKeys, getDaemonPublicKey, hasProjectKey, isE2eEncrypted, rememberProjectKey } from "./daemon-crypto.js";
 import { dispatchWebhook } from "./webhook-dispatch.js";
 import { ModelDiscovery } from "./model-discovery.js";
 import { parseGitPorcelain } from "./git-status.js";
@@ -147,6 +149,7 @@ class DaemonClient {
    *  em ~60s — sem isso, sleep/wake do laptop deixa socket fantasma. */
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private lastPongAt = 0;
+  private lastPingSentAt = 0;
   // 4G/CGNAT: NAT mapping expira em 60s tipicamente. PING WS a cada 15s
   // mantém NAT entry "ativa" + detecta morte cedo. TIMEOUT 90s = 6 ciclos
   // de chance antes do terminate; tolera jitter mobile sem matar conn
@@ -281,6 +284,8 @@ class DaemonClient {
     // troca) deixa daemon achando que está online por minutos/horas.
     ws.on("pong", () => {
       this.lastPongAt = Date.now();
+      // RTT do canal com o orchestrator — vira o indicador de latência da UI.
+      if (this.lastPingSentAt) recordWsRtt(Date.now() - this.lastPingSentAt);
     });
 
     ws.on("open", () => {
@@ -655,6 +660,16 @@ class DaemonClient {
       case "summarize:request":
         await this.handleSummarize(msg);
         return;
+      case "daemon:logs:get": {
+        // Visor de debug da UI: as últimas linhas do ring (pós-scrub).
+        const m = msg as { correlationId?: string; limit?: number };
+        this.send({
+          type: "daemon:logs:result",
+          correlationId: m.correlationId,
+          lines: recentLogs(m.limit ?? 300),
+        });
+        return;
+      }
       case "project_key:for_daemon": {
         const ok = rememberProjectKey(msg.projectId, msg.wrappedProjectKey);
         if (!ok) {
@@ -1752,12 +1767,30 @@ class DaemonClient {
         return;
       }
       try {
+        this.lastPingSentAt = Date.now();
         ws.ping();
       } catch (e) {
         log("warn", `ws.ping failed: ${(e as Error).message}`);
       }
+      // Snapshot de saúde no mesmo compasso do heartbeat: 15s é granular o
+      // bastante pra UI e barato o bastante pra nem aparecer no perfil.
+      this.sendHealth();
     }, DaemonClient.HEARTBEAT_INTERVAL_MS);
   }
+  /** Snapshot de saúde → server → UI. Falha silenciosa se o canal caiu. */
+  private sendHealth() {
+    try {
+      const health = healthSnapshot({
+        turnGate: turnGateStats(),
+        agentsRunning: this.host.agentCount(),
+        e2eeProjects: countUsableProjectKeys(),
+      });
+      this.send({ type: "daemon:health", health });
+    } catch (e) {
+      log("warn", `sendHealth falhou: ${(e as Error).message}`);
+    }
+  }
+
   private stopHeartbeat() {
     if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
   }
@@ -1815,6 +1848,8 @@ function log(level: "info" | "warn" | "error", msg: string) {
   const safe = scrubLog(msg);
   for (const line of safe.split(/\r?\n/)) {
     stream.write(`[${ts}] [${level}] ${line}\n`);
+    // Ring de debug da UI — sempre DEPOIS do scrub, nunca o texto cru.
+    recordLog(level, line);
   }
 }
 

@@ -765,7 +765,40 @@ export interface ModelsCatalogResult {
   catalogs: RunnerModelCatalog[];
 }
 
+/** Snapshot de saúde do daemon (indicadores da UI). */
+export interface DaemonHealthEv {
+  type: "daemon:health";
+  health: {
+    ts: number;
+    uptimeS: number;
+    memRssMb: number;
+    wsRttMs: number | null;
+    turnGate: { active: number; queued: number; max: number };
+    turns: { started: number; ok: number; failed: number; hardRecovers: number; hangs: number };
+    turnP50Ms: number | null;
+    turnP95Ms: number | null;
+    byRunner: Record<string, { started: number; ok: number; failed: number; hardRecovers: number; hangs: number }>;
+    agentsRunning: number;
+    e2eeProjects: number;
+  };
+}
+
+/** Pedido do visor de logs de debug da UI (via server). */
+export interface DaemonLogsGetRequest {
+  type: "daemon:logs:get";
+  correlationId?: string;
+  limit?: number;
+}
+
+export interface DaemonLogsResult {
+  type: "daemon:logs:result";
+  correlationId?: string;
+  lines: Array<{ ts: number; level: "info" | "warn" | "error"; msg: string }>;
+}
+
 export type FromDaemon =
+  | DaemonHealthEv
+  | DaemonLogsResult
   | GitlabApiResult
   | DaemonHello | DaemonPing | DaemonChallengeResponse
   | AgentStateEv | AgentRunningEv | AgentSessionEv | AgentTokenResyncEv | AgentUsageDeltaEv
@@ -789,6 +822,7 @@ export type FromDaemon =
   | ModelsCatalogResult;
 
 export type FromOrch =
+  | DaemonLogsGetRequest
   | DaemonWelcome | DaemonPong | DaemonChallenge | RunnerPolicySet
   | AgentSpawn | AgentStop | AgentSend | AgentClear | AgentCompact
   | AutoApproveSet | WorkspaceSet
