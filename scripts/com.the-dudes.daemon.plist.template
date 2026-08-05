@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent template — the-dudes daemon (macOS, user-level).
+
+  Placeholders substituídos por install-launchagent.sh:
+    __LABEL__        com.the-dudes.daemon
+    __BASH__         path absoluto de bash
+    __RUN_DAEMON__   path absoluto de run-daemon.sh
+    __ENV_FILE__     path do daemon.env
+    __LOG_FILE__     path do log do daemon (rotação pelo launcher)
+    __HOME__         $HOME do usuário
+    __PATH__         PATH com node (homebrew/local)
+    __NODE__         path absoluto de node (THE_DUDES_NODE)
+    __STDOUT__       log launchd stdout (bootstrap/erros do wrapper)
+    __STDERR__       log launchd stderr
+
+  O ProgramArguments invoca o launcher (run-daemon.sh), NÃO o node
+  direto: token fica no env-file (não em argv/ps), self-update exit 42
+  relança no loop do launcher, log rotaciona 20MB×2.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>__LABEL__</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__BASH__</string>
+    <string>__RUN_DAEMON__</string>
+    <string>__ENV_FILE__</string>
+    <string>__LOG_FILE__</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__HOME__/.the-dudes</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>__HOME__</string>
+    <key>PATH</key>
+    <string>__PATH__</string>
+    <key>THE_DUDES_NODE</key>
+    <string>__NODE__</string>
+    <key>THE_DUDES_LAUNCHER</key>
+    <string>1</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Relança o launcher se ele sair (crash/kill). Exit 42 do daemon
+       é engolido pelo loop de run-daemon.sh e NÃO cai aqui. -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <!-- Logs do launchd/wrapper (o daemon escreve no __LOG_FILE__ via launcher). -->
+  <key>StandardOutPath</key>
+  <string>__STDOUT__</string>
+  <key>StandardErrorPath</key>
+  <string>__STDERR__</string>
+</dict>
+</plist>

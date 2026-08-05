@@ -14,11 +14,14 @@
 #   ~/.the-dudes/run-daemon.sh <env-file> [log-file]
 # Ex.:
 #   nohup ~/.the-dudes/run-daemon.sh ~/.the-dudes/daemon.env ~/.the-dudes/daemon-prod.log &
+# Preferido no macOS: LaunchAgent (daemon/scripts/install-launchagent.sh).
 set -euo pipefail
 
 ENV_FILE="${1:?uso: run-daemon.sh <env-file> [log-file]}"
 LOG_FILE="${2:-$HOME/.the-dudes/daemon.log}"
 DAEMON_BIN="${THE_DUDES_DAEMON_BIN:-$HOME/.the-dudes/daemon.cjs}"
+# Path absoluto de node sob launchd (PATH esparso). install-launchagent.sh define.
+NODE_BIN="${THE_DUDES_NODE:-node}"
 MAX_LOG_BYTES=$((20 * 1024 * 1024))   # 20MB por geração
 KEEP_GENERATIONS=2
 
@@ -45,13 +48,15 @@ while true; do
   set +a
   export THE_DUDES_LAUNCHER=1
   set +e
-  node "$DAEMON_BIN" >> "$LOG_FILE" 2>&1
+  "$NODE_BIN" "$DAEMON_BIN" >> "$LOG_FILE" 2>&1
   code=$?
   set -e
   if [ "$code" -eq 42 ]; then
     echo "[$(date -u +%FT%TZ)] [launcher] daemon pediu relançamento pós-update (exit 42)" >> "$LOG_FILE"
     continue
   fi
+  # Sob launchd (KeepAlive), o agent relança este script. Fora do launchd,
+  # exit evita crash-loop silencioso (nohup puro).
   echo "[$(date -u +%FT%TZ)] [launcher] daemon saiu com código $code — encerrando launcher" >> "$LOG_FILE"
   exit "$code"
 done
