@@ -11,14 +11,20 @@
 #    encerra o launcher (crash-loop infinito mascara problema real).
 #
 # Uso:
-#   ~/.the-dudes/run-daemon.sh <env-file> [log-file]
-# Ex.:
+#   <profile-home>/run-daemon.sh <env-file> [log-file]
+# Ex. default (T-026):
 #   nohup ~/.the-dudes/run-daemon.sh ~/.the-dudes/daemon.env ~/.the-dudes/daemon-prod.log &
-# Preferido no macOS: LaunchAgent (daemon/scripts/install-launchagent.sh).
+# Ex. perfil "work" (T-029):
+#   ~/.the-dudes-work/run-daemon.sh ~/.the-dudes-work/daemon.env ~/.the-dudes-work/daemon-prod.log
+#
+# Multi-conta: cada perfil tem o PRÓPRIO daemon.cjs (THE_DUDES_DAEMON_BIN).
+# Self-update escreve em dirname(selfPath) — sem race entre perfis.
+# Preferido no macOS: install-launchagent.sh [--profile X].
 set -euo pipefail
 
 ENV_FILE="${1:?uso: run-daemon.sh <env-file> [log-file]}"
 LOG_FILE="${2:-$HOME/.the-dudes/daemon.log}"
+# Default = home canônico; LaunchAgent multi-perfil sobrescreve via env/plist.
 DAEMON_BIN="${THE_DUDES_DAEMON_BIN:-$HOME/.the-dudes/daemon.cjs}"
 # Path absoluto de node sob launchd (PATH esparso). install-launchagent.sh define.
 NODE_BIN="${THE_DUDES_NODE:-node}"
