@@ -70,17 +70,20 @@ export function mergeCliConfig(...configs: Array<DaemonCliConfig | undefined | n
 }
 
 export function resolveCliCommands(config: DaemonCliConfig = {}): ResolvedCliCommands {
+  // Launchd / nohup herdam PATH mínimo — CLIs de usuário vivem fora dele
+  // (~/.local/bin, ~/.grok/bin). Sempre varrer userRunnerBinDirs (T-031).
+  const userDirs = userRunnerBinDirs();
   const resolved: ResolvedCliCommands = {
-    claude: resolveOne("claude", config.cliPaths?.claude),
-    opencode: resolveOne("opencode", config.cliPaths?.opencode),
-    gemini: resolveOne("gemini", config.cliPaths?.gemini),
-    codex: resolveOne("codex", config.cliPaths?.codex),
+    claude: resolveOne("claude", config.cliPaths?.claude, userDirs),
+    opencode: resolveOne("opencode", config.cliPaths?.opencode, userDirs),
+    gemini: resolveOne("gemini", config.cliPaths?.gemini, userDirs),
+    codex: resolveOne("codex", config.cliPaths?.codex, userDirs),
     // crush (charmbracelet) instala via brew/go install em ~/.local/bin ou
     // /opt/homebrew/bin — dirs que o PATH herdado pelo daemon nem sempre tem.
-    crush: resolveOne("crush", config.cliPaths?.crush, pythonBinDirs()),
+    crush: resolveOne("crush", config.cliPaths?.crush, userDirs),
     // grok (xAI Grok Build) instala em ~/.grok/bin (installer oficial) e às
     // vezes em ~/.local/bin / homebrew — fora do PATH do daemon.
-    grok: resolveOne("grok", config.cliPaths?.grok, grokBinDirs()),
+    grok: resolveOne("grok", config.cliPaths?.grok, userDirs),
     // graphify/graphify-mcp costumam ser instalados via pip --user/pipx em
     // dirs FORA do PATH herdado pelo daemon (ex: ~/Library/Python/X.Y/bin,
     // ~/.local/bin). Além do `which`, varre esses dirs de script do pip.
@@ -90,26 +93,37 @@ export function resolveCliCommands(config: DaemonCliConfig = {}): ResolvedCliCom
   return resolved;
 }
 
-/** Dirs comuns onde pip/pipx instalam console scripts, fora do PATH padrão. */
-function pythonBinDirs(): string[] {
-  const home = os.homedir();
-  const dirs: string[] = [path.join(home, ".local", "bin"), "/opt/homebrew/bin", "/usr/local/bin"];
-  // macOS pip --user: ~/Library/Python/X.Y/bin
-  collectVersionedBins(path.join(home, "Library", "Python"), dirs);
-  // python.org framework: /Library/Frameworks/Python.framework/Versions/X.Y/bin
-  collectVersionedBins("/Library/Frameworks/Python.framework/Versions", dirs);
-  return dirs;
-}
-
-/** Dirs onde o installer oficial do Grok Build coloca o binário. */
-function grokBinDirs(): string[] {
+/**
+ * Dirs onde runners de usuário costumam morar sob launchd (PATH esparso).
+ * Exportado para testes e para o install-launchagent espelhar o mesmo conjunto.
+ * Ordem: dirs de usuário primeiro, depois homebrew/system.
+ */
+export function userRunnerBinDirs(): string[] {
   const home = os.homedir();
   return [
     path.join(home, ".grok", "bin"),
     path.join(home, ".local", "bin"),
+    path.join(home, "bin"),
     "/opt/homebrew/bin",
     "/usr/local/bin",
   ];
+}
+
+/** Dirs comuns onde pip/pipx instalam console scripts, fora do PATH padrão. */
+function pythonBinDirs(): string[] {
+  const home = os.homedir();
+  const dirs: string[] = [
+    ...userRunnerBinDirs(),
+    path.join(home, ".local", "bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+  ];
+  // macOS pip --user: ~/Library/Python/X.Y/bin
+  collectVersionedBins(path.join(home, "Library", "Python"), dirs);
+  // python.org framework: /Library/Frameworks/Python.framework/Versions/X.Y/bin
+  collectVersionedBins("/Library/Frameworks/Python.framework/Versions", dirs);
+  // dedupe preserving order
+  return [...new Set(dirs)];
 }
 
 function collectVersionedBins(base: string, out: string[]): void {

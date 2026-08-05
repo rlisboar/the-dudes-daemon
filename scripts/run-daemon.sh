@@ -31,6 +31,32 @@ NODE_BIN="${THE_DUDES_NODE:-node}"
 MAX_LOG_BYTES=$((20 * 1024 * 1024))   # 20MB por geração
 KEEP_GENERATIONS=2
 
+# T-031: sob launchd o PATH é mínimo e não carrega .zshrc. Prepende dirs
+# padrão de runners de usuário (espelha userRunnerBinDirs no daemon).
+# Não usa `zsh -lc` — evita depender de dotfiles e de side-effects de login.
+ensure_runner_path() {
+  local home="${HOME:-}"
+  local prepend=(
+    "${home}/.grok/bin"
+    "${home}/.local/bin"
+    "${home}/bin"
+    "/opt/homebrew/bin"
+    "/usr/local/bin"
+  )
+  local d new=""
+  for d in "${prepend[@]}"; do
+    [ -n "$d" ] || continue
+    case ":${PATH:-}:" in
+      *":$d:"*) ;; # já no PATH
+      *) new="${new:+$new:}$d" ;;
+    esac
+  done
+  if [ -n "$new" ]; then
+    export PATH="$new${PATH:+:$PATH}"
+  fi
+}
+ensure_runner_path
+
 rotate_log() {
   # Rotaciona no start e sempre que a geração atual passa do teto.
   local size
@@ -54,6 +80,12 @@ while true; do
   set +a
   export THE_DUDES_LAUNCHER=1
   set +e
+  # Nota T-031: se launchd.stderr mostrar
+  #   run-daemon.sh: line N: PID Killed: 9  "$NODE_BIN" ...
+  # isso NÃO é este script matando a si mesmo. É o bash reportando que o
+  # filho node recebeu SIGKILL (exit 137 = 128+9) de fora — em geral
+  # install-launchagent.sh safe_stop (reinstall do mesmo perfil) ou kill
+  # manual. O launcher nunca envia kill.
   "$NODE_BIN" "$DAEMON_BIN" >> "$LOG_FILE" 2>&1
   code=$?
   set -e
@@ -63,6 +95,7 @@ while true; do
   fi
   # Sob launchd (KeepAlive), o agent relança este script. Fora do launchd,
   # exit evita crash-loop silencioso (nohup puro).
+  # code 137 = SIGKILL externo (ver nota acima).
   echo "[$(date -u +%FT%TZ)] [launcher] daemon saiu com código $code — encerrando launcher" >> "$LOG_FILE"
   exit "$code"
 done

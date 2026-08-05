@@ -81,28 +81,28 @@ require_macos() {
 }
 
 # Resolve LABEL e TD_DIR a partir do perfil.
+# Perfil NOMEADO ignora THE_DUDES_HOME (evita 2 labels no MESMO home se a
+# var estiver exportada no shell do dono — colisão de kill/binário).
 resolve_profile() {
-  if [ -z "$PROFILE" ]; then
+  if [ -z "$PROFILE" ] || [ "$PROFILE" = "default" ]; then
     LABEL="com.the-dudes.daemon"
     TD_DIR="${THE_DUDES_HOME:-$HOME_DIR/.the-dudes}"
     PROFILE_DISP="default"
+    PROFILE=""
     return
   fi
-  case "$PROFILE" in
-    default|"")
-      LABEL="com.the-dudes.daemon"
-      TD_DIR="${THE_DUDES_HOME:-$HOME_DIR/.the-dudes}"
-      PROFILE_DISP="default"
-      PROFILE=""
-      return
-      ;;
-  esac
   if ! printf '%s' "$PROFILE" | grep -Eq '^[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}$'; then
     die "perfil inválido '$PROFILE' (use [a-zA-Z0-9][a-zA-Z0-9_-]{0,31})"
   fi
-  # "preview" e nomes com prefixo já usados como ~/.the-dudes-preview
   LABEL="com.the-dudes.daemon.$PROFILE"
-  TD_DIR="${THE_DUDES_HOME:-$HOME_DIR/.the-dudes-$PROFILE}"
+  if [ -n "${THE_DUDES_HOME:-}" ] && [ "${THE_DUDES_HOME_FORCE:-}" != "1" ]; then
+    warn "THE_DUDES_HOME=$THE_DUDES_HOME ignorado para --profile $PROFILE (use THE_DUDES_HOME_FORCE=1 para forçar)"
+  fi
+  if [ "${THE_DUDES_HOME_FORCE:-}" = "1" ] && [ -n "${THE_DUDES_HOME:-}" ]; then
+    TD_DIR="$THE_DUDES_HOME"
+  else
+    TD_DIR="$HOME_DIR/.the-dudes-$PROFILE"
+  fi
   PROFILE_DISP="$PROFILE"
 }
 
@@ -141,23 +141,94 @@ resolve_bash() {
   die "bash não encontrado"
 }
 
+# PATH do LaunchAgent (T-031): inclui dirs de runners de usuário.
+# Espelha userRunnerBinDirs() em daemon/src/cli-config.ts — sem depender de
+# .zshrc. Ordem: user bins → homebrew → system.
 default_path() {
-  printf '%s\n' "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+  local home="${HOME_DIR:-$HOME}"
+  local parts=(
+    "$home/.grok/bin"
+    "$home/.local/bin"
+    "$home/bin"
+    "/opt/homebrew/bin"
+    "/usr/local/bin"
+    "/usr/bin"
+    "/bin"
+    "/usr/sbin"
+    "/sbin"
+  )
+  local out="" d
+  for d in "${parts[@]}"; do
+    # inclui mesmo se ainda não existir (usuário pode instalar CLI depois)
+    if [ -z "$out" ]; then out="$d"; else out="$out:$d"; fi
+  done
+  printf '%s\n' "$out"
 }
 
-# PIDs soltos deste perfil (path canônico do TD_DIR). Nunca pkill genérico.
+# Reporta se runners resolvem com o PATH do plist (simula launchd).
+report_runners_on_plist_path() {
+  local path_val
+  path_val="$(default_path)"
+  log "plist_PATH:      $path_val"
+  local r found miss
+  for r in grok claude opencode gemini codex crush; do
+    found=""
+    # which com PATH=plist (não herda shell do dono)
+    found="$(PATH="$path_val" /usr/bin/which "$r" 2>/dev/null || true)"
+    if [ -z "$found" ]; then
+      # fallback: scan dirs do PATH manualmente (which às vezes falha em symlink)
+      local dir cand
+      IFS=':' read -r -a _dirs <<< "$path_val"
+      for dir in "${_dirs[@]}"; do
+        cand="$dir/$r"
+        if [ -x "$cand" ]; then found="$cand"; break; fi
+      done
+    fi
+    if [ -n "$found" ]; then
+      log "runner $r:       OK  $found"
+    else
+      log "runner $r:       AUSENTE (não está no PATH do LaunchAgent)"
+      miss=1
+    fi
+  done
+  if [ "${miss:-0}" = "1" ]; then
+    warn "runners ausentes sob PATH do plist — agentes desses CLIs não iniciam sob launchd"
+    warn "instale o CLI ou adicione o dir ao default_path / daemon-config cliPaths"
+  fi
+}
+
+# True se $cmd referencia EXATAMENTE um path sob $TD_DIR (não um primo
+# ~/.the-dudes-work quando TD_DIR=~/.the-dudes). Exige o path completo do
+# binário/launcher como token de argv.
+cmd_belongs_to_td_dir() {
+  local cmd="$1"
+  local bin="$TD_DIR/daemon.cjs"
+  local run="$TD_DIR/run-daemon.sh"
+  # token match: espaço/início antes e espaço/fim depois — evita substring
+  # acidental. Paths absolutos no argv do launchd/node.
+  case " $cmd " in
+    *" $bin "*|*" $bin"|*"$bin "*) return 0 ;;
+    *" $run "*|*" $run"|*"$run "*) return 0 ;;
+  esac
+  # argv às vezes cola sem espaço final
+  case "$cmd" in
+    "$bin"|"$bin "*|*" $bin"|*" $bin "*) return 0 ;;
+    "$run"|"$run "*|*" $run"|*" $run "*) return 0 ;;
+  esac
+  return 1
+}
+
+# PIDs deste perfil apenas. Nunca pkill genérico; nunca outro perfil.
 list_loose_pids() {
   local pid cmd
-  local needle_daemon="$TD_DIR/daemon.cjs"
-  local needle_run="$TD_DIR/run-daemon.sh"
   ps -axo pid=,command= 2>/dev/null | while IFS= read -r line; do
     line="${line#"${line%%[![:space:]]*}"}"
     pid="${line%% *}"
     cmd="${line#"$pid"}"
     cmd="${cmd#"${cmd%%[![:space:]]*}"}"
-    case "$cmd" in
-      *"$needle_daemon"*|*"$needle_run"*) printf '%s\n' "$pid" ;;
-    esac
+    if cmd_belongs_to_td_dir "$cmd"; then
+      printf '%s\n' "$pid"
+    fi
   done | sort -un
 }
 
@@ -165,10 +236,7 @@ pid_still_ours() {
   local pid="$1" cmd
   cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
   [ -n "$cmd" ] || return 1
-  case "$cmd" in
-    *"$TD_DIR/daemon.cjs"*|*"$TD_DIR/run-daemon.sh"*) return 0 ;;
-    *) return 1 ;;
-  esac
+  cmd_belongs_to_td_dir "$cmd"
 }
 
 safe_stop_loose() {
@@ -176,24 +244,40 @@ safe_stop_loose() {
   pids="$(list_loose_pids | tr '\n' ' ')"
   pids="${pids%% }"
   if [ -z "${pids// }" ]; then
-    log "nenhum daemon solto em $TD_DIR"
+    log "nenhum processo do perfil em $TD_DIR"
     return 0
   fi
-  log "daemons soltos do perfil (PIDs): $pids"
+  log "processos do perfil a parar (PIDs): $pids"
   if [ "$NO_KILL" -eq 1 ]; then
     warn "--no-kill: não mato"
     return 0
   fi
   for pid in $pids; do
-    pid_still_ours "$pid" || { warn "PID $pid já não é nosso"; continue; }
-    log "SIGTERM PID $pid"
+    pid_still_ours "$pid" || { warn "PID $pid já não é deste perfil — pulando"; continue; }
+    log "SIGTERM PID $pid (perfil $PROFILE_DISP)"
     kill -TERM "$pid" 2>/dev/null || true
   done
   sleep 1
   for pid in $pids; do
     if pid_still_ours "$pid"; then
-      log "SIGKILL PID $pid"
+      log "SIGKILL PID $pid (perfil $PROFILE_DISP)"
       kill -KILL "$pid" 2>/dev/null || true
+    fi
+  done
+}
+
+# Avisa se plists de OUTROS perfis sumiram (não deveria acontecer).
+assert_siblings_intact() {
+  local f base
+  shopt -s nullglob 2>/dev/null || true
+  for f in "$PLIST_DIR"/com.the-dudes.daemon*.plist; do
+    [ -f "$f" ] || continue
+    base="$(basename "$f" .plist)"
+    [ "$base" = "$LABEL" ] && continue
+    if ! launchctl print "$DOMAIN/$base" >/dev/null 2>&1; then
+      warn "irmão $base tem plist mas não está loaded (não fui eu que removi o arquivo)"
+    else
+      log "irmão intacto: $base"
     fi
   done
 }
@@ -307,6 +391,7 @@ check_report() {
   log "agent_loaded:    $loaded"
   log "loose_pids:      ${pids:-"(nenhum)"}"
   log "self_update:     isolado em dirname($DAEMON_BIN) — sem race com outros perfis"
+  report_runners_on_plist_path
 
   if [ -f "$TEMPLATE" ] && [ "$node" != "AUSENTE" ] && [ "$bash_bin" != "AUSENTE" ]; then
     local tmp
@@ -350,11 +435,6 @@ EOF
   fi
 
   mkdir -p "$TD_DIR" "$PLIST_DIR"
-  cp "$RUN_DAEMON_SRC" "$RUN_DAEMON_DST"
-  chmod 755 "$RUN_DAEMON_DST"
-  log "launcher → $RUN_DAEMON_DST"
-
-  seed_binaries
 
   if [ ! -f "$ENV_FILE" ]; then
     warn "env ausente: $ENV_FILE — crie com THE_DUDES_ORCH / THE_DUDES_DAEMON_TOKEN / THE_DUDES_DAEMON_NAME antes de usar"
@@ -362,21 +442,31 @@ EOF
 
   local tmp
   tmp="$(mktemp -t td-plist.XXXXXX)"
+  # render precisa dos paths; run-daemon ainda não precisa estar no destino
   render_plist "$tmp"
   if command -v plutil >/dev/null 2>&1; then
     plutil -lint "$tmp" >/dev/null || die "plist inválido"
   fi
 
+  # ORDEM CRÍTICA (T-031): parar o agent ANTES de sobrescrever run-daemon.sh.
+  # Copiar o script enquanto o bash do launchd ainda o executa corrompe o
+  # fluxo (leituras parciais) e deixa o job em estado estranho.
   if [ "$NO_LOAD" -eq 0 ]; then
-    safe_stop_loose
     if agent_loaded; then
-      log "bootout $DOMAIN/$LABEL"
+      log "bootout $DOMAIN/$LABEL (antes de atualizar arquivos)"
       launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || \
         launchctl unload "$PLIST_PATH" 2>/dev/null || true
     fi
+    safe_stop_loose
   else
     log "--no-load: skip kill/bootout"
   fi
+
+  # Só agora atualiza launcher/binários no home do perfil.
+  cp "$RUN_DAEMON_SRC" "$RUN_DAEMON_DST"
+  chmod 755 "$RUN_DAEMON_DST"
+  log "launcher → $RUN_DAEMON_DST"
+  seed_binaries
 
   cp "$tmp" "$PLIST_PATH"
   chmod 644 "$PLIST_PATH"
@@ -385,24 +475,38 @@ EOF
 
   if [ "$NO_LOAD" -eq 1 ]; then
     log "OK materializado (sem load). Perfil=$PROFILE_DISP td=$TD_DIR"
+    assert_siblings_intact
     return 0
   fi
 
   if launchctl bootstrap "$DOMAIN" "$PLIST_PATH" 2>/dev/null; then
     log "bootstrap OK"
   else
-    warn "bootstrap falhou ou já existia — enable/kickstart"
-    launchctl enable "$DOMAIN/$LABEL" 2>/dev/null || true
+    # Já existia no domínio: tenta bootout residual + bootstrap de novo
+    warn "bootstrap falhou — retry bootout+bootstrap"
+    launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+    if ! launchctl bootstrap "$DOMAIN" "$PLIST_PATH" 2>/dev/null; then
+      warn "bootstrap ainda falhou — tentando load legacy"
+      launchctl load -w "$PLIST_PATH" 2>/dev/null || launchctl load "$PLIST_PATH" || true
+    else
+      log "bootstrap OK (retry)"
+    fi
   fi
   launchctl enable "$DOMAIN/$LABEL" 2>/dev/null || true
   if launchctl kickstart -k "$DOMAIN/$LABEL" 2>/dev/null; then
     log "kickstart OK"
   else
-    launchctl load -w "$PLIST_PATH" 2>/dev/null || launchctl load "$PLIST_PATH" || true
-    log "load (legacy) tentado"
+    launchctl kickstart "$DOMAIN/$LABEL" 2>/dev/null || true
+    log "kickstart (sem -k) tentado"
   fi
   sleep 1
-  if agent_loaded; then log "agent ativo: $DOMAIN/$LABEL"; else warn "agent não aparece em print"; fi
+  if agent_loaded; then
+    log "agent ativo: $DOMAIN/$LABEL"
+  else
+    warn "agent NÃO ativo após install — plist em $PLIST_PATH; ver $LAUNCHD_STDERR"
+    warn "NÃO remova o plist; rode de novo: $0 --yes ${PROFILE:+--profile $PROFILE}"
+  fi
+  assert_siblings_intact
   log "log: $LOG_FILE"
 }
 
