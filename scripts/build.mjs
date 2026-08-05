@@ -13,6 +13,7 @@ import { build } from "esbuild";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { homedir } from "node:os";
 import { sign as edSign, createHash, createPrivateKey } from "node:crypto";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -72,21 +73,33 @@ for (const name of ["daemon.cjs", "mcp-bridge.cjs"]) {
 }
 
 // Assinatura Ed25519 dos bundles (autenticidade, além do SHA-256 de
-// integridade). A chave PRIVADA fica só no host de build (offline em relação
-// ao orchestrator) — um server comprometido não consegue forjar assinatura
-// válida. A pública vai embutida no install script + entrypoint. Sem chave
-// (CI sem secret), pula a assinatura (degrada pra só checksum).
-const signKeyPath = process.env.THE_DUDES_SIGN_KEY_FILE || resolve(root, ".signing/sign.key");
-if (existsSync(signKeyPath)) {
+// integridade). A chave PRIVADA fica só no host de build / secret manager
+// (offline em relação ao orchestrator) — um server comprometido não consegue
+// forjar assinatura válida. Durante dual-trust (rotação T-006) QUALQUER
+// privada do conjunto confiado (antiga OU nova) produz .sig aceito.
+//
+// Resolução da privada (primeira que existir):
+//   1. THE_DUDES_SIGN_KEY_FILE (CI/secret manager — preferido)
+//   2. ~/.the-dudes-signing/sign-new.key  (nova, pós T-006)
+//   3. daemon/.signing/sign.key          (legado — NÃO commitar; deprecar)
+//
+// Ver docs/ED25519-KEY-ROTATION.md. Sem chave, pula assinatura (só checksum).
+const signKeyCandidates = [
+  process.env.THE_DUDES_SIGN_KEY_FILE,
+  resolve(homedir(), ".the-dudes-signing/sign-new.key"),
+  resolve(root, ".signing/sign.key"),
+].filter(Boolean);
+const signKeyPath = signKeyCandidates.find((p) => existsSync(p));
+if (signKeyPath) {
   const key = createPrivateKey(readFileSync(signKeyPath));
   for (const f of ["dist/daemon.cjs", "dist/mcp-bridge.cjs"]) {
     const p = resolve(root, f);
     const sig = edSign(null, readFileSync(p), key).toString("base64");
     writeFileSync(`${p}.sig`, sig + "\n");
   }
-  console.log("[build] signed: daemon.cjs.sig + mcp-bridge.cjs.sig (Ed25519)");
+  console.log(`[build] signed: daemon.cjs.sig + mcp-bridge.cjs.sig (Ed25519) key=${signKeyPath}`);
 } else {
-  console.warn(`[build] signing key absent (${signKeyPath}) — bundles NOT signed (só checksum)`);
+  console.warn(`[build] signing key absent (tried THE_DUDES_SIGN_KEY_FILE, ~/.the-dudes-signing/sign-new.key, .signing/sign.key) — bundles NOT signed (só checksum)`);
 }
 
 console.log("[build] done");

@@ -10,9 +10,10 @@
  *  1. baixa /install/daemon.cjs.sha256 do orchestrator e compara com o hash
  *     do binário em execução — igual = nada a fazer;
  *  2. baixa bundle + .sig (e o par mcp-bridge) — tamanho limitado;
- *  3. verifica a assinatura Ed25519 contra a CHAVE PÚBLICA EMBUTIDA (a mesma
- *     do docker-entrypoint). Um orchestrator comprometido não consegue
- *     empurrar binário forjado: ele não tem a chave privada;
+ *  3. verifica a assinatura Ed25519 contra o conjunto de chaves públicas
+ *     confiáveis (dual-trust durante rotação — ver docs/ED25519-KEY-ROTATION.md).
+ *     Um orchestrator comprometido não consegue empurrar binário forjado: ele
+ *     não tem nenhuma privada do conjunto;
  *  4. confere o sha256 anunciado;
  *  5. escreve ao lado do binário atual e troca com rename atômico;
  *  6. sai com código 42 — o launcher (run-daemon.sh) relança com o novo.
@@ -26,10 +27,32 @@ import { verify as edVerify, createHash } from "node:crypto";
 import { renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
-/** Mesma pubkey Ed25519 do docker-entrypoint.sh — par da .signing/sign.key. */
-const SIGN_PUB = `-----BEGIN PUBLIC KEY-----
+/**
+ * Conjunto de pubkeys Ed25519 confiáveis (dual-trust).
+ *
+ *  - [0] ANTIGA — daemons em campo pré-rotação confiam só nela; permanece
+ *    até o estágio N+1 estabilizar (ver docs/ED25519-KEY-ROTATION.md).
+ *  - [1] NOVA — gerada em T-006, privada em ~/.the-dudes-signing/sign-new.key
+ *    (FORA do repo, chmod 600). Embutida agora para o estágio N: release
+ *    assinado com a ANTIGA carrega este código; no estágio N+1 a privada
+ *    NOVA assina sozinha.
+ *
+ * Ordem: tenta cada uma; basta UMA aceitar. Assinatura que não casa com
+ * nenhuma → fail-closed.
+ */
+export const TRUSTED_SIGN_PUBS: readonly string[] = [
+  // ANTIGA (par de daemon/.signing/sign.key legado — NÃO commitar a privada)
+  `-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEAhnydRabRqG76LrgUBsx+1Wk5HcojzeYcr3CB/EkglaI=
------END PUBLIC KEY-----`;
+-----END PUBLIC KEY-----`,
+  // NOVA (T-006 — par em ~/.the-dudes-signing/sign-new.{key,pub})
+  `-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAyOfZNGAQ8udECo/9GauS2CG7jBZM/nIcrry4dd7atXY=
+-----END PUBLIC KEY-----`,
+];
+
+/** @deprecated use TRUSTED_SIGN_PUBS[0] — mantido só se algum import legar. */
+export const SIGN_PUB = TRUSTED_SIGN_PUBS[0]!;
 
 const MAX_BUNDLE_BYTES = 32 * 1024 * 1024;
 
@@ -54,10 +77,42 @@ async function fetchBytes(f: typeof fetch, url: string, maxBytes: number): Promi
   return buf;
 }
 
-/** Valida assinatura + checksum de um bundle. Lança se qualquer etapa falhar. */
-export function verifyBundle(bundle: Buffer, sigB64: string, expectedSha256: string): void {
-  const ok = edVerify(null, bundle, SIGN_PUB, Buffer.from(sigB64.trim(), "base64"));
-  if (!ok) throw new Error("assinatura Ed25519 inválida — bundle recusado");
+/**
+ * True se a assinatura for válida sob pelo menos uma pubkey do conjunto.
+ * Exportada para testes de dual-trust com pubs injetáveis.
+ */
+export function signatureAccepted(
+  bundle: Buffer,
+  sigB64: string,
+  pubs: readonly string[] = TRUSTED_SIGN_PUBS,
+): boolean {
+  let sig: Buffer;
+  try {
+    sig = Buffer.from(sigB64.trim(), "base64");
+  } catch {
+    return false;
+  }
+  if (sig.length === 0) return false;
+  for (const pub of pubs) {
+    try {
+      if (edVerify(null, bundle, pub, sig)) return true;
+    } catch {
+      // pubkey malformada no conjunto — ignora e tenta a próxima
+    }
+  }
+  return false;
+}
+
+/** Valida assinatura (dual-trust) + checksum de um bundle. Lança se falhar. */
+export function verifyBundle(
+  bundle: Buffer,
+  sigB64: string,
+  expectedSha256: string,
+  pubs: readonly string[] = TRUSTED_SIGN_PUBS,
+): void {
+  if (!signatureAccepted(bundle, sigB64, pubs)) {
+    throw new Error("assinatura Ed25519 inválida — bundle recusado");
+  }
   const sha = createHash("sha256").update(bundle).digest("hex");
   if (sha !== expectedSha256.toLowerCase()) {
     throw new Error(`sha256 divergente (anunciado ${expectedSha256.slice(0, 12)}, real ${sha.slice(0, 12)})`);
