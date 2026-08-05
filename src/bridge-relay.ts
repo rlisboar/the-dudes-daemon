@@ -54,7 +54,14 @@ export function encryptBridgePayload(
     }
     return json;
   }
-  // board_*
+  // board_* — T-024: content é alias de body (mcp-bridge já normaliza; se
+  // algum caller mandar content cru, vira body ANTES de cifrar).
+  if (json.body == null && typeof json.content === "string") {
+    json.body = json.content;
+    delete json.content;
+  } else if ("content" in json) {
+    delete json.content;
+  }
   for (const campo of ["title", "body", "say", "text", "label"]) {
     if (campo in json) json[campo] = cifra(json[campo]);
   }

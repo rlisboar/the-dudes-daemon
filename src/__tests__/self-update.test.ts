@@ -20,11 +20,11 @@ import {
 /**
  * A chave embutida no módulo é a de produção; o teste NÃO tem a privada dela
  * por default. Estratégia:
- *  - fail-closed (assinatura errada → recusa);
- *  - dual-trust com par efêmero A/B injetado;
- *  - nova chave de T-006 (privada fora do repo) assina e passa no conjunto real;
- *  - se a privada ANTIGA existir em daemon/.signing/sign.key (host de dev),
- *    prova que a antiga ainda é aceita.
+ *  - fail-closed (assinatura errada → recusa) — sempre no CI;
+ *  - dual-trust com par efêmero A/B injetado — sempre no CI;
+ *  - privada NOVA em disco (THE_DUDES_SIGN_KEY_FILE ou ~/.the-dudes-signing/sign-new.key):
+ *    skip explícito se ausente (CI); roda no host do dono;
+ *  - privada ANTIGA em daemon/.signing/sign.key: skip se ausente.
  */
 
 const log = () => {};
@@ -130,9 +130,18 @@ test("TRUSTED_SIGN_PUBS tem exatamente 2 entradas (antiga + nova)", () => {
   }
 });
 
-test("nova chave T-006 assina e passa no conjunto real (dual-trust prod)", () => {
-  const newKeyPath = path.join(os.homedir(), ".the-dudes-signing", "sign-new.key");
-  assert.ok(existsSync(newKeyPath), `privada nova ausente em ${newKeyPath} — gere com openssl (T-006)`);
+test("nova chave T-006 assina e passa no conjunto real (dual-trust prod)", (t) => {
+  // Path default do host do dono; override via THE_DUDES_SIGN_KEY_FILE para
+  // simular CI (apontar p/ path inexistente) sem renomear a chave real.
+  const newKeyPath =
+    process.env.THE_DUDES_SIGN_KEY_FILE ||
+    path.join(os.homedir(), ".the-dudes-signing", "sign-new.key");
+  if (!existsSync(newKeyPath)) {
+    t.skip(
+      `privada nova ausente em ${newKeyPath} — skip no CI; dual-trust coberta pelos testes A/B em memória`,
+    );
+    return;
+  }
   const privateKey = createPrivateKey(readFileSync(newKeyPath));
   const bundle = Buffer.from("t006-new-key-vector");
   const sig = edSign(null, bundle, privateKey).toString("base64");
@@ -141,8 +150,8 @@ test("nova chave T-006 assina e passa no conjunto real (dual-trust prod)", () =>
   assert.doesNotThrow(() => verifyBundle(bundle, sig, sha));
 });
 
-test("antiga chave (se presente no host) ainda assina e passa no dual-trust", () => {
-  // Path canônico legado; em CI sem a privada, o teste é skip lógico.
+test("antiga chave (se presente no host) ainda assina e passa no dual-trust", (t) => {
+  // Path canônico legado; em CI sem a privada, skip explícito (mesma política da nova).
   const oldKeyPath = path.resolve(
     path.dirname(new URL(import.meta.url).pathname),
     "../../.signing/sign.key",
@@ -155,8 +164,9 @@ test("antiga chave (se presente no host) ainda assina e passa no dual-trust", ()
   ];
   const found = candidates.find((p) => existsSync(p));
   if (!found) {
-    // Host sem privada antiga — dual-trust da antiga fica coberto pelo teste
-    // efêmero A/B. Não falha a suíte.
+    t.skip(
+      "privada antiga ausente no host — skip; dual-trust da antiga coberta pelo teste efêmero A",
+    );
     return;
   }
   const privateKey = createPrivateKey(readFileSync(found));

@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { normalizeBoardUpsertArgs } from "./board-upsert-args.js";
 
 const AGENT_ID = process.env.THE_DUDES_AGENT_ID;
 const AGENT_NAME = process.env.THE_DUDES_AGENT_NAME ?? AGENT_ID ?? "unknown";
@@ -1190,7 +1191,10 @@ Optional say: spoken aloud via TTS if the agent has voice enabled.`),
           ? z.enum(["markdown", "d2", "chart", "callout", "steps", "flow"])
           : z.enum(["markdown", "mermaid", "chart", "callout", "steps", "flow"])),
     title: z.string().optional(),
-    body: z.string().optional(),
+    body: z.string().optional().describe("Block body (HTML/markdown/diagram source). Prefer this name."),
+    // T-024: alias de body — LLMs reusam o nome de send_message (`content`)
+    // e o Zod descartava o campo → server 400 "html exige body".
+    content: z.string().optional().describe("Alias of body (same meaning). Prefer body."),
     tone: z.enum(["info", "warn", "ok", "err"]).optional(),
     order: z.number().optional(),
     focus: z.boolean().optional().describe("Scroll UI to this block (default true)"),
@@ -1213,7 +1217,9 @@ Optional say: spoken aloud via TTS if the agent has voice enabled.`),
   },
   async (args) => {
     try {
-      const r = await postJSON("board_upsert_block", args);
+      // content→body antes do post (e do E2EE do relay, que cifra `body`).
+      const payload = normalizeBoardUpsertArgs(args as Record<string, unknown>);
+      const r = await postJSON("board_upsert_block", payload);
       if (r.error) return { content: [{ type: "text", text: r.error }], isError: true };
       const n = r.board?.blocks?.length ?? 0;
       const id = args.id ?? r.board?.focusBlockId ?? "?";

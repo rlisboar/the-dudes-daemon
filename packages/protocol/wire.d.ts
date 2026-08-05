@@ -1053,6 +1053,12 @@ export type ServerEvent =
   | { type: "daemon:status"; status: DaemonStatus }
   | {
       type: "daemon:health"; daemonName: string; health: DaemonHealth;
+      /**
+       * Id estável da conexão/token do daemon (T-021). Cliente usa como chave
+       * do store pra não colidir dois daemons com o mesmo nome legível.
+       * Opcional: daemons/servers antigos só mandam daemonName.
+       */
+      daemonId?: string;
       /** Identidade e compatibilidade das duas pontas, avaliada pelo server. */
       versions?: {
         daemonVersion: string;
