@@ -18,18 +18,12 @@ fi
 DEST=/opt/the-dudes
 mkdir -p "$DEST"
 
-# Chaves públicas Ed25519 (dual-trust durante rotação — ver docs/ED25519-KEY-ROTATION.md).
-# Privadas NUNCA no container. Basta UMA pubkey aceitar a assinatura.
-# [0] ANTIGA  [1] NOVA (T-006)
-SIGN_PUB_OLD='-----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEAhnydRabRqG76LrgUBsx+1Wk5HcojzeYcr3CB/EkglaI=
------END PUBLIC KEY-----'
-SIGN_PUB_NEW='-----BEGIN PUBLIC KEY-----
+# Chave pública Ed25519 (estágio N+3 — SÓ a NOVA; T-035). Privada NUNCA no container.
+# Ver docs/ED25519-KEY-ROTATION.md.
+SIGN_PUB='-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEAyOfZNGAQ8udECo/9GauS2CG7jBZM/nIcrry4dd7atXY=
 -----END PUBLIC KEY-----'
-export SIGN_PUB_OLD SIGN_PUB_NEW
-# Compat: SIGN_PUB = antiga (scripts legados)
-export SIGN_PUB="$SIGN_PUB_OLD"
+export SIGN_PUB
 
 # Baixa + confere SHA-256 (anti-tampering). Mismatch aborta.
 dl_verify() {
@@ -48,7 +42,7 @@ dl_verify() {
   fi
 }
 
-# Verifica assinatura Ed25519 dual-trust — FAIL-CLOSED: nenhuma pubkey aceita → aborta.
+# Verifica assinatura Ed25519 — FAIL-CLOSED (só pubkey NOVA).
 verify_sig() {
   _out="$1"
   _sig=$(curl -fsSL "$THE_DUDES_ORCH/install/$(basename "$_out").sig" 2>/dev/null || true)
@@ -61,11 +55,12 @@ verify_sig() {
 const {verify}=require("crypto"), fs=require("fs");
 const body=fs.readFileSync(process.argv[1]);
 const sig=Buffer.from(fs.readFileSync(process.argv[2],"utf8").trim(),"base64");
-const pubs=[process.env.SIGN_PUB_OLD, process.env.SIGN_PUB_NEW].filter(Boolean);
-const ok=pubs.some((p)=>{ try { return verify(null, body, p, sig); } catch { return false; } });
+const pub=process.env.SIGN_PUB;
+let ok=false;
+try { ok=!!pub && verify(null, body, pub, sig); } catch { ok=false; }
 process.exit(ok?0:1);
 ' "$_out" "$_out.sig"; then
-    echo "  ✓ assinatura Ed25519 ok (dual-trust): $_out"; rm -f "$_out.sig"
+    echo "  ✓ assinatura Ed25519 ok: $_out"; rm -f "$_out.sig"
   else
     echo "error: ASSINATURA INVÁLIDA em $_out — abortando (tampering)" >&2
     rm -f "$_out" "$_out.sig"; exit 1

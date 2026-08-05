@@ -122,15 +122,19 @@ test("dual-trust: assinatura de chave fora do conjunto é rejeitada", () => {
   assert.throws(() => verifyBundle(bundle, sig, sha, pubs), /assinatura/);
 });
 
-test("TRUSTED_SIGN_PUBS tem exatamente 2 entradas (antiga + nova)", () => {
-  assert.equal(TRUSTED_SIGN_PUBS.length, 2);
+test("TRUSTED_SIGN_PUBS tem exatamente 1 entrada (só NOVA — N+3)", () => {
+  assert.equal(TRUSTED_SIGN_PUBS.length, 1);
   for (const p of TRUSTED_SIGN_PUBS) {
     assert.match(p, /BEGIN PUBLIC KEY/);
     assert.match(p, /END PUBLIC KEY/);
   }
+  // NOVA canônica embutida
+  assert.match(TRUSTED_SIGN_PUBS[0]!, /AyOfZNGAQ8udECo/);
+  // ANTIGA removida
+  assert.ok(!TRUSTED_SIGN_PUBS.some((p) => p.includes("AhnydRabRqG76")));
 });
 
-test("nova chave T-006 assina e passa no conjunto real (dual-trust prod)", (t) => {
+test("nova chave T-006 assina e passa no conjunto real (prod N+3)", (t) => {
   // Path default do host do dono; override via THE_DUDES_SIGN_KEY_FILE para
   // simular CI (apontar p/ path inexistente) sem renomear a chave real.
   const newKeyPath =
@@ -138,7 +142,7 @@ test("nova chave T-006 assina e passa no conjunto real (dual-trust prod)", (t) =
     path.join(os.homedir(), ".the-dudes-signing", "sign-new.key");
   if (!existsSync(newKeyPath)) {
     t.skip(
-      `privada nova ausente em ${newKeyPath} — skip no CI; dual-trust coberta pelos testes A/B em memória`,
+      `privada nova ausente em ${newKeyPath} — skip no CI; cobertura via dual-trust A/B em memória`,
     );
     return;
   }
@@ -150,13 +154,12 @@ test("nova chave T-006 assina e passa no conjunto real (dual-trust prod)", (t) =
   assert.doesNotThrow(() => verifyBundle(bundle, sig, sha));
 });
 
-test("antiga chave (se presente no host) ainda assina e passa no dual-trust", (t) => {
-  // Path canônico legado; em CI sem a privada, skip explícito (mesma política da nova).
+test("antiga chave (se presente no host) é REJEITADA no trust N+3", (t) => {
+  // Estágio N+3: a antiga saiu do trust set — assinatura dela não deve passar.
   const oldKeyPath = path.resolve(
     path.dirname(new URL(import.meta.url).pathname),
     "../../.signing/sign.key",
   );
-  // fallback: home monorepo worktree → daemon/.signing/sign.key
   const candidates = [
     oldKeyPath,
     path.join(process.cwd(), ".signing", "sign.key"),
@@ -164,15 +167,13 @@ test("antiga chave (se presente no host) ainda assina e passa no dual-trust", (t
   ];
   const found = candidates.find((p) => existsSync(p));
   if (!found) {
-    t.skip(
-      "privada antiga ausente no host — skip; dual-trust da antiga coberta pelo teste efêmero A",
-    );
+    t.skip("privada antiga ausente no host — skip; rejeição coberta pelo teste efêmero outsider");
     return;
   }
   const privateKey = createPrivateKey(readFileSync(found));
-  const bundle = Buffer.from("t006-old-key-vector");
+  const bundle = Buffer.from("t035-old-key-must-fail");
   const sig = edSign(null, bundle, privateKey).toString("base64");
   const sha = createHash("sha256").update(bundle).digest("hex");
-  assert.equal(signatureAccepted(bundle, sig), true, "antiga deve continuar aceita");
-  assert.doesNotThrow(() => verifyBundle(bundle, sig, sha));
+  assert.equal(signatureAccepted(bundle, sig), false, "antiga NÃO deve ser aceita pós N+3");
+  assert.throws(() => verifyBundle(bundle, sig, sha), /assinatura/);
 });

@@ -28,23 +28,17 @@ import { renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 /**
- * Conjunto de pubkeys Ed25519 confiáveis (dual-trust).
+ * Conjunto de pubkeys Ed25519 confiáveis.
  *
- *  - [0] ANTIGA — daemons em campo pré-rotação confiam só nela; permanece
- *    até o estágio N+1 estabilizar (ver docs/ED25519-KEY-ROTATION.md).
- *  - [1] NOVA — gerada em T-006, privada em ~/.the-dudes-signing/sign-new.key
- *    (FORA do repo, chmod 600). Embutida agora para o estágio N: release
- *    assinado com a ANTIGA carrega este código; no estágio N+1 a privada
- *    NOVA assina sozinha.
+ * Estágio N+3 (T-035): SÓ a chave NOVA. A ANTIGA (comprometida / exposta a
+ * agentes no worktree legado) foi removida do trust set. Releases assinados
+ * com a antiga são rejeitados fail-closed.
  *
- * Ordem: tenta cada uma; basta UMA aceitar. Assinatura que não casa com
- * nenhuma → fail-closed.
+ * Histórico: dual-trust (antiga+nova) nos estágios N…N+2 — ver
+ * docs/ED25519-KEY-ROTATION.md. Privada da NOVA: ~/.the-dudes-signing/sign-new.key
+ * (FORA do repo, chmod 600).
  */
 export const TRUSTED_SIGN_PUBS: readonly string[] = [
-  // ANTIGA (par de daemon/.signing/sign.key legado — NÃO commitar a privada)
-  `-----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEAhnydRabRqG76LrgUBsx+1Wk5HcojzeYcr3CB/EkglaI=
------END PUBLIC KEY-----`,
   // NOVA (T-006 — par em ~/.the-dudes-signing/sign-new.{key,pub})
   `-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEAyOfZNGAQ8udECo/9GauS2CG7jBZM/nIcrry4dd7atXY=
