@@ -8,6 +8,7 @@ import {
 } from "./runners/outbound-delivery.js";
 import { checkAndApplyUpdate } from "./self-update.js";
 import { createSelfUpdateGate } from "./self-update-gate.js";
+import { createDeliveryDeduper } from "./inbound-dedup.js";
 import { WIRE_PROTOCOL_VERSION } from "@the-dudes/protocol/wire-version";
 import { initSentry, capture, captureWarn, breadcrumb, setTag, flush as flushSentry } from "./sentry.js";
 initSentry(); // gated em SENTRY_DSN_DAEMON / SENTRY_DSN; no-op sem env
@@ -618,6 +619,11 @@ class DaemonClient {
         return;
       case "agent:send": {
         log("info", `agent:send recebido agent=${msg.agentId} bytes=${String(msg.content ?? "").length} imgs=${(msg.images ?? []).length}`);
+        // T-037: reentrega do server (pending + resume) usa o mesmo deliveryId
+        if (!this.deliveryDedup.accept(msg.deliveryId)) {
+          log("info", `agent:send deliveryId=${msg.deliveryId?.slice(0, 8)} — duplicata ignorada`);
+          return;
+        }
         let content: string;
         const dropMissingKey = () => {
           log("warn", `agent:send to ${msg.agentId} encrypted but project key not held — dropping`);
@@ -649,7 +655,7 @@ class DaemonClient {
           if (msg.systemSuffix) content = content + msg.systemSuffix;
         }
         if (msg.telegram !== undefined) this.host.setTelegramMirror(msg.agentId, msg.telegram);
-        this.host.send_message(msg.agentId, content, msg.images);
+        this.host.send_message(msg.agentId, content, msg.images, msg.deliveryId);
         return;
       }
       case "agent:clear":
@@ -1758,6 +1764,8 @@ class DaemonClient {
    * o user nunca vê a resposta (mudo sem watchdog; hipótese T-009 WAN).
    */
   private outboundQueue = createOutboundQueue(80);
+  /** T-037: dedup de agent:send reentregues (pending queue + resume buffer). */
+  private deliveryDedup = createDeliveryDeduper(500);
   private static readonly WS_MAX_BUFFERED = 4 * 1024 * 1024;
 
   private send(obj: FromDaemon): boolean {

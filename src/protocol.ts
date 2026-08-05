@@ -187,6 +187,11 @@ export type AgentSendPart =
 export interface AgentSend {
   type: "agent:send";
   agentId: string;
+  /**
+   * T-037: id estável da entrega. Server reenvia o mesmo id no reconnect;
+   * daemon deduplica pra não duplicar TASK_ASSIGN. Opcional (legado).
+   */
+  deliveryId?: string;
   /** When the active project has E2EE enabled, content arrives as
    *  "e2e:" + base64(iv||ct||tag). Daemon decrypts before forwarding
    *  to the CLI. Ignored if `parts` is provided. */

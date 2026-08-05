@@ -10,6 +10,7 @@ import type { AgentInfo, ImageAttachment } from "./types.js";
 import type { AgentSpawn, FromDaemon } from "./protocol.js";
 import type { DropTarget } from "./privileges.js";
 import { compatibleSessionId } from "./runners/index.js";
+import { createAgentInboundBuffer } from "./inbound-dedup.js";
 
 // Works in both CJS bundle (where __dirname is native) and ESM dev (tsx)
 // where we fall back to the process entry script.
@@ -59,6 +60,8 @@ interface Entry {
 
 export class AgentHost {
   private entries = new Map<string, Entry>();
+  /** T-037: agent:send chegando antes do runner (gap pós-spawn/self-update). */
+  private inboundBuffer = createAgentInboundBuffer({ maxPerAgent: 20 });
 
   /** Quantos agentes este daemon mantém vivos — indicador de saúde da UI. */
   agentCount(): number {
@@ -517,6 +520,8 @@ export class AgentHost {
       agentToken: msg.agentToken,
     });
     this.send({ type: "agent:running", agentId: msg.agent.id, running: true });
+    // T-037: agent:send que chegou no gap pré-spawn (self-update / auto-resume)
+    this.flushInboundBuffer(msg.agent.id);
   }
 
   listAgentTokens(): { id: string; token: string }[] {
@@ -533,21 +538,37 @@ export class AgentHost {
     e.runner.stop();
   }
 
-  send_message(agentId: string, content: string, images?: ImageAttachment[]) {
+  send_message(agentId: string, content: string, images?: ImageAttachment[], deliveryId?: string) {
     const e = this.entries.get(agentId);
     if (!e?.runner) {
-      // Drop SILENCIOSO era o pior caso de diagnóstico: a mensagem sumia sem
-      // log e sem erro, e o chat ficava esperando resposta de um agente que
-      // não tem runner (exit não observado pelo server, reconfig no meio).
-      this.log("warn", `send_message para ${agentId} sem runner ativo (entry=${e ? "existe" : "ausente"}) — mensagem descartada`);
-      this.send({
-        type: "agent:error",
-        agentId,
-        message: "mensagem não entregue: o runner deste agente não está ativo no daemon — pare e inicie o agente",
+      // T-037: em vez de dropar, buffera até o spawn (gap self-update / auto-resume).
+      // Se o agente nunca subir, TTL 15min limpa. Antes: drop + agent:error e a
+      // TASK_ASSIGN sumia mesmo com o server reenviando.
+      this.inboundBuffer.push(agentId, {
+        deliveryId,
+        content,
+        images,
+        enqueuedAt: Date.now(),
       });
+      this.log(
+        "warn",
+        `send_message para ${agentId} sem runner ativo (entry=${e ? "existe" : "ausente"}) — enfileirado (${this.inboundBuffer.size(agentId)} pending)`,
+      );
       return;
     }
     e.runner.pushUserMessage(content, images);
+  }
+
+  /** Chamado após spawn bem-sucedido — drena fila local T-037. */
+  flushInboundBuffer(agentId: string): number {
+    const pending = this.inboundBuffer.drain(agentId);
+    const e = this.entries.get(agentId);
+    if (!e?.runner || pending.length === 0) return 0;
+    for (const m of pending) {
+      e.runner.pushUserMessage(m.content, m.images as ImageAttachment[] | undefined);
+    }
+    this.log("info", `flushInboundBuffer agent=${agentId} entregou ${pending.length} msg(s) buffered`);
+    return pending.length;
   }
 
   async clear(agentId: string) {

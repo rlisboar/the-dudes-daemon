@@ -4,6 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { normalizeBoardUpsertArgs } from "./board-upsert-args.js";
+import { withBridgeRetry } from "./bridge-retry.js";
 
 const AGENT_ID = process.env.THE_DUDES_AGENT_ID;
 const AGENT_NAME = process.env.THE_DUDES_AGENT_NAME ?? AGENT_ID ?? "unknown";
@@ -103,9 +104,19 @@ async function postViaHttp(route: string, body: unknown): Promise<any> {
   }
 }
 
-async function postJSON(route: string, body: unknown): Promise<any> {
+async function postJSONOnce(route: string, body: unknown): Promise<any> {
   if (BRIDGE_SOCKET) return postViaSocket(route, body);
   return postViaHttp(route, body);
+}
+
+/**
+ * T-037: retry em falhas transitórias (502, ECONNREFUSED, timeout) — restart
+ * do server / troca do bridge.sock no self-update. Rotas críticas (send)
+ * usam isto; o helper postJSON genérico também, pra list/tasks não sumirem
+ * no mesmo buraco.
+ */
+async function postJSON(route: string, body: unknown): Promise<any> {
+  return withBridgeRetry(() => postJSONOnce(route, body), { attempts: 4, baseDelayMs: 200 });
 }
 
 const server = new McpServer({ name: "the-dudes", version: "0.1.0" });
