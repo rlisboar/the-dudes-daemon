@@ -1047,6 +1047,16 @@ export interface RunnerModelCatalog {
   error?: string;
 }
 
+/**
+ * Server → daemon (WS /ws/daemon): release novo em /install (T-033).
+ * Não é ServerEvent de web — documentado aqui pro contrato de fio unificado.
+ * Daemons antigos ignoram tipos desconhecidos.
+ */
+export interface ReleaseAvailableToDaemon {
+  type: "release:available";
+  sha256: string;
+}
+
 export type ServerEvent =
   | { type: "prefs_updated"; prefs: Record<string, unknown> }
   | { type: "auth"; user: UserPublic | null }

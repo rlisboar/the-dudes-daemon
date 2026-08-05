@@ -67,6 +67,16 @@ export interface DaemonWelcome {
 export interface DaemonPing { type: "daemon:ping"; ts: number }
 export interface DaemonPong { type: "daemon:pong"; ts: number }
 
+/**
+ * Server → daemon: release novo em /install (T-033).
+ * Dispara self-update check na hora. Daemons antigos ignoram (sem case).
+ */
+export interface ReleaseAvailable {
+  type: "release:available";
+  /** sha256 hex do daemon.cjs publicado. */
+  sha256: string;
+}
+
 /** Política definida no dashboard e persistida no servidor. */
 export interface RunnerPolicySet {
   type: "runner-policy:set";
@@ -833,6 +843,7 @@ export type FromDaemon =
 export type FromOrch =
   | DaemonLogsGetRequest
   | DaemonWelcome | DaemonPong | DaemonChallenge | RunnerPolicySet
+  | ReleaseAvailable
   | AgentSpawn | AgentStop | AgentSend | AgentClear | AgentCompact
   | AutoApproveSet | WorkspaceSet
   | FileListRequest | FileReadRequest | FileWriteRequest | FileOperationRequest | FileSearchRequest

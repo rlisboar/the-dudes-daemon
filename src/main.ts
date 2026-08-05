@@ -7,6 +7,7 @@ import {
   trySendOutbound,
 } from "./runners/outbound-delivery.js";
 import { checkAndApplyUpdate } from "./self-update.js";
+import { createSelfUpdateGate } from "./self-update-gate.js";
 import { WIRE_PROTOCOL_VERSION } from "@the-dudes/protocol/wire-version";
 import { initSentry, capture, captureWarn, breadcrumb, setTag, flush as flushSentry } from "./sentry.js";
 initSentry(); // gated em SENTRY_DSN_DAEMON / SENTRY_DSN; no-op sem env
@@ -471,6 +472,13 @@ class DaemonClient {
         return;
       case "daemon:pong":
         return;
+      case "release:available": {
+        // T-033: server detectou sha novo em /install — check imediato
+        // (sem esperar o intervalo horário). Dedup no gate se já checando.
+        const sha = typeof msg.sha256 === "string" ? msg.sha256.slice(0, 12) : "?";
+        void this.selfUpdateGate.trigger(`push ${sha}`);
+        return;
+      }
       case "runner-policy:set": {
         const allowed = new Set(msg.allowedRunners);
         for (const runner of ["claude", "codex", "opencode", "gemini", "crush", "grok"] as const) {
@@ -1853,24 +1861,30 @@ class DaemonClient {
   }
   private selfUpdateTimer: NodeJS.Timeout | null = null;
 
+  /** Gate com dedup — push WS + timer horário compartilham o mesmo check. */
+  private readonly selfUpdateGate = createSelfUpdateGate({
+    enabled: () => process.env.THE_DUDES_SELF_UPDATE !== "0",
+    run: () => checkAndApplyUpdate({
+      orchBase: this.orchUrl,
+      selfPath: process.argv[1] ?? "",
+      runningHash: runningBinaryHash(),
+      log,
+      underLauncher: process.env.THE_DUDES_LAUNCHER === "1",
+    }),
+    log: (level, msg) => log(level, msg),
+  });
+
   /**
    * Self-update assinado: 2min após conectar (não no boot — deixa o canal
-   * estabilizar) e depois a cada hora. Opt-out: THE_DUDES_SELF_UPDATE=0.
-   * Só troca binário com assinatura Ed25519 válida; ver self-update.ts.
+   * estabilizar) e depois a cada hora (fallback se o push WS falhar/atrasar).
+   * Opt-out: THE_DUDES_SELF_UPDATE=0. Só troca binário com assinatura Ed25519
+   * válida; ver self-update.ts. T-033: release:available também chama o gate.
    */
   private scheduleSelfUpdate() {
     if (process.env.THE_DUDES_SELF_UPDATE === "0") return;
     if (this.selfUpdateTimer) return;
-    const rodar = () => {
-      void checkAndApplyUpdate({
-        orchBase: this.orchUrl,
-        selfPath: process.argv[1] ?? "",
-        runningHash: runningBinaryHash(),
-        log,
-        underLauncher: process.env.THE_DUDES_LAUNCHER === "1",
-      });
-    };
-    const primeira = setTimeout(rodar, 2 * 60_000);
+    const rodar = () => { void this.selfUpdateGate.trigger("interval-1h"); };
+    const primeira = setTimeout(() => { void this.selfUpdateGate.trigger("initial-2min"); }, 2 * 60_000);
     primeira.unref?.();
     this.selfUpdateTimer = setInterval(rodar, 60 * 60_000);
     this.selfUpdateTimer.unref?.();
