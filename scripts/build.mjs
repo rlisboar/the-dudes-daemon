@@ -75,19 +75,17 @@ for (const name of ["daemon.cjs", "mcp-bridge.cjs"]) {
 // Assinatura Ed25519 dos bundles (autenticidade, além do SHA-256 de
 // integridade). A chave PRIVADA fica só no host de build / secret manager
 // (offline em relação ao orchestrator) — um server comprometido não consegue
-// forjar assinatura válida. Durante dual-trust (rotação T-006) QUALQUER
-// privada do conjunto confiado (antiga OU nova) produz .sig aceito.
+// forjar assinatura válida. Trust set pós N+3: só a chave NOVA.
 //
-// Resolução da privada (primeira que existir):
+// Resolução da privada (primeira que existir) — T-036 removeu o fallback
+// legado daemon/.signing/sign.key (chave antiga comprometida / apagada):
 //   1. THE_DUDES_SIGN_KEY_FILE (CI/secret manager — preferido)
-//   2. ~/.the-dudes-signing/sign-new.key  (nova, pós T-006)
-//   3. daemon/.signing/sign.key          (legado — NÃO commitar; deprecar)
+//   2. ~/.the-dudes-signing/sign-new.key  (NOVA, pós T-006)
 //
 // Ver docs/ED25519-KEY-ROTATION.md. Sem chave, pula assinatura (só checksum).
 const signKeyCandidates = [
   process.env.THE_DUDES_SIGN_KEY_FILE,
   resolve(homedir(), ".the-dudes-signing/sign-new.key"),
-  resolve(root, ".signing/sign.key"),
 ].filter(Boolean);
 const signKeyPath = signKeyCandidates.find((p) => existsSync(p));
 if (signKeyPath) {
@@ -99,7 +97,7 @@ if (signKeyPath) {
   }
   console.log(`[build] signed: daemon.cjs.sig + mcp-bridge.cjs.sig (Ed25519) key=${signKeyPath}`);
 } else {
-  console.warn(`[build] signing key absent (tried THE_DUDES_SIGN_KEY_FILE, ~/.the-dudes-signing/sign-new.key, .signing/sign.key) — bundles NOT signed (só checksum)`);
+  console.warn(`[build] signing key absent (tried THE_DUDES_SIGN_KEY_FILE, ~/.the-dudes-signing/sign-new.key) — bundles NOT signed (só checksum)`);
 }
 
 console.log("[build] done");
