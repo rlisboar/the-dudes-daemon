@@ -9,6 +9,10 @@ import {
 import { checkAndApplyUpdate } from "./self-update.js";
 import { createSelfUpdateGate } from "./self-update-gate.js";
 import { createDeliveryDeduper } from "./inbound-dedup.js";
+import {
+  resolveGrokSessionRoots,
+  scheduleGrokSessionCleanup,
+} from "./grok-session-cleanup.js";
 import { WIRE_PROTOCOL_VERSION } from "@the-dudes/protocol/wire-version";
 import { initSentry, capture, captureWarn, breadcrumb, setTag, flush as flushSentry } from "./sentry.js";
 initSentry(); // gated em SENTRY_DSN_DAEMON / SENTRY_DSN; no-op sem env
@@ -240,6 +244,20 @@ class DaemonClient {
         try { fs.rmSync(path.join(parent, name), { recursive: true, force: true }); } catch { /* skip */ }
       }
     } catch { /* dir não existe ainda — ok */ }
+    // T-051: GC de sessões Grok do summarizer (cwd the-dudes-cli-*). Nunca
+    // toca sessões de projeto/worktree/outros prefixes. Boot + a cada 6h.
+    try {
+      this.grokSessionCleanup = scheduleGrokSessionCleanup({
+        roots: resolveGrokSessionRoots({
+          home: process.env.HOME ?? os.homedir(),
+          dropToHome: this.dropTo?.home ?? null,
+          grokHomeEnv: process.env.GROK_HOME ?? null,
+        }),
+        log: (level, msg) => log(level, msg),
+      });
+    } catch (e) {
+      log("warn", `grok session cleanup init falhou: ${(e as Error).message}`);
+    }
     // Start the local Unix-socket relay so MCP bridges spawned by agents
     // (which run as the dropped user) can reach the orchestrator without
     // hitting an outbound firewall app.
@@ -1868,6 +1886,8 @@ class DaemonClient {
     }, DaemonClient.HEARTBEAT_INTERVAL_MS);
   }
   private selfUpdateTimer: NodeJS.Timeout | null = null;
+  /** T-051: GC de ~/.grok/sessions/the-dudes-cli-* (summarizer). */
+  private grokSessionCleanup: { stop: () => void } | null = null;
 
   /** Gate com dedup — push WS + timer horário compartilham o mesmo check. */
   private readonly selfUpdateGate = createSelfUpdateGate({
@@ -1924,6 +1944,8 @@ class DaemonClient {
     if (this.relay) this.relay.stop();
     this.stopPing();
     this.stopHeartbeat();
+    try { this.grokSessionCleanup?.stop(); } catch { /* noop */ }
+    this.grokSessionCleanup = null;
     forgetAllProjectKeys();
     try { this.ws?.close(1000, "shutdown"); } catch {}
     process.exit(0);
