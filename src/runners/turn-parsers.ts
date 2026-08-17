@@ -3,6 +3,7 @@ export type NormalizedTurnEvent =
   | { type: "text"; text: string }
   | { type: "tool"; name: string; input: unknown; id?: string }
   | { type: "usage"; input: number; output: number; cacheCreate: number; cacheRead: number; cumulative: boolean }
+  | { type: "plan" }
   | { type: "result" }
   | { type: "thought"; text: string }
   | { type: "error"; message: string };
@@ -129,12 +130,32 @@ export function parseGrokStreamEvent(raw: unknown): NormalizedTurnEvent[] {
     ? [{ type: "session", sessionId: event.sessionId }, { type: "result" }]
     : [{ type: "result" }];
   if (event.type === "error") return [{ type: "error", message: String(event.message ?? event.data ?? "grok error") }];
+  // T-055: usage/plan = progresso real (billing mid-turn, plano de tools) —
+  // contam como atividade pro hang watch. Antes eram descartados e o relógio
+  // só avançava em text/tool, gerando hard recover em turns legítimos longos.
+  if (event.type === "usage") {
+    const u = record(event.data) ?? record(event.usage) ?? event;
+    return [{
+      type: "usage",
+      input: Number(u.input_tokens ?? u.input ?? 0),
+      output: Number(u.output_tokens ?? u.output ?? 0),
+      cacheCreate: Number(u.cache_creation_input_tokens ?? u.cacheCreate ?? 0),
+      cacheRead: Number(u.cache_read_input_tokens ?? u.cached_input_tokens ?? u.cacheRead ?? 0),
+      cumulative: false,
+    }];
+  }
+  if (event.type === "plan") return [{ type: "plan" }];
   // JSON final (output-format json): { text, sessionId, … }
   if (!event.type && typeof event.text === "string") {
     const out: NormalizedTurnEvent[] = [{ type: "text", text: event.text }];
     if (typeof event.sessionId === "string" && event.sessionId) out.push({ type: "session", sessionId: event.sessionId });
     out.push({ type: "result" });
     return out;
+  }
+  // T-055: JSON válido com type desconhecido = batimento de vida do CLI
+  // (não vira mensagem; só conta atividade via sawSemantic no runner).
+  if (typeof event.type === "string" && event.type.length > 0) {
+    return [{ type: "plan" }]; // reusa tag leve de "progresso sem texto"
   }
   return [];
 }

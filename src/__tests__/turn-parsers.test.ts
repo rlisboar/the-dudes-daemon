@@ -48,6 +48,11 @@ test("Grok normalizes stream chunks, final objects, sessions and errors", () => 
   assert.deepEqual(parseGrokStreamEvent({ type: "end", sessionId: "g1" }), [{ type: "session", sessionId: "g1" }, { type: "result" }]);
   assert.deepEqual(parseGrokStreamEvent({ text: "done", sessionId: "g2" }), [{ type: "text", text: "done" }, { type: "session", sessionId: "g2" }, { type: "result" }]);
   assert.deepEqual(parseGrokStreamEvent({ type: "error", message: "bad" }), [{ type: "error", message: "bad" }]);
+  // T-055: usage/plan = atividade (não descartados)
+  assert.equal(parseGrokStreamEvent({ type: "usage", data: { input_tokens: 1, output_tokens: 2 } })[0]?.type, "usage");
+  assert.deepEqual(parseGrokStreamEvent({ type: "plan" }), [{ type: "plan" }]);
+  // type desconhecido com JSON válido → batimento de vida
+  assert.equal(parseGrokStreamEvent({ type: "model_status", x: 1 }).length, 1);
 });
 
 test("Grok stream tool_call / tool_call_update → tool (estado thinking no runner)", () => {

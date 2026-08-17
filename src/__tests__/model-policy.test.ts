@@ -1,8 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  claudeThinkingEffort, codexEffort, grokThinkingEffort,
-  providerModelParts, resolveContextLimit,
+  claudeThinkingEffort, codexEffort, contextLimitFor, grokSupportsXhigh,
+  grokThinkingEffort, normalizeGrokEffort, providerModelParts, resolveContextLimit,
 } from "../runners/model-policy.js";
 
 test("provider/model parsing trims whitespace and removes only a terminal effort suffix", () => {
@@ -34,11 +34,37 @@ test("runner effort policies preserve provider-specific accepted levels", () => 
   assert.equal(codexEffort("max"), "xhigh");
   assert.equal(codexEffort("minimal"), "xhigh");
   assert.equal(codexEffort("high"), "high");
-  // Grok wire: only low|medium|high. xhigh/max → high; none/minimal → low (or high when lifted).
+  // Grok wire legado (sem modelo / 4.5): low|medium|high. xhigh/max → high.
   assert.equal(grokThinkingEffort("minimal", true, false), "high");
   assert.equal(grokThinkingEffort("minimal", true, true), "low");
   assert.equal(grokThinkingEffort("xhigh", false, false), "high");
   assert.equal(grokThinkingEffort("max", false, false), "high");
   assert.equal(grokThinkingEffort("medium", false, false), "medium");
   assert.equal(grokThinkingEffort(undefined, false, false), undefined);
+  // T-057: grok-4.6+ aceita xhigh no wire; 4.5 rebaixa.
+  assert.equal(normalizeGrokEffort("xhigh", "grok-4.5"), "high");
+  assert.equal(normalizeGrokEffort("xhigh", "grok-4.6"), "xhigh");
+  assert.equal(normalizeGrokEffort("max", "grok-4.7"), "xhigh");
+  assert.equal(grokThinkingEffort("xhigh", false, false, "grok-4.6"), "xhigh");
+  assert.equal(grokThinkingEffort("xhigh", false, false, "grok-4.5"), "high");
+  assert.equal(grokSupportsXhigh("grok-4.6"), true);
+  assert.equal(grokSupportsXhigh("grok-4.5"), false);
+  assert.equal(grokSupportsXhigh("grok-composer-2.5-fast"), false);
+});
+
+test("T-057: grok-4.N context 500k (explícito e futuro sem entrada)", () => {
+  assert.equal(contextLimitFor("grok-4.5"), 500_000);
+  assert.equal(contextLimitFor("grok-4.6"), 500_000);
+  assert.equal(contextLimitFor("grok-4.7"), 500_000);
+  assert.equal(contextLimitFor("xai/grok-4.6"), 500_000);
+});
+
+test("T-057: regressão grok-4.5 — context e effort idênticos ao pré-4.6", () => {
+  // Agente ainda em 4.5: context 500k; xhigh degrada pra high (CLI legado).
+  assert.equal(contextLimitFor("grok-4.5"), 500_000);
+  assert.equal(normalizeGrokEffort("xhigh", "grok-4.5"), "high");
+  assert.equal(normalizeGrokEffort("high", "grok-4.5"), "high");
+  assert.equal(normalizeGrokEffort("medium", "grok-4.5"), "medium");
+  assert.equal(normalizeGrokEffort("low", "grok-4.5"), "low");
+  assert.equal(grokThinkingEffort("xhigh", false, false, "grok-4.5"), "high");
 });

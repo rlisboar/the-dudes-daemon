@@ -1,6 +1,6 @@
 import type { z } from "zod";
 
-export type AgentRuntimeState = "idle" | "thinking" | "speaking" | "sending" | "stopping" | "stalled";
+export type AgentRuntimeState = "idle" | "queued" | "thinking" | "speaking" | "sending" | "stopping" | "stalled";
 export type EffortLevel = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 export type CliRunner = "claude" | "opencode" | "gemini" | "codex" | "crush" | "grok";
 export type ProjectMemberRole = "admin" | "member";

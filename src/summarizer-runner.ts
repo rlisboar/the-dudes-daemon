@@ -19,6 +19,7 @@ import type { ResolvedCliCommands } from "./cli-config.js";
 import { extractOneShotText } from "./agent-runner.js";
 import { spawnDropped, type DropTarget } from "./privileges.js";
 import { normalizeGrokEffort } from "./runners/model-policy.js";
+import { acquireTurnSlot } from "./runners/turn-gate.js";
 import type { CliRunner } from "./types.js";
 
 export interface SummarizerArgs {
@@ -268,6 +269,21 @@ export async function runCliText(prompt: string, args: CliTextArgs): Promise<Cli
   const promptText = prompt.trim();
   if (!promptText) return { ok: false, error: "prompt vazio" };
 
+  // T-055: pool `bg` — summarizer/shim não roubam slots dos turnos de agente.
+  const releaseSlot = await acquireTurnSlot(`bg:${args.runner}`, undefined, "bg");
+  try {
+    return await runCliTextWithSlot(promptText, args, cliCommand, timeoutMs);
+  } finally {
+    releaseSlot();
+  }
+}
+
+async function runCliTextWithSlot(
+  promptText: string,
+  args: CliTextArgs,
+  cliCommand: string,
+  timeoutMs: number,
+): Promise<CliTextResult> {
   const cwd = mkdtempSync(join(tmpdir(), "the-dudes-cli-"));
   // Scrub secrets do daemon antes de spawn — summarizer CLI process
   // veria THE_DUDES_DAEMON_TOKEN via /proc/<pid>/environ. Prompt

@@ -1,7 +1,40 @@
-import type { ChildProcess } from "node:child_process";
+import { spawnSync, type ChildProcess } from "node:child_process";
+import { existsSync, unlinkSync } from "node:fs";
 
 export function processAlive(process: ChildProcess | null | undefined): process is ChildProcess {
   return !!process && process.exitCode === null && process.signalCode === null;
+}
+
+/**
+ * T-055: mata o leader do Grok amarrado a um `--leader-socket`.
+ *
+ * O SIGKILL do cliente headless NÃO atinge o leader (processo separado no
+ * socket). Leader zumbi = próximos turnos pendem sem CPU/log até restart.
+ * Best-effort: lsof → kill; unlink do sock. Falha silenciosa se sem lsof.
+ */
+export function killGrokLeader(leaderSocketPath: string | undefined | null): number {
+  if (!leaderSocketPath) return 0;
+  let killed = 0;
+  try {
+    const r = spawnSync("lsof", ["-t", leaderSocketPath], {
+      encoding: "utf8",
+      timeout: 2_000,
+    });
+    const pids = (r.stdout ?? "")
+      .split(/\s+/)
+      .map((s) => parseInt(s, 10))
+      .filter((n) => Number.isFinite(n) && n > 1);
+    for (const pid of pids) {
+      try {
+        process.kill(pid, "SIGKILL");
+        killed += 1;
+      } catch { /* ESRCH */ }
+    }
+  } catch { /* lsof ausente / timeout */ }
+  try {
+    if (existsSync(leaderSocketPath)) unlinkSync(leaderSocketPath);
+  } catch { /* best-effort */ }
+  return killed;
 }
 
 export function killProcess(child: ChildProcess | null | undefined, signal: NodeJS.Signals = "SIGKILL"): boolean {

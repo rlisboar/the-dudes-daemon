@@ -30,12 +30,18 @@ test("grok plan, compact and thinking policies are mutually consistent", () => {
   assert.ok(compact.includes("--trust"));
   assert.ok(compact.includes("--no-subagents"));
   assert.ok(!compact.includes("--permission-mode"));
-  // xhigh is not a Grok wire level — maps to high
+  // xhigh em modelo legado/sem model → high (wire 4.5)
   const xhigh = grokHeadlessArgs({ prompt, outputFormat: "json", workspaceRoot: "/repo", effort: "xhigh" });
   const effortIdx = xhigh.indexOf("--effort");
   assert.ok(effortIdx >= 0);
   assert.equal(xhigh[effortIdx + 1], "high");
   assert.ok(!xhigh.includes("xhigh"));
+  // T-057: grok-4.6 passa xhigh intacto
+  const x46 = grokHeadlessArgs({
+    prompt, outputFormat: "json", workspaceRoot: "/repo", effort: "xhigh", model: "grok-4.6",
+  });
+  const i46 = x46.indexOf("--effort");
+  assert.equal(x46[i46 + 1], "xhigh");
 });
 
 test("grok leader socket isolates the agent when informed", () => {

@@ -42,6 +42,8 @@ export interface AgentInfo {
   /** When true, daemon forwards Claude's extended-thinking blocks via onThinkingText.
    *  Resolved by the server (agent override ?? project default ?? false). */
   collectThinking?: boolean;
+  /** Subagente Brain (mcp delegate) — usa pool turn-gate `bg` (T-055). */
+  ephemeral?: boolean;
 }
 
 export interface ImageAttachment {

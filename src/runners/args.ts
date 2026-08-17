@@ -69,7 +69,8 @@ export function grokHeadlessArgs(input: GrokHeadlessArgs): string[] {
   ];
   if (input.leaderSocket) args.push("--leader-socket", input.leaderSocket);
   if (input.model) args.push("-m", input.model);
-  const effort = grokThinkingEffort(input.effort, !!input.collectThinking, !!input.forCompact);
+  // T-057: effort wire depende do modelo (4.6+ aceita xhigh).
+  const effort = grokThinkingEffort(input.effort, !!input.collectThinking, !!input.forCompact, input.model);
   if (effort) args.push("--effort", effort);
   if (input.sessionId) args.push("--resume", input.sessionId);
   if (input.planMode && !input.forCompact) {

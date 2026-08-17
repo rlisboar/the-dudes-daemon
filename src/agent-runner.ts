@@ -29,7 +29,7 @@ import { parseCodexTurnEvent, parseCrushSessionMeta, parseGeminiTurnEvent, parse
 import { buildBridgeEnv, buildClaudeMcpConfig, buildCodexMcpArgs, buildCrushMcpConfig, buildGeminiMcpServers, buildGrokMcpToml, buildOpenCodeMcpConfig } from "./runners/mcp-config.js";
 import { RunnerRuntimeFiles } from "./runners/runtime-files.js";
 import { ContextTracker, CumulativeUsageTracker, type UsageSemantics } from "./runners/context-tracker.js";
-import { armHardTimeout, collectProcessOutput, killProcess, processAlive as procAlive, terminateAndWait, terminateWithEscalation } from "./runners/process-lifecycle.js";
+import { armHardTimeout, collectProcessOutput, killGrokLeader, killProcess, processAlive as procAlive, terminateAndWait, terminateWithEscalation } from "./runners/process-lifecycle.js";
 import { memoryTitleNearDup, parseAndStripMemory } from "./memory-utils.js";
 import {
   createActivityClock,
@@ -247,6 +247,8 @@ export class AgentRunner {
    *  NÃO bytes brutos de stdout/stderr — ver touchActivity + runGrokMessage. */
   private activityClock: TurnActivityClock = createActivityClock();
   private hangWatchTimer: NodeJS.Timeout | null = null;
+  /** T-055: true enquanto await acquireTurnSlot — hang watch NÃO conta. */
+  private waitingTurnGate = false;
   private recoveringHung = false;
   /**
    * Release do turn-gate do turno per-message em voo. O 'close' do processo
@@ -565,7 +567,8 @@ export class AgentRunner {
   async runOneShot(prompt: string): Promise<string> {
     if (this.stopped) return "";
     // Semáforo global: N turnos de CLI simultâneos = N×~120MB; ver turn-gate.
-    const releaseSlot = await acquireTurnSlot(`${this.opts.cliRunner}:${this.info.name}`, this.opts.log);
+    const pool = this.info.ephemeral ? "bg" as const : "main" as const;
+    const releaseSlot = await acquireTurnSlot(`${this.opts.cliRunner}:${this.info.name}`, this.opts.log, pool);
     if (this.stopped) { releaseSlot(); return ""; }
     recordTurnStart(this.opts.cliRunner);
     const turnoT0 = Date.now();
@@ -2418,15 +2421,22 @@ export class AgentRunner {
         ? this.inflightPerMessage.attempt
         : 0;
     this.inflightPerMessage = { content, images, attempt: prevAttempt };
-    this.setState("thinking");
+    // T-055: fila do turn-gate NÃO é hang. Estado "queued" + flag interna
+    // suspendem o watchdog até o slot ser concedido e o CLI spawnar.
+    this.waitingTurnGate = true;
+    this.setState("queued");
     // Mesmo semáforo do runOneShot: turnos grok de resume são o caso medido
     // (4 simultâneos × ~120MB com swap saturado). O release fica amarrado ao
     // 'close' do processo; o guard interno do gate cobre o "close não veio".
-    const releaseSlot = await acquireTurnSlot(`grok:${this.info.name}`, this.opts.log);
+    // T-055: ephemeral (Brain subagent) compete no pool `bg`, não no main.
+    const pool = this.info.ephemeral ? "bg" as const : "main" as const;
+    const releaseSlot = await acquireTurnSlot(`grok:${this.info.name}`, this.opts.log, pool);
+    this.waitingTurnGate = false;
     if (this.stopped || !this.messageSession.owns(epoch0)) { releaseSlot(); return; }
     // Guarda o release pro hard recover: close pós-SIGKILL não é garantido
     // (netos herdam pipes) e sem isto o slot trava a fila por até 15min.
     this.activeTurnRelease = releaseSlot;
+    this.setState("thinking");
     recordTurnStart("grok");
     const grokTurnT0 = Date.now();
     this.writeGrokConfig();
@@ -3683,8 +3693,9 @@ export class AgentRunner {
     if (state === this.currentState) return;
     this.currentState = state;
     this.info.state = state;
-    // Atividade real (não stalled/idle) zera o soft-stall
-    if (state !== "idle" && state !== "stopping" && state !== "stalled") {
+    // Atividade real (não stalled/idle/queued) zera o soft-stall.
+    // "queued" = espera de gate — NÃO reseta o relógio (T-055).
+    if (state !== "idle" && state !== "stopping" && state !== "stalled" && state !== "queued") {
       this.touchActivity();
     }
     this.opts.onState(state);
@@ -3769,6 +3780,8 @@ export class AgentRunner {
 
   /** true se o agent está no meio de um turno (busy per-message ou estado ativo). */
   private isInTurn(): boolean {
+    // T-055: "queued" = esperando slot do gate — NÃO é turno em execução.
+    if (this.waitingTurnGate || this.currentState === "queued") return false;
     if (this.messageSession.busy) return true;
     const s = this.currentState;
     return s === "thinking" || s === "speaking" || s === "sending" || s === "stalled";
@@ -3793,6 +3806,14 @@ export class AgentRunner {
 
   private tickHangWatch(): void {
     if (this.stopped || this.recoveringHung) return;
+    // T-055: espera no turn-gate (MAX saturado) — relógio NÃO corre. O
+    // busy=true + thinking antigo contava a fila como inatividade e o
+    // watchdog matava turnos que nem tinham spawnado.
+    if (this.waitingTurnGate || this.currentState === "queued") {
+      this.activityClock.deadSince = null;
+      this.activityClock.softReported = false;
+      return;
+    }
     // compacting preso: desbloqueia a fila (senão mensagens somem pra sempre).
     // Este teto era só um comentário — o código apenas retornava, então um
     // await que nunca resolve no compact desarmava o watchdog E travava a
@@ -3938,10 +3959,21 @@ export class AgentRunner {
       );
       killProcess(this.ocActiveProc, "SIGKILL");
       killProcess(this.oneShotProc, "SIGKILL");
+      // T-055: cliente headless morto NÃO mata o leader do Grok — se o leader
+      // travou, o próximo turno fica mudo até restart. Mata o processo no
+      // --leader-socket deste agente e limpa o sock.
+      if (this.opts.cliRunner === "grok") {
+        const sock = this.runtimeFiles.grokLeaderSocket();
+        const n = killGrokLeader(sock);
+        if (n > 0) {
+          this.opts.log("warn", `[hang:${this.info.name}] matou leader grok (${n} pid) sock=${sock}`);
+        }
+      }
       // Grok/crush: netos podem manter o ChildProcess "vivo" no Node —
       // nullifica mesmo se kill falhar pra não bloquear dead-detect.
       this.ocActiveProc = null;
       this.oneShotProc = null;
+      this.waitingTurnGate = false;
       this.toolsInFlight = 0;
       this.toolsInFlightSince = null;
       this.activityClock.softReported = false;

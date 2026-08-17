@@ -25,7 +25,9 @@ export const MODEL_CONTEXT_LIMITS: Record<string, number> = {
   "accounts/fireworks/models/glm-5p2": 1_048_575,
   "deepseek/deepseek-v4-pro": 200_000, "deepseek/deepseek-v4-flash": 200_000,
   "deepseek/deepseek-chat": 128_000,
-  "grok-4.5": 500_000, "grok-build": 500_000, "grok-composer-2.5-fast": 500_000,
+  // Grok 4.x family (docs xAI): 500k. IDs explícitos + fallback regex em lookup.
+  "grok-4.5": 500_000, "grok-4.6": 500_000,
+  "grok-build": 500_000, "grok-composer-2.5-fast": 500_000,
 };
 
 export const DEFAULT_CONTEXT_LIMIT = 200_000;
@@ -40,6 +42,8 @@ export function lookupContextLimit(model: string | undefined): number | undefine
   if (Object.hasOwn(MODEL_CONTEXT_LIMITS, base)) return MODEL_CONTEXT_LIMITS[base];
   const undated = base.replace(DATED_MODEL_ID_RE, "");
   if (undated !== base && Object.hasOwn(MODEL_CONTEXT_LIMITS, undated)) return MODEL_CONTEXT_LIMITS[undated];
+  // T-057: grok-4.7, grok-4.10… sem entrada explícita ainda herdam 500k.
+  if (/^grok-4\.\d+$/i.test(base) || /\/grok-4\.\d+$/i.test(base)) return 500_000;
   const slash = base.indexOf("/");
   return slash > 0 ? lookupContextLimit(base.slice(slash + 1)) : undefined;
 }
@@ -77,17 +81,44 @@ export function claudeThinkingEffort(effort: EffortLevel | undefined, collectThi
   return { effort: lifted ? "high" : effort, lifted };
 }
 
-/** Wire levels do Grok Build (CLI 0.2.x / grok-4.5): só `low|medium|high`.
- *  none/minimal/xhigh/max existem no union multi-runner mas o CLI rejeita
- *  (`unknown effort level 'xhigh'; use one of: high, medium, low`). */
+/**
+ * Wire efforts Grok Build.
+ * - grok-4.5 e pré-4.x (build/composer): low|medium|high — xhigh rejeitado pelo CLI.
+ * - grok-4.6+ (API/docs 2026-08): low|medium|high|xhigh.
+ * max → xhigh (4.6+) ou high (legado).
+ */
 export const GROK_WIRE_EFFORTS = ["low", "medium", "high"] as const;
-export type GrokWireEffort = (typeof GROK_WIRE_EFFORTS)[number];
+export const GROK_WIRE_EFFORTS_XHIGH = ["low", "medium", "high", "xhigh"] as const;
+export type GrokWireEffort = "low" | "medium" | "high" | "xhigh";
 
-export function normalizeGrokEffort(effort: string | undefined | null): GrokWireEffort | undefined {
+/** Minor version de `grok-4.N` ou null se não for família 4.x. */
+export function grok4Minor(model?: string | null): number | null {
+  const m = (model ?? "").trim().toLowerCase().replace(EFFORT_SUFFIX_RE, "");
+  const bare = m.includes("/") ? m.slice(m.lastIndexOf("/") + 1) : m;
+  const match = bare.match(/^grok-4\.(\d+)/);
+  return match ? parseInt(match[1]!, 10) : null;
+}
+
+/** grok-4.6 e posteriores aceitam xhigh no wire (CLI ≥0.2.118 / API). */
+export function grokSupportsXhigh(model?: string | null): boolean {
+  const minor = grok4Minor(model);
+  return minor != null && minor >= 6;
+}
+
+export function grokWireEfforts(model?: string | null): readonly GrokWireEffort[] {
+  return grokSupportsXhigh(model) ? GROK_WIRE_EFFORTS_XHIGH : GROK_WIRE_EFFORTS;
+}
+
+export function normalizeGrokEffort(
+  effort: string | undefined | null,
+  model?: string | null,
+): GrokWireEffort | undefined {
   if (!effort) return undefined;
   if (effort === "low" || effort === "medium" || effort === "high") return effort;
   if (effort === "none" || effort === "minimal" || effort === "off") return "low";
-  if (effort === "xhigh" || effort === "max") return "high";
+  if (effort === "xhigh" || effort === "max") {
+    return grokSupportsXhigh(model) ? "xhigh" : "high";
+  }
   return "medium";
 }
 
@@ -95,11 +126,12 @@ export function grokThinkingEffort(
   effort: EffortLevel | undefined,
   collectThinking: boolean,
   forCompact: boolean,
+  model?: string | null,
 ): GrokWireEffort | undefined {
   // Com thinking coletado, sobe effort fraco pra high (mesmo padrão do claude).
   const lifted =
     !forCompact && collectThinking && (!effort || ["none", "minimal", "low", "medium"].includes(effort))
       ? "high"
       : effort;
-  return normalizeGrokEffort(lifted);
+  return normalizeGrokEffort(lifted, model);
 }

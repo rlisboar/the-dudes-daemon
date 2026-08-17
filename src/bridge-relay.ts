@@ -151,6 +151,10 @@ export class BridgeRelay {
    *  com folga payloads MCP (tasks list, send_message com anexos). */
   private static readonly MAX_BODY_BYTES = 10 * 1024 * 1024;
 
+  /** T-055: fetch nativo sem timeout pende forever se orch/rede congela.
+   *  Bridge MCP espera no Unix socket → hang do agente. Critério: 25s. */
+  static readonly UPSTREAM_FETCH_TIMEOUT_MS = 25_000;
+
   private async handle(req: http.IncomingMessage, res: http.ServerResponse) {
     // Path allowlist: bridge relay deve só forward /api/bridge/*. Outros
     // paths (ex: /api/admin/users) seriam bypass de auth — atacante local
@@ -257,11 +261,33 @@ export class BridgeRelay {
       else if (typeof v === "string") fwd[k] = v;
     }
     try {
-      const upstream = await fetch(url, {
-        method: req.method,
-        headers: fwd,
-        body: body && body.length ? new Uint8Array(body) : undefined,
+      const ctrl = new AbortController();
+      const fetchTimer = setTimeout(
+        () => ctrl.abort(new Error(`bridge relay timeout após ${BridgeRelay.UPSTREAM_FETCH_TIMEOUT_MS}ms`)),
+        BridgeRelay.UPSTREAM_FETCH_TIMEOUT_MS,
+      );
+      // Client disconnect no Unix socket → cancela upstream (não deixa fetch órfão).
+      // NÃO usar req 'close' (dispara após body consumido com client ainda vivo).
+      const onClientGone = () => {
+        try { ctrl.abort(new Error("bridge client disconnected")); } catch { /* */ }
+      };
+      req.once("aborted", onClientGone);
+      res.once("close", () => {
+        // close sem writableFinished = client desconectou mid-flight
+        if (!res.writableFinished) onClientGone();
       });
+      let upstream: Response;
+      try {
+        upstream = await fetch(url, {
+          method: req.method,
+          headers: fwd,
+          body: body && body.length ? new Uint8Array(body) : undefined,
+          signal: ctrl.signal,
+        });
+      } finally {
+        clearTimeout(fetchTimer);
+        req.removeListener("aborted", onClientGone);
+      }
       let buf = Buffer.from(await upstream.arrayBuffer());
       // E2EE: decrypt cipher fields in list-style responses so the LLM sees
       // plaintext. Server stores ciphertext per project; daemon holds the
