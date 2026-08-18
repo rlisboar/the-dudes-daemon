@@ -87,6 +87,23 @@ test("decryptForProject: ciphertext adulterado falha (tag GCM) → null", () => 
   forgetProjectKey("proj-tamper");
 });
 
+test("T-062: e2e: legado abre; v2 AAD errado falha; e2e:v1: fail-closed", async () => {
+  const { aadV2, E2EE_TABLE } = await import("@the-dudes/protocol/e2ee-fields");
+  provisionKey("proj-aad");
+  const v1 = encryptForProject("legado", "proj-aad")!;
+  assert.ok(v1.startsWith("e2e:") && !v1.startsWith("e2e:v2:"));
+  assert.equal(decryptForProject(v1, "proj-aad"), "legado");
+  const aadOk = aadV2({ projectId: "proj-aad", table: E2EE_TABLE.TASKS, field: "title" });
+  const aadBad = aadV2({ projectId: "proj-aad", table: E2EE_TABLE.GOALS, field: "title" });
+  const v2 = encryptForProject("segredo", "proj-aad", aadOk)!;
+  assert.ok(v2.startsWith("e2e:v2:"));
+  assert.equal(decryptForProject(v2, "proj-aad", aadOk), "segredo");
+  assert.equal(decryptForProject(v2, "proj-aad", aadBad), null);
+  assert.equal(decryptForProject(v2, "proj-aad"), null, "v2 sem AAD fail-closed");
+  assert.equal(decryptForProject("e2e:v1:AAAA", "proj-aad"), null);
+  forgetProjectKey("proj-aad");
+});
+
 test("isE2eEncrypted", () => {
   assert.equal(isE2eEncrypted("e2e:abc"), true);
   assert.equal(isE2eEncrypted("plain"), false);

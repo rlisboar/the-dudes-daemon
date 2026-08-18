@@ -13,6 +13,12 @@
  */
 
 import {
+  E2E_PREFIX,
+  E2E_V2_PREFIX,
+  isE2eV1Rejected,
+  isE2eV2,
+} from "@the-dudes/protocol/e2ee-fields";
+import {
   constants,
   createCipheriv,
   createDecipheriv,
@@ -432,23 +438,36 @@ export function redactCredentialsDeep(projectId: string, value: unknown): unknow
 
 /* ---------- content AES-GCM (matches web/src/crypto.ts format) ---------- */
 
-const E2E_PREFIX = "e2e:";
-
-/** Cifra UTF-8 com uma AES-256 raw (mesmo wire format e2e: do web). */
-function encryptWithRawKey(plain: string, key: Buffer): string | null {
+/** Cifra UTF-8 com uma AES-256 raw. Sem aad → e2e: (v1). Com aad → e2e:v2:. */
+function encryptWithRawKey(plain: string, key: Buffer, aad?: string): string | null {
   if (key.length !== 32) return null;
   const iv = randomBytes(12);
   const cipher = createCipheriv("aes-256-gcm", key, iv);
+  if (aad != null) cipher.setAAD(Buffer.from(aad, "utf8"));
   const ct = Buffer.concat([cipher.update(plain, "utf8"), cipher.final()]);
   const tag = cipher.getAuthTag();
-  return E2E_PREFIX + Buffer.concat([iv, ct, tag]).toString("base64");
+  const prefix = aad != null ? E2E_V2_PREFIX : E2E_PREFIX;
+  return prefix + Buffer.concat([iv, ct, tag]).toString("base64");
 }
 
-/** Decifra blob e2e: com uma AES-256 raw. null se auth fail / formato ruim. */
-function decryptWithRawKey(stored: string, key: Buffer): string | null {
-  if (!stored.startsWith(E2E_PREFIX)) return stored;
+/** Decifra blob e2e: / e2e:v2:. e2e:v1: → null (fail-closed). */
+function decryptWithRawKey(stored: string, key: Buffer, aad?: string): string | null {
+  if (isE2eV1Rejected(stored)) return null;
   if (key.length !== 32) return null;
   try {
+    if (isE2eV2(stored)) {
+      if (aad == null || aad === "") return null;
+      const all = Buffer.from(stored.slice(E2E_V2_PREFIX.length), "base64");
+      if (all.length < 12 + 16) return null;
+      const iv = all.subarray(0, 12);
+      const tag = all.subarray(all.length - 16);
+      const ct = all.subarray(12, all.length - 16);
+      const decipher = createDecipheriv("aes-256-gcm", key, iv);
+      decipher.setAAD(Buffer.from(aad, "utf8"));
+      decipher.setAuthTag(tag);
+      return Buffer.concat([decipher.update(ct), decipher.final()]).toString("utf8");
+    }
+    if (!stored.startsWith(E2E_PREFIX)) return stored;
     const all = Buffer.from(stored.slice(E2E_PREFIX.length), "base64");
     if (all.length < 12 + 16) return null;
     const iv = all.subarray(0, 12);
@@ -462,13 +481,12 @@ function decryptWithRawKey(stored: string, key: Buffer): string | null {
   }
 }
 
-/** Encrypt a UTF-8 string with the project AES-256 key. Returns
- *  "e2e:" + base64(iv || ciphertext || tag) — same wire format the web
- *  client uses, so values round-trip transparently. */
-export function encryptForProject(plain: string, projectId: string): string | null {
+/** Encrypt a UTF-8 string with the project AES-256 key. Sem aad → v1
+ *  (estágio 1). `aad` só para testes / T-062b. */
+export function encryptForProject(plain: string, projectId: string, aad?: string): string | null {
   const key = keyFor(projectId);
   if (!key) return null;
-  return encryptWithRawKey(plain, key);
+  return encryptWithRawKey(plain, key, aad);
 }
 
 /** Decrypt an "e2e:"-prefixed base64 blob back to UTF-8. Pass-through if
@@ -478,18 +496,21 @@ export function encryptForProject(plain: string, projectId: string): string | nu
  *  Fallback do key ring: tenta a ativa e depois as antigas (mais recente
  *  primeiro) — paridade com maybeDecrypt do web. Sem isso, rotação tornava
  *  histórico pré-rotação ilegível no MCP bridge. */
-export function decryptForProject(stored: string, projectId: string): string | null {
+export function decryptForProject(stored: string, projectId: string, aad?: string): string | null {
+  if (isE2eV1Rejected(stored)) return null;
   if (!stored.startsWith(E2E_PREFIX)) return stored;
+  // v2 sem AAD: fail-closed (D5). Não defaultar kind.
+  if (isE2eV2(stored) && (aad == null || aad === "")) return null;
   const key = keyFor(projectId);
   if (!key) return null;
-  const plain = decryptWithRawKey(stored, key);
+  const plain = decryptWithRawKey(stored, key, aad);
   if (plain != null) return plain;
   // AES-GCM auth fail na ativa = blob de era anterior OU lixo. Tenta o ring
   // antes de desistir. NÃO apagar a project key — um único blob stale mataria
   // decrypt de TODOS os agentes/mensagens do projeto.
   const antigas = projectKeysOld.get(projectId) ?? [];
   for (const antiga of antigas) {
-    const p = decryptWithRawKey(stored, antiga);
+    const p = decryptWithRawKey(stored, antiga, aad);
     if (p != null) return p;
   }
   console.warn(`[the-dudes] decrypt failed for ${projectId}: nenhuma chave do ring abriu o blob`);

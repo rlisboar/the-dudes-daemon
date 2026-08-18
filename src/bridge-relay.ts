@@ -4,6 +4,7 @@ import path from "node:path";
 import os from "node:os";
 import { chmodSync, chownSync, existsSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
 import type { DropTarget } from "./privileges.js";
+import { aadV2, E2EE_TABLE } from "@the-dudes/protocol/e2ee-fields";
 import { decryptForProject, encryptForProject, isE2eEncrypted, rememberCredentialPlaintext } from "./daemon-crypto.js";
 
 /**
@@ -303,9 +304,10 @@ export class BridgeRelay {
         if (projectId) {
           try {
             const json = JSON.parse(buf.toString("utf8"));
-            const dec = (s: unknown): unknown => {
+            const dec = (s: unknown, table?: string, field?: string): unknown => {
               if (typeof s !== "string" || !isE2eEncrypted(s)) return s;
-              return decryptForProject(s, projectId) ?? s;
+              const aad = table && field ? aadV2({ projectId, table, field }) : undefined;
+              return decryptForProject(s, projectId, aad) ?? s;
             };
             const decryptPlanTasks = (tasks: any[]) => {
               for (const t of tasks) {
@@ -316,24 +318,24 @@ export class BridgeRelay {
             };
             if (op === "tasks_list" && Array.isArray(json.tasks)) {
               for (const t of json.tasks) {
-                if (t.title) t.title = dec(t.title);
-                if (t.description) t.description = dec(t.description);
+                if (t.title) t.title = dec(t.title, E2EE_TABLE.TASKS, "title");
+                if (t.description) t.description = dec(t.description, E2EE_TABLE.TASKS, "description");
               }
             } else if (op === "tasks_comment_list" && Array.isArray(json.comments)) {
               for (const c of json.comments) {
-                if (c.content) c.content = dec(c.content);
+                if (c.content) c.content = dec(c.content, E2EE_TABLE.TASK_COMMENTS, "content");
               }
             } else if (op === "goals_list" && Array.isArray(json.goals)) {
               for (const g of json.goals) {
-                if (g.title) g.title = dec(g.title);
-                if (g.description) g.description = dec(g.description);
+                if (g.title) g.title = dec(g.title, E2EE_TABLE.GOALS, "title");
+                if (g.description) g.description = dec(g.description, E2EE_TABLE.GOALS, "description");
               }
             } else if (op === "memory_list" && Array.isArray(json.memories)) {
               // entrega title/body em plaintext pro agente (a tool recall
               // filtra query/substring sobre isto). Mantém os campos cipher.
               for (const e of json.memories) {
-                if (e.titleCipher) e.title = dec(e.titleCipher);
-                if (e.bodyCipher) e.body = dec(e.bodyCipher);
+                if (e.titleCipher) e.title = dec(e.titleCipher, E2EE_TABLE.MEMORIES, "title");
+                if (e.bodyCipher) e.body = dec(e.bodyCipher, E2EE_TABLE.MEMORIES, "body");
               }
             } else if (op === "plans_list" && Array.isArray(json.plans)) {
               for (const p of json.plans) {

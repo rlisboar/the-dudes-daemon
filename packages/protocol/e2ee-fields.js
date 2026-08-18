@@ -39,3 +39,43 @@ export const GOAL_FIELDS = ["title", "description"];
 
 /** Resumo de sessão (summarize:result no daemon ↔ store no web). */
 export const SUMMARY_FIELDS = ["summary"];
+
+/**
+ * Tabelas lógicas do AAD (T-062). Sem recordId — IDs são gerados no server
+ * depois da cifra. Fecha cross-table/cross-field; não fecha cópia intra-campo.
+ */
+export const E2EE_TABLE = Object.freeze({
+  TASKS: "tasks",
+  TASK_COMMENTS: "task_comments",
+  GOALS: "goals",
+  MEMORIES: "memories",
+  MESSAGES: "messages",
+  BOARDS: "explanation_boards",
+  SUMMARIES: "tts_summaries",
+});
+
+/** Prefixos de wire. v2 leva AAD; v1 abortado é fail-closed; `e2e:` é legado. */
+export const E2E_PREFIX = "e2e:";
+export const E2E_V2_PREFIX = "e2e:v2:";
+export const E2E_V1_REJECT_PREFIX = "e2e:v1:";
+
+/**
+ * AAD canônico: utf8 `v2|{projectId}|{table}|{field}`.
+ * Uma string, dois lados (web SubtleCrypto + daemon node:crypto).
+ */
+export function aadV2({ projectId, table, field }) {
+  if (typeof projectId !== "string" || !projectId
+    || typeof table !== "string" || !table
+    || typeof field !== "string" || !field) {
+    throw new Error("aadV2: projectId, table e field são obrigatórios");
+  }
+  return `v2|${projectId}|${table}|${field}`;
+}
+
+export function isE2eV2(stored) {
+  return typeof stored === "string" && stored.startsWith(E2E_V2_PREFIX);
+}
+
+export function isE2eV1Rejected(stored) {
+  return typeof stored === "string" && stored.startsWith(E2E_V1_REJECT_PREFIX);
+}

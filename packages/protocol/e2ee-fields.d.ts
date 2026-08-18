@@ -9,3 +9,21 @@ export declare const TASK_FIELDS: string[];
 export declare const COMMENT_FIELDS: string[];
 export declare const GOAL_FIELDS: string[];
 export declare const SUMMARY_FIELDS: string[];
+
+export declare const E2EE_TABLE: {
+  readonly TASKS: "tasks";
+  readonly TASK_COMMENTS: "task_comments";
+  readonly GOALS: "goals";
+  readonly MEMORIES: "memories";
+  readonly MESSAGES: "messages";
+  readonly BOARDS: "explanation_boards";
+  readonly SUMMARIES: "tts_summaries";
+};
+
+export declare const E2E_PREFIX: "e2e:";
+export declare const E2E_V2_PREFIX: "e2e:v2:";
+export declare const E2E_V1_REJECT_PREFIX: "e2e:v1:";
+
+export declare function aadV2(args: { projectId: string; table: string; field: string }): string;
+export declare function isE2eV2(stored: string): boolean;
+export declare function isE2eV1Rejected(stored: string): boolean;

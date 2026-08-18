@@ -2,6 +2,9 @@ import type { z } from "zod";
 
 export declare const commandSchemas: Record<string, z.ZodTypeAny>;
 
+/** Comandos cujo handler persiste no Postgres. Todo nome tem schema. */
+export declare const DB_WRITE_COMMANDS: readonly string[];
+
 export type CommandValidation =
   | { ok: true; error?: undefined }
   | { ok: false; error: string };

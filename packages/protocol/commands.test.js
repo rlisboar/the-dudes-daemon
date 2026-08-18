@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { commandSchemas, validateCommand } from "./commands.js";
+import { commandSchemas, DB_WRITE_COMMANDS, validateCommand } from "./commands.js";
 
 const root = resolve(fileURLToPath(new URL(".", import.meta.url)), "../..");
 const wire = readFileSync(resolve(root, "packages/protocol/wire.d.ts"), "utf8");
@@ -25,16 +25,11 @@ test("todo schema registrado corresponde a um comando real", () => {
 });
 
 test("as famílias de risco estão cobertas", () => {
-  // Comando novo de escrita em DB ou de authz tem que entrar deliberadamente.
-  // Se este teste quebrar: registre o schema, não relaxe o prefixo.
   const reais = discriminantesDeClientCommand();
-  const risco = [...reais].filter((n) =>
-    n.startsWith("admin:") ||
-    /^(add|update|remove)_member$/.test(n) ||
-    /^(create|update|delete)_project$/.test(n),
-  );
-  const sem = risco.filter((n) => !(n in commandSchemas));
-  assert.deepEqual(sem, [], `comandos de risco sem schema: ${sem.join(", ")}`);
+  const sem = DB_WRITE_COMMANDS.filter((n) => !(n in commandSchemas));
+  assert.deepEqual(sem, [], `writer de DB sem schema: ${sem.join(", ")}`);
+  const fora = DB_WRITE_COMMANDS.filter((n) => !reais.has(n));
+  assert.deepEqual(fora, [], `DB_WRITE que não é ClientCommand: ${fora.join(", ")}`);
 });
 
 test("aceita payload correto", () => {

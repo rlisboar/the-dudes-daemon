@@ -78,3 +78,14 @@ test("board: cifra todos os campos de texto, steps, chart e annotations", () => 
   // passar a MANDAR anotações, este assert avisa que falta cifrar.
   void BOARD_ANNOTATION_FIELDS;
 });
+
+test("T-062 parity daemon: cifra v2 e decifra com o mesmo aadV2", async () => {
+  const { aadV2, E2EE_TABLE } = await import("@the-dudes/protocol/e2ee-fields");
+  const aad = aadV2({ projectId: PID, table: E2EE_TABLE.MESSAGES, field: "content" });
+  const { encryptForProject, decryptForProject } = await import("../daemon-crypto.js");
+  const ct = encryptForProject("texto de content", PID, aad);
+  assert.ok(ct && ct.startsWith("e2e:v2:"));
+  assert.equal(decryptForProject(ct!, PID, aad), "texto de content");
+  const aadOutro = aadV2({ projectId: PID, table: E2EE_TABLE.TASKS, field: "title" });
+  assert.equal(decryptForProject(ct!, PID, aadOutro), null);
+});
