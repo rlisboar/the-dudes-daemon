@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { registerAgentPid } from "../privileges.js";
 
 export interface RuntimeImage {
   base64: string;
@@ -36,6 +37,11 @@ export class RunnerRuntimeFiles {
     writeFileSync(tokenPath, this.input.agentToken, { mode: 0o600 });
     try { chmodSync(tokenPath, 0o600); } catch {}
     return tokenPath;
+  }
+
+  /** Associa o pid do CLI (e a árvore de filhos) a este agente. */
+  bindProcess(pid: number): void {
+    registerAgentPid(this.input.agentId, pid);
   }
 
   geminiConfigDir(): string {

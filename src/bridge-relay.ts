@@ -1,9 +1,11 @@
 import http from "node:http";
+import net from "node:net";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import os from "node:os";
 import { chmodSync, chownSync, existsSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
 import type { DropTarget } from "./privileges.js";
+import { getUnixPeerPid, resolveAgentIdFromPid } from "./privileges.js";
 import { aadV2, E2EE_TABLE } from "@the-dudes/protocol/e2ee-fields";
 import { decryptForProject, encryptForProject, isE2eEncrypted, rememberCredentialPlaintext } from "./daemon-crypto.js";
 
@@ -94,11 +96,20 @@ export class BridgeRelay {
   private agentProjectLookup?: (agentId: string) => string | null;
 
   private socketDir: string;
+  private peerPidSelfTest?: () => Promise<boolean>;
+  /** true só depois do self-test passar. Senão fail-OPEN. */
+  peerPidEnforced = false;
 
-  constructor(orchUrl: string, dropTo: DropTarget | null, agentProjectLookup?: (agentId: string) => string | null) {
+  constructor(
+    orchUrl: string,
+    dropTo: DropTarget | null,
+    agentProjectLookup?: (agentId: string) => string | null,
+    opts?: { peerPidSelfTest?: () => Promise<boolean> },
+  ) {
     this.orchUrl = orchUrl.replace(/\/$/, "");
     this.dropTo = dropTo;
     this.agentProjectLookup = agentProjectLookup;
+    this.peerPidSelfTest = opts?.peerPidSelfTest;
     // Symlink attack defense: socket vivia em /tmp/the-dudes-bridge-<pid>.sock
     // — path previsível (PID sequential). Atacante local poderia pré-criar
     // symlink em /tmp/the-dudes-bridge-<next-pid>.sock → /tmp/evil-target.sock
@@ -136,8 +147,42 @@ export class BridgeRelay {
           return;
         }
         this.server.removeListener("error", reject);
-        resolve();
+        void this.runPeerPidSelfTest().then(resolve, (e) => {
+          console.error("[bridge-relay] ERROR: peer-pid self-test threw — fail-OPEN", e);
+          this.peerPidEnforced = false;
+          resolve();
+        });
       });
+    });
+  }
+
+  private async runPeerPidSelfTest(): Promise<void> {
+    const ok = await (this.peerPidSelfTest ?? (() => this.defaultPeerPidSelfTest()))();
+    this.peerPidEnforced = ok;
+    if (!ok) {
+      console.error("[bridge-relay] ERROR: peer-pid self-test failed — fail-OPEN (cross-agent token theft not enforced)");
+    }
+  }
+
+  private defaultPeerPidSelfTest(): Promise<boolean> {
+    return new Promise((resolve) => {
+      let settled = false;
+      let client: net.Socket | undefined;
+      const finish = (ok: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.server.removeListener("connection", onConn);
+        try { client?.destroy(); } catch { /* */ }
+        resolve(ok);
+      };
+      const timer = setTimeout(() => finish(false), 1500);
+      const onConn = (sock: net.Socket) => {
+        finish(getUnixPeerPid(sock) === process.pid);
+      };
+      this.server.on("connection", onConn);
+      client = net.connect(this.socketPath);
+      client.on("error", () => finish(false));
     });
   }
 
@@ -186,6 +231,16 @@ export class BridgeRelay {
       res.writeHead(403, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "path not allowed via bridge relay" }));
       return;
+    }
+    if (this.peerPidEnforced) {
+      const urlAgent = parsed.pathname.match(/^\/api\/bridge\/([^/]+)/)?.[1];
+      const peerPid = getUnixPeerPid(req.socket);
+      const peerAgent = peerPid != null ? resolveAgentIdFromPid(peerPid) : null;
+      if (!peerAgent || !urlAgent || peerAgent !== urlAgent) {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "bridge peer does not match agent" }));
+        return;
+      }
     }
     // Reconstrói o upstream a partir do pathname normalizado + search,
     // não da string crua, pra não reintroduzir o que acabamos de validar.

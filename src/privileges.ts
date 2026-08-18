@@ -8,7 +8,7 @@
 
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
-import { accessSync, constants as fsConstants } from "node:fs";
+import { accessSync, constants as fsConstants, readFileSync } from "node:fs";
 
 export interface DropTarget {
   uid: number;
@@ -186,7 +186,7 @@ export function spawnDropped(
    */
   opts = { ...opts, detached: true };
   if (!drop) {
-    return spawn(cmd, args, opts);
+    return trackSpawnedAgent(spawn(cmd, args, opts), opts);
   }
   const setpriv = findSetpriv();
   if (setpriv) {
@@ -211,7 +211,7 @@ export function spawnDropped(
     const safeOpts: SpawnOptions = { ...opts, env: envOnly };
     delete (safeOpts as any).uid;
     delete (safeOpts as any).gid;
-    return spawn(setpriv, wrappedArgs, safeOpts);
+    return trackSpawnedAgent(spawn(setpriv, wrappedArgs, safeOpts), safeOpts);
   }
   // setpriv ausente: o drop nativo deixa vazar os supplementary groups de
   // root (docker/wheel/admin → escalada trivial). Fail-closed por padrão;
@@ -235,5 +235,157 @@ export function spawnDropped(
       "Instale util-linux ou rode o daemon como o user alvo direto.",
     );
   }
-  return spawn(cmd, args, applyDrop(opts, drop));
+  return trackSpawnedAgent(spawn(cmd, args, applyDrop(opts, drop)), applyDrop(opts, drop));
+}
+
+/* ---------- T-061: pid do peer Unix → agentId ---------- */
+
+const AGENT_PID_WALK_MAX = 10;
+const agentPidToId = new Map<number, string>();
+
+export type PeerSocket = { fd?: number; _handle?: { fd?: number } };
+
+type PeerPidReader = (sock: object) => number | null;
+type ParentPidReader = (pid: number) => number | null;
+
+let peerPidReader: PeerPidReader = defaultGetUnixPeerPid;
+let parentPidReader: ParentPidReader = defaultGetParentPid;
+
+export function setUnixPeerPidReader(fn: PeerPidReader | null): void {
+  peerPidReader = fn ?? defaultGetUnixPeerPid;
+}
+
+export function setParentPidReader(fn: ParentPidReader | null): void {
+  parentPidReader = fn ?? defaultGetParentPid;
+}
+
+export function registerAgentPid(agentId: string, pid: number): void {
+  if (!agentId || !Number.isFinite(pid) || pid <= 0) return;
+  agentPidToId.set(pid, agentId);
+}
+
+export function unregisterAgentPid(pid: number): void {
+  agentPidToId.delete(pid);
+}
+
+export function clearAgentPidRegistry(): void {
+  agentPidToId.clear();
+}
+
+export function getUnixPeerPid(sock: object): number | null {
+  try {
+    const pid = peerPidReader(sock);
+    return pid && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+export function getParentPid(pid: number): number | null {
+  try {
+    const ppid = parentPidReader(pid);
+    return ppid && ppid > 0 ? ppid : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Sobe a árvore de pais até achar um pid registrado (teto ~10). */
+export function resolveAgentIdFromPid(pid: number): string | null {
+  let current = pid;
+  const seen = new Set<number>();
+  for (let i = 0; i < AGENT_PID_WALK_MAX; i++) {
+    if (!current || current <= 1 || seen.has(current)) return null;
+    seen.add(current);
+    const id = agentPidToId.get(current);
+    if (id) return id;
+    current = getParentPid(current) ?? 0;
+  }
+  return null;
+}
+
+function trackSpawnedAgent(child: ChildProcess, opts: SpawnOptions): ChildProcess {
+  const env = (opts.env ?? process.env) as NodeJS.ProcessEnv;
+  const agentId = env.THE_DUDES_AGENT_ID;
+  const pid = child.pid;
+  if (pid && typeof agentId === "string" && agentId) {
+    registerAgentPid(agentId, pid);
+    const forget = () => unregisterAgentPid(pid);
+    child.once("exit", forget);
+    child.once("error", forget);
+  }
+  return child;
+}
+
+export function unixSocketFd(sock: object): number | null {
+  const s = sock as PeerSocket;
+  if (typeof s.fd === "number" && s.fd >= 0) return s.fd;
+  const fd = s._handle?.fd;
+  return typeof fd === "number" && fd >= 0 ? fd : null;
+}
+
+function defaultGetParentPid(pid: number): number | null {
+  if (process.platform === "linux") {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const close = stat.indexOf(")");
+      const rest = close >= 0 ? stat.slice(close + 2).split(" ") : [];
+      const ppid = Number(rest[1]);
+      return Number.isFinite(ppid) && ppid > 0 ? ppid : null;
+    } catch {
+      return null;
+    }
+  }
+  try {
+    const out = execFileSync("ps", ["-p", String(pid), "-o", "ppid="], {
+      encoding: "utf8",
+      timeout: 800,
+    });
+    const ppid = Number(out.trim());
+    return Number.isFinite(ppid) && ppid > 0 ? ppid : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Sem FFI/koffi: herda o fd e pergunta ao python3 (ctypes/getsockopt).
+ * Ausente ou falha → null (o self-test desliga o enforcement).
+ */
+function defaultGetUnixPeerPid(sock: object): number | null {
+  const fd = unixSocketFd(sock);
+  if (fd == null) return null;
+  const py = process.platform === "darwin"
+    ? [
+        "import ctypes,sys",
+        "fd=3",
+        "libc=ctypes.CDLL('/usr/lib/libSystem.B.dylib')",
+        "pid=ctypes.c_int(0)",
+        "sz=ctypes.c_uint32(4)",
+        "r=libc.getsockopt(fd,0,2,ctypes.byref(pid),ctypes.byref(sz))",
+        "sys.exit(1) if r!=0 else print(pid.value)",
+      ].join(";")
+    : process.platform === "linux"
+      ? [
+          "import socket,struct,sys",
+          "s=socket.fromfd(3,socket.AF_UNIX,socket.SOCK_STREAM)",
+          "c=s.getsockopt(socket.SOL_SOCKET,17,struct.calcsize('3i'))",
+          "print(struct.unpack('3i',c)[0])",
+        ].join(";")
+      : null;
+  if (!py) return null;
+  const bins = ["/usr/bin/python3", "/usr/local/bin/python3", "python3"];
+  for (const bin of bins) {
+    try {
+      const out = spawnSync(bin, ["-c", py], {
+        encoding: "utf8",
+        timeout: 800,
+        stdio: ["ignore", "pipe", "pipe", fd],
+      });
+      if (out.status !== 0) continue;
+      const pid = Number((out.stdout ?? "").trim());
+      if (Number.isFinite(pid) && pid > 0) return pid;
+    } catch { /* tenta o próximo bin */ }
+  }
+  return null;
 }

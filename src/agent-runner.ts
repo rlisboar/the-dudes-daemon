@@ -29,7 +29,7 @@ import { parseCodexTurnEvent, parseCrushSessionMeta, parseGeminiTurnEvent, parse
 import { buildBridgeEnv, buildClaudeMcpConfig, buildCodexMcpArgs, buildCrushMcpConfig, buildGeminiMcpServers, buildGrokMcpToml, buildOpenCodeMcpConfig } from "./runners/mcp-config.js";
 import { RunnerRuntimeFiles } from "./runners/runtime-files.js";
 import { ContextTracker, CumulativeUsageTracker, type UsageSemantics } from "./runners/context-tracker.js";
-import { armHardTimeout, collectProcessOutput, killGrokLeader, killProcess, processAlive as procAlive, terminateAndWait, terminateWithEscalation } from "./runners/process-lifecycle.js";
+import { armHardTimeout, appendCapped, collectProcessOutput, killGrokLeader, killProcess, processAlive as procAlive, RUNNER_OUTPUT_CAP_BYTES, terminateAndWait, terminateWithEscalation } from "./runners/process-lifecycle.js";
 import { memoryTitleNearDup, parseAndStripMemory } from "./memory-utils.js";
 import {
   createActivityClock,
@@ -670,6 +670,7 @@ export class AgentRunner {
         timeoutMs: ONE_SHOT_TIMEOUT_MS,
         onStdout: (chunk) => this.traceCli(runner, "stdout", chunk),
         onStderr: (chunk) => this.traceCli(runner, "stderr", chunk),
+        onTruncated: (stream) => this.opts.log("warn", `[${runner}:${this.info.name}] ${stream} exceeded ${RUNNER_OUTPUT_CAP_BYTES} bytes — truncated`),
       }).then((result) => {
         if (this.oneShotProc === proc) this.oneShotProc = null;
         resolve(result.timedOut ? "" : extractOneShotText(result.stdout, runner));
@@ -1449,8 +1450,16 @@ export class AgentRunner {
 
   /* ---------- Claude stdout parsing ---------- */
 
+  private capAccum(label: string, buf: string, chunk: string): string {
+    const next = appendCapped(buf, chunk);
+    if (next.justHit) {
+      this.opts.log("warn", `[${label}:${this.info.name}] output exceeded ${RUNNER_OUTPUT_CAP_BYTES} bytes — truncated`);
+    }
+    return next.text;
+  }
+
   private handleStdout(chunk: string) {
-    this.buffer += chunk;
+    this.buffer = this.capAccum("claude", this.buffer, chunk);
     let idx: number;
     while ((idx = this.buffer.indexOf("\n")) >= 0) {
       const line = this.buffer.slice(0, idx).trim();
@@ -2108,7 +2117,7 @@ export class AgentRunner {
     proc.stderr!.setEncoding("utf8");
     proc.stdout!.on("data", (chunk: string) => {
       this.traceCli("gemini", "stdout", chunk);
-      buf += chunk;
+      buf = this.capAccum("gemini", buf, chunk);
       let idx: number;
       while ((idx = buf.indexOf("\n")) >= 0) {
         const line = buf.slice(0, idx).trim();
@@ -2248,7 +2257,7 @@ export class AgentRunner {
     proc.stderr!.setEncoding("utf8");
     proc.stdout!.on("data", (chunk: string) => {
       this.traceCli("codex", "stdout", chunk);
-      buf += chunk;
+      buf = this.capAccum("codex", buf, chunk);
       let idx: number;
       while ((idx = buf.indexOf("\n")) >= 0) {
         const line = buf.slice(0, idx).trim();
@@ -2650,7 +2659,7 @@ export class AgentRunner {
     // 2026-08-04: zero linhas [hang] no log). Só ingestLine semântico conta.
     proc.stdout!.on("data", (chunk: string) => {
       this.traceCli("grok", "stdout", chunk);
-      buf += chunk;
+      buf = this.capAccum("grok", buf, chunk);
       let idx: number;
       while ((idx = buf.indexOf("\n")) >= 0) {
         const line = buf.slice(0, idx).trim();
@@ -2662,7 +2671,7 @@ export class AgentRunner {
       const msg = chunk.trim();
       if (!msg) return;
       this.traceCli("grok", "stderr", msg);
-      errOut += chunk;
+      errOut = this.capAccum("grok", errOut, chunk);
       this.checkContextFullError(msg);
     });
 
@@ -2897,7 +2906,10 @@ export class AgentRunner {
           stdio: ["ignore", "pipe", "pipe"],
         }, this.opts.dropTo ?? null);
       } catch { resolve(null); return; }
-      void collectProcessOutput(proc, { timeoutMs: 15_000 }).then((result) => {
+      void collectProcessOutput(proc, {
+        timeoutMs: 15_000,
+        onTruncated: () => this.opts.log("warn", `[crush:${this.info.name}] session json exceeded ${RUNNER_OUTPUT_CAP_BYTES} bytes — truncated`),
+      }).then((result) => {
         if (result.timedOut) { resolve(null); return; }
         try { resolve(JSON.parse(result.stdout.trim())); } catch { resolve(null); }
       });
@@ -2978,13 +2990,13 @@ export class AgentRunner {
     proc.stderr!.setEncoding("utf8");
     proc.stdout!.on("data", (chunk: string) => {
       this.traceCli("crush", "stdout", chunk);
-      out += chunk;
+      out = this.capAccum("crush", out, chunk);
     });
     proc.stderr!.on("data", (chunk: string) => {
       const msg = chunk.trim();
       if (!msg) return;
       this.traceCli("crush", "stderr", msg);
-      errOut += chunk;
+      errOut = this.capAccum("crush", errOut, chunk);
       this.checkContextFullError(msg);
     });
 
@@ -3689,6 +3701,7 @@ export class AgentRunner {
         timeoutMs: ONE_SHOT_TIMEOUT_MS,
         onStdout: (chunk) => this.traceCli("claude", "stdout", chunk),
         onStderr: (chunk) => this.traceCli("claude", "stderr", chunk),
+        onTruncated: (stream) => this.opts.log("warn", `[claude:${this.info.name}] ${stream} exceeded ${RUNNER_OUTPUT_CAP_BYTES} bytes — truncated`),
       }).then((result) => {
         if (this.oneShotProc === proc) this.oneShotProc = null;
         resolve(result.timedOut ? "" : result.stdout.trim());

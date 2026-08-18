@@ -114,12 +114,48 @@ export interface CollectedProcessOutput {
   timedOut: boolean;
 }
 
+/** Teto por acumulador de stdout/stderr do turno. Uma linha sem \\n não
+ *  pode crescer até o limite de string do V8. */
+export const RUNNER_OUTPUT_CAP_BYTES = 8 * 1024 * 1024;
+export const RUNNER_OUTPUT_TRUNC_MARK = "\n[the-dudes: output truncated]\n";
+
+export function appendCapped(
+  buf: string,
+  chunk: string,
+  cap = RUNNER_OUTPUT_CAP_BYTES,
+): { text: string; truncated: boolean; justHit: boolean } {
+  const cur = Buffer.byteLength(buf, "utf8");
+  if (cur >= cap) return { text: buf, truncated: true, justHit: false };
+  const add = Buffer.byteLength(chunk, "utf8");
+  if (cur + add <= cap) return { text: buf + chunk, truncated: false, justHit: false };
+  const remain = cap - cur;
+  const head = remain > 0 ? Buffer.from(chunk, "utf8").subarray(0, remain).toString("utf8") : "";
+  return { text: buf + head + RUNNER_OUTPUT_TRUNC_MARK, truncated: true, justHit: true };
+}
+
+function takeCapped(
+  buf: string,
+  chunk: string,
+  onTruncated?: () => void,
+  onData?: (chunk: string) => void,
+): string {
+  const next = appendCapped(buf, chunk);
+  if (next.justHit) {
+    onTruncated?.();
+    onData?.(RUNNER_OUTPUT_TRUNC_MARK);
+  } else if (!next.truncated) {
+    onData?.(chunk);
+  }
+  return next.text;
+}
+
 /** Resolve no timeout sem depender de `close`: processos netos podem herdar
  * pipes e impedir que o evento seja emitido mesmo depois do SIGKILL. */
 export function collectProcessOutput(process: ChildProcess, input: {
   timeoutMs: number;
   onStdout?: (chunk: string) => void;
   onStderr?: (chunk: string) => void;
+  onTruncated?: (stream: "stdout" | "stderr") => void;
 }): Promise<CollectedProcessOutput> {
   return new Promise((resolve) => {
     let stdout = "";
@@ -133,8 +169,12 @@ export function collectProcessOutput(process: ChildProcess, input: {
     };
     process.stdout?.setEncoding("utf8");
     process.stderr?.setEncoding("utf8");
-    process.stdout?.on("data", (chunk: string) => { stdout += chunk; input.onStdout?.(chunk); });
-    process.stderr?.on("data", (chunk: string) => { stderr += chunk; input.onStderr?.(chunk); });
+    process.stdout?.on("data", (chunk: string) => {
+      stdout = takeCapped(stdout, chunk, () => input.onTruncated?.("stdout"), input.onStdout);
+    });
+    process.stderr?.on("data", (chunk: string) => {
+      stderr = takeCapped(stderr, chunk, () => input.onTruncated?.("stderr"), input.onStderr);
+    });
     const timer = setTimeout(() => {
       killProcess(process, "SIGKILL");
       settle({ stdout, stderr, code: process.exitCode, timedOut: true });
