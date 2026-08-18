@@ -75,6 +75,11 @@ const OPENCODE_TURN_TIMEOUT_MS = 600_000;
  *  prompt gigante (skills) deixa o processo zumbi por horas com busy=true e
  *  a fila enche (`ocQueue cheia`). 12 min cobre turnos longos com tools. */
 const GROK_TURN_TIMEOUT_MS = 12 * 60_000;
+/** Cap absoluto por turno pra codex/gemini/crush. Antes só grok/opencode
+ *  tinham; um CLI travado em loop dependia só do hang-watch por inatividade,
+ *  que não dispara se ele segue emitindo. Generoso pra não matar turno longo
+ *  legítimo (build/tool). armHardTimeout auto-limpa no exit do processo. */
+const PER_MSG_TURN_TIMEOUT_MS = 15 * 60_000;
 
 // Banner de rate-limit do provider que o claude CLI emite como TEXTO do assistant
 // (não como erro). Sem isto o server trata como output real, cifra (E2EE), e o
@@ -2079,6 +2084,9 @@ export class AgentRunner {
       stdio: ["ignore", "pipe", "pipe"],
     }, this.opts.dropTo ?? null);
     this.ocActiveProc = proc;
+    armHardTimeout(proc, PER_MSG_TURN_TIMEOUT_MS, () => {
+      this.opts.log("warn", `[gemini:${this.info.name}] turno excedeu ${PER_MSG_TURN_TIMEOUT_MS / 1000}s — SIGKILL`);
+    });
 
     let buf = "";
     let pendingText = "";
@@ -2227,6 +2235,9 @@ export class AgentRunner {
       stdio: ["ignore", "pipe", "pipe"],
     }, this.opts.dropTo ?? null);
     this.ocActiveProc = proc;
+    armHardTimeout(proc, PER_MSG_TURN_TIMEOUT_MS, () => {
+      this.opts.log("warn", `[codex:${this.info.name}] turno excedeu ${PER_MSG_TURN_TIMEOUT_MS / 1000}s — SIGKILL`);
+    });
     // Epoch do spawn: eventos deste turno só valem enquanto a sessão não foi
     // resetada (clear/compact) — ver handleCodexEvent.
     const epoch = this.messageSession.epoch;
@@ -2956,6 +2967,9 @@ export class AgentRunner {
       return;
     }
     this.ocActiveProc = proc;
+    armHardTimeout(proc, PER_MSG_TURN_TIMEOUT_MS, () => {
+      this.opts.log("warn", `[crush:${this.info.name}] turno excedeu ${PER_MSG_TURN_TIMEOUT_MS / 1000}s — SIGKILL`);
+    });
 
     let out = "";
     let errOut = "";
@@ -3216,6 +3230,11 @@ export class AgentRunner {
     // (cwd + session store do gemini) debaixo dele.
     killProcess(this.oneShotProc, "SIGKILL");
     this.oneShotProc = null;
+    // Grok: mata também o leader persistente (não é o ocActiveProc). Sem isto
+    // o leader fica zumbi entre restarts — só era morto no HARD recover.
+    if (this.opts.cliRunner === "grok") {
+      try { killGrokLeader(this.runtimeFiles.grokLeaderSocket()); } catch { /* best-effort */ }
+    }
     if (isPerMessageRunner(this.opts.cliRunner)) {
       if (procAlive(this.ocActiveProc)) {
         terminateWithEscalation(this.ocActiveProc);

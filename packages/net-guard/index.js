@@ -1,6 +1,12 @@
+/* global AbortSignal */
 import * as dns from "node:dns/promises";
 import * as net from "node:net";
 import { Agent, fetch as undiciFetch } from "undici";
+
+// Teto default de egress: sem isto um upstream lento pendura o request
+// indefinidamente (undici não desiste sozinho). Callers com signal próprio
+// mantêm o deles; `opts.timeoutMs: null` desliga.
+const DEFAULT_TIMEOUT_MS = 15_000;
 
 /**
  * Guard de SSRF compartilhado entre orchestrator e daemon.
@@ -25,11 +31,18 @@ const PRIVATE_CIDRS = [
   /^::1$/i,
   // Link-local (cobre o metadata 169.254.169.254)
   /^169\.254\./,
-  /^fe80:/i,
+  // Link-local v6 fe80::/10 — cobre fe80:: até febf:: (não só fe80:).
+  /^fe[89ab][0-9a-f]:/i,
   // ULA fc00::/7 — cobre fc00:: até fdff:: (fd00:ec2::254 é o IMDS v6 da AWS)
   /^f[cd][0-9a-f]{2}:/i,
   // CGNAT 100.64.0.0/10
   /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./,
+  // Multicast v4 224.0.0.0/4 (inclui SSDP 239.255.255.250, descoberta de LAN)
+  /^2(2[4-9]|3[0-9])\./,
+  // Reservado/futuro 240.0.0.0/4 + broadcast 255.255.255.255
+  /^2(4[0-9]|5[0-5])\./,
+  // Multicast v6 ff00::/8
+  /^ff[0-9a-f]{2}:/i,
   // unspecified
   /^0\./,
   /^::$/,
@@ -56,10 +69,43 @@ export function unmapV4(ip) {
   return null;
 }
 
-export function isPrivateAddress(ip) {
+/** Extrai IPv4 embutido em formas que o unmapV4 (só `::ffff:`) não cobre:
+ *  IPv4-compatible (`::7f00:1` == `::127.0.0.1`) e 6to4 (`2002:AABB:CCDD::`).
+ *  Sem isto, `::127.0.0.1` e `2002:7f00:1::1` furavam o guard como "público". */
+export function embeddedV4(ip) {
   const norm = ip.toLowerCase();
+  // IPv4-compatible ::a.b.c.d / ::hi:lo — exclui ::1 e :: (já cobertos por CIDR).
+  let m = /^::((?:\d{1,3}\.){3}\d{1,3}|[0-9a-f]{1,4}:[0-9a-f]{1,4})$/i.exec(norm);
+  if (m) {
+    const rest = m[1];
+    if (rest.includes(".")) return rest;
+    const hm = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(rest);
+    if (hm) {
+      const hi = parseInt(hm[1], 16);
+      const lo = parseInt(hm[2], 16);
+      if (!Number.isNaN(hi) && !Number.isNaN(lo)) {
+        return `${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`;
+      }
+    }
+  }
+  // 6to4 2002:AABB:CCDD::/48 embute A.B.C.D nos dois hextets após 2002:.
+  m = /^2002:([0-9a-f]{1,4}):([0-9a-f]{1,4}):/i.exec(norm);
+  if (m) {
+    const hi = parseInt(m[1], 16);
+    const lo = parseInt(m[2], 16);
+    if (!Number.isNaN(hi) && !Number.isNaN(lo)) {
+      return `${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`;
+    }
+  }
+  return null;
+}
+
+export function isPrivateAddress(ip) {
+  // Strip de colchetes: `new URL("http://[::1]/").hostname` devolve "[::1]",
+  // então sem isto net.isIP falha e todo literal IPv6 furava o guard.
+  const norm = ip.toLowerCase().replace(/^\[/, "").replace(/\]$/, "");
   if (PRIVATE_CIDRS.some((re) => re.test(norm))) return true;
-  const v4 = unmapV4(norm);
+  const v4 = unmapV4(norm) ?? embeddedV4(norm);
   return v4 !== null && PRIVATE_CIDRS.some((re) => re.test(v4));
 }
 
@@ -86,7 +132,8 @@ export async function checkOutboundUrl(rawUrl, opts = {}) {
   }
   const allowed = opts.allowSchemes ?? ["http:", "https:"];
   if (!allowed.includes(u.protocol)) return `protocolo não permitido: ${u.protocol}`;
-  const host = u.hostname.toLowerCase();
+  // hostname vem com colchetes em literal IPv6 ("[::1]") — remove pra net.isIP.
+  const host = u.hostname.toLowerCase().replace(/^\[/, "").replace(/\]$/, "");
   if (opts.allowLocalhost && isLoopbackLiteral(host)) return null;
   if (net.isIP(host)) {
     if (isPrivateAddress(host)) return `endereço privado bloqueado: ${host}`;
@@ -119,12 +166,16 @@ export async function checkOutboundUrl(rawUrl, opts = {}) {
  */
 export async function safeFetch(rawUrl, init = {}, opts = {}) {
   const maxRedirects = opts.maxRedirects ?? 5;
+  // Timeout total da cadeia (todos os hops). `opts.timeoutMs === null` desliga.
+  // Se o caller já passa init.signal, respeita o dele e não sobrepõe.
+  const timeoutMs = opts.timeoutMs === null ? null : (opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const signal = init.signal ?? (timeoutMs != null ? AbortSignal.timeout(timeoutMs) : undefined);
   let current = rawUrl;
   for (let hop = 0; hop <= maxRedirects; hop++) {
     const ssrf = await checkOutboundUrl(current, opts);
     if (ssrf) throw new Error(`SSRF bloqueado: ${ssrf}`);
     const u = new URL(current);
-    const host = u.hostname.toLowerCase();
+    const host = u.hostname.toLowerCase().replace(/^\[/, "").replace(/\]$/, "");
     let pinned;
     if (net.isIP(host)) {
       pinned = { address: host, family: net.isIPv6(host) ? 6 : 4 };
@@ -147,7 +198,7 @@ export async function safeFetch(rawUrl, init = {}, opts = {}) {
         },
       },
     });
-    const resp = await undiciFetch(current, { ...init, dispatcher, redirect: "manual" });
+    const resp = await undiciFetch(current, { ...init, ...(signal ? { signal } : {}), dispatcher, redirect: "manual" });
     if (resp.status >= 300 && resp.status < 400 && resp.headers.has("location")) {
       current = new URL(resp.headers.get("location"), current).toString();
       continue;

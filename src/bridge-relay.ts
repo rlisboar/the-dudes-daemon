@@ -119,14 +119,16 @@ export class BridgeRelay {
   start(): Promise<void> {
     return new Promise((resolve, reject) => {
       this.server.once("error", reject);
-      // Defesa em depth: seta umask 0o007 ANTES de listen pra que o
-      // socket seja criado com mode 0o660 direto (sem janela TOCTOU
-      // entre listen e chmodSync). chmodSync depois é redundância.
-      const prevUmask = process.umask(0o007);
+      // 0o600 (não 0o660): no macOS o gid do dropTo costuma ser `staff` (gid 20),
+      // grupo primário de TODO usuário local — 0o660 abriria o relay pra
+      // qualquer conta local. Todos os agentes do daemon rodam no mesmo uid,
+      // então 0o600 não bloqueia nenhum agente legítimo. umask antes do listen
+      // fecha a janela TOCTOU entre listen e chmodSync.
+      const prevUmask = process.umask(0o077);
       this.server.listen(this.socketPath, () => {
         process.umask(prevUmask);
         try {
-          chmodSync(this.socketPath, 0o660);
+          chmodSync(this.socketPath, 0o600);
           if (this.dropTo) chownSync(this.socketPath, this.dropTo.uid, this.dropTo.gid);
         } catch (e) {
           reject(e);

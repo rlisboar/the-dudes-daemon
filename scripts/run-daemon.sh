@@ -74,6 +74,12 @@ rotate_log() {
 
 while true; do
   rotate_log
+  # Blindagem do env: daemon.env guarda THE_DUDES_DAEMON_TOKEN. Se ficar
+  # legível por grupo/outros, o token vaza; se ficar gravável, vira execução
+  # arbitrária sob launchd (source de conteúdo controlado). Força 0600 antes.
+  if [ -n "$ENV_FILE" ] && [ -f "$ENV_FILE" ]; then
+    chmod go-rwx "$ENV_FILE" 2>/dev/null || true
+  fi
   set -a
   # shellcheck disable=SC1090
   source "$ENV_FILE"

@@ -6,6 +6,7 @@ import { spawnDropped, type DropTarget } from "./privileges.js";
 import type { DiscoveredRunnerModel, RunnerModelCatalog } from "./protocol.js";
 import { killProcess } from "./runners/process-lifecycle.js";
 import { openCodeEffortsFor } from "./runners/opencode-effort.js";
+import { grokWireEfforts } from "./runners/model-policy.js";
 import { withModelCapability } from "./model-capability.js";
 
 const CACHE_TTL_MS = 5 * 60_000;
@@ -50,7 +51,13 @@ export function parseLineModelCatalog(output: string, runner: "opencode" | "crus
       id,
       label: id,
       isDefault: isDefault || id === advertisedDefault || undefined,
-      ...(runner === "opencode" ? { efforts: openCodeEffortsFor(id) } : {}),
+      // Popula efforts do grok no catálogo (4.6+ inclui xhigh). Sem isto a UI
+      // caía no fallback estático e xhigh não aparecia pra grok-4.6 (T-059).
+      ...(runner === "opencode"
+        ? { efforts: openCodeEffortsFor(id) }
+        : runner === "grok"
+          ? { efforts: [...grokWireEfforts(id)] }
+          : {}),
     }));
     if (models.length >= MAX_MODELS) break;
   }

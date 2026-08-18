@@ -27,10 +27,17 @@ test("Grok catalog recognizes its advertised default", () => {
   assert.deepEqual(
     parseLineModelCatalog("Default model: grok-build\n* grok-build (default)\n* grok-fast\n", "grok"),
     [
-      { id: "grok-build", label: "grok-build", isDefault: true, capabilityTier: 2, speedTier: 2, costTier: 2 },
-      { id: "grok-fast", label: "grok-fast", isDefault: undefined, capabilityTier: 1, speedTier: 3, costTier: 1 },
+      { id: "grok-build", label: "grok-build", isDefault: true, efforts: ["low", "medium", "high"], capabilityTier: 2, speedTier: 2, costTier: 2 },
+      { id: "grok-fast", label: "grok-fast", isDefault: undefined, efforts: ["low", "medium", "high"], capabilityTier: 1, speedTier: 3, costTier: 1 },
     ],
   );
+});
+
+test("Grok 4.6+ expõe xhigh no catálogo (raiz do T-059)", () => {
+  const models = parseLineModelCatalog("* grok-4.5\n* grok-4.6\n", "grok");
+  const byId = Object.fromEntries(models.map((m) => [m.id, m.efforts]));
+  assert.deepEqual(byId["grok-4.5"], ["low", "medium", "high"]);
+  assert.deepEqual(byId["grok-4.6"], ["low", "medium", "high", "xhigh"]);
 });
 
 test("Codex app-server catalog preserves capabilities and ignores hidden models", () => {

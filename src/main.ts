@@ -148,6 +148,13 @@ class DaemonClient {
   private ws: WebSocket | null = null;
   private reconnectDelay = 1_000;
   private static readonly RECONNECT_CAP_MS = 60_000;
+  // Backoff separado pro transient: sem isto, um outage que feche com
+  // 1006/1005/1011 de forma persistente reconectava a ~5x/s indefinidamente
+  // (hot loop). Escala 200ms→5s e reseta ao conectar.
+  private transientBackoff = 200;
+  private stableConnTimer: NodeJS.Timeout | null = null;
+  private static readonly TRANSIENT_BASE_MS = 200;
+  private static readonly TRANSIENT_BACKOFF_CAP_MS = 5_000;
   // Tracker de disconnects transient (1006/1005/1011) — sliding window
   // 5min. Acima do threshold, log warn explícito uma vez orientando user
   // sobre rede ruim em vez de spam de mensagens individuais.
@@ -235,14 +242,33 @@ class DaemonClient {
     process.on("SIGINT", () => this.shutdown());
     process.on("SIGTERM", () => this.shutdown());
     // Sweep de tmpdirs órfãos de agentes (token plaintext em /tmp) — cobre
-    // crash anterior onde o cleanup do emitExit não rodou. No boot ainda não
-    // há runner ativo deste daemon, então limpar tudo em /tmp/the-dudes é
-    // seguro (dirs novos "ag-*" + legados por agentId). Ver SECURITY-TODO S-05.
+    // crash anterior onde o cleanup do emitExit não rodou. Só varre se NENHUM
+    // outro daemon vivo compartilha este parent: num host com 2 daemons (mesmo
+    // $TMPDIR/user), limpar tudo destruía agent.token/.gemini de agentes ativos
+    // do vizinho. Marca a própria liveness por PID. Ver SECURITY-TODO S-05.
     try {
       const parent = path.join(os.tmpdir(), "the-dudes");
-      for (const name of fs.readdirSync(parent)) {
-        try { fs.rmSync(path.join(parent, name), { recursive: true, force: true }); } catch { /* skip */ }
+      let neighborAlive = false;
+      try {
+        for (const name of fs.readdirSync(parent)) {
+          const m = /^\.daemon-(\d+)\.alive$/.exec(name);
+          if (m && Number(m[1]) !== process.pid && isPidAlive(Number(m[1]))) { neighborAlive = true; break; }
+        }
+      } catch { /* dir não existe ainda */ }
+      if (neighborAlive) {
+        log("info", "boot sweep pulado: outro daemon vivo compartilha o tmpdir");
+      } else {
+        try {
+          for (const name of fs.readdirSync(parent)) {
+            try { fs.rmSync(path.join(parent, name), { recursive: true, force: true }); } catch { /* skip */ }
+          }
+        } catch { /* dir não existe ainda — ok */ }
       }
+      // Marca este daemon como vivo pro próximo boot respeitar (após o sweep).
+      try {
+        fs.mkdirSync(parent, { recursive: true });
+        fs.writeFileSync(path.join(parent, `.daemon-${process.pid}.alive`), String(process.pid));
+      } catch { /* best-effort */ }
     } catch { /* dir não existe ainda — ok */ }
     // T-051: GC de sessões Grok do summarizer (cwd the-dudes-cli-*). Nunca
     // toca sessões de projeto/worktree/outros prefixes. Boot + a cada 6h.
@@ -320,6 +346,13 @@ class DaemonClient {
 
     ws.on("open", () => {
       this.reconnectDelay = 1_000;
+      // NÃO reseta transientBackoff já no open: 1011/1006 podem chegar DEPOIS
+      // do handshake e um reset imediato manteria o hot loop pós-open. Só reseta
+      // após a conexão ficar ESTÁVEL por 30s (limpo no close se cair antes).
+      if (this.stableConnTimer) clearTimeout(this.stableConnTimer);
+      this.stableConnTimer = setTimeout(() => {
+        this.transientBackoff = DaemonClient.TRANSIENT_BASE_MS;
+      }, 30_000);
       this.lastPongAt = Date.now();
       log("info", "connected · sending hello");
       breadcrumb("ws", "open", { url });
@@ -395,11 +428,13 @@ class DaemonClient {
     ws.on("close", (code, reason) => {
       this.stopPing();
       this.stopHeartbeat();
+      // Cai antes dos 30s de estabilidade → não reseta o backoff transient.
+      if (this.stableConnTimer) { clearTimeout(this.stableConnTimer); this.stableConnTimer = null; }
       this.ws = null;
       if (this.stopped) return;
       const reasonStr = reason?.toString() || "(no reason)";
       const isTransient = code === 1006 || code === 1005 || code === 1011;
-      const baseDelay = isTransient ? 200 : this.reconnectDelay;
+      const baseDelay = isTransient ? this.transientBackoff : this.reconnectDelay;
       const jittered = Math.floor(baseDelay * (0.75 + Math.random() * 0.5));
       // Transient (1006/1005/1011) é esperado em mobile/CGNAT — não
       // poluir log com mensagem individual. Tracker abaixo agrega.
@@ -438,6 +473,8 @@ class DaemonClient {
           this.reconnectDelay = Math.min(this.reconnectDelay * 2, DaemonClient.RECONNECT_CAP_MS);
         } else {
           this.reconnectDelay = 1_000; // reset pra próximo non-transient
+          // Escala o backoff transient — outage persistente não vira hot loop.
+          this.transientBackoff = Math.min(this.transientBackoff * 2, DaemonClient.TRANSIENT_BACKOFF_CAP_MS);
         }
         this.connect();
       }, jittered);
@@ -1936,20 +1973,42 @@ class DaemonClient {
     if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
   }
 
-  private shutdown() {
+  private shuttingDown = false;
+  private async shutdown() {
+    if (this.shuttingDown) return;
+    this.shuttingDown = true;
     log("info", "shutting down");
     this.stopped = true;
-    try { stopAllGraphWatches(); } catch { /* noop */ }
-    this.host.shutdown();
-    if (this.relay) this.relay.stop();
-    this.stopPing();
-    this.stopHeartbeat();
-    try { this.grokSessionCleanup?.stop(); } catch { /* noop */ }
-    this.grokSessionCleanup = null;
-    forgetAllProjectKeys();
-    try { this.ws?.close(1000, "shutdown"); } catch {}
-    process.exit(0);
+    // try/finally: shutdown virou async, então um throw em host.shutdown()/
+    // relay.stop()/forgetAllProjectKeys() viraria unhandled rejection e pularia
+    // o process.exit(0). O finally garante que o daemon sempre encerra.
+    try {
+      try { stopAllGraphWatches(); } catch { /* noop */ }
+      this.host.shutdown();
+      if (this.relay) this.relay.stop();
+      this.stopPing();
+      this.stopHeartbeat();
+      try { this.grokSessionCleanup?.stop(); } catch { /* noop */ }
+      this.grokSessionCleanup = null;
+      forgetAllProjectKeys();
+      try { this.ws?.close(1000, "shutdown"); } catch {}
+      // Remove o marker de liveness pra não bloquear o sweep do próximo boot.
+      try { fs.rmSync(path.join(os.tmpdir(), "the-dudes", `.daemon-${process.pid}.alive`), { force: true }); } catch {}
+      // Espera o SIGTERM→SIGKILL dos CLIs filhos escalar (terminateWithEscalation
+      // agenda o SIGKILL em ~1.5s). Antes, process.exit(0) síncrono matava esse
+      // timer e os filhos detached sobreviviam órfãos entre restarts.
+      await new Promise((r) => setTimeout(r, 2_500));
+    } finally {
+      process.exit(0);
+    }
   }
+}
+
+/** PID vivo? kill(pid,0) não envia sinal — só testa existência. EPERM = existe
+ *  mas não é nosso (ainda vivo); ESRCH = morto. */
+function isPidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
 }
 
 function wsUrlFromOrch(orch: string): string {

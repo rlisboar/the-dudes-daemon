@@ -49,6 +49,36 @@ test("checkOutboundUrl: scheme, URL inválida e literais privados", async () => 
   assert.equal(await checkOutboundUrl("https://8.8.8.8/"), null);
 });
 
+test("literais IPv6 entre colchetes são normalizados e barrados", async () => {
+  // Regressão: hostname vem "[::1]" e net.isIP dava 0 → isPrivateAddress nunca
+  // rodava e todo literal IPv6 furava o guard (caía em DNS ENOTFOUND por acaso).
+  assert.notEqual(await checkOutboundUrl("http://[::1]/"), null);
+  assert.notEqual(await checkOutboundUrl("http://[::ffff:169.254.169.254]/latest/"), null);
+  assert.notEqual(await checkOutboundUrl("http://[fe80::1]/"), null);
+  assert.notEqual(await checkOutboundUrl("http://[::127.0.0.1]/"), null);
+  assert.notEqual(await checkOutboundUrl("http://[fd00:ec2::254]/"), null);
+  // Público IPv6 literal segue liberado.
+  assert.equal(await checkOutboundUrl("https://[2001:4860:4860::8888]/"), null);
+});
+
+test("classes reservadas/multicast/6to4/link-local ampliadas", () => {
+  const bloqueados = [
+    "224.0.0.1", "239.255.255.250", // multicast v4 (SSDP)
+    "255.255.255.255", "240.0.0.1", // broadcast / reservado 240/4
+    "fe90::1", "feb0::1", "febf::1", // link-local /10 além de fe80:
+    "ff02::1", // multicast v6
+    "::127.0.0.1", "::7f00:1", // IPv4-compatible → loopback
+    "2002:7f00:0001::1", // 6to4 embute 127.0.0.1
+  ];
+  for (const ip of bloqueados) {
+    assert.equal(isPrivateAddress(ip), true, `${ip} deveria ser privado/reservado`);
+  }
+  // Público não regride.
+  for (const ip of ["8.8.8.8", "2001:4860:4860::8888", "172.32.0.1"]) {
+    assert.equal(isPrivateAddress(ip), false, `${ip} NÃO deveria ser privado`);
+  }
+});
+
 test("checkOutboundUrl: localhost barrado sem depender do resolver", async () => {
   assert.notEqual(await checkOutboundUrl("http://localhost:8787/"), null);
 });

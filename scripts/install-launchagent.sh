@@ -311,6 +311,41 @@ render_plist() {
     "$TEMPLATE" > "$out"
 }
 
+# Verifica sha256 de um bundle contra seu .sha256. Retorna 0=ok, 1=mismatch,
+# 2=sem arquivo .sha256, 3=sem ferramenta de hash. O caminho de self-update
+# (self-update.ts) já verifica assinatura Ed25519; aqui garantimos ao menos
+# integridade no seed, que antes copiava cego.
+verify_sha256() {
+  local file="$1" shafile="$2" expected actual
+  [ -f "$shafile" ] || return 2
+  expected="$(awk '{print $1; exit}' "$shafile")"
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$file" | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$file" | awk '{print $1}')"
+  else
+    return 3
+  fi
+  [ -n "$expected" ] && [ "$expected" = "$actual" ]
+}
+
+# Gate de integridade antes de copiar um binário semeado. Fail-closed em
+# corrupção; warn (não bloqueia install) quando não há sha/ferramenta.
+seed_check() {
+  local file="$1" name="$2" rc=0
+  # `|| rc=$?` é obrigatório: sob `set -e`, chamar verify_sha256 solto abortaria
+  # o install em QUALQUER retorno ≠0 (inclusive 2/3 = "sem sha/ferramenta"),
+  # transformando os warns em código morto. O `||` captura o código e desliga
+  # o errexit pra esta chamada.
+  verify_sha256 "$file" "$file.sha256" || rc=$?
+  case $rc in
+    0) : ;;
+    1) die "seed $name FALHOU sha256 — bundle corrompido em $file, abortando" ;;
+    2) warn "seed $name sem .sha256 — copiando sem verificar integridade" ;;
+    3) warn "seed $name: sem sha256sum/shasum — copiando sem verificar integridade" ;;
+  esac
+}
+
 seed_binaries() {
   # Copia binários para o home do perfil se ausentes — isolamento de self-update.
   local seed_dir=""
@@ -324,10 +359,12 @@ seed_binaries() {
 
   if [ ! -f "$DAEMON_BIN" ]; then
     if [ -n "$seed_dir" ] && [ -f "$seed_dir/daemon.cjs" ]; then
+      seed_check "$seed_dir/daemon.cjs" "daemon.cjs"
       cp "$seed_dir/daemon.cjs" "$DAEMON_BIN"
       chmod 755 "$DAEMON_BIN"
       log "seed daemon.cjs ← $seed_dir"
       if [ -f "$seed_dir/mcp-bridge.cjs" ]; then
+        seed_check "$seed_dir/mcp-bridge.cjs" "mcp-bridge.cjs"
         cp "$seed_dir/mcp-bridge.cjs" "$MCP_BIN"
         chmod 755 "$MCP_BIN"
       fi
@@ -435,9 +472,15 @@ EOF
   fi
 
   mkdir -p "$TD_DIR" "$PLIST_DIR"
+  # 0700: TD_DIR guarda daemon.env (token), .sig e binários — não deve ser
+  # legível por grupo/outros.
+  chmod 700 "$TD_DIR" 2>/dev/null || true
 
   if [ ! -f "$ENV_FILE" ]; then
     warn "env ausente: $ENV_FILE — crie com THE_DUDES_ORCH / THE_DUDES_DAEMON_TOKEN / THE_DUDES_DAEMON_NAME antes de usar"
+  else
+    # daemon.env tem o token — 0600 sempre (self-heal de instalações antigas 644).
+    chmod 600 "$ENV_FILE" 2>/dev/null || true
   fi
 
   local tmp
