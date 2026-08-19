@@ -422,6 +422,7 @@ export class AgentHost {
         // redação tem que ser aqui. Depois cifra com a project key. Sem key
         // (legacy/pre-bootstrap) cai pro plaintext já redatado.
         const red = msg.projectId ? redactCredentials(msg.projectId, text) : text;
+        // T-062b rework: messages/content ainda é lido sem AAD na UI (T-072).
         const enc = msg.projectId ? encryptForProject(red, msg.projectId) : null;
         const ok = this.deliver({ type: "agent:text", agentId: msg.agent.id, text: enc ?? red });
         // Espelho Telegram: encaminha a MESMA resposta (em claro, já redatada)

@@ -34,12 +34,16 @@ export function encryptBridgePayload(
   json: Record<string, unknown>,
   projectId: string,
 ): Record<string, unknown> {
-  const cifra = (v: unknown): unknown => {
+  const cifra = (v: unknown, table: string, field: string): unknown => {
     if (typeof v !== "string" || !v || isE2eEncrypted(v)) return v;
-    return encryptForProject(v, projectId) ?? v;
+    return encryptForProject(v, projectId, aadV2({ projectId, table, field })) ?? v;
   };
   if (kind === "send") {
-    if (typeof json.content === "string") json.content = cifra(json.content);
+    // T-062b rework: messages/content ainda é lido sem AAD na UI (T-072).
+    // Write-v2 só depois que os dois lados leem com aadV2 — permanece e2e:.
+    if (typeof json.content === "string" && json.content && !isE2eEncrypted(json.content)) {
+      json.content = encryptForProject(json.content, projectId) ?? json.content;
+    }
     return json;
   }
   if (kind === "memory_add") {
@@ -48,11 +52,11 @@ export function encryptBridgePayload(
       json.contentHash = createHash("sha256").update(`${norm(json.title)}\n${norm(json.body)}`).digest("hex");
     }
     if (typeof json.title === "string" && !isE2eEncrypted(json.title)) {
-      const enc = encryptForProject(json.title, projectId);
+      const enc = encryptForProject(json.title, projectId, aadV2({ projectId, table: E2EE_TABLE.MEMORIES, field: "title" }));
       if (enc) { json.titleCipher = enc; delete json.title; }
     }
     if (typeof json.body === "string" && !isE2eEncrypted(json.body)) {
-      const enc = encryptForProject(json.body, projectId);
+      const enc = encryptForProject(json.body, projectId, aadV2({ projectId, table: E2EE_TABLE.MEMORIES, field: "body" }));
       if (enc) { json.bodyCipher = enc; delete json.body; }
     }
     return json;
@@ -66,19 +70,21 @@ export function encryptBridgePayload(
     delete json.content;
   }
   for (const campo of ["title", "body", "say", "text", "label"]) {
-    if (campo in json) json[campo] = cifra(json[campo]);
+    if (campo in json) json[campo] = cifra(json[campo], E2EE_TABLE.BOARDS, campo);
   }
   if (Array.isArray(json.steps)) {
     json.steps = (json.steps as Record<string, unknown>[]).map((st) =>
-      st && typeof st === "object" ? { ...st, label: cifra(st.label), detail: cifra(st.detail) } : st,
+      st && typeof st === "object"
+        ? { ...st, label: cifra(st.label, E2EE_TABLE.BOARDS, "steps.label"), detail: cifra(st.detail, E2EE_TABLE.BOARDS, "steps.detail") }
+        : st,
     );
   }
   if (json.chart && typeof json.chart === "object") {
     const c = json.chart as { labels?: unknown[]; series?: Record<string, unknown>[] };
-    if (Array.isArray(c.labels)) c.labels = c.labels.map(cifra);
+    if (Array.isArray(c.labels)) c.labels = c.labels.map((x) => cifra(x, E2EE_TABLE.BOARDS, "chart.labels"));
     if (Array.isArray(c.series)) {
       c.series = c.series.map((se) =>
-        se && typeof se === "object" ? { ...se, name: cifra(se.name) } : se,
+        se && typeof se === "object" ? { ...se, name: cifra(se.name, E2EE_TABLE.BOARDS, "chart.series.name") } : se,
       );
     }
   }

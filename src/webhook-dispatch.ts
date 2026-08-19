@@ -1,11 +1,18 @@
 import { createHmac } from "node:crypto";
+import { aadV2, E2EE_TABLE } from "@the-dudes/protocol/e2ee-fields";
 import { decryptForProject, isE2eEncrypted } from "./daemon-crypto.js";
 
 type Format = "generic" | "discord" | "slack";
 
+function decField(value: unknown, projectId: string, table: string, field: string): unknown {
+  if (typeof value !== "string" || !isE2eEncrypted(value)) return value;
+  return decryptForProject(value, projectId, aadV2({ projectId, table, field })) ?? value;
+}
+
 /** Recursively walk an object/array and decrypt any string field that
  *  starts with "e2e:" using the project's symmetric key. The structure
- *  is preserved; only cipher leaves are replaced. */
+ *  is preserved; only cipher leaves are replaced. Campos do catálogo
+ *  (v2) usam aadV2; o resto (legado / sem contexto) decifra sem AAD. */
 function decryptDeep(value: any, projectId: string): any {
   if (typeof value === "string") {
     if (isE2eEncrypted(value)) return decryptForProject(value, projectId) ?? value;
@@ -18,6 +25,35 @@ function decryptDeep(value: any, projectId: string): any {
     return out;
   }
   return value;
+}
+
+/** Aplica AAD do catálogo nos caminhos conhecidos e depois o walk legado. */
+function decryptEvent(event: any, projectId: string): any {
+  if (!event || typeof event !== "object") return decryptDeep(event, projectId);
+  const out: Record<string, unknown> = { ...event };
+  if (out.msg && typeof out.msg === "object") {
+    const m = { ...(out.msg as Record<string, unknown>) };
+    m.content = decField(m.content, projectId, E2EE_TABLE.MESSAGES, "content");
+    out.msg = m;
+  }
+  if (out.task && typeof out.task === "object") {
+    const t = { ...(out.task as Record<string, unknown>) };
+    t.title = decField(t.title, projectId, E2EE_TABLE.TASKS, "title");
+    t.description = decField(t.description, projectId, E2EE_TABLE.TASKS, "description");
+    out.task = t;
+  }
+  if (out.comment && typeof out.comment === "object") {
+    const c = { ...(out.comment as Record<string, unknown>) };
+    c.content = decField(c.content, projectId, E2EE_TABLE.TASK_COMMENTS, "content");
+    out.comment = c;
+  }
+  if (out.goal && typeof out.goal === "object") {
+    const g = { ...(out.goal as Record<string, unknown>) };
+    g.title = decField(g.title, projectId, E2EE_TABLE.GOALS, "title");
+    g.description = decField(g.description, projectId, E2EE_TABLE.GOALS, "description");
+    out.goal = g;
+  }
+  return decryptDeep(out, projectId);
 }
 
 function colorForEvent(t: string): number {
@@ -236,7 +272,7 @@ export async function dispatchWebhook(args: {
   format: Format;
   headers?: Record<string, string>;
 }): Promise<DispatchResult> {
-  const decrypted = decryptDeep(args.event, args.projectId);
+  const decrypted = decryptEvent(args.event, args.projectId);
   const payload = buildPayload(decrypted, {
     projectId: args.projectId,
     projectName: args.projectName ?? args.projectId,

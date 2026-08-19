@@ -5,6 +5,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { normalizeBoardUpsertArgs } from "../board-upsert-args.js";
 import { encryptBridgePayload } from "../bridge-relay.js";
+import { aadV2, E2EE_TABLE } from "@the-dudes/protocol/e2ee-fields";
 import os from "node:os";
 import path from "node:path";
 import { randomBytes, publicEncrypt, createPublicKey, constants } from "node:crypto";
@@ -87,14 +88,16 @@ test("caminho bridge: content → body → E2EE cifra body (server recebe body c
   // 2) relay cifra como board (mesmo path do socket)
   const cifrado = encryptBridgePayload("board", { ...payload }, PID);
   assert.equal(cifrado.content, undefined);
-  assert.ok(typeof cifrado.body === "string" && String(cifrado.body).startsWith("e2e:"));
-  assert.equal(decryptForProject(cifrado.body as string, PID), html);
+  assert.ok(typeof cifrado.body === "string" && String(cifrado.body).startsWith("e2e:v2:"));
+  const aadBody = aadV2({ projectId: PID, table: E2EE_TABLE.BOARDS, field: "body" });
+  assert.equal(decryptForProject(cifrado.body as string, PID, aadBody), html);
 });
 
 test("relay sozinho: content cru vira body cifrado (defesa em profundidade)", () => {
   const html = "<p>cru</p>";
   const cifrado = encryptBridgePayload("board", { kind: "html", content: html }, PID);
   assert.equal(cifrado.content, undefined);
-  assert.ok(typeof cifrado.body === "string" && String(cifrado.body).startsWith("e2e:"));
-  assert.equal(decryptForProject(cifrado.body as string, PID), html);
+  assert.ok(typeof cifrado.body === "string" && String(cifrado.body).startsWith("e2e:v2:"));
+  const aadBody = aadV2({ projectId: PID, table: E2EE_TABLE.BOARDS, field: "body" });
+  assert.equal(decryptForProject(cifrado.body as string, PID, aadBody), html);
 });

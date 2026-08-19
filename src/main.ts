@@ -34,6 +34,7 @@ import { BridgeRelay } from "./bridge-relay.js";
 import { defaultDaemonConfigPath, formatCliStatus, loadDaemonCliConfig, mergeCliConfig, resolveCliCommands, type DaemonCliConfig, type ResolvedCliCommands } from "./cli-config.js";
 import type { FromDaemon, FromOrch } from "./protocol.js";
 import { runSummarizer } from "./summarizer-runner.js";
+import { aadV2, E2EE_TABLE } from "@the-dudes/protocol/e2ee-fields";
 import { decryptForProject, encryptForProject, countUsableProjectKeys, forgetAllProjectKeys, getDaemonPublicKey, hasProjectKey, isE2eEncrypted, rememberProjectKey } from "./daemon-crypto.js";
 import { dispatchWebhook } from "./webhook-dispatch.js";
 import { ModelDiscovery } from "./model-discovery.js";
@@ -646,8 +647,12 @@ class DaemonClient {
           const MEMORY_CHAR_BUDGET = 8000;
           const decoded: Array<{ type: string; text: string }> = [];
           for (const m of msg.memory) {
-            const title = isE2eEncrypted(m.titleCipher) ? decryptForProject(m.titleCipher, msg.projectId) : m.titleCipher;
-            const body = isE2eEncrypted(m.bodyCipher) ? decryptForProject(m.bodyCipher, msg.projectId) : m.bodyCipher;
+            const title = isE2eEncrypted(m.titleCipher)
+              ? decryptForProject(m.titleCipher, msg.projectId, aadV2({ projectId: msg.projectId, table: E2EE_TABLE.MEMORIES, field: "title" }))
+              : m.titleCipher;
+            const body = isE2eEncrypted(m.bodyCipher)
+              ? decryptForProject(m.bodyCipher, msg.projectId, aadV2({ projectId: msg.projectId, table: E2EE_TABLE.MEMORIES, field: "body" }))
+              : m.bodyCipher;
             if (title === null || body === null) continue;
             decoded.push({ type: m.type || "fact", text: `### [${m.type}] ${title}\n${body}` });
           }
@@ -694,7 +699,7 @@ class DaemonClient {
             if (p.kind === "plain") { out.push(p.text); continue; }
             if (!isE2eEncrypted(p.text)) { out.push(p.text); continue; }
             if (!msg.projectId) { dropMissingKey(); return; }
-            const dec = decryptForProject(p.text, msg.projectId);
+            const dec = decryptForProject(p.text, msg.projectId, aadV2({ projectId: msg.projectId, table: E2EE_TABLE.MESSAGES, field: "content" }));
             if (dec === null) { dropMissingKey(); return; }
             out.push(dec);
           }
@@ -702,7 +707,7 @@ class DaemonClient {
         } else {
           content = msg.content;
           if (msg.projectId && isE2eEncrypted(content)) {
-            const dec = decryptForProject(content, msg.projectId);
+            const dec = decryptForProject(content, msg.projectId, aadV2({ projectId: msg.projectId, table: E2EE_TABLE.MESSAGES, field: "content" }));
             if (dec !== null) content = dec;
             else { dropMissingKey(); return; }
           }
@@ -1262,6 +1267,7 @@ class DaemonClient {
       });
       let outSummary = result.summary;
       if (result.ok && msg.projectId && outSummary) {
+        // T-062b rework: tts_summaries ainda é lido sem AAD na UI (T-072).
         const enc = encryptForProject(outSummary, msg.projectId);
         if (enc) outSummary = enc;
       }

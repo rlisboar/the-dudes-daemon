@@ -438,7 +438,7 @@ export function redactCredentialsDeep(projectId: string, value: unknown): unknow
 
 /* ---------- content AES-GCM (matches web/src/crypto.ts format) ---------- */
 
-/** Cifra UTF-8 com uma AES-256 raw. Sem aad → e2e: (v1). Com aad → e2e:v2:. */
+/** Cifra UTF-8 com uma AES-256 raw. Sem aad → e2e: (legado). Com aad → e2e:v2:. Nunca e2e:v1:. */
 function encryptWithRawKey(plain: string, key: Buffer, aad?: string): string | null {
   if (key.length !== 32) return null;
   const iv = randomBytes(12);
@@ -481,8 +481,8 @@ function decryptWithRawKey(stored: string, key: Buffer, aad?: string): string | 
   }
 }
 
-/** Encrypt a UTF-8 string with the project AES-256 key. Sem aad → v1
- *  (estágio 1). `aad` só para testes / T-062b. */
+/** Encrypt a UTF-8 string with the project AES-256 key. Sem aad → e2e:
+ *  (legado / sem table|field). Com aad → e2e:v2:. Nunca e2e:v1:. */
 export function encryptForProject(plain: string, projectId: string, aad?: string): string | null {
   const key = keyFor(projectId);
   if (!key) return null;

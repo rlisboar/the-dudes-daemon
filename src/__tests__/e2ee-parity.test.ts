@@ -7,8 +7,10 @@ import {
   BOARD_ANNOTATION_FIELDS,
   BOARD_STEP_FIELDS,
   BOARD_TEXT_FIELDS,
+  E2EE_TABLE,
   MEMORY_PLAIN_TO_CIPHER,
   MESSAGE_FIELDS,
+  aadV2,
 } from "@the-dudes/protocol/e2ee-fields";
 
 process.env.THE_DUDES_DAEMON_KEY_PATH = path.join(os.tmpdir(), `td-parity-key-${process.pid}-${Date.now()}.pem`);
@@ -34,15 +36,18 @@ const PID = "proj-parity";
   rememberProjectKey(PID, wrapped.toString("base64"));
 }
 
-const cifrado = (v: unknown) => typeof v === "string" && v.startsWith("e2e:");
+const cifradoV2 = (v: unknown) => typeof v === "string" && v.startsWith("e2e:v2:");
 
 test("send: cifra os campos de mensagem da lista canônica", () => {
   const json: Record<string, unknown> = {};
   for (const f of MESSAGE_FIELDS) json[f] = `texto de ${f}`;
   const out = encryptBridgePayload("send", json, PID);
   for (const f of MESSAGE_FIELDS) {
-    assert.ok(cifrado(out[f]), `${f} subiu em claro`);
-    assert.equal(decryptForProject(out[f] as string, PID), `texto de ${f}`);
+    const blob = out[f] as string;
+    assert.ok(typeof blob === "string" && blob.startsWith("e2e:"), `${f} subiu em claro`);
+    assert.ok(!blob.startsWith("e2e:v2:"), `${f} emitiu e2e:v2: (T-072 ainda não leu AAD)`);
+    assert.ok(!blob.startsWith("e2e:v1:"), `${f} emitiu e2e:v1:`);
+    assert.equal(decryptForProject(blob, PID), `texto de ${f}`);
   }
 });
 
@@ -50,7 +55,9 @@ test("memory_add: plaintext vira *Cipher e contentHash preserva dedup", () => {
   const out = encryptBridgePayload("memory_add", { title: "T", body: "B" }, PID);
   for (const [plain, cipher] of Object.entries(MEMORY_PLAIN_TO_CIPHER)) {
     assert.equal(out[plain], undefined, `${plain} ficou no payload em claro`);
-    assert.ok(cifrado(out[cipher]), `${cipher} não foi cifrado`);
+    assert.ok(cifradoV2(out[cipher]), `${cipher} não saiu e2e:v2:`);
+    const aad = aadV2({ projectId: PID, table: E2EE_TABLE.MEMORIES, field: plain });
+    assert.equal(decryptForProject(out[cipher] as string, PID, aad), plain === "title" ? "T" : "B");
   }
   assert.match(String(out.contentHash), /^[0-9a-f]{64}$/, "contentHash sumiu (dedup quebraria)");
 });
@@ -63,12 +70,16 @@ test("board: cifra todos os campos de texto, steps, chart e annotations", () => 
   };
   for (const f of BOARD_TEXT_FIELDS) json[f] = `v-${f}`;
   const out = encryptBridgePayload("board", json, PID);
-  for (const f of BOARD_TEXT_FIELDS) assert.ok(cifrado(out[f]), `board.${f} subiu em claro`);
+  for (const f of BOARD_TEXT_FIELDS) {
+    assert.ok(cifradoV2(out[f]), `board.${f} não saiu e2e:v2:`);
+    const aad = aadV2({ projectId: PID, table: E2EE_TABLE.BOARDS, field: f });
+    assert.equal(decryptForProject(out[f] as string, PID, aad), `v-${f}`);
+  }
   const st = (out.steps as Record<string, unknown>[])[0]!;
-  for (const f of BOARD_STEP_FIELDS) assert.ok(cifrado(st[f]), `step.${f} subiu em claro`);
+  for (const f of BOARD_STEP_FIELDS) assert.ok(cifradoV2(st[f]), `step.${f} não saiu e2e:v2:`);
   const chart = out.chart as { labels: unknown[]; series: Record<string, unknown>[] };
-  assert.ok(cifrado(chart.labels[0]), "chart.label subiu em claro");
-  assert.ok(cifrado(chart.series[0]!.name), "chart.series.name subiu em claro");
+  assert.ok(cifradoV2(chart.labels[0]), "chart.label não saiu e2e:v2:");
+  assert.ok(cifradoV2(chart.series[0]!.name), "chart.series.name não saiu e2e:v2:");
   // Estrutura NÃO cifrada de propósito: o server aplica limites estruturais.
   assert.equal(st.ordem, 1);
   assert.deepEqual((chart.series[0] as { values: number[] }).values, [1]);
@@ -80,12 +91,30 @@ test("board: cifra todos os campos de texto, steps, chart e annotations", () => 
 });
 
 test("T-062 parity daemon: cifra v2 e decifra com o mesmo aadV2", async () => {
-  const { aadV2, E2EE_TABLE } = await import("@the-dudes/protocol/e2ee-fields");
-  const aad = aadV2({ projectId: PID, table: E2EE_TABLE.MESSAGES, field: "content" });
+  const aad = aadV2({ projectId: PID, table: E2EE_TABLE.TASKS, field: "title" });
   const { encryptForProject, decryptForProject } = await import("../daemon-crypto.js");
-  const ct = encryptForProject("texto de content", PID, aad);
+  const ct = encryptForProject("texto de title", PID, aad);
   assert.ok(ct && ct.startsWith("e2e:v2:"));
-  assert.equal(decryptForProject(ct!, PID, aad), "texto de content");
-  const aadOutro = aadV2({ projectId: PID, table: E2EE_TABLE.TASKS, field: "title" });
+  assert.ok(!ct!.startsWith("e2e:v1:"));
+  assert.equal(decryptForProject(ct!, PID, aad), "texto de title");
+  const aadOutro = aadV2({ projectId: PID, table: E2EE_TABLE.GOALS, field: "title" });
   assert.equal(decryptForProject(ct!, PID, aadOutro), null);
+});
+
+test("T-062b write+read: blob movido entre table/field não abre", () => {
+  const out = encryptBridgePayload("memory_add", { title: "segredo-title", body: "corpo" }, PID);
+  const blob = out.titleCipher as string;
+  assert.ok(cifradoV2(blob));
+  const aadTitle = aadV2({ projectId: PID, table: E2EE_TABLE.MEMORIES, field: "title" });
+  const aadBody = aadV2({ projectId: PID, table: E2EE_TABLE.MEMORIES, field: "body" });
+  assert.equal(decryptForProject(blob, PID, aadTitle), "segredo-title");
+  assert.equal(decryptForProject(blob, PID, aadBody), null, "AAD de outro campo deve falhar");
+  assert.equal(decryptForProject(blob, PID), null, "v2 sem AAD fail-closed");
+});
+
+test("T-062b: encrypt sem aad continua e2e: (não emite e2e:v1:)", async () => {
+  const { encryptForProject } = await import("../daemon-crypto.js");
+  const legado = encryptForProject("ring-wrap", PID);
+  assert.ok(legado && legado.startsWith("e2e:") && !legado.startsWith("e2e:v2:") && !legado.startsWith("e2e:v1:"));
+  assert.equal(decryptForProject(legado!, PID), "ring-wrap");
 });
