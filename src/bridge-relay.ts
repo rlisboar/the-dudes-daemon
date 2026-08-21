@@ -6,7 +6,7 @@ import os from "node:os";
 import { chmodSync, chownSync, existsSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
 import type { DropTarget } from "./privileges.js";
 import { getUnixPeerPid, resolveAgentIdFromPid } from "./privileges.js";
-import { aadV2, E2EE_TABLE } from "@the-dudes/protocol/e2ee-fields";
+import { aadV2, COMMENT_FIELDS, E2EE_TABLE, GOAL_FIELDS, TASK_FIELDS } from "@the-dudes/protocol/e2ee-fields";
 import { decryptForProject, encryptForProject, E2eeRequiredError, isE2eEncrypted, isE2eeRequired, rememberCredentialPlaintext } from "./daemon-crypto.js";
 
 /**
@@ -29,8 +29,18 @@ import { decryptForProject, encryptForProject, E2eeRequiredError, isE2eEncrypted
  *
  * Muta e devolve o próprio objeto.
  */
+export type BridgeEncryptKind =
+  | "send"
+  | "memory_add"
+  | "board"
+  | "tasks_add"
+  | "tasks_update"
+  | "tasks_comment_add"
+  | "goals_add"
+  | "goals_update";
+
 export function encryptBridgePayload(
-  kind: "send" | "memory_add" | "board",
+  kind: BridgeEncryptKind,
   json: Record<string, unknown>,
   projectId: string,
 ): Record<string, unknown> {
@@ -40,6 +50,11 @@ export function encryptBridgePayload(
     if (enc) return enc;
     if (isE2eeRequired(projectId)) throw new E2eeRequiredError();
     return v;
+  };
+  const cifraFields = (obj: Record<string, unknown>, table: string, fields: readonly string[]): void => {
+    for (const f of fields) {
+      if (f in obj) obj[f] = cifra(obj[f], table, f);
+    }
   };
   if (kind === "send") {
     // T-073: messages/content escreve e2e:v2 com aadV2 (reads já em prod, T-072).
@@ -66,6 +81,31 @@ export function encryptBridgePayload(
       if (enc) { json.bodyCipher = enc; delete json.body; }
       else if (isE2eeRequired(projectId)) throw new E2eeRequiredError();
     }
+    return json;
+  }
+  // T-079: tasks/goals/comments criados pelo agente via bridge — a UI já
+  // cifra (encryptTaskFields/Goal/Comment); o relay não cifrava e o
+  // e2ee_required recusava title em claro.
+  if (kind === "tasks_add" || kind === "tasks_update") {
+    const obj = (json.task && typeof json.task === "object"
+      ? json.task
+      : json.patch && typeof json.patch === "object"
+        ? json.patch
+        : json) as Record<string, unknown>;
+    cifraFields(obj, E2EE_TABLE.TASKS, TASK_FIELDS);
+    return json;
+  }
+  if (kind === "tasks_comment_add") {
+    cifraFields(json, E2EE_TABLE.TASK_COMMENTS, COMMENT_FIELDS);
+    return json;
+  }
+  if (kind === "goals_add" || kind === "goals_update") {
+    const obj = (json.goal && typeof json.goal === "object"
+      ? json.goal
+      : json.patch && typeof json.patch === "object"
+        ? json.patch
+        : json) as Record<string, unknown>;
+    cifraFields(obj, E2EE_TABLE.GOALS, GOAL_FIELDS);
     return json;
   }
   // board_* — T-024: content é alias de body (mcp-bridge já normaliza; se
@@ -280,7 +320,7 @@ export class BridgeRelay {
     // Encrypt the `content` field with the source agent's project key so
     // the server only forwards ciphertext. Target daemon decrypts on the
     // agent:send path. If we don't hold the key, fall through to plain.
-    const encryptOr409 = (kind: "send" | "memory_add" | "board", projectId: string, buf: Buffer): boolean => {
+    const encryptOr409 = (kind: BridgeEncryptKind, projectId: string, buf: Buffer): boolean => {
       try {
         const json = JSON.parse(buf.toString("utf8"));
         if (json && typeof json === "object") {
@@ -316,6 +356,13 @@ export class BridgeRelay {
       if (bm) {
         const projectId = this.agentProjectLookup(bm[1]);
         if (projectId && !encryptOr409("board", projectId, body)) return;
+      }
+      const wm = parsed.pathname.match(
+        /^\/api\/bridge\/([^/]+)\/(tasks_add|tasks_update|tasks_comment_add|goals_add|goals_update)$/,
+      );
+      if (wm) {
+        const projectId = this.agentProjectLookup(wm[1]);
+        if (projectId && !encryptOr409(wm[2] as BridgeEncryptKind, projectId, body)) return;
       }
     }
     // Strip headers that don't make sense to forward (host/connection/etc).

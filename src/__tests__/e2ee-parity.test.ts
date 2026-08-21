@@ -7,9 +7,12 @@ import {
   BOARD_ANNOTATION_FIELDS,
   BOARD_STEP_FIELDS,
   BOARD_TEXT_FIELDS,
+  COMMENT_FIELDS,
   E2EE_TABLE,
+  GOAL_FIELDS,
   MEMORY_PLAIN_TO_CIPHER,
   MESSAGE_FIELDS,
+  TASK_FIELDS,
   aadV2,
 } from "@the-dudes/protocol/e2ee-fields";
 
@@ -158,4 +161,60 @@ test("T-074: required+sem chave recusa; OFF passthrough; required+chave cifra", 
   } finally {
     setE2eeRequired(PID, false);
   }
+});
+
+test("T-079 tasks_add: title/description saem e2e:v2 com aadV2 do catálogo", () => {
+  const out = encryptBridgePayload("tasks_add", { title: "título", description: "desc", status: "todo" }, PID);
+  assert.equal(out.status, "todo", "campo estrutural não cifra");
+  for (const f of TASK_FIELDS) {
+    const blob = out[f] as string;
+    assert.ok(cifradoV2(blob), `task.${f} não saiu e2e:v2:`);
+    const aad = aadV2({ projectId: PID, table: E2EE_TABLE.TASKS, field: f });
+    assert.equal(decryptForProject(blob, PID, aad), f === "title" ? "título" : "desc");
+    assert.equal(decryptForProject(blob, PID, aadV2({ projectId: PID, table: E2EE_TABLE.GOALS, field: f })), null);
+  }
+});
+
+test("T-079 tasks_update e comment: cifra nested/top-level; content de comment", () => {
+  const upd = encryptBridgePayload("tasks_update", { id: "task_1", title: "novo" }, PID);
+  assert.equal(upd.id, "task_1");
+  assert.ok(cifradoV2(upd.title));
+  const nested = encryptBridgePayload("tasks_update", { id: "task_1", patch: { description: "p" } }, PID);
+  const patch = nested.patch as Record<string, unknown>;
+  assert.ok(cifradoV2(patch.description));
+  const cmt = encryptBridgePayload("tasks_comment_add", { taskId: "task_1", content: "oi" }, PID);
+  assert.equal(cmt.taskId, "task_1");
+  for (const f of COMMENT_FIELDS) {
+    const blob = cmt[f] as string;
+    assert.ok(cifradoV2(blob), `comment.${f} não saiu e2e:v2:`);
+    const aad = aadV2({ projectId: PID, table: E2EE_TABLE.TASK_COMMENTS, field: f });
+    assert.equal(decryptForProject(blob, PID, aad), "oi");
+  }
+});
+
+test("T-079 goals_add: title/description e2e:v2", () => {
+  const out = encryptBridgePayload("goals_add", { goal: { title: "G", description: "d" } }, PID);
+  const g = out.goal as Record<string, unknown>;
+  for (const f of GOAL_FIELDS) {
+    const blob = g[f] as string;
+    assert.ok(cifradoV2(blob), `goal.${f} não saiu e2e:v2:`);
+    const aad = aadV2({ projectId: PID, table: E2EE_TABLE.GOALS, field: f });
+    assert.equal(decryptForProject(blob, PID, aad), f === "title" ? "G" : "d");
+  }
+});
+
+test("T-079 required+chave: tasks_add cifra (não recusa); sem chave recusa", { concurrency: false }, async () => {
+  const { setE2eeRequired } = await import("../daemon-crypto.js");
+  setE2eeRequired(PID, true);
+  try {
+    const out = encryptBridgePayload("tasks_add", { title: "ok" }, PID);
+    assert.ok(cifradoV2(out.title));
+  } finally {
+    setE2eeRequired(PID, false);
+  }
+  setE2eeRequired("sem-chave", true);
+  assert.throws(
+    () => encryptBridgePayload("tasks_add", { title: "claro" }, "sem-chave"),
+    /e2ee-required/,
+  );
 });
