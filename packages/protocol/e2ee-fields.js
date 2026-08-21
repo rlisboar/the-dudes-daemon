@@ -79,3 +79,107 @@ export function isE2eV2(stored) {
 export function isE2eV1Rejected(stored) {
   return typeof stored === "string" && stored.startsWith(E2E_V1_REJECT_PREFIX);
 }
+
+/** Texto de conteúdo em claro: string não-vazia sem prefixo e2e:. */
+export function isPlainCatalogText(v) {
+  return typeof v === "string" && v.length > 0 && !v.startsWith(E2E_PREFIX);
+}
+
+function collectFields(obj, fields, prefix) {
+  const hits = [];
+  if (!obj || typeof obj !== "object") return hits;
+  for (const f of fields) {
+    if (isPlainCatalogText(obj[f])) hits.push(prefix ? `${prefix}.${f}` : f);
+  }
+  return hits;
+}
+
+function collectBoardHits(p) {
+  const hits = collectFields(p, BOARD_TEXT_FIELDS, "board");
+  if (Array.isArray(p.steps)) {
+    for (const st of p.steps) hits.push(...collectFields(st, BOARD_STEP_FIELDS, "board.steps"));
+  }
+  if (p.chart && typeof p.chart === "object") {
+    if (Array.isArray(p.chart.labels)) {
+      for (const x of p.chart.labels) {
+        if (isPlainCatalogText(x)) hits.push("board.chart.labels");
+      }
+    }
+    if (Array.isArray(p.chart.series)) {
+      for (const se of p.chart.series) hits.push(...collectFields(se, BOARD_CHART_SERIES_FIELDS, "board.chart.series"));
+    }
+  }
+  if (Array.isArray(p.annotations)) {
+    for (const a of p.annotations) hits.push(...collectFields(a, BOARD_ANNOTATION_FIELDS, "board.annotations"));
+  }
+  if (Array.isArray(p.blocks)) {
+    for (const b of p.blocks) hits.push(...collectBoardHits(b));
+  }
+  return hits;
+}
+
+function collectMemoryHits(mem) {
+  const hits = [];
+  if (!mem || typeof mem !== "object") return hits;
+  for (const [plain, cipher] of Object.entries(MEMORY_PLAIN_TO_CIPHER)) {
+    if (isPlainCatalogText(mem[plain]) || isPlainCatalogText(mem[cipher])) hits.push(`memory.${plain}`);
+  }
+  return hits;
+}
+
+/**
+ * Campos do catálogo em claro num write (comando WS ou op do bridge).
+ * Usado pelo server (D4) pra recusar persistência quando e2eeRequired.
+ */
+export function catalogPlainHits(kind, payload) {
+  const p = payload && typeof payload === "object" ? payload : {};
+  switch (kind) {
+    case "add_task":
+    case "tasks_add":
+      return collectFields(p.task ?? p, TASK_FIELDS, "task");
+    case "update_task":
+    case "tasks_update":
+      return collectFields(p.patch ?? p, TASK_FIELDS, "task");
+    case "add_task_comment":
+    case "tasks_comment_add":
+      return collectFields(p, COMMENT_FIELDS, "comment");
+    case "add_goal":
+      return collectFields(p.goal ?? p, GOAL_FIELDS, "goal");
+    case "update_goal":
+      return collectFields(p.patch ?? p, GOAL_FIELDS, "goal");
+    case "add_memory":
+    case "memory_add":
+      return collectMemoryHits(p.memory ?? p);
+    case "update_memory":
+      return collectMemoryHits(p.patch ?? p);
+    case "user_to_agent":
+    case "broadcast":
+    case "send":
+    case "agent:text": {
+      const hits = [];
+      if (isPlainCatalogText(p.content) || isPlainCatalogText(p.text)) hits.push("message.content");
+      if (p.msg) hits.push(...collectFields(p.msg, MESSAGE_FIELDS, "message"));
+      return hits;
+    }
+    case "save_tts_summary": {
+      const e = p.entry ?? p;
+      const hits = [];
+      for (const f of SUMMARY_FIELDS) {
+        if (isPlainCatalogText(e[f])) hits.push(`summary.${f}`);
+      }
+      if (isPlainCatalogText(e.original)) hits.push("summary.original");
+      return hits;
+    }
+    case "board_set_title":
+    case "board_set":
+    case "board_say":
+    case "board_upsert_block":
+    case "board_create":
+    case "board_draw":
+    case "board":
+      return collectBoardHits(p);
+    default:
+      if (typeof kind === "string" && kind.startsWith("board_")) return collectBoardHits(p);
+      return [];
+  }
+}

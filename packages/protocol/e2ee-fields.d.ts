@@ -27,3 +27,6 @@ export declare const E2E_V1_REJECT_PREFIX: "e2e:v1:";
 export declare function aadV2(args: { projectId: string; table: string; field: string }): string;
 export declare function isE2eV2(stored: string): boolean;
 export declare function isE2eV1Rejected(stored: string): boolean;
+export declare function isPlainCatalogText(v: unknown): boolean;
+/** Campos do catálogo em claro num write (comando WS ou op do bridge). */
+export declare function catalogPlainHits(kind: string, payload: unknown): string[];

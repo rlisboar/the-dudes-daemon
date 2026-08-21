@@ -256,6 +256,8 @@ export interface Project {
   defaultPlanValidator?: PlanValidator;
   /** Memória global ligada (default true). Off = não injeta memórias no contexto dos agentes. */
   memoryEnabled?: boolean;
+  /** Fail-closed no write: sem project key a cifra recusa (não degrada a plaintext). Default false. */
+  e2eeRequired?: boolean;
   /** Cota de pins (hot-set) por agente. Clamp 1–100, default 15. */
   memoryMaxPinned?: number;
   /** Board de tasks ligado p/ os agentes (tools + seção do system prompt). Lean: novos nascem off. */
@@ -1147,7 +1149,7 @@ export type ServerEvent =
   | { type: "credential:revealed"; id: string; value: string }
   | { type: "permission:request"; req: PermissionRequest }
   | { type: "permission:resolved"; requestId: string; allow: boolean }
-  | { type: "config"; autoApprove: boolean; loopProtection: "reactive" | "preventive"; loopLimitEnabled?: boolean; loopLimit?: number; loopPairLimit?: number; loopPairWindowMs?: number; memoryEnabled?: boolean; memoryMaxPinned?: number; tasksEnabled?: boolean; teammatesEnabled?: boolean; goalsEnabled?: boolean; credentialsEnabled?: boolean; webhooksEnabled?: boolean; graphEnabled?: boolean; boardEnabled?: boolean; diagramLanguage?: DiagramLanguage; boardMode?: BoardMode; boardHtmlLevel?: BoardHtmlLevel; boardWidth?: BoardWidth; autoRetryEnabled?: boolean; autoRetrySeconds?: number }
+  | { type: "config"; autoApprove: boolean; loopProtection: "reactive" | "preventive"; loopLimitEnabled?: boolean; loopLimit?: number; loopPairLimit?: number; loopPairWindowMs?: number; memoryEnabled?: boolean; memoryMaxPinned?: number; e2eeRequired?: boolean; tasksEnabled?: boolean; teammatesEnabled?: boolean; goalsEnabled?: boolean; credentialsEnabled?: boolean; webhooksEnabled?: boolean; graphEnabled?: boolean; boardEnabled?: boolean; diagramLanguage?: DiagramLanguage; boardMode?: BoardMode; boardHtmlLevel?: BoardHtmlLevel; boardWidth?: BoardWidth; autoRetryEnabled?: boolean; autoRetrySeconds?: number }
   | { type: "graph:status"; status: "idle" | "building" | "ready" | "error"; nodeCount?: number; edgeCount?: number; error?: string; inputTokens?: number; outputTokens?: number; lastIndexedAt?: number; progress?: number; phase?: string; indexMtime?: number; stale?: boolean; graphifyAvailable?: boolean; graphifyMcpAvailable?: boolean; docsPending?: boolean; hasSemantic?: boolean }
   | { type: "graph:data"; json?: string; error?: string }
   | { type: "usage_breakdown"; byUser: { userId: string; input: number; output: number }[]; byModel: { model: string; input: number; output: number }[]; from?: string; to?: string }
@@ -1347,6 +1349,7 @@ export type ClientCommand =
   | { type: "memory_hygiene"; mode?: "unpin_non_sticky" | "enforce_quota" }
   | { type: "set_memory_enabled"; value: boolean }
   | { type: "set_memory_max_pinned"; value: number }
+  | { type: "set_e2ee_required"; value: boolean }
   | { type: "set_context_feature"; feature: "tasks" | "teammates" | "goals" | "credentials" | "webhooks" | "graph" | "board"; value: boolean }
   | { type: "graph:reindex"; semantic?: boolean; backend?: string; model?: string }
   | { type: "graph:get" }

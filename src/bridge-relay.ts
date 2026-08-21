@@ -7,7 +7,7 @@ import { chmodSync, chownSync, existsSync, mkdtempSync, rmSync, unlinkSync } fro
 import type { DropTarget } from "./privileges.js";
 import { getUnixPeerPid, resolveAgentIdFromPid } from "./privileges.js";
 import { aadV2, E2EE_TABLE } from "@the-dudes/protocol/e2ee-fields";
-import { decryptForProject, encryptForProject, isE2eEncrypted, rememberCredentialPlaintext } from "./daemon-crypto.js";
+import { decryptForProject, encryptForProject, E2eeRequiredError, isE2eEncrypted, isE2eeRequired, rememberCredentialPlaintext } from "./daemon-crypto.js";
 
 /**
  * Local Unix-socket HTTP relay. The MCP bridge child process talks to this
@@ -36,13 +36,18 @@ export function encryptBridgePayload(
 ): Record<string, unknown> {
   const cifra = (v: unknown, table: string, field: string): unknown => {
     if (typeof v !== "string" || !v || isE2eEncrypted(v)) return v;
-    return encryptForProject(v, projectId, aadV2({ projectId, table, field })) ?? v;
+    const enc = encryptForProject(v, projectId, aadV2({ projectId, table, field }));
+    if (enc) return enc;
+    if (isE2eeRequired(projectId)) throw new E2eeRequiredError();
+    return v;
   };
   if (kind === "send") {
-    // T-062b rework: messages/content ainda é lido sem AAD na UI (T-072).
-    // Write-v2 só depois que os dois lados leem com aadV2 — permanece e2e:.
+    // T-073: messages/content escreve e2e:v2 com aadV2 (reads já em prod, T-072).
+    // T-074: fail-closed se e2eeRequired e sem chave (cifra() retorna null).
     if (typeof json.content === "string" && json.content && !isE2eEncrypted(json.content)) {
-      json.content = encryptForProject(json.content, projectId) ?? json.content;
+      const enc = cifra(json.content, E2EE_TABLE.MESSAGES, "content");
+      if (enc) json.content = enc;
+      else if (isE2eeRequired(projectId)) throw new E2eeRequiredError();
     }
     return json;
   }
@@ -54,10 +59,12 @@ export function encryptBridgePayload(
     if (typeof json.title === "string" && !isE2eEncrypted(json.title)) {
       const enc = encryptForProject(json.title, projectId, aadV2({ projectId, table: E2EE_TABLE.MEMORIES, field: "title" }));
       if (enc) { json.titleCipher = enc; delete json.title; }
+      else if (isE2eeRequired(projectId)) throw new E2eeRequiredError();
     }
     if (typeof json.body === "string" && !isE2eEncrypted(json.body)) {
       const enc = encryptForProject(json.body, projectId, aadV2({ projectId, table: E2EE_TABLE.MEMORIES, field: "body" }));
       if (enc) { json.bodyCipher = enc; delete json.body; }
+      else if (isE2eeRequired(projectId)) throw new E2eeRequiredError();
     }
     return json;
   }
@@ -273,19 +280,28 @@ export class BridgeRelay {
     // Encrypt the `content` field with the source agent's project key so
     // the server only forwards ciphertext. Target daemon decrypts on the
     // agent:send path. If we don't hold the key, fall through to plain.
+    const encryptOr409 = (kind: "send" | "memory_add" | "board", projectId: string, buf: Buffer): boolean => {
+      try {
+        const json = JSON.parse(buf.toString("utf8"));
+        if (json && typeof json === "object") {
+          body = Buffer.from(JSON.stringify(encryptBridgePayload(kind, json, projectId)), "utf8");
+        }
+        return true;
+      } catch (e) {
+        if (e instanceof E2eeRequiredError) {
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: e.message }));
+          return false;
+        }
+        return true;
+      }
+    };
     if (body && body.length > 0 && this.agentProjectLookup) {
       const m = parsed.pathname.match(/^\/api\/bridge\/([^/]+)\/send$/);
       if (m) {
         const agentId = m[1];
         const projectId = this.agentProjectLookup(agentId);
-        if (projectId) {
-          try {
-            const json = JSON.parse(body.toString("utf8"));
-            if (json && typeof json === "object") {
-              body = Buffer.from(JSON.stringify(encryptBridgePayload("send", json, projectId)), "utf8");
-            }
-          } catch { /* not JSON or not the shape we expect; leave alone */ }
-        }
+        if (projectId && !encryptOr409("send", projectId, body)) return;
       }
       // E2EE: memory_add carrega title/body em plaintext do agente. Cifra
       // com a project key antes de subir, igual ao `send` — server guarda
@@ -294,26 +310,12 @@ export class BridgeRelay {
       const mm = parsed.pathname.match(/^\/api\/bridge\/([^/]+)\/memory_add$/);
       if (mm) {
         const projectId = this.agentProjectLookup(mm[1]);
-        if (projectId) {
-          try {
-            const json = JSON.parse(body.toString("utf8"));
-            if (json && typeof json === "object") {
-              body = Buffer.from(JSON.stringify(encryptBridgePayload("memory_add", json, projectId)), "utf8");
-            }
-          } catch { /* leave alone */ }
-        }
+        if (projectId && !encryptOr409("memory_add", projectId, body)) return;
       }
       const bm = parsed.pathname.match(/^\/api\/bridge\/([^/]+)\/(board_[a-z_]+)$/);
       if (bm) {
         const projectId = this.agentProjectLookup(bm[1]);
-        if (projectId) {
-          try {
-            const json = JSON.parse(body.toString("utf8"));
-            if (json && typeof json === "object") {
-              body = Buffer.from(JSON.stringify(encryptBridgePayload("board", json, projectId)), "utf8");
-            }
-          } catch { /* leave alone */ }
-        }
+        if (projectId && !encryptOr409("board", projectId, body)) return;
       }
     }
     // Strip headers that don't make sense to forward (host/connection/etc).

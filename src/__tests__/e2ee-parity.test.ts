@@ -44,10 +44,10 @@ test("send: cifra os campos de mensagem da lista canônica", () => {
   const out = encryptBridgePayload("send", json, PID);
   for (const f of MESSAGE_FIELDS) {
     const blob = out[f] as string;
-    assert.ok(typeof blob === "string" && blob.startsWith("e2e:"), `${f} subiu em claro`);
-    assert.ok(!blob.startsWith("e2e:v2:"), `${f} emitiu e2e:v2: (T-072 ainda não leu AAD)`);
+    assert.ok(cifradoV2(blob), `${f} não saiu e2e:v2:`);
     assert.ok(!blob.startsWith("e2e:v1:"), `${f} emitiu e2e:v1:`);
-    assert.equal(decryptForProject(blob, PID), `texto de ${f}`);
+    const aad = aadV2({ projectId: PID, table: E2EE_TABLE.MESSAGES, field: f });
+    assert.equal(decryptForProject(blob, PID, aad), `texto de ${f}`);
   }
 });
 
@@ -117,4 +117,45 @@ test("T-062b: encrypt sem aad continua e2e: (não emite e2e:v1:)", async () => {
   const legado = encryptForProject("ring-wrap", PID);
   assert.ok(legado && legado.startsWith("e2e:") && !legado.startsWith("e2e:v2:") && !legado.startsWith("e2e:v1:"));
   assert.equal(decryptForProject(legado!, PID), "ring-wrap");
+});
+
+test("T-073 write+read: messages/content e tts_summaries/summary em e2e:v2; campo trocado falha", async () => {
+  const { encryptForProject } = await import("../daemon-crypto.js");
+  const out = encryptBridgePayload("send", { content: "segredo-msg" }, PID);
+  const blob = out.content as string;
+  assert.ok(cifradoV2(blob));
+  const aadMsg = aadV2({ projectId: PID, table: E2EE_TABLE.MESSAGES, field: "content" });
+  const aadSum = aadV2({ projectId: PID, table: E2EE_TABLE.SUMMARIES, field: "summary" });
+  const aadTitle = aadV2({ projectId: PID, table: E2EE_TABLE.TASKS, field: "title" });
+  assert.equal(decryptForProject(blob, PID, aadMsg), "segredo-msg");
+  assert.equal(decryptForProject(blob, PID, aadSum), null, "AAD de summary não abre message");
+  assert.equal(decryptForProject(blob, PID, aadTitle), null, "AAD de title não abre message");
+  assert.equal(decryptForProject(blob, PID), null, "v2 sem AAD fail-closed");
+
+  const ctSum = encryptForProject("resumo tts", PID, aadSum)!;
+  assert.ok(ctSum.startsWith("e2e:v2:") && !ctSum.startsWith("e2e:v1:"));
+  assert.equal(decryptForProject(ctSum, PID, aadSum), "resumo tts");
+  assert.equal(decryptForProject(ctSum, PID, aadMsg), null, "AAD de message não abre summary");
+  const legado = encryptForProject("chat legado", PID)!;
+  assert.ok(legado.startsWith("e2e:") && !legado.startsWith("e2e:v2:"));
+  assert.equal(decryptForProject(legado, PID), "chat legado");
+  assert.equal(decryptForProject(legado, PID, aadMsg), "chat legado", "e2e: legado ignora AAD");
+});
+
+test("T-074: required+sem chave recusa; OFF passthrough; required+chave cifra", { concurrency: false }, async () => {
+  const { setE2eeRequired } = await import("../daemon-crypto.js");
+  const pid = "proj-req-off";
+  setE2eeRequired(pid, false);
+  const outOff = encryptBridgePayload("send", { content: "claro" }, pid);
+  assert.equal(outOff.content, "claro");
+  setE2eeRequired(pid, true);
+  assert.throws(() => encryptBridgePayload("send", { content: "claro" }, pid), /e2ee-required/);
+  setE2eeRequired(pid, false);
+  setE2eeRequired(PID, true);
+  try {
+    const outOn = encryptBridgePayload("send", { content: "segredo-req" }, PID);
+    assert.ok(typeof outOn.content === "string" && String(outOn.content).startsWith("e2e:"));
+  } finally {
+    setE2eeRequired(PID, false);
+  }
 });

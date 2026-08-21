@@ -35,7 +35,7 @@ import { defaultDaemonConfigPath, formatCliStatus, loadDaemonCliConfig, mergeCli
 import type { FromDaemon, FromOrch } from "./protocol.js";
 import { runSummarizer } from "./summarizer-runner.js";
 import { aadV2, E2EE_TABLE } from "@the-dudes/protocol/e2ee-fields";
-import { decryptForProject, encryptForProject, countUsableProjectKeys, forgetAllProjectKeys, getDaemonPublicKey, hasProjectKey, isE2eEncrypted, rememberProjectKey } from "./daemon-crypto.js";
+import { decryptForProject, encryptForProject, countUsableProjectKeys, forgetAllProjectKeys, getDaemonPublicKey, hasProjectKey, isE2eEncrypted, isE2eeRequired, rememberProjectKey, setE2eeRequired } from "./daemon-crypto.js";
 import { dispatchWebhook } from "./webhook-dispatch.js";
 import { ModelDiscovery } from "./model-discovery.js";
 import { parseGitPorcelain } from "./git-status.js";
@@ -758,6 +758,11 @@ class DaemonClient {
         });
         return;
       }
+      case "project:e2ee_required": {
+        setE2eeRequired(msg.projectId, !!msg.value);
+        log("info", `e2eeRequired=${!!msg.value} project=${msg.projectId}`);
+        return;
+      }
       case "project_key:for_daemon": {
         // keyRing opcional (T-007): cadeia project_key_ring mais-antiga→mais-nova.
         const ring = Array.isArray(msg.keyRing) ? msg.keyRing : undefined;
@@ -1244,6 +1249,10 @@ class DaemonClient {
     // E2EE: if `text` is encrypted with the project key, decrypt before
     // running the LLM, then re-encrypt the summary so the server only
     // ever forwards ciphertext.
+    if (msg.projectId && isE2eeRequired(msg.projectId) && !hasProjectKey(msg.projectId)) {
+      this.send({ type: "summarize:result", correlationId: msg.correlationId, ok: false, error: "e2ee-required: sem chave do projeto" });
+      return;
+    }
     let plainText = msg.text;
     if (msg.projectId && isE2eEncrypted(plainText)) {
       const dec = decryptForProject(plainText, msg.projectId);
@@ -1267,9 +1276,21 @@ class DaemonClient {
       });
       let outSummary = result.summary;
       if (result.ok && msg.projectId && outSummary) {
-        // T-062b rework: tts_summaries ainda é lido sem AAD na UI (T-072).
-        const enc = encryptForProject(outSummary, msg.projectId);
+        const enc = encryptForProject(
+          outSummary,
+          msg.projectId,
+          aadV2({ projectId: msg.projectId, table: E2EE_TABLE.SUMMARIES, field: "summary" }),
+        );
         if (enc) outSummary = enc;
+        else if (isE2eeRequired(msg.projectId)) {
+          this.send({
+            type: "summarize:result",
+            correlationId: msg.correlationId,
+            ok: false,
+            error: "e2ee-required: sem chave do projeto",
+          });
+          return;
+        }
       }
       log(result.ok ? "info" : "warn", `summarize:result ok=${result.ok} ${result.ok ? `len=${result.summary?.length ?? 0} tokens=${result.usage?.input ?? 0}/${result.usage?.output ?? 0}` : `error=${result.error}`}`);
       this.send({

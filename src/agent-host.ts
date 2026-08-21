@@ -4,7 +4,8 @@ import { spawnSync } from "node:child_process";
 import { AgentRunner, type AgentRunnerOptions } from "./agent-runner.js";
 import { breadcrumb, captureWarn } from "./sentry.js";
 import { assertWorkspaceScoped, autoWorkspaceCwd, cloneRepoIfMissing, expandBasePath, findGitRoot, getWorkspaceRoot, isInsideRoot, repoCwd } from "./workspace.js";
-import { encryptForProject, redactCredentials, redactCredentialsDeep } from "./daemon-crypto.js";
+import { aadV2, E2EE_TABLE } from "@the-dudes/protocol/e2ee-fields";
+import { encryptForProject, isE2eeRequired, setE2eeRequired, redactCredentials, redactCredentialsDeep } from "./daemon-crypto.js";
 import type { ResolvedCliCommands } from "./cli-config.js";
 import type { AgentInfo, ImageAttachment } from "./types.js";
 import type { AgentSpawn, FromDaemon } from "./protocol.js";
@@ -140,6 +141,7 @@ export class AgentHost {
   }
 
   async spawn(msg: AgentSpawn): Promise<void> {
+    if (msg.projectId && msg.e2eeRequired != null) setE2eeRequired(msg.projectId, !!msg.e2eeRequired);
     const existing = this.entries.get(msg.agent.id);
     if (existing?.runner) {
       // Distingue RECONNECT (WS reconectou; mesma config) de RECONFIG
@@ -422,8 +424,14 @@ export class AgentHost {
         // redação tem que ser aqui. Depois cifra com a project key. Sem key
         // (legacy/pre-bootstrap) cai pro plaintext já redatado.
         const red = msg.projectId ? redactCredentials(msg.projectId, text) : text;
-        // T-062b rework: messages/content ainda é lido sem AAD na UI (T-072).
-        const enc = msg.projectId ? encryptForProject(red, msg.projectId) : null;
+        const enc = msg.projectId
+          ? encryptForProject(red, msg.projectId, aadV2({ projectId: msg.projectId, table: E2EE_TABLE.MESSAGES, field: "content" }))
+          : null;
+        if (msg.projectId && isE2eeRequired(msg.projectId) && !enc) {
+          this.log("error", `agent:text recusado: e2ee-required sem chave project=${msg.projectId}`);
+          this.deliver({ type: "agent:error", agentId: msg.agent.id, message: "e2ee-required: sem chave do projeto — texto não enviado" });
+          return true;
+        }
         const ok = this.deliver({ type: "agent:text", agentId: msg.agent.id, text: enc ?? red });
         // Espelho Telegram: encaminha a MESMA resposta (em claro, já redatada)
         // pro chat vinculado. Server é E2EE-cego, por isso o mirror é aqui.
@@ -444,6 +452,10 @@ export class AgentHost {
       onThinkingText: (text, thinkOpts) => {
         const red = msg.projectId ? redactCredentials(msg.projectId, text) : text;
         const enc = msg.projectId ? encryptForProject(red, msg.projectId) : null;
+        if (msg.projectId && isE2eeRequired(msg.projectId) && !enc) {
+          this.log("error", `agent:thinking recusado: e2ee-required sem chave project=${msg.projectId}`);
+          return;
+        }
         this.deliver({ type: "agent:thinking", agentId: msg.agent.id, text: enc ?? red, redacted: !!thinkOpts?.redacted });
       },
       onSessionId: (sid) => { this.deliver({ type: "agent:session", agentId: msg.agent.id, sessionId: sid }); },

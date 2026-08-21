@@ -45,6 +45,12 @@ export interface DaemonHello {
   installedRunners?: Array<"claude" | "codex" | "opencode" | "gemini" | "crush" | "grok">;
 }
 
+export interface ProjectE2eeRequired {
+  type: "project:e2ee_required";
+  projectId: string;
+  value: boolean;
+}
+
 export interface ProjectKeyForDaemon {
   type: "project_key:for_daemon";
   projectId: string;
@@ -98,6 +104,8 @@ export interface AgentSpawn {
    *  E2EE project key when the agent's systemPrompt and inbound
    *  messages are encrypted. */
   projectId?: string;
+  /** T-074: fail-closed no write deste projeto. Piggyback — o caso crítico é SEM chave. */
+  e2eeRequired?: boolean;
   basePath: string;
   /** name of the project base repo (folder under basePath) when agent has none of its own */
   repoName?: string;
@@ -861,6 +869,7 @@ export type FromOrch =
   | GitlabApiRequest
   | SummarizeRequest
   | ProjectKeyForDaemon
+  | ProjectE2eeRequired
   | WebhookDispatchRequest
   | SkillsRescanRequest
   | SkillReadFileRequest

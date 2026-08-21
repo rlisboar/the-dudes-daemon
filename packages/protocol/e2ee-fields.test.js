@@ -17,3 +17,14 @@ test("prefixos de wire", () => {
   assert.equal(isE2eV1Rejected("e2e:v1:abc"), true);
   assert.equal(isE2eV1Rejected("e2e:v2:abc"), false);
 });
+
+test("T-074 catalogPlainHits: recusa conteúdo em claro; e2e: passa", async () => {
+  const { catalogPlainHits } = await import("./e2ee-fields.js");
+  assert.deepEqual(catalogPlainHits("add_task", { task: { title: "claro" } }), ["task.title"]);
+  assert.deepEqual(catalogPlainHits("add_task", { task: { title: "e2e:blob" } }), []);
+  assert.deepEqual(catalogPlainHits("send", { content: "oi" }), ["message.content"]);
+  assert.deepEqual(catalogPlainHits("send", { content: "e2e:v2:xx" }), []);
+  assert.deepEqual(catalogPlainHits("user_to_agent", { content: "segredo" }), ["message.content"]);
+  assert.ok(catalogPlainHits("memory_add", { title: "T", body: "B" }).includes("memory.title"));
+  assert.deepEqual(catalogPlainHits("ping", { x: 1 }), []);
+});

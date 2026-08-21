@@ -481,6 +481,26 @@ function decryptWithRawKey(stored: string, key: Buffer, aad?: string): string | 
   }
 }
 
+/** T-074: fail-closed por projeto. Default false (fail-open, comportamento atual). */
+const e2eeRequiredByProject = new Map<string, boolean>();
+
+export function setE2eeRequired(projectId: string, value: boolean): void {
+  if (!projectId) return;
+  e2eeRequiredByProject.set(projectId, !!value);
+}
+
+export function isE2eeRequired(projectId: string): boolean {
+  return e2eeRequiredByProject.get(projectId) === true;
+}
+
+export class E2eeRequiredError extends Error {
+  readonly code = "E2EE_REQUIRED";
+  constructor(message = "e2ee-required: sem chave do projeto") {
+    super(message);
+    this.name = "E2eeRequiredError";
+  }
+}
+
 /** Encrypt a UTF-8 string with the project AES-256 key. Sem aad → e2e:
  *  (legado / sem table|field). Com aad → e2e:v2:. Nunca e2e:v1:. */
 export function encryptForProject(plain: string, projectId: string, aad?: string): string | null {

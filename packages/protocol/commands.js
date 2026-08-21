@@ -180,6 +180,7 @@ export const commandSchemas = {
   memory_hygiene: cmd({ mode: z.enum(["unpin_non_sticky", "enforce_quota"]).optional() }),
   set_memory_enabled: cmd({ value: flag }),
   set_memory_max_pinned: cmd({ value: num }),
+  set_e2ee_required: cmd({ value: flag }),
 
   /* ---------- goals ---------- */
   add_goal: cmd({
@@ -571,7 +572,7 @@ export const DB_WRITE_COMMANDS = Object.freeze([
   "admin:set_project_role", "admin:add_user_to_project", "admin:remove_user_from_project",
   "add_task", "update_task", "remove_task", "lock_task", "unlock_task", "add_task_comment",
   "add_memory", "update_memory", "remove_memory", "clear_memories", "bulk_memories",
-  "memory_hygiene", "set_memory_enabled", "set_memory_max_pinned",
+  "memory_hygiene", "set_memory_enabled", "set_memory_max_pinned", "set_e2ee_required",
   "add_goal", "update_goal", "remove_goal", "update_goal_auto_complete",
   "add_credential", "remove_credential", "grant_credential", "revoke_credential",
   "create_project", "create_project_with_key", "duplicate_project", "update_project",
