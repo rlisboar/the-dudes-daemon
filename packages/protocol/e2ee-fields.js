@@ -40,6 +40,22 @@ export const GOAL_FIELDS = ["title", "description"];
 /** Resumo de sessão (summarize:result no daemon ↔ store no web). */
 export const SUMMARY_FIELDS = ["summary"];
 
+/** Plan (create_plan / plans_create). */
+export const PLAN_FIELDS = ["title", "description"];
+/**
+ * Membership do plano. title/prompt.
+ * Drafts materializados como board task: o relay cifra title com
+ * tasks.title e prompt com tasks.description (addTask); o snapshot da
+ * membership herda o mesmo blob. update_plan_task cifra com plan_tasks.*.
+ */
+export const PLAN_TASK_FIELDS = ["title", "prompt"];
+/** Mission (create_mission). */
+export const MISSION_FIELDS = ["title", "description"];
+/** Mission step (add_mission_step / apply_plan_steps). */
+export const MISSION_STEP_FIELDS = ["title", "prompt"];
+/** Schedule (add_schedule). title + prompt (não há payload). */
+export const SCHEDULE_FIELDS = ["title", "prompt"];
+
 /**
  * Tabelas lógicas do AAD (T-062). Sem recordId — IDs são gerados no server
  * depois da cifra. Fecha cross-table/cross-field; não fecha cópia intra-campo.
@@ -52,7 +68,29 @@ export const E2EE_TABLE = Object.freeze({
   MESSAGES: "messages",
   BOARDS: "explanation_boards",
   SUMMARIES: "tts_summaries",
+  PLANS: "plans",
+  PLAN_TASKS: "plan_tasks",
+  MISSIONS: "missions",
+  MISSION_STEPS: "mission_steps",
+  SCHEDULES: "schedules",
 });
+
+/**
+ * T-083 call-out A — fallback de AAD SÓ na leitura.
+ *
+ * startPlan (server) copia o blob opaco cross-tabela: plan.title/description →
+ * mission.title/description, item.title/prompt (AAD tasks.*) → mission_steps.*.
+ * O server não tem a chave, então não re-cifra. EXATAMENTE 4 pares;
+ * proibido loop genérico por todas as AAD. Destino primeiro, depois
+ * UMA fonte. apply_plan_steps nascido no destino continua 1:1 (o
+ * destino abre sozinho; a fonte não é consultada).
+ */
+export const AAD_READ_FALLBACK = Object.freeze([
+  Object.freeze({ destTable: E2EE_TABLE.MISSIONS, destField: "title", sourceTable: E2EE_TABLE.PLANS, sourceField: "title" }),
+  Object.freeze({ destTable: E2EE_TABLE.MISSIONS, destField: "description", sourceTable: E2EE_TABLE.PLANS, sourceField: "description" }),
+  Object.freeze({ destTable: E2EE_TABLE.MISSION_STEPS, destField: "title", sourceTable: E2EE_TABLE.TASKS, sourceField: "title" }),
+  Object.freeze({ destTable: E2EE_TABLE.MISSION_STEPS, destField: "prompt", sourceTable: E2EE_TABLE.TASKS, sourceField: "description" }),
+]);
 
 /** Prefixos de wire. v2 leva AAD; v1 abortado é fail-closed; `e2e:` é legado. */
 export const E2E_PREFIX = "e2e:";
@@ -70,6 +108,17 @@ export function aadV2({ projectId, table, field }) {
     throw new Error("aadV2: projectId, table e field são obrigatórios");
   }
   return `v2|${projectId}|${table}|${field}`;
+}
+
+/**
+ * Cadeia de AAD pra LEITURA: [destino, fonte?] — 1 ou 2 strings.
+ * Nunca varre o catálogo inteiro.
+ */
+export function aadReadChain({ projectId, table, field }) {
+  const dest = aadV2({ projectId, table, field });
+  const pair = AAD_READ_FALLBACK.find((p) => p.destTable === table && p.destField === field);
+  if (!pair) return [dest];
+  return [dest, aadV2({ projectId, table: pair.sourceTable, field: pair.sourceField })];
 }
 
 export function isE2eV2(stored) {
@@ -127,6 +176,13 @@ function collectMemoryHits(mem) {
   return hits;
 }
 
+function collectListHits(list, fields, prefix) {
+  const hits = [];
+  if (!Array.isArray(list)) return hits;
+  for (const item of list) hits.push(...collectFields(item, fields, prefix));
+  return hits;
+}
+
 /**
  * Campos do catálogo em claro num write (comando WS ou op do bridge).
  * Usado pelo server (D4) pra recusar persistência quando e2eeRequired.
@@ -178,6 +234,43 @@ export function catalogPlainHits(kind, payload) {
     case "board_draw":
     case "board":
       return collectBoardHits(p);
+    case "create_plan":
+    case "plans_create": {
+      const src = p.plan ?? p;
+      return [
+        ...collectFields(src, PLAN_FIELDS, "plan"),
+        ...collectListHits(src.tasks ?? p.tasks, PLAN_TASK_FIELDS, "plan_task"),
+      ];
+    }
+    case "update_plan":
+      return collectFields(p.patch ?? p, PLAN_FIELDS, "plan");
+    case "add_plan_task":
+    case "plans_add_task":
+      return collectFields(p.task ?? p, PLAN_TASK_FIELDS, "plan_task");
+    case "update_plan_task":
+      return collectFields(p.patch ?? p, PLAN_TASK_FIELDS, "plan_task");
+    case "apply_plan_tasks":
+    case "plans_apply_tasks":
+      return collectListHits(p.tasks, PLAN_TASK_FIELDS, "plan_task");
+    case "apply_plan_steps":
+      return collectListHits(p.steps, MISSION_STEP_FIELDS, "mission_step");
+    case "create_mission": {
+      const src = p.mission ?? p;
+      return [
+        ...collectFields(src, MISSION_FIELDS, "mission"),
+        ...collectListHits(src.steps, MISSION_STEP_FIELDS, "mission_step"),
+      ];
+    }
+    case "update_mission":
+      return collectFields(p.patch ?? p, MISSION_FIELDS, "mission");
+    case "add_mission_step":
+      return collectFields(p.step ?? p, MISSION_STEP_FIELDS, "mission_step");
+    case "update_mission_step":
+      return collectFields(p.patch ?? p, MISSION_STEP_FIELDS, "mission_step");
+    case "add_schedule":
+      return collectFields(p.schedule ?? p, SCHEDULE_FIELDS, "schedule");
+    case "update_schedule":
+      return collectFields(p.patch ?? p, SCHEDULE_FIELDS, "schedule");
     default:
       if (typeof kind === "string" && kind.startsWith("board_")) return collectBoardHits(p);
       return [];

@@ -6,7 +6,15 @@ import os from "node:os";
 import { chmodSync, chownSync, existsSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
 import type { DropTarget } from "./privileges.js";
 import { getUnixPeerPid, resolveAgentIdFromPid } from "./privileges.js";
-import { aadV2, COMMENT_FIELDS, E2EE_TABLE, GOAL_FIELDS, TASK_FIELDS } from "@the-dudes/protocol/e2ee-fields";
+import {
+  aadReadChain,
+  aadV2,
+  COMMENT_FIELDS,
+  E2EE_TABLE,
+  GOAL_FIELDS,
+  PLAN_FIELDS,
+  TASK_FIELDS,
+} from "@the-dudes/protocol/e2ee-fields";
 import { decryptForProject, encryptForProject, E2eeRequiredError, isE2eEncrypted, isE2eeRequired, rememberCredentialPlaintext } from "./daemon-crypto.js";
 
 /**
@@ -37,7 +45,10 @@ export type BridgeEncryptKind =
   | "tasks_update"
   | "tasks_comment_add"
   | "goals_add"
-  | "goals_update";
+  | "goals_update"
+  | "plans_create"
+  | "plans_add_task"
+  | "plans_apply_tasks";
 
 export function encryptBridgePayload(
   kind: BridgeEncryptKind,
@@ -106,6 +117,34 @@ export function encryptBridgePayload(
         ? json.patch
         : json) as Record<string, unknown>;
     cifraFields(obj, E2EE_TABLE.GOALS, GOAL_FIELDS);
+    return json;
+  }
+  // T-083 SEC-04: plans_* — title/description do plano (PLANS); drafts que
+  // viram board task: title→tasks.title, prompt→tasks.description (addTask).
+  const cifraPlanDraft = (t: Record<string, unknown>): void => {
+    if ("title" in t) t.title = cifra(t.title, E2EE_TABLE.TASKS, "title");
+    if ("prompt" in t) t.prompt = cifra(t.prompt, E2EE_TABLE.TASKS, "description");
+    else if ("description" in t) t.description = cifra(t.description, E2EE_TABLE.TASKS, "description");
+  };
+  if (kind === "plans_create") {
+    cifraFields(json, E2EE_TABLE.PLANS, PLAN_FIELDS);
+    if (Array.isArray(json.tasks)) {
+      for (const t of json.tasks) {
+        if (t && typeof t === "object") cifraPlanDraft(t as Record<string, unknown>);
+      }
+    }
+    return json;
+  }
+  if (kind === "plans_add_task") {
+    cifraPlanDraft(json);
+    return json;
+  }
+  if (kind === "plans_apply_tasks") {
+    if (Array.isArray(json.tasks)) {
+      for (const t of json.tasks) {
+        if (t && typeof t === "object") cifraPlanDraft(t as Record<string, unknown>);
+      }
+    }
     return json;
   }
   // board_* — T-024: content é alias de body (mcp-bridge já normaliza; se
@@ -358,7 +397,7 @@ export class BridgeRelay {
         if (projectId && !encryptOr409("board", projectId, body)) return;
       }
       const wm = parsed.pathname.match(
-        /^\/api\/bridge\/([^/]+)\/(tasks_add|tasks_update|tasks_comment_add|goals_add|goals_update)$/,
+        /^\/api\/bridge\/([^/]+)\/(tasks_add|tasks_update|tasks_comment_add|goals_add|goals_update|plans_create|plans_add_task|plans_apply_tasks)$/,
       );
       if (wm) {
         const projectId = this.agentProjectLookup(wm[1]);
@@ -406,7 +445,7 @@ export class BridgeRelay {
       // plaintext. Server stores ciphertext per project; daemon holds the
       // project key and rewrites the response body in place before handing
       // it to the MCP bridge child.
-      const m2 = parsed.pathname.match(/^\/api\/bridge\/([^/]+)\/(tasks_list|tasks_comment_list|goals_list|memory_list|plans_list|plans_get)$/);
+      const m2 = parsed.pathname.match(/^\/api\/bridge\/([^/]+)\/(tasks_list|tasks_comment_list|goals_list|memory_list|plans_list|plans_get|plans_create|plans_add_task|plans_apply_tasks)$/);
       if (m2 && this.agentProjectLookup && upstream.status === 200) {
         const agentId = m2[1];
         const op = m2[2];
@@ -416,14 +455,28 @@ export class BridgeRelay {
             const json = JSON.parse(buf.toString("utf8"));
             const dec = (s: unknown, table?: string, field?: string): unknown => {
               if (typeof s !== "string" || !isE2eEncrypted(s)) return s;
-              const aad = table && field ? aadV2({ projectId, table, field }) : undefined;
-              return decryptForProject(s, projectId, aad) ?? s;
+              if (!table || !field) return decryptForProject(s, projectId) ?? s;
+              // T-083: destino primeiro, depois no máx. UMA fonte canônica.
+              for (const aad of aadReadChain({ projectId, table, field })) {
+                const p = decryptForProject(s, projectId, aad);
+                if (p != null) return p;
+              }
+              return s;
             };
             const decryptPlanTasks = (tasks: any[]) => {
               for (const t of tasks) {
-                if (t.title) t.title = dec(t.title);
-                if (t.prompt) t.prompt = dec(t.prompt);
-                if (t.output) t.output = dec(t.output);
+                // Snapshot do board (T-083): title/prompt herdados de
+                // tasks.title / tasks.description. Fallback plan_tasks.*
+                // p/ update_plan_task.
+                if (t.title) {
+                  const a = dec(t.title, E2EE_TABLE.TASKS, "title");
+                  t.title = a !== t.title ? a : dec(t.title, E2EE_TABLE.PLAN_TASKS, "title");
+                }
+                if (t.prompt) {
+                  const a = dec(t.prompt, E2EE_TABLE.TASKS, "description");
+                  t.prompt = a !== t.prompt ? a : dec(t.prompt, E2EE_TABLE.PLAN_TASKS, "prompt");
+                }
+                if (t.output) t.output = dec(t.output, E2EE_TABLE.PLAN_TASKS, "output");
               }
             };
             if (op === "tasks_list" && Array.isArray(json.tasks)) {
@@ -449,13 +502,13 @@ export class BridgeRelay {
               }
             } else if (op === "plans_list" && Array.isArray(json.plans)) {
               for (const p of json.plans) {
-                if (p.title) p.title = dec(p.title);
-                if (p.description) p.description = dec(p.description);
+                if (p.title) p.title = dec(p.title, E2EE_TABLE.PLANS, "title");
+                if (p.description) p.description = dec(p.description, E2EE_TABLE.PLANS, "description");
                 if (Array.isArray(p.tasks)) decryptPlanTasks(p.tasks);
               }
-            } else if (op === "plans_get" && json.plan) {
-              if (json.plan.title) json.plan.title = dec(json.plan.title);
-              if (json.plan.description) json.plan.description = dec(json.plan.description);
+            } else if ((op === "plans_get" || op === "plans_create" || op === "plans_add_task" || op === "plans_apply_tasks") && json.plan) {
+              if (json.plan.title) json.plan.title = dec(json.plan.title, E2EE_TABLE.PLANS, "title");
+              if (json.plan.description) json.plan.description = dec(json.plan.description, E2EE_TABLE.PLANS, "description");
               if (Array.isArray(json.plan.tasks)) decryptPlanTasks(json.plan.tasks);
             }
             buf = Buffer.from(JSON.stringify(json), "utf8");
