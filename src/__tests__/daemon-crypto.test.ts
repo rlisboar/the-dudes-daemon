@@ -11,6 +11,7 @@ process.env.THE_DUDES_PROJECT_KEYS_PATH = path.join(os.tmpdir(), `td-test-pkeys-
 const {
   getDaemonPublicKey, rememberProjectKey, getProjectKey, forgetProjectKey, hasProjectKey,
   encryptForProject, decryptForProject, isE2eEncrypted,
+  encryptBytesForProject, decryptBytesForProject,
   countOldProjectKeys,
   rememberCredentialPlaintext, redactCredentials, redactCredentialsDeep,
 } = await import("../daemon-crypto.js");
@@ -102,6 +103,22 @@ test("T-062: e2e: legado abre; v2 AAD errado falha; e2e:v1: fail-closed", async 
   assert.equal(decryptForProject(v2, "proj-aad"), null, "v2 sem AAD fail-closed");
   assert.equal(decryptForProject("e2e:v1:AAAA", "proj-aad"), null);
   forgetProjectKey("proj-aad");
+});
+
+test("T-103 bytes: cifra→decifra idênticos; AAD errado null; legado passa", async () => {
+  const { aadV2, E2EE_TABLE, MESSAGE_IMAGE_FIELD } = await import("@the-dudes/protocol/e2ee-fields");
+  provisionKey("proj-bytes");
+  const aad = aadV2({ projectId: "proj-bytes", table: E2EE_TABLE.MESSAGES, field: MESSAGE_IMAGE_FIELD });
+  const aadBad = aadV2({ projectId: "proj-bytes", table: E2EE_TABLE.MESSAGES, field: "content" });
+  const raw = Buffer.from([0x00, 0xff, 0x89, 0x50, 0x4e, 0x47, 1, 2, 3]);
+  const blob = encryptBytesForProject(raw, "proj-bytes", aad)!;
+  assert.ok(blob.startsWith("e2e:v2:"));
+  assert.deepEqual(decryptBytesForProject(blob, "proj-bytes", aad), raw);
+  assert.equal(decryptBytesForProject(blob, "proj-bytes", aadBad), null);
+  assert.equal(decryptBytesForProject(blob, "proj-bytes"), null);
+  const legado = raw.toString("base64");
+  assert.deepEqual(decryptBytesForProject(legado, "proj-bytes", aad), raw);
+  forgetProjectKey("proj-bytes");
 });
 
 test("isE2eEncrypted", () => {

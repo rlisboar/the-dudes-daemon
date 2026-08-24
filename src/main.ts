@@ -6,7 +6,8 @@ import {
   flushOutboundQueue,
   trySendOutbound,
 } from "./runners/outbound-delivery.js";
-import { checkAndApplyUpdate } from "./self-update.js";
+import { captureBootBinaryHash, checkAndApplyUpdate, runningReleaseInfo } from "./self-update.js";
+import { DAEMON_BUILD_TS } from "./daemon-build-ts.js";
 import { createSelfUpdateGate } from "./self-update-gate.js";
 import { createDeliveryDeduper } from "./inbound-dedup.js";
 import {
@@ -22,10 +23,9 @@ import { parseArgs } from "node:util";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { createHash } from "node:crypto";
 import { WebSocket } from "ws";
 import { MAX_DAEMON_WIRE_MESSAGE_BYTES, WireMessageTooLargeError, parseWireMessage } from "@the-dudes/protocol";
-import { AgentHost } from "./agent-host.js";
+import { AgentHost, agentErrorKind, sealAgentErrorMessage } from "./agent-host.js";
 import { assertWorkspaceScoped, autoWorkspaceCwd, describeGitRoots, ensureWritableDir, expandBasePath, isInsideRoot, validateBasePath, validateGitHash, validateGitRef } from "./workspace.js";
 import { buildGraph, graphMtime, graphPath, hasSemanticMarker, loadGraphJsonForUi, needsSemanticUpdate } from "./graph-indexer.js";
 import { ensureGraphWatch, stopAllGraphWatches } from "./graph-watcher.js";
@@ -35,7 +35,7 @@ import { defaultDaemonConfigPath, formatCliStatus, loadDaemonCliConfig, mergeCli
 import type { FromDaemon, FromOrch } from "./protocol.js";
 import { runSummarizer } from "./summarizer-runner.js";
 import { aadV2, E2EE_TABLE } from "@the-dudes/protocol/e2ee-fields";
-import { decryptForProject, encryptForProject, countUsableProjectKeys, forgetAllProjectKeys, getDaemonPublicKey, hasProjectKey, isE2eEncrypted, isE2eeRequired, rememberProjectKey, setE2eeRequired } from "./daemon-crypto.js";
+import { decryptForProject, decryptImageAttachments, encryptForProject, countUsableProjectKeys, forgetAllProjectKeys, getDaemonPublicKey, hasProjectKey, isE2eEncrypted, isE2eeRequired, rememberProjectKey, setE2eeRequired } from "./daemon-crypto.js";
 import { dispatchWebhook } from "./webhook-dispatch.js";
 import { ModelDiscovery } from "./model-discovery.js";
 import { parseGitPorcelain } from "./git-status.js";
@@ -45,10 +45,9 @@ import { applyMemoryCharBudget } from "./memory-utils.js";
 // modo dev (tsx direto, sem define).
 const VERSION = process.env.DAEMON_PKG_VERSION ?? "0.0.0-dev";
 
-function runningBinaryHash(): string | undefined {
-  try { return createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"); }
-  catch { return undefined; }
-}
+// T-088: hash da imagem CARREGADA. Nunca re-ler argv[1] depois — o arquivo
+// no disco muda no self-update; o processo segue na imagem antiga até re-exec.
+const BOOT_BINARY_HASH = captureBootBinaryHash(process.argv[1] ?? "");
 
 interface Args {
   orch: string;
@@ -371,7 +370,7 @@ class DaemonClient {
         hostname: os.hostname(),
         version: VERSION,
         protocolVersion: WIRE_PROTOCOL_VERSION,
-        binaryHash: runningBinaryHash(),
+        ...runningReleaseInfo(),
         cryptoPublicKey,
         // Resume: server reenvia msgs com seq > lastSeenSeq do buffer
         // persistente per-tokenId. 0/ausente = primeira conn / buffer
@@ -581,7 +580,11 @@ class DaemonClient {
           const skillsIdxFull = typeof rawSpFull === "string" ? rawSpFull.indexOf(skillsMark) : -1;
           const e2eOnly = skillsIdxFull >= 0 ? rawSpFull.slice(0, skillsIdxFull) : rawSpFull;
           const skillsTailFromServer = skillsIdxFull >= 0 ? rawSpFull.slice(skillsIdxFull) : "";
-          const dec = decryptForProject(e2eOnly, msg.projectId);
+          const dec = decryptForProject(
+            e2eOnly,
+            msg.projectId,
+            aadV2({ projectId: msg.projectId, table: E2EE_TABLE.AGENTS, field: "system_prompt" }),
+          );
           if (dec !== null) {
             this.spawnKeyWaited.delete(spec.agent.id);
             spec.agent = { ...spec.agent, systemPrompt: dec + skillsTailFromServer };
@@ -617,11 +620,13 @@ class DaemonClient {
               : "project key não chegou ao daemon a tempo";
             // Cipher não decripta; tail de skills (se o server appendou) sobrevive.
             log("error", `agent ${spec.agent.id}: systemPrompt E2EE falhou (${why}) — spawn com role-only + sem resume${skillsTailFromServer ? " + skills plaintext" : ""}; re-salve o system prompt no browser`);
-            this.send({
-              type: "agent:error",
-              agentId: spec.agent.id,
-              message: `systemPrompt E2EE não decripta (${why}). Agente sobe com role-only (sessão limpa) — abra o projeto no browser e re-salve o system prompt do agente.`,
-            });
+            {
+              const plain = `systemPrompt E2EE não decripta (${why}). Agente sobe com role-only (sessão limpa) — abra o projeto no browser e re-salve o system prompt do agente.`;
+              const sealed = sealAgentErrorMessage(msg.projectId, plain);
+              if (sealed) {
+                this.send({ type: "agent:error", agentId: spec.agent.id, message: sealed, errorKind: agentErrorKind(plain) });
+              } else log("error", `agent:error recusado: e2ee-required sem chave project=${msg.projectId}`);
+            }
             // Notifica orch pra zerar session_id no DB (evita re-resume no próximo auto-spawn).
             this.send({ type: "agent:session", agentId: spec.agent.id, sessionId: "" });
             spec.agent = {
@@ -687,11 +692,11 @@ class DaemonClient {
         let content: string;
         const dropMissingKey = () => {
           log("warn", `agent:send to ${msg.agentId} encrypted but project key not held — dropping`);
-          this.send({
-            type: "agent:error",
-            agentId: msg.agentId,
-            message: "daemon sem chave do projeto — recarregue a página ou reinicie o daemon",
-          });
+          const plain = "daemon sem chave do projeto — recarregue a página ou reinicie o daemon";
+          const sealed = sealAgentErrorMessage(msg.projectId, plain);
+          if (sealed) {
+            this.send({ type: "agent:error", agentId: msg.agentId, message: sealed, errorKind: agentErrorKind(plain) });
+          } else log("error", `agent:error recusado: e2ee-required sem chave project=${msg.projectId}`);
         };
         if (msg.parts && msg.parts.length > 0) {
           const out: string[] = [];
@@ -714,8 +719,10 @@ class DaemonClient {
           if (msg.systemPrefix) content = msg.systemPrefix + content;
           if (msg.systemSuffix) content = content + msg.systemSuffix;
         }
+        const images = decryptImageAttachments(msg.images, msg.projectId);
+        if (images === null) { dropMissingKey(); return; }
         if (msg.telegram !== undefined) this.host.setTelegramMirror(msg.agentId, msg.telegram);
-        this.host.send_message(msg.agentId, content, msg.images, msg.deliveryId);
+        this.host.send_message(msg.agentId, content, images, msg.deliveryId);
         return;
       }
       case "agent:clear":
@@ -1255,7 +1262,11 @@ class DaemonClient {
     }
     let plainText = msg.text;
     if (msg.projectId && isE2eEncrypted(plainText)) {
-      const dec = decryptForProject(plainText, msg.projectId);
+      const dec = decryptForProject(
+        plainText,
+        msg.projectId,
+        aadV2({ projectId: msg.projectId, table: E2EE_TABLE.SUMMARIZE, field: "text" }),
+      );
       if (dec === null) {
         this.send({ type: "summarize:result", correlationId: msg.correlationId, ok: false, error: "project key not held by daemon" });
         return;
@@ -1959,9 +1970,18 @@ class DaemonClient {
     run: () => checkAndApplyUpdate({
       orchBase: this.orchUrl,
       selfPath: process.argv[1] ?? "",
-      runningHash: runningBinaryHash(),
+      runningHash: BOOT_BINARY_HASH,
+      runningBuildTs: DAEMON_BUILD_TS,
       log,
       underLauncher: process.env.THE_DUDES_LAUNCHER === "1",
+      // T-088: idle = turn-gate vazio (main+bg). Agentes spawned sem turno
+      // não bloqueiam; turnos/fila sim (restart derruba sessões).
+      isIdle: () => {
+        const t = turnGateStats();
+        return t.ativos === 0 && t.fila === 0 && t.bg.ativos === 0 && t.bg.fila === 0;
+      },
+      // T-100: idle-restart mata CLIs (detached:true) ANTES do exit 42.
+      prepareReexec: () => this.prepareReexec(),
     }),
     log: (level, msg) => log(level, msg),
   });
@@ -1990,7 +2010,7 @@ class DaemonClient {
         agentsRunning: this.host.agentCount(),
         e2eeProjects: countUsableProjectKeys(),
       });
-      this.send({ type: "daemon:health", health });
+      this.send({ type: "daemon:health", health: { ...health, ...runningReleaseInfo() } });
     } catch (e) {
       log("warn", `sendHealth falhou: ${(e as Error).message}`);
     }
@@ -2001,6 +2021,16 @@ class DaemonClient {
   }
 
   private shuttingDown = false;
+
+  /** T-100: só os filhos/CLIs — NÃO process.exit. O caller decide 0 vs 42. */
+  private async prepareReexec(): Promise<void> {
+    log("info", "[self-update] parando CLIs filhos antes do re-exec");
+    try { stopAllGraphWatches(); } catch { /* noop */ }
+    this.host.shutdown();
+    // terminateWithEscalation agenda SIGKILL em ~1.5s; espera o timer.
+    await new Promise((r) => setTimeout(r, 2_500));
+  }
+
   private async shutdown() {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
@@ -2010,8 +2040,7 @@ class DaemonClient {
     // relay.stop()/forgetAllProjectKeys() viraria unhandled rejection e pularia
     // o process.exit(0). O finally garante que o daemon sempre encerra.
     try {
-      try { stopAllGraphWatches(); } catch { /* noop */ }
-      this.host.shutdown();
+      await this.prepareReexec();
       if (this.relay) this.relay.stop();
       this.stopPing();
       this.stopHeartbeat();
@@ -2021,10 +2050,6 @@ class DaemonClient {
       try { this.ws?.close(1000, "shutdown"); } catch {}
       // Remove o marker de liveness pra não bloquear o sweep do próximo boot.
       try { fs.rmSync(path.join(os.tmpdir(), "the-dudes", `.daemon-${process.pid}.alive`), { force: true }); } catch {}
-      // Espera o SIGTERM→SIGKILL dos CLIs filhos escalar (terminateWithEscalation
-      // agenda o SIGKILL em ~1.5s). Antes, process.exit(0) síncrono matava esse
-      // timer e os filhos detached sobreviviam órfãos entre restarts.
-      await new Promise((r) => setTimeout(r, 2_500));
     } finally {
       process.exit(0);
     }

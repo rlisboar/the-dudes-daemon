@@ -977,6 +977,10 @@ export interface DaemonInfo {
   hostname: string;
   version: string;
   binaryHash?: string;
+  /** Epoch DAEMON_BUILD_TS da imagem carregada (T-088/T-095). */
+  buildTs?: number;
+  /** true após swap do arquivo, até re-exec (T-088/T-095). */
+  updatePending?: boolean;
   updateAvailable?: boolean;
   /** Versão do protocolo de fio declarada no hello (ausente = daemon antigo). */
   protocolVersion?: number;
@@ -1013,6 +1017,10 @@ export interface DaemonHealth {
   byRunner: Record<string, { started: number; ok: number; failed: number; hardRecovers: number; hangs: number }>;
   agentsRunning: number;
   e2eeProjects: number;
+  /** T-088: identidade da imagem em execução (mesmo contrato do hello). */
+  binaryHash?: string;
+  buildTs?: number;
+  updatePending?: boolean;
 }
 
 export interface DaemonLogLine {

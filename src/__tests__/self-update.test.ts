@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import { afterEach, test } from "node:test";
 import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
@@ -11,7 +11,11 @@ import {
   verify as edVerify,
 } from "node:crypto";
 import {
+  _resetIdleRestartForTest,
+  captureBootBinaryHash,
   checkAndApplyUpdate,
+  extractBuildTs,
+  runningReleaseInfo,
   signatureAccepted,
   verifyBundle,
   TRUSTED_SIGN_PUBS,
@@ -28,6 +32,51 @@ import {
  */
 
 const log = () => {};
+
+afterEach(() => { _resetIdleRestartForTest(); });
+
+function signBundle(body: string, privateKey: ReturnType<typeof generateKeyPairSync>["privateKey"]) {
+  const bundle = Buffer.from(body);
+  return {
+    bundle,
+    sha: createHash("sha256").update(bundle).digest("hex"),
+    sig: edSign(null, bundle, privateKey).toString("base64"),
+  };
+}
+
+function fetchMap(map: Record<string, Buffer>): typeof fetch {
+  return (async (url: string) => {
+    const k = Object.keys(map).find((p) => String(url).endsWith(p));
+    if (!k) throw new Error(`sem fixture pra ${url}`);
+    return { ok: true, arrayBuffer: async () => map[k]! };
+  }) as unknown as typeof fetch;
+}
+
+function signedInstall(
+  daemonBody: string,
+  bridgeBody: string,
+): { pubs: string[]; fetchFn: typeof fetch; daemonSha: string } {
+  const pair = generateKeyPairSync("ed25519");
+  const pubs = [pair.publicKey.export({ type: "spki", format: "pem" }) as string];
+  const d = signBundle(daemonBody, pair.privateKey);
+  const b = signBundle(bridgeBody, pair.privateKey);
+  return {
+    pubs,
+    daemonSha: d.sha,
+    fetchFn: fetchMap({
+      "/install/daemon.cjs.sha256": Buffer.from(`${d.sha}  daemon.cjs\n`),
+      "/install/daemon.cjs": d.bundle,
+      "/install/daemon.cjs.sig": Buffer.from(d.sig),
+      "/install/mcp-bridge.cjs.sha256": Buffer.from(`${b.sha}  mcp-bridge.cjs\n`),
+      "/install/mcp-bridge.cjs": b.bundle,
+      "/install/mcp-bridge.cjs.sig": Buffer.from(b.sig),
+    }),
+  };
+}
+
+function daemonSrc(ts: number): string {
+  return `#!/usr/bin/env node\nconst DAEMON_BUILD_TS = Number("${ts}");\n`;
+}
 
 test("hash publicado igual ao rodando → nada a fazer", async () => {
   const fetchFn = (async (_url: string) => ({
@@ -176,4 +225,238 @@ test("antiga chave (se presente no host) é REJEITADA no trust N+3", (t) => {
   const sha = createHash("sha256").update(bundle).digest("hex");
   assert.equal(signatureAccepted(bundle, sig), false, "antiga NÃO deve ser aceita pós N+3");
   assert.throws(() => verifyBundle(bundle, sig, sha), /assinatura/);
+});
+
+test("extractBuildTs lê Number(\"epoch\") do bundle", () => {
+  assert.equal(extractBuildTs(Buffer.from('const DAEMON_BUILD_TS = Number("1700000000000");')), 1_700_000_000_000);
+  assert.equal(extractBuildTs(Buffer.from("sem marcador")), null);
+});
+
+test("T-088 idle + update aplicado -> re-exec (exit 42, arquivo novo)", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "sup-idle-"));
+  const selfPath = path.join(dir, "daemon.cjs");
+  writeFileSync(selfPath, "ANTIGO");
+  const inst = signedInstall(daemonSrc(2_000_000_000_000), "bridge");
+  let exitCode: number | null = null;
+  const r = await checkAndApplyUpdate({
+    orchBase: "http://x", selfPath,
+    runningHash: "b".repeat(64),
+    runningBuildTs: 1_000_000_000_000,
+    log, underLauncher: true,
+    fetchFn: inst.fetchFn, trustedPubs: inst.pubs,
+    isIdle: () => true,
+    exitFn: (c) => { exitCode = c; },
+  });
+  assert.equal(r, "updated");
+  assert.equal(exitCode, 42);
+  assert.match(readFileSync(selfPath, "utf8"), /2000000000000/);
+});
+
+test("T-088 ocupado -> não reinicia, pending, reinicia ao esvaziar", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "sup-busy-"));
+  const selfPath = path.join(dir, "daemon.cjs");
+  writeFileSync(selfPath, "ANTIGO");
+  const inst = signedInstall(daemonSrc(2_000_000_000_000), "bridge");
+  let idle = false;
+  const ticks: Array<() => void> = [];
+  let exitCode: number | null = null;
+  const logs: string[] = [];
+  const r = await checkAndApplyUpdate({
+    orchBase: "http://x", selfPath,
+    runningHash: "b".repeat(64),
+    runningBuildTs: 1_000_000_000_000,
+    log: (_l, m) => { logs.push(m); },
+    underLauncher: true,
+    fetchFn: inst.fetchFn, trustedPubs: inst.pubs,
+    isIdle: () => idle,
+    idleRecheckMs: 5,
+    setTimeoutFn: (fn) => { ticks.push(fn); return 0; },
+    exitFn: (c) => { exitCode = c; },
+  });
+  assert.equal(r, "updated-awaiting-idle");
+  assert.equal(exitCode, null, "não pode exit enquanto ocupado");
+  assert.equal(runningReleaseInfo().updatePending, true);
+  assert.ok(logs.some((m) => m.includes("update aplicado, aguardando idle")));
+  assert.match(readFileSync(selfPath, "utf8"), /2000000000000/, "arquivo já trocado");
+  assert.equal(ticks.length, 1);
+  ticks[0]!();
+  assert.equal(exitCode, null, "ainda ocupado no recheck");
+  idle = true;
+  ticks[1]!();
+  assert.equal(exitCode, 42);
+});
+
+test("T-088 bundle VÁLIDO com BUILD_TS antigo -> recusado + log; arquivo intacto", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "sup-oldts-"));
+  const selfPath = path.join(dir, "daemon.cjs");
+  writeFileSync(selfPath, "ANTIGO");
+  const inst = signedInstall(daemonSrc(1_000_000_000_000), "bridge");
+  const logs: string[] = [];
+  const r = await checkAndApplyUpdate({
+    orchBase: "http://x", selfPath,
+    runningHash: "b".repeat(64),
+    runningBuildTs: 2_000_000_000_000,
+    log: (_l, m) => { logs.push(m); },
+    underLauncher: true,
+    fetchFn: inst.fetchFn, trustedPubs: inst.pubs,
+    exitFn: () => { throw new Error("não deveria sair"); },
+  });
+  assert.equal(r, "failed");
+  assert.equal(readFileSync(selfPath, "utf8"), "ANTIGO");
+  assert.ok(logs.some((m) => /BUILD_TS recusado/.test(m)), logs.join("\n"));
+});
+
+test("T-088 pós-update sem restart: hello reporta hash/BUILD_TS velhos + updatePending; re-exec limpa", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "sup-boot-"));
+  const selfPath = path.join(dir, "daemon.cjs");
+  const oldBody = "BINARIO-VELHO-BOOT";
+  writeFileSync(selfPath, oldBody);
+  const bootHash = captureBootBinaryHash(selfPath);
+  const bootTs = runningReleaseInfo().buildTs;
+  assert.equal(bootHash, createHash("sha256").update(oldBody).digest("hex"));
+  assert.equal(runningReleaseInfo().updatePending, false);
+
+  const inst = signedInstall(daemonSrc(2_000_000_000_000), "bridge");
+  const r = await checkAndApplyUpdate({
+    orchBase: "http://x", selfPath,
+    runningHash: bootHash,
+    runningBuildTs: 1_000_000_000_000,
+    log, underLauncher: true,
+    fetchFn: inst.fetchFn, trustedPubs: inst.pubs,
+    isIdle: () => false,
+    idleRecheckMs: 60_000,
+    setTimeoutFn: () => 0,
+    exitFn: () => { throw new Error("não deveria re-exec enquanto ocupado"); },
+  });
+  assert.equal(r, "updated-awaiting-idle");
+  const hello = runningReleaseInfo();
+  assert.equal(hello.binaryHash, bootHash, "hello não pode re-ler o arquivo novo");
+  assert.equal(hello.buildTs, bootTs, "BUILD_TS é da imagem carregada, não do arquivo");
+  assert.equal(hello.updatePending, true);
+  const fileBuf = readFileSync(selfPath);
+  const fileHash = createHash("sha256").update(fileBuf).digest("hex");
+  assert.notEqual(fileHash, bootHash);
+  assert.equal(extractBuildTs(fileBuf), 2_000_000_000_000);
+
+  // Segundo check: já aplicado — não re-baixa; hello segue mentindo se re-lesse o arquivo
+  const r2 = await checkAndApplyUpdate({
+    orchBase: "http://x", selfPath,
+    runningHash: bootHash,
+    runningBuildTs: 1_000_000_000_000,
+    log, underLauncher: true,
+    fetchFn: inst.fetchFn, trustedPubs: inst.pubs,
+    isIdle: () => false,
+    idleRecheckMs: 60_000,
+    setTimeoutFn: () => 0,
+    exitFn: () => { throw new Error("não deveria re-exec"); },
+  });
+  assert.equal(r2, "updated-awaiting-idle");
+  assert.equal(runningReleaseInfo().binaryHash, bootHash);
+  assert.equal(runningReleaseInfo().updatePending, true);
+
+  // Simula re-exec: processo novo captura o arquivo novo, pending=false
+  _resetIdleRestartForTest();
+  const after = captureBootBinaryHash(selfPath);
+  assert.equal(after, fileHash);
+  assert.equal(runningReleaseInfo().updatePending, false);
+  assert.equal(runningReleaseInfo().binaryHash, fileHash);
+});
+
+test("T-088 bundle BUILD_TS novo -> aceito", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "sup-newts-"));
+  const selfPath = path.join(dir, "daemon.cjs");
+  writeFileSync(selfPath, "ANTIGO");
+  const inst = signedInstall(daemonSrc(2_000_000_000_000), "bridge");
+  let exitCode: number | null = null;
+  const r = await checkAndApplyUpdate({
+    orchBase: "http://x", selfPath,
+    runningHash: "b".repeat(64),
+    runningBuildTs: 1_500_000_000_000,
+    log, underLauncher: true,
+    fetchFn: inst.fetchFn, trustedPubs: inst.pubs,
+    isIdle: () => true,
+    exitFn: (c) => { exitCode = c; },
+  });
+  assert.equal(r, "updated");
+  assert.equal(exitCode, 42);
+  assert.match(readFileSync(selfPath, "utf8"), /2000000000000/);
+});
+
+test("T-100 idle-restart: filhos terminam ANTES do exit 42", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "sup-t100-order-"));
+  const selfPath = path.join(dir, "daemon.cjs");
+  writeFileSync(selfPath, "ANTIGO");
+  const inst = signedInstall(daemonSrc(2_000_000_000_000), "bridge");
+  const order: string[] = [];
+  let exitCode: number | null = null;
+  const r = await checkAndApplyUpdate({
+    orchBase: "http://x", selfPath,
+    runningHash: "b".repeat(64),
+    runningBuildTs: 1_000_000_000_000,
+    log, underLauncher: true,
+    fetchFn: inst.fetchFn, trustedPubs: inst.pubs,
+    isIdle: () => true,
+    prepareReexec: async () => { order.push("kill-children"); },
+    exitFn: (c) => { order.push(`exit-${c}`); exitCode = c; },
+  });
+  assert.equal(r, "updated");
+  assert.equal(exitCode, 42);
+  assert.deepEqual(order, ["kill-children", "exit-42"]);
+});
+
+test("T-100 filho que não morre no prazo: escalation e exit mesmo assim", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "sup-t100-hang-"));
+  const selfPath = path.join(dir, "daemon.cjs");
+  writeFileSync(selfPath, "ANTIGO");
+  const inst = signedInstall(daemonSrc(2_000_000_000_000), "bridge");
+  const logs: string[] = [];
+  let exitCode: number | null = null;
+  const t0 = Date.now();
+  const r = await checkAndApplyUpdate({
+    orchBase: "http://x", selfPath,
+    runningHash: "b".repeat(64),
+    runningBuildTs: 1_000_000_000_000,
+    log: (_l, m) => { logs.push(m); },
+    underLauncher: true,
+    fetchFn: inst.fetchFn, trustedPubs: inst.pubs,
+    isIdle: () => true,
+    prepareReexec: () => new Promise(() => { /* filho zumbi — nunca resolve */ }),
+    reexecTimeoutMs: 40,
+    exitFn: (c) => { exitCode = c; },
+  });
+  const elapsed = Date.now() - t0;
+  assert.equal(r, "updated");
+  assert.equal(exitCode, 42);
+  assert.ok(elapsed < 2_000, `travou o restart (${elapsed}ms)`);
+  assert.ok(logs.some((m) => /estourou 40ms/.test(m)), logs.join("\n"));
+});
+
+test("T-100 sem launcher: pending, sem exit, sem matar filhos", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "sup-t100-nolaunch-"));
+  const selfPath = path.join(dir, "daemon.cjs");
+  writeFileSync(selfPath, "ANTIGO");
+  const inst = signedInstall(daemonSrc(2_000_000_000_000), "bridge");
+  let killed = false;
+  let exitCode: number | null = null;
+  const r = await checkAndApplyUpdate({
+    orchBase: "http://x", selfPath,
+    runningHash: "b".repeat(64),
+    runningBuildTs: 1_000_000_000_000,
+    log, underLauncher: false,
+    fetchFn: inst.fetchFn, trustedPubs: inst.pubs,
+    isIdle: () => true,
+    prepareReexec: () => { killed = true; },
+    exitFn: (c) => { exitCode = c; },
+  });
+  assert.equal(r, "updated-restart-pending");
+  assert.equal(exitCode, null);
+  assert.equal(killed, false);
+  assert.equal(runningReleaseInfo().updatePending, true);
+});
+
+test("T-100 main.ts injeta prepareReexec no checkAndApplyUpdate", () => {
+  const src = readFileSync(new URL("../main.ts", import.meta.url), "utf8");
+  assert.match(src, /prepareReexec:\s*\(\)\s*=>\s*this\.prepareReexec\(\)/);
+  assert.match(src, /parando CLIs filhos antes do re-exec/);
+  assert.doesNotMatch(src, /process\.exit\(42\)/);
 });

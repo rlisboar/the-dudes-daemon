@@ -24,6 +24,11 @@ export const BOARD_ANNOTATION_FIELDS = ["label"];
 
 /** Mensagem de agente (send no relay ↔ log/decryptForProject no web). */
 export const MESSAGE_FIELDS = ["content"];
+/**
+ * Anexo de mensagem (T-103). AAD: table=messages field=images, por anexo.
+ * Cifra BYTES crus do base64 (não o ASCII). mimeType e name SEMPRE claros.
+ */
+export const MESSAGE_IMAGE_FIELD = "images";
 
 /** Memória (memory_add: title/body viram titleCipher/bodyCipher). */
 export const MEMORY_PLAIN_TO_CIPHER = { title: "titleCipher", body: "bodyCipher" };
@@ -56,6 +61,13 @@ export const MISSION_STEP_FIELDS = ["title", "prompt"];
 /** Schedule (add_schedule). title + prompt (não há payload). */
 export const SCHEDULE_FIELDS = ["title", "prompt"];
 
+/** T-094: agents.system_prompt (JS: spec.systemPrompt). AAD field=system_prompt. */
+export const AGENT_FIELDS = ["system_prompt"];
+/** T-094: credentials.value. */
+export const CREDENTIAL_FIELDS = ["value"];
+/** T-094: summarize:request.text (RPC efêmero, NÃO tts_summaries). */
+export const SUMMARIZE_FIELDS = ["text"];
+
 /**
  * Tabelas lógicas do AAD (T-062). Sem recordId — IDs são gerados no server
  * depois da cifra. Fecha cross-table/cross-field; não fecha cópia intra-campo.
@@ -73,6 +85,9 @@ export const E2EE_TABLE = Object.freeze({
   MISSIONS: "missions",
   MISSION_STEPS: "mission_steps",
   SCHEDULES: "schedules",
+  AGENTS: "agents",
+  CREDENTIALS: "credentials",
+  SUMMARIZE: "summarize",
 });
 
 /**
@@ -176,6 +191,17 @@ function collectMemoryHits(mem) {
   return hits;
 }
 
+/** base64 do anexo em claro (sem e2e:) — mimeType/name nunca entram. */
+function collectImageHits(images) {
+  if (!Array.isArray(images)) return [];
+  for (const img of images) {
+    if (img && typeof img === "object" && isPlainCatalogText(img.base64)) {
+      return ["message.images"];
+    }
+  }
+  return [];
+}
+
 function collectListHits(list, fields, prefix) {
   const hits = [];
   if (!Array.isArray(list)) return hits;
@@ -215,6 +241,7 @@ export function catalogPlainHits(kind, payload) {
       const hits = [];
       if (isPlainCatalogText(p.content) || isPlainCatalogText(p.text)) hits.push("message.content");
       if (p.msg) hits.push(...collectFields(p.msg, MESSAGE_FIELDS, "message"));
+      hits.push(...collectImageHits(p.images ?? p.msg?.images));
       return hits;
     }
     case "save_tts_summary": {
@@ -271,6 +298,19 @@ export function catalogPlainHits(kind, payload) {
       return collectFields(p.schedule ?? p, SCHEDULE_FIELDS, "schedule");
     case "update_schedule":
       return collectFields(p.patch ?? p, SCHEDULE_FIELDS, "schedule");
+    case "save_agent":
+    case "spawn": {
+      const spec = p.spec ?? p.agent ?? p;
+      const hits = [];
+      if (isPlainCatalogText(spec.systemPrompt) || isPlainCatalogText(spec.system_prompt)) {
+        hits.push("agent.system_prompt");
+      }
+      return hits;
+    }
+    case "add_credential":
+      return collectFields(p.credential ?? p, CREDENTIAL_FIELDS, "credential");
+    case "summarize":
+      return isPlainCatalogText(p.text) ? ["summarize.text"] : [];
     default:
       if (typeof kind === "string" && kind.startsWith("board_")) return collectBoardHits(p);
       return [];

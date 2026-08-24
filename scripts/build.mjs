@@ -29,11 +29,16 @@ const root = resolve(__dirname, "..");
 const dsn = process.env.SENTRY_DSN_DAEMON_BUILD || "";
 const buildSha = process.env.BUILD_SHA || "";
 const env = process.env.SENTRY_ENV || process.env.NODE_ENV || "production";
+// T-088: epoch DENTRO do bundle assinado (anti-rollback). Sempre carimbado
+// (Date.now), override via DAEMON_BUILD_TS. Quebra bit-a-bit reproduzível
+// de propósito — dois builds no mesmo SHA de git não são a mesma release.
+const buildTs = process.env.DAEMON_BUILD_TS || String(Date.now());
 
 const repro = !dsn && !buildSha;
 console.log(`[build] sentry dsn: ${dsn ? "embedded (opt-in, NÃO reproduzível)" : "(absent — telemetry off)"}`);
 console.log(`[build] build sha:  ${buildSha || "(none)"}`);
-console.log(`[build] reproducible: ${repro ? "yes (default distribuível)" : "no (DSN/SHA embutidos)"}`);
+console.log(`[build] build ts:   ${buildTs}`);
+console.log(`[build] reproducible: ${repro ? "yes (DSN/SHA ausentes; BUILD_TS único por build)" : "no (DSN/SHA embutidos)"}`);
 
 // Versão do package embutida (reproduzível: mesma árvore → mesma versão).
 // Era "0.1.0" hardcoded no main.ts, morto há meses — o painel de monitoramento
@@ -48,6 +53,7 @@ const common = {
   define: {
     "process.env.SENTRY_DSN_DAEMON_DEFAULT": JSON.stringify(dsn),
     "process.env.BUILD_SHA": JSON.stringify(buildSha),
+    "process.env.DAEMON_BUILD_TS": JSON.stringify(buildTs),
     "process.env.SENTRY_ENV_DEFAULT": JSON.stringify(env),
     "process.env.DAEMON_PKG_VERSION": JSON.stringify(pkgVersion),
   },

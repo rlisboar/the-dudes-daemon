@@ -15,6 +15,9 @@
 import {
   E2E_PREFIX,
   E2E_V2_PREFIX,
+  E2EE_TABLE,
+  MESSAGE_IMAGE_FIELD,
+  aadV2,
   isE2eV1Rejected,
   isE2eV2,
 } from "@the-dudes/protocol/e2ee-fields";
@@ -543,4 +546,120 @@ export function hasProjectKey(projectId: string): boolean {
 
 export function isE2eEncrypted(value: string | null | undefined): boolean {
   return typeof value === "string" && value.startsWith(E2E_PREFIX);
+}
+
+/* ---------- T-103: AES-GCM de BYTES (anexos). Wire = e2e:v2: + base64(iv+ct+tag).
+ *  Plaintext = bytes crus (não o ASCII do base64). Leitura re-encoda base64
+ *  pro CLI/UI. Sem prefixo e2e: = legado claro, pass-through. ---------- */
+
+function encryptBytesWithRawKey(plain: Buffer, key: Buffer, aad?: string): string | null {
+  if (key.length !== 32) return null;
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  if (aad != null) cipher.setAAD(Buffer.from(aad, "utf8"));
+  const ct = Buffer.concat([cipher.update(plain), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  const prefix = aad != null ? E2E_V2_PREFIX : E2E_PREFIX;
+  return prefix + Buffer.concat([iv, ct, tag]).toString("base64");
+}
+
+function decryptBytesWithRawKey(stored: string, key: Buffer, aad?: string): Buffer | null {
+  if (isE2eV1Rejected(stored)) return null;
+  if (key.length !== 32) return null;
+  try {
+    if (isE2eV2(stored)) {
+      if (aad == null || aad === "") return null;
+      const all = Buffer.from(stored.slice(E2E_V2_PREFIX.length), "base64");
+      if (all.length < 12 + 16) return null;
+      const iv = all.subarray(0, 12);
+      const tag = all.subarray(all.length - 16);
+      const ct = all.subarray(12, all.length - 16);
+      const decipher = createDecipheriv("aes-256-gcm", key, iv);
+      decipher.setAAD(Buffer.from(aad, "utf8"));
+      decipher.setAuthTag(tag);
+      return Buffer.concat([decipher.update(ct), decipher.final()]);
+    }
+    if (!stored.startsWith(E2E_PREFIX)) return Buffer.from(stored, "base64");
+    const all = Buffer.from(stored.slice(E2E_PREFIX.length), "base64");
+    if (all.length < 12 + 16) return null;
+    const iv = all.subarray(0, 12);
+    const tag = all.subarray(all.length - 16);
+    const ct = all.subarray(12, all.length - 16);
+    const decipher = createDecipheriv("aes-256-gcm", key, iv);
+    decipher.setAuthTag(tag);
+    return Buffer.concat([decipher.update(ct), decipher.final()]);
+  } catch {
+    return null;
+  }
+}
+
+/** Cifra bytes crus com a AES do projeto. Com aad → e2e:v2:. */
+export function encryptBytesForProject(plain: Buffer | Uint8Array, projectId: string, aad?: string): string | null {
+  const key = keyFor(projectId);
+  if (!key) return null;
+  const buf = Buffer.isBuffer(plain) ? plain : Buffer.from(plain);
+  return encryptBytesWithRawKey(buf, key, aad);
+}
+
+/** Decifra blob e2e:/e2e:v2: pra bytes. Sem prefixo: trata `stored` como
+ *  base64 legado e devolve os bytes. AAD errado / sem chave → null. */
+export function decryptBytesForProject(stored: string, projectId: string, aad?: string): Buffer | null {
+  if (isE2eV1Rejected(stored)) return null;
+  if (!stored.startsWith(E2E_PREFIX)) return Buffer.from(stored, "base64");
+  if (isE2eV2(stored) && (aad == null || aad === "")) return null;
+  const key = keyFor(projectId);
+  if (!key) return null;
+  const plain = decryptBytesWithRawKey(stored, key, aad);
+  if (plain != null) return plain;
+  const antigas = projectKeysOld.get(projectId) ?? [];
+  for (const antiga of antigas) {
+    const p = decryptBytesWithRawKey(stored, antiga, aad);
+    if (p != null) return p;
+  }
+  console.warn(`[the-dudes] decrypt-bytes failed for ${projectId}: nenhuma chave do ring abriu o blob`);
+  return null;
+}
+
+export type ImageCipherAttachment = { mimeType: string; base64: string; name?: string };
+
+function aadMessageImages(projectId: string): string {
+  return aadV2({ projectId, table: E2EE_TABLE.MESSAGES, field: MESSAGE_IMAGE_FIELD });
+}
+
+/** Cifra o base64 de um anexo: decodifica → AES em bytes → e2e:v2:. */
+export function encryptImageBase64(b64: string, projectId: string): string | null {
+  if (!b64) return b64;
+  if (isE2eEncrypted(b64)) return b64;
+  return encryptBytesForProject(Buffer.from(b64, "base64"), projectId, aadMessageImages(projectId));
+}
+
+/**
+ * Decifra images[] de agent:send. mimeType/name passam intactos.
+ * Sem prefixo e2e: = legado, pass-through. Qualquer blob que não abra → null
+ * (caller dropa a mensagem, fail-closed).
+ */
+export function decryptImageAttachments(
+  images: ImageCipherAttachment[] | undefined,
+  projectId: string | undefined,
+): ImageCipherAttachment[] | undefined | null {
+  if (!images || images.length === 0) return images;
+  const out: ImageCipherAttachment[] = [];
+  for (const img of images) {
+    const mimeType = img.mimeType;
+    const name = img.name;
+    const stored = img.base64 ?? "";
+    if (!isE2eEncrypted(stored)) {
+      out.push({ mimeType, base64: stored, ...(name !== undefined ? { name } : {}) });
+      continue;
+    }
+    if (!projectId) return null;
+    const bytes = decryptBytesForProject(stored, projectId, aadMessageImages(projectId));
+    if (bytes == null) return null;
+    out.push({
+      mimeType,
+      base64: bytes.toString("base64"),
+      ...(name !== undefined ? { name } : {}),
+    });
+  }
+  return out;
 }

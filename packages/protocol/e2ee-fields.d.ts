@@ -4,6 +4,7 @@ export declare const BOARD_CHART_SERIES_FIELDS: string[];
 export declare const BOARD_CHART_HAS_LABELS: boolean;
 export declare const BOARD_ANNOTATION_FIELDS: string[];
 export declare const MESSAGE_FIELDS: string[];
+export declare const MESSAGE_IMAGE_FIELD: "images";
 export declare const MEMORY_PLAIN_TO_CIPHER: Record<string, string>;
 export declare const TASK_FIELDS: string[];
 export declare const COMMENT_FIELDS: string[];
@@ -14,6 +15,9 @@ export declare const PLAN_TASK_FIELDS: string[];
 export declare const MISSION_FIELDS: string[];
 export declare const MISSION_STEP_FIELDS: string[];
 export declare const SCHEDULE_FIELDS: string[];
+export declare const AGENT_FIELDS: string[];
+export declare const CREDENTIAL_FIELDS: string[];
+export declare const SUMMARIZE_FIELDS: string[];
 
 export declare const E2EE_TABLE: {
   readonly TASKS: "tasks";
@@ -28,6 +32,9 @@ export declare const E2EE_TABLE: {
   readonly MISSIONS: "missions";
   readonly MISSION_STEPS: "mission_steps";
   readonly SCHEDULES: "schedules";
+  readonly AGENTS: "agents";
+  readonly CREDENTIALS: "credentials";
+  readonly SUMMARIZE: "summarize";
 };
 
 export declare const E2E_PREFIX: "e2e:";

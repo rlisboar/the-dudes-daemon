@@ -189,8 +189,13 @@ export class BridgeRelay {
 
   private socketDir: string;
   private peerPidSelfTest?: () => Promise<boolean>;
-  /** true só depois do self-test passar. Senão fail-OPEN. */
+  /** true só depois do self-test passar. */
   peerPidEnforced = false;
+  /**
+   * Self-test falhou e THE_DUDES_PEER_PID_INSECURE=1: aceita conexões
+   * não-verificáveis (downgrade explícito). Default = fail-CLOSED.
+   */
+  peerPidAllowInsecure = false;
 
   constructor(
     orchUrl: string,
@@ -240,20 +245,32 @@ export class BridgeRelay {
         }
         this.server.removeListener("error", reject);
         void this.runPeerPidSelfTest().then(resolve, (e) => {
-          console.error("[bridge-relay] ERROR: peer-pid self-test threw — fail-OPEN", e);
-          this.peerPidEnforced = false;
+          this.applyPeerPidSelfTestResult(false, e);
           resolve();
         });
       });
     });
   }
 
+  private applyPeerPidSelfTestResult(ok: boolean, err?: unknown): void {
+    this.peerPidEnforced = ok;
+    this.peerPidAllowInsecure = !ok && process.env.THE_DUDES_PEER_PID_INSECURE === "1";
+    if (ok) return;
+    const why = err != null ? String((err as Error).message ?? err) : "self-test failed";
+    if (this.peerPidAllowInsecure) {
+      console.error(
+        `[bridge-relay] ERROR: peer-pid ${why} — INSECURE override THE_DUDES_PEER_PID_INSECURE=1 (downgrade; cross-agent token theft not enforced)`,
+      );
+      return;
+    }
+    console.error(
+      `[bridge-relay] ERROR: peer-pid ${why} — fail-CLOSED. Install python3 (ctypes/getsockopt) or set THE_DUDES_PEER_PID_INSECURE=1 to accept unverifiable bridge connections.`,
+    );
+  }
+
   private async runPeerPidSelfTest(): Promise<void> {
     const ok = await (this.peerPidSelfTest ?? (() => this.defaultPeerPidSelfTest()))();
-    this.peerPidEnforced = ok;
-    if (!ok) {
-      console.error("[bridge-relay] ERROR: peer-pid self-test failed — fail-OPEN (cross-agent token theft not enforced)");
-    }
+    this.applyPeerPidSelfTestResult(ok);
   }
 
   private defaultPeerPidSelfTest(): Promise<boolean> {
@@ -333,6 +350,19 @@ export class BridgeRelay {
         res.end(JSON.stringify({ error: "bridge peer does not match agent" }));
         return;
       }
+    } else if (!this.peerPidAllowInsecure) {
+      console.error(
+        "[bridge-relay] ERROR: refusing unverifiable bridge connection — peer-pid unavailable. Install python3 or set THE_DUDES_PEER_PID_INSECURE=1",
+      );
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: "bridge peer-pid unavailable — install python3 (ctypes/getsockopt) or set THE_DUDES_PEER_PID_INSECURE=1",
+      }));
+      return;
+    } else {
+      console.warn(
+        "[bridge-relay] WARN: peer-pid INSECURE — accepting unverifiable bridge connection (THE_DUDES_PEER_PID_INSECURE=1)",
+      );
     }
     // Reconstrói o upstream a partir do pathname normalizado + search,
     // não da string crua, pra não reintroduzir o que acabamos de validar.
@@ -527,7 +557,11 @@ export class BridgeRelay {
             const json = JSON.parse(buf.toString("utf8"));
             if (typeof json.value === "string") {
               if (isE2eEncrypted(json.value)) {
-                const dec = decryptForProject(json.value, projectId);
+                const dec = decryptForProject(
+                  json.value,
+                  projectId,
+                  aadV2({ projectId, table: E2EE_TABLE.CREDENTIALS, field: "value" }),
+                );
                 if (dec != null) {
                   json.value = dec;
                   rememberCredentialPlaintext(projectId, dec);

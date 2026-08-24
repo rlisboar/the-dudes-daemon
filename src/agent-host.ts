@@ -6,6 +6,32 @@ import { breadcrumb, captureWarn } from "./sentry.js";
 import { assertWorkspaceScoped, autoWorkspaceCwd, cloneRepoIfMissing, expandBasePath, findGitRoot, getWorkspaceRoot, isInsideRoot, repoCwd } from "./workspace.js";
 import { aadV2, E2EE_TABLE } from "@the-dudes/protocol/e2ee-fields";
 import { encryptForProject, isE2eeRequired, setE2eeRequired, redactCredentials, redactCredentialsDeep } from "./daemon-crypto.js";
+import { classifyRunnerFailure } from "./runners/error-classifier.js";
+
+/** 1 enum operacional (paridade hung.soft). Classifica no plaintext ANTES do seal. */
+export type AgentErrorKind = "rate_limit" | "other";
+
+export function agentErrorKind(plain: string): AgentErrorKind {
+  return classifyRunnerFailure(plain) === "rate_limit" ? "rate_limit" : "other";
+}
+
+/**
+ * T-092: cifra stderr/erro com o mesmo AAD de agent:text (`messages.content`).
+ * Sem chave + e2ee-required → null (caller DROP). Sem projectId → plaintext redatado.
+ */
+export function sealAgentErrorMessage(projectId: string | undefined, message: string): string | null {
+  const raw = String(message ?? "");
+  const red = projectId ? redactCredentials(projectId, raw) : raw;
+  if (!projectId) return red;
+  const enc = encryptForProject(
+    red,
+    projectId,
+    aadV2({ projectId, table: E2EE_TABLE.MESSAGES, field: "content" }),
+  );
+  if (enc) return enc;
+  if (isE2eeRequired(projectId)) return null;
+  return red;
+}
 import type { ResolvedCliCommands } from "./cli-config.js";
 import type { AgentInfo, ImageAttachment } from "./types.js";
 import type { AgentSpawn, FromDaemon } from "./protocol.js";
@@ -106,6 +132,18 @@ export class AgentHost {
     return r !== false;
   }
 
+  /** Emite agent:error cifrado (messages.content) ou DROP se e2ee-required sem chave. */
+  private emitAgentError(agentId: string, message: string, projectId?: string): void {
+    const pid = projectId ?? this.entries.get(agentId)?.projectId;
+    const errorKind = agentErrorKind(message);
+    const sealed = sealAgentErrorMessage(pid, message);
+    if (sealed == null) {
+      this.log("error", `agent:error recusado: e2ee-required sem chave project=${pid}`);
+      return;
+    }
+    this.deliver({ type: "agent:error", agentId, message: sealed, errorKind });
+  }
+
   /** Returns the project ID this agent is spawned into, or null if the
    *  agent isn't tracked locally (e.g. message destined for an agent on
    *  another daemon — bridge relay falls back to passing through). */
@@ -194,21 +232,21 @@ export class AgentHost {
     const cwdOverrideEff = remap(msg.cwdOverride);
     const basePathEff = remap(msg.basePath) ?? msg.basePath;
     if (wsRoot && (cwdOverrideEff !== msg.cwdOverride || basePathEff !== msg.basePath)) {
-      this.send({
-        type: "agent:error",
-        agentId: msg.agent.id,
-        message: `workspace configurado fica fora do root permitido — usando "${wsRoot}" (THE_DUDES_WORKSPACE_ROOT)`,
-      });
+      this.emitAgentError(
+        msg.agent.id,
+        `workspace configurado fica fora do root permitido — usando "${wsRoot}" (THE_DUDES_WORKSPACE_ROOT)`,
+        msg.projectId,
+      );
     }
     if (msg.agentRepo && cwdOverrideEff) {
       const cwdOverride = expandBasePath(cwdOverrideEff);
       cwd = repoCwd(cwdOverride, msg.agentRepo.name);
       if (!fs.existsSync(path.join(cwd, ".git"))) {
-        this.send({
-          type: "agent:error",
-          agentId: msg.agent.id,
-          message: `clonando ${msg.agentRepo.name} em ${cwd} …`,
-        });
+        this.emitAgentError(
+          msg.agent.id,
+          `clonando ${msg.agentRepo.name} em ${cwd} …`,
+          msg.projectId,
+        );
         try {
           // ensure parent dir exists
           if (!fs.existsSync(cwdOverride)) {
@@ -221,20 +259,20 @@ export class AgentHost {
             this.dropTo,
           );
           if (!result.ok) {
-            this.send({
-              type: "agent:error",
-              agentId: msg.agent.id,
-              message: `git clone falhou: ${result.message}`,
-            });
+            this.emitAgentError(
+              msg.agent.id,
+              `git clone falhou: ${result.message}`,
+              msg.projectId,
+            );
             this.send({ type: "agent:running", agentId: msg.agent.id, running: false });
             return;
           }
         } catch (e) {
-          this.send({
-            type: "agent:error",
-            agentId: msg.agent.id,
-            message: `setup falhou: ${(e as Error).message}`,
-          });
+          this.emitAgentError(
+            msg.agent.id,
+            `setup falhou: ${(e as Error).message}`,
+            msg.projectId,
+          );
           this.send({ type: "agent:running", agentId: msg.agent.id, running: false });
           return;
         }
@@ -260,7 +298,7 @@ export class AgentHost {
     try {
       assertWorkspaceScoped(cwd);
     } catch (e) {
-      this.send({ type: "agent:error", agentId: msg.agent.id, message: (e as Error).message });
+      this.emitAgentError(msg.agent.id, (e as Error).message, msg.projectId);
       this.send({ type: "agent:running", agentId: msg.agent.id, running: false });
       return;
     }
@@ -273,11 +311,11 @@ export class AgentHost {
     }
     this.log("info", `agent ${msg.agent.id} cwd resolvido=${cwd}${wsRoot ? ` (root=${wsRoot})` : ""}`);
     if (!fs.existsSync(cwd)) {
-      this.send({
-        type: "agent:error",
-        agentId: msg.agent.id,
-        message: `cwd "${cwd}" not found — set workspace and clone repos first`,
-      });
+      this.emitAgentError(
+        msg.agent.id,
+        `cwd "${cwd}" not found — set workspace and clone repos first`,
+        msg.projectId,
+      );
       this.send({ type: "agent:running", agentId: msg.agent.id, running: false });
       return;
     }
@@ -327,11 +365,11 @@ export class AgentHost {
             // Falha (branch já existe, HEAD destacado, árvore suja…). Não cair
             // silenciosamente no cwd compartilhado: avisa e mantém o cwd base.
             const detail = wtRes.error?.message ?? ((wtRes.stderr || "").trim() || `exit ${wtRes.status}`);
-            this.send({
-              type: "agent:error",
-              agentId: msg.agent.id,
-              message: `worktree isolado falhou (${detail}) — agente roda no cwd compartilhado`,
-            });
+            this.emitAgentError(
+              msg.agent.id,
+              `worktree isolado falhou (${detail}) — agente roda no cwd compartilhado`,
+              msg.projectId,
+            );
             worktreePath = undefined;
           } else if (this.dropTo && fs.existsSync(worktreePath)) {
             // chown recursive — git worktree add criou árvore como root.
@@ -358,22 +396,22 @@ export class AgentHost {
             }
             if (fs.existsSync(worktreePath)) {
               cwd = worktreePath;
-              this.send({
-                type: "agent:error",
-                agentId: msg.agent.id,
-                message: `worktree isolado criado em ${worktreePath} (branch ${branchName})`,
-              });
+              this.emitAgentError(
+                msg.agent.id,
+                `worktree isolado criado em ${worktreePath} (branch ${branchName})`,
+                msg.projectId,
+              );
             }
           }
         } catch (e) {
           // Não engolir silenciosamente: o throw aqui vem do escape-guard de
           // containment (path traversal / symlink) — é segurança, tem que
           // aparecer. Cai no cwd compartilhado depois de avisar.
-          this.send({
-            type: "agent:error",
-            agentId: msg.agent.id,
-            message: `worktree isolado abortado: ${(e as Error).message}`,
-          });
+          this.emitAgentError(
+            msg.agent.id,
+            `worktree isolado abortado: ${(e as Error).message}`,
+            msg.projectId,
+          );
         }
       }
     }
@@ -429,7 +467,7 @@ export class AgentHost {
           : null;
         if (msg.projectId && isE2eeRequired(msg.projectId) && !enc) {
           this.log("error", `agent:text recusado: e2ee-required sem chave project=${msg.projectId}`);
-          this.deliver({ type: "agent:error", agentId: msg.agent.id, message: "e2ee-required: sem chave do projeto — texto não enviado" });
+          this.emitAgentError(msg.agent.id, "e2ee-required: sem chave do projeto — texto não enviado", msg.projectId);
           return true;
         }
         const ok = this.deliver({ type: "agent:text", agentId: msg.agent.id, text: enc ?? red });
@@ -461,11 +499,11 @@ export class AgentHost {
       onSessionId: (sid) => { this.deliver({ type: "agent:session", agentId: msg.agent.id, sessionId: sid }); },
       onUsageDelta: (delta) => { this.deliver({ type: "agent:usage_delta", agentId: msg.agent.id, delta }); },
       onSessionInvalid: () => {
-        this.deliver({
-          type: "agent:error",
-          agentId: msg.agent.id,
-          message: "[ctx] sessão anterior não encontrada — iniciando sessão nova",
-        });
+        this.emitAgentError(
+          msg.agent.id,
+          "[ctx] sessão anterior não encontrada — iniciando sessão nova",
+          msg.projectId,
+        );
       },
       onContextUsage: (used, limit) => { this.deliver({ type: "agent:context", agentId: msg.agent.id, used, limit }); },
       onContextWarning: (used, limit) => { this.deliver({ type: "agent:context_warning", agentId: msg.agent.id, used, limit }); },
@@ -491,11 +529,8 @@ export class AgentHost {
       },
       onGraphWatch: (root, gbin) => this.onGraphWatch?.(root, gbin, msg.projectId),
       onError: (err) => {
-        // stderr do agente pode conter credencial (echo/uso). Redacta as creds
-        // conhecidas ANTES de sair do daemon (vira system message no server,
-        // server-visível por design — então redact, não cifra).
-        const message = msg.projectId ? redactCredentials(msg.projectId, String(err ?? "")) : String(err ?? "");
-        this.deliver({ type: "agent:error", agentId: msg.agent.id, message });
+        // T-092: redact + cifra (messages.content), paridade com agent:text.
+        this.emitAgentError(msg.agent.id, String(err ?? ""), msg.projectId);
       },
       onExit: (code) => {
         const e = this.entries.get(msg.agent.id);
@@ -588,7 +623,7 @@ export class AgentHost {
     const e = this.entries.get(agentId);
     if (!e?.runner) return;
     try { await e.runner.clearContext(); } catch (err) {
-      this.send({ type: "agent:error", agentId, message: `clear failed: ${(err as Error).message}` });
+      this.emitAgentError(agentId, `clear failed: ${(err as Error).message}`);
     }
   }
 
@@ -596,7 +631,7 @@ export class AgentHost {
     const e = this.entries.get(agentId);
     if (!e?.runner) return;
     try { await e.runner.compactContext(saveMemory); } catch (err) {
-      this.send({ type: "agent:error", agentId, message: `compact failed: ${(err as Error).message}` });
+      this.emitAgentError(agentId, `compact failed: ${(err as Error).message}`);
     }
   }
 

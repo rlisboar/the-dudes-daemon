@@ -58,31 +58,114 @@ test("T-061: spawnDropped registra THE_DUDES_AGENT_ID; bindProcess também", () 
   files.cleanup();
 });
 
-test("T-061: self-test passa → enforce; falha → fail-open + ERROR", async () => {
+test("T-061: self-test passa → enforce", async () => {
+  const on = new BridgeRelay("http://127.0.0.1:9", null, undefined, {
+    peerPidSelfTest: async () => true,
+  });
+  await on.start();
+  try {
+    assert.equal(on.peerPidEnforced, true);
+    assert.equal(on.peerPidAllowInsecure, false);
+  } finally {
+    on.stop();
+  }
+});
+
+test("T-093: self-test falha → fail-CLOSED, conexão RECUSADA (503) + log acionável", async () => {
   const logs: string[] = [];
   const orig = console.error;
   console.error = (...args: unknown[]) => { logs.push(String(args[0])); };
+  delete process.env.THE_DUDES_PEER_PID_INSECURE;
   try {
-    const on = new BridgeRelay("http://127.0.0.1:9", null, undefined, {
-      peerPidSelfTest: async () => true,
-    });
-    await on.start();
-    assert.equal(on.peerPidEnforced, true);
-    on.stop();
-
     const off = new BridgeRelay("http://127.0.0.1:9", null, undefined, {
       peerPidSelfTest: async () => false,
     });
     await off.start();
-    assert.equal(off.peerPidEnforced, false);
-    assert.ok(logs.some((l) => l.includes("fail-OPEN")));
-    off.stop();
+    try {
+      assert.equal(off.peerPidEnforced, false);
+      assert.equal(off.peerPidAllowInsecure, false);
+      assert.ok(logs.some((l) => l.includes("fail-CLOSED")));
+      assert.ok(logs.some((l) => l.includes("python3")));
+      assert.equal(await unixStatus(off.socketPath, "/api/bridge/ag_x/tasks_list"), 503);
+      assert.ok(logs.some((l) => l.includes("refusing unverifiable")));
+    } finally {
+      off.stop();
+    }
   } finally {
     console.error = orig;
   }
 });
 
-test("T-061: agentId da URL ≠ peer → 403", async () => {
+test("T-093: self-test throw → fail-CLOSED (não fail-OPEN)", async () => {
+  const logs: string[] = [];
+  const orig = console.error;
+  console.error = (...args: unknown[]) => { logs.push(String(args[0])); };
+  delete process.env.THE_DUDES_PEER_PID_INSECURE;
+  try {
+    const boom = new BridgeRelay("http://127.0.0.1:9", null, undefined, {
+      peerPidSelfTest: async () => { throw new Error("no python3"); },
+    });
+    await boom.start();
+    try {
+      assert.equal(boom.peerPidEnforced, false);
+      assert.equal(boom.peerPidAllowInsecure, false);
+      assert.equal(await unixStatus(boom.socketPath, "/api/bridge/ag_x/tasks_list"), 503);
+      assert.ok(logs.some((l) => l.includes("fail-CLOSED")));
+    } finally {
+      boom.stop();
+    }
+  } finally {
+    console.error = orig;
+  }
+});
+
+test("T-093: THE_DUDES_PEER_PID_INSECURE=1 → aceita + loga downgrade por conexão", async () => {
+  const logs: string[] = [];
+  const origErr = console.error;
+  const origWarn = console.warn;
+  console.error = (...args: unknown[]) => { logs.push(String(args[0])); };
+  console.warn = (...args: unknown[]) => { logs.push(String(args[0])); };
+  const prev = process.env.THE_DUDES_PEER_PID_INSECURE;
+  process.env.THE_DUDES_PEER_PID_INSECURE = "1";
+  try {
+    const insecure = new BridgeRelay("http://127.0.0.1:9", null, undefined, {
+      peerPidSelfTest: async () => false,
+    });
+    await insecure.start();
+    try {
+      assert.equal(insecure.peerPidEnforced, false);
+      assert.equal(insecure.peerPidAllowInsecure, true);
+      assert.ok(logs.some((l) => l.includes("INSECURE override")));
+      // Aceita o handle (não 503): orch fake → 502 no fetch.
+      assert.equal(await unixStatus(insecure.socketPath, "/api/bridge/ag_x/tasks_list"), 502);
+      assert.ok(logs.some((l) => l.includes("accepting unverifiable")));
+    } finally {
+      insecure.stop();
+    }
+  } finally {
+    console.error = origErr;
+    console.warn = origWarn;
+    if (prev === undefined) delete process.env.THE_DUDES_PEER_PID_INSECURE;
+    else process.env.THE_DUDES_PEER_PID_INSECURE = prev;
+  }
+});
+
+test("T-093: self-test real no host (python3) → enforce", async () => {
+  delete process.env.THE_DUDES_PEER_PID_INSECURE;
+  const relay = new BridgeRelay("http://127.0.0.1:9", null);
+  await relay.start();
+  try {
+    assert.equal(
+      relay.peerPidEnforced,
+      true,
+      "host deve passar o self-test peer-pid (python3 ctypes/getsockopt)",
+    );
+  } finally {
+    relay.stop();
+  }
+});
+
+test("T-061: caminho feliz — agentId da URL ≠ peer → 403", async () => {
   registerAgentPid("ag_victim", 4242);
   registerAgentPid("ag_thief", 7777);
   setUnixPeerPidReader(() => 7777);

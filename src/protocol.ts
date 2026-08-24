@@ -31,8 +31,12 @@ export interface DaemonHello {
    *  use this to wrap project keys for end-to-end transport without the
    *  server seeing the symmetric key. */
   cryptoPublicKey?: string;
-  /** SHA-256 hex of the daemon's binary, for tamper-detection (Phase 5). */
+  /** SHA-256 hex da imagem carregada no boot (não re-lê o arquivo após self-update). */
   binaryHash?: string;
+  /** Epoch injetado no bundle (DAEMON_BUILD_TS da imagem em execução). */
+  buildTs?: number;
+  /** Arquivo novo no disco; processo ainda na imagem antiga (restart pendente). */
+  updatePending?: boolean;
   /** State recovery: maior seq de msg outbound vista antes do disconnect
    *  anterior. Server replay buffer das msgs com seq > resumeFromSeq.
    *  0/ausente = primeira conn ou buffer expirou. */
@@ -247,7 +251,16 @@ export interface AgentUsageDeltaEv { type: "agent:usage_delta"; agentId: string;
 export interface AgentTextEv { type: "agent:text"; agentId: string; text: string }
 export interface AgentToolUseEv { type: "agent:tool_use"; agentId: string; toolName: string; input: unknown }
 export interface AgentThinkingEv { type: "agent:thinking"; agentId: string; text: string; redacted: boolean }
-export interface AgentErrorEv { type: "agent:error"; agentId: string; message: string }
+export interface AgentErrorEv {
+  type: "agent:error";
+  agentId: string;
+  message: string;
+  /**
+   * T-092: classe operacional no plaintext ANTES do seal (paridade hung.soft).
+   * Ausente = daemon velho: em E2EE o server NÃO dispara auto-retry até atualizar.
+   */
+  errorKind?: "rate_limit" | "other";
+}
 /** Runner sem atividade / processo morto — soft=aviso; hard=turno abortado. */
 export interface AgentHungEv {
   type: "agent:hung";
@@ -812,6 +825,10 @@ export interface DaemonHealthEv {
     byRunner: Record<string, { started: number; ok: number; failed: number; hardRecovers: number; hangs: number }>;
     agentsRunning: number;
     e2eeProjects: number;
+    /** T-088: identidade da imagem em execução (mesmo contrato do hello). */
+    binaryHash?: string;
+    buildTs?: number;
+    updatePending?: boolean;
   };
 }
 

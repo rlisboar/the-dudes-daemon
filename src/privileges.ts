@@ -350,7 +350,8 @@ function defaultGetParentPid(pid: number): number | null {
 
 /**
  * Sem FFI/koffi: herda o fd e pergunta ao python3 (ctypes/getsockopt).
- * Ausente ou falha → null (o self-test desliga o enforcement).
+ * Ausente ou falha → null. O relay trata como fail-CLOSED (recusa
+ * conexões não-verificáveis) salvo THE_DUDES_PEER_PID_INSECURE=1.
  */
 function defaultGetUnixPeerPid(sock: object): number | null {
   const fd = unixSocketFd(sock);

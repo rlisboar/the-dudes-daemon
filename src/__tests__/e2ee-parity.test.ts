@@ -12,6 +12,7 @@ import {
   GOAL_FIELDS,
   MEMORY_PLAIN_TO_CIPHER,
   MESSAGE_FIELDS,
+  MESSAGE_IMAGE_FIELD,
   MISSION_FIELDS,
   MISSION_STEP_FIELDS,
   PLAN_FIELDS,
@@ -24,7 +25,7 @@ import {
 
 process.env.THE_DUDES_DAEMON_KEY_PATH = path.join(os.tmpdir(), `td-parity-key-${process.pid}-${Date.now()}.pem`);
 process.env.THE_DUDES_PROJECT_KEYS_PATH = path.join(os.tmpdir(), `td-parity-pkeys-${process.pid}-${Date.now()}.json`);
-const { getDaemonPublicKey, rememberProjectKey, decryptForProject, encryptForProject } = await import("../daemon-crypto.js");
+const { getDaemonPublicKey, rememberProjectKey, decryptForProject, encryptForProject, encryptBytesForProject, decryptBytesForProject } = await import("../daemon-crypto.js");
 const { encryptBridgePayload } = await import("../bridge-relay.js");
 
 /**
@@ -348,4 +349,44 @@ test("T-083 rework A: apply_plan_steps nascido no destino é 1:1 (destino abre, 
     "prompt client",
   );
   assert.equal(decryptForProject(destTitle, PID, aadV2({ projectId: PID, table: E2EE_TABLE.TASKS, field: "title" })), null);
+});
+
+test("T-094 daemon: agents/credentials/summarize v2+AAD e legado; AAD errado null", () => {
+  const grupos: Array<[string, string, string]> = [
+    [E2EE_TABLE.AGENTS, "system_prompt", "você é o backend"],
+    [E2EE_TABLE.CREDENTIALS, "value", "sk-live-secreto"],
+    [E2EE_TABLE.SUMMARIZE, "text", "texto longo pra resumir"],
+  ];
+  for (const [table, field, plain] of grupos) {
+    const aad = aadV2({ projectId: PID, table, field });
+    const blob = encryptForProject(plain, PID, aad)!;
+    assert.ok(cifradoV2(blob), `${table}.${field} não saiu e2e:v2:`);
+    assert.equal(decryptForProject(blob, PID, aad), plain);
+    assert.equal(decryptForProject(blob, PID, aadV2({ projectId: PID, table: E2EE_TABLE.TASKS, field: "title" })), null);
+    assert.equal(decryptForProject(blob, PID), null, "v2 sem AAD fail-closed");
+    const legado = encryptForProject(plain, PID)!;
+    assert.ok(legado.startsWith("e2e:") && !legado.startsWith("e2e:v2:"));
+    assert.equal(decryptForProject(legado, PID, aad), plain, "legado e2e: ignora AAD");
+  }
+});
+
+test("T-094 daemon ponta-a-ponta: spawn/get_credential/summarize usam AAD canônico", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { dirname, join } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const srcDir = dirname(fileURLToPath(import.meta.url));
+  const mainSrc = readFileSync(join(srcDir, "../main.ts"), "utf8");
+  const relaySrc = readFileSync(join(srcDir, "../bridge-relay.ts"), "utf8");
+  assert.match(mainSrc, /E2EE_TABLE\.AGENTS,\s*field:\s*"system_prompt"/);
+  assert.match(mainSrc, /E2EE_TABLE\.SUMMARIZE,\s*field:\s*"text"/);
+  assert.match(relaySrc, /E2EE_TABLE\.CREDENTIALS,\s*field:\s*"value"/);
+});
+
+test("T-103 daemon: messages.images AAD cifra bytes; AAD content não abre", () => {
+  const aad = aadV2({ projectId: PID, table: E2EE_TABLE.MESSAGES, field: MESSAGE_IMAGE_FIELD });
+  const raw = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const blob = encryptBytesForProject(raw, PID, aad)!;
+  assert.ok(cifradoV2(blob));
+  assert.deepEqual(decryptBytesForProject(blob, PID, aad), raw);
+  assert.equal(decryptBytesForProject(blob, PID, aadV2({ projectId: PID, table: E2EE_TABLE.MESSAGES, field: "content" })), null);
 });
