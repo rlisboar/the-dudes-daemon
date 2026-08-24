@@ -559,6 +559,11 @@ export const commandSchemas = {
   /* ---------- file locks (tabela file_locks) ---------- */
   lock_file: cmd({ path: text }),
   unlock_file: cmd({ path: text }),
+
+  /* ---------- T-098 task workspaces ---------- */
+  workspace_create: cmd({ taskId: id, agentId: id }),
+  workspace_remove: cmd({ taskId: id, force: flag.optional() }),
+  workspace_list: cmd({}),
 };
 
 /**
@@ -601,6 +606,7 @@ export const DB_WRITE_COMMANDS = Object.freeze([
   "totp:setup_init", "totp:setup_confirm", "totp:disable",
   "project_keys:rotate", "project_keys:set_for_member", "project_keys:enable_e2ee",
   "lock_file", "unlock_file",
+  "workspace_create", "workspace_remove",
 ]);
 
 export function validateCommand(command) {

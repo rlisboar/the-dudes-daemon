@@ -283,6 +283,41 @@ export interface WorkspaceResult {
   clones: { repoName: string; ok: boolean; message: string }[];
 }
 
+/** T-098: orch → daemon. Tipo próprio pra não colidir com workspace:set. */
+export interface WorkspaceTaskCreateRequest {
+  type: "workspace:create";
+  correlationId: string;
+  workspaceRoot: string;
+  taskId: string;
+  agentId: string;
+}
+
+export interface WorkspaceTaskRemoveRequest {
+  type: "workspace:remove";
+  correlationId: string;
+  workspaceRoot: string;
+  path: string;
+  branch: string;
+  force?: boolean;
+  taskId?: string;
+}
+
+/**
+ * T-098: daemon → orch. NÃO reusa `workspace:result` (clone do workspace
+ * do projeto) — senão o handler de toast no server engole o persist.
+ */
+export interface WorkspaceTaskResult {
+  type: "workspace:task_result";
+  correlationId: string;
+  op: "create" | "remove";
+  taskId?: string;
+  ok: boolean;
+  path?: string;
+  branch?: string;
+  error?: string;
+  pendingCommits?: string[];
+}
+
 /* ---------- file browser (orch → daemon) ---------- */
 
 export interface FileListRequest {
@@ -854,6 +889,7 @@ export type FromDaemon =
   | AgentTextEv | AgentToolUseEv | AgentThinkingEv | AgentErrorEv | AgentHungEv | AgentExitEv
   | AgentContextWarningEv | AgentContextFullEv | AgentContextEv
   | WorkspaceResult
+  | WorkspaceTaskResult
   | FileListResult | FileReadResult | FileWriteResult | FileOperationResult | FileSearchResult
   | GitLogResult | GitStatusResult | GitDiffResult
   | GitResult
@@ -876,6 +912,7 @@ export type FromOrch =
   | ReleaseAvailable
   | AgentSpawn | AgentStop | AgentSend | AgentClear | AgentCompact
   | AutoApproveSet | WorkspaceSet
+  | WorkspaceTaskCreateRequest | WorkspaceTaskRemoveRequest
   | FileListRequest | FileReadRequest | FileWriteRequest | FileOperationRequest | FileSearchRequest
   | GitLogRequest | GitStatusRequest | GitDiffRequest
   | GitStageRequest | GitUnstageRequest | GitCommitRequest

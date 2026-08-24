@@ -441,6 +441,8 @@ export interface AgentInfo {
    * Atualizado via `agent:context` do daemon; não persiste no DB.
    */
   contextWindow?: { used: number; limit: number } | null;
+  /** T-096: presença derivada no READ (nunca persistida). */
+  derived?: AgentDerived;
 }
 
 export type MessageKind =
@@ -466,6 +468,19 @@ export interface GitCommit {
 export interface GitFileStatus {
   path: string;
   status: string;
+}
+
+/** T-098: vínculo persistido task ↔ worktree ↔ branch. */
+export interface TaskWorkspaceLink {
+  id: string;
+  projectId: string;
+  taskId: string;
+  agentId: string;
+  branch: string;
+  path: string;
+  createdBy: string;
+  createdAt?: string;
+  removedAt?: string | null;
 }
 
 export interface FileLock {
@@ -546,6 +561,28 @@ export interface Task {
   blockedByTaskNumber?: number | null;
   /** goal this task contributes to */
   goalId?: string | null;
+  /**
+   * T-096: status derivado no READ (nunca persistido). Clientes velhos ignoram.
+   * Só metadados operacionais — sem ciphertext.
+   */
+  derived?: TaskDerived;
+}
+
+/** T-096 — shape consumido pelo T-097 (coluna Needs-you). */
+export type DerivedTaskStatus = "working" | "stale" | "awaiting_review" | "idle";
+export type DerivedAgentPresence = "online" | "busy" | "stopped";
+
+export interface TaskDerived {
+  status: DerivedTaskStatus;
+  staleAfterMs: number;
+  lastActivityAt: number | null;
+  reasons: string[];
+}
+
+export interface AgentDerived {
+  presence: DerivedAgentPresence;
+  lastActivityAt: number | null;
+  reasons: string[];
 }
 
 export interface TaskComment {
@@ -1232,6 +1269,8 @@ export type ServerEvent =
       commits?: GitCommit[]; diff?: string; files?: GitFileStatus[];
       branches?: { name: string; current: boolean }[];
       stashes?: { index: number; message: string; branch: string }[]; }
+  | { type: "workspace_result"; op: "create" | "remove"; ok: boolean; taskId: string; path?: string; branch?: string; error?: string; pendingCommits?: string[] }
+  | { type: "workspace_list_result"; workspaces: TaskWorkspaceLink[] }
   | { type: "file_locks"; locks: FileLock[] }
   | { type: "file_lock:updated"; lock: FileLock }
   | { type: "file_lock:released"; id: string }
@@ -1641,4 +1680,7 @@ export type ClientCommand =
   | { type: "git_stash_pop" }
   | { type: "list_file_locks" }
   | { type: "lock_file"; path: string }
-  | { type: "unlock_file"; path: string };
+  | { type: "unlock_file"; path: string }
+  | { type: "workspace_create"; taskId: string; agentId: string }
+  | { type: "workspace_remove"; taskId: string; force?: boolean }
+  | { type: "workspace_list" };

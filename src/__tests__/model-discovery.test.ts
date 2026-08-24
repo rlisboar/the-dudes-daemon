@@ -14,9 +14,10 @@ test("line catalogs parse plain model IDs and remove duplicates/noise", () => {
 
 test("OpenCode catalog publishes effort capabilities for each installed model", () => {
   assert.deepEqual(
-    parseLineModelCatalog("zai-coding-plan/glm-5.2\nopenai/gpt-5\ndeepseek/deepseek-v4-pro\n", "opencode"),
+    parseLineModelCatalog("zai-coding-plan/glm-5.2\nzai-coding-plan/glm-5.3\nopenai/gpt-5\ndeepseek/deepseek-v4-pro\n", "opencode"),
     [
       { id: "zai-coding-plan/glm-5.2", label: "zai-coding-plan/glm-5.2", isDefault: undefined, efforts: ["none", "high"], capabilityTier: 4, speedTier: 1, costTier: 3 },
+      { id: "zai-coding-plan/glm-5.3", label: "zai-coding-plan/glm-5.3", isDefault: undefined, efforts: ["none", "low", "high", "max"], capabilityTier: 2, speedTier: 2, costTier: 2 },
       { id: "openai/gpt-5", label: "openai/gpt-5", isDefault: undefined, efforts: ["none", "low", "medium", "high"], capabilityTier: 2, speedTier: 2, costTier: 2 },
       { id: "deepseek/deepseek-v4-pro", label: "deepseek/deepseek-v4-pro", isDefault: undefined, efforts: ["none"], capabilityTier: 4, speedTier: 1, costTier: 3 },
     ],

@@ -39,6 +39,7 @@ import { decryptForProject, decryptImageAttachments, encryptForProject, countUsa
 import { dispatchWebhook } from "./webhook-dispatch.js";
 import { ModelDiscovery } from "./model-discovery.js";
 import { parseGitPorcelain } from "./git-status.js";
+import { createTaskWorktree, removeTaskWorktree } from "./task-workspace.js";
 import { applyMemoryCharBudget } from "./memory-utils.js";
 
 // Embutida no build a partir do package.json (ver build.mjs); fallback pro
@@ -848,6 +849,45 @@ class DaemonClient {
       }
       case "mcps:delete": {
         await this.handleMCPDelete(msg);
+        return;
+      }
+      case "workspace:create": {
+        const r = createTaskWorktree({
+          workspaceRoot: String(msg.workspaceRoot ?? ""),
+          taskId: String(msg.taskId ?? ""),
+          agentId: String(msg.agentId ?? ""),
+        });
+        this.send({
+          type: "workspace:task_result",
+          correlationId: msg.correlationId,
+          op: "create",
+          taskId: msg.taskId,
+          ok: r.ok,
+          path: r.path,
+          branch: r.branch,
+          error: r.ok ? undefined : r.error,
+          pendingCommits: r.ok ? undefined : r.pendingCommits,
+        });
+        return;
+      }
+      case "workspace:remove": {
+        const r = removeTaskWorktree({
+          workspaceRoot: String(msg.workspaceRoot ?? ""),
+          path: String(msg.path ?? ""),
+          branch: String(msg.branch ?? ""),
+          force: !!msg.force,
+        });
+        this.send({
+          type: "workspace:task_result",
+          correlationId: msg.correlationId,
+          op: "remove",
+          taskId: msg.taskId,
+          ok: r.ok,
+          path: r.path,
+          branch: r.branch,
+          error: r.ok ? undefined : r.error,
+          pendingCommits: r.ok ? undefined : r.pendingCommits,
+        });
         return;
       }
       case "git:log":
