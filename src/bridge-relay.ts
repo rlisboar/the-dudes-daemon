@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import { chmodSync, chownSync, existsSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
 import type { DropTarget } from "./privileges.js";
-import { getUnixPeerPid, resolveAgentIdFromPid } from "./privileges.js";
+import { getParentPid, getUnixPeerPid, resolveAgentIdFromPid, setParentPidReader } from "./privileges.js";
 import {
   aadReadChain,
   aadV2,
@@ -177,11 +177,23 @@ export function encryptBridgePayload(
   return json;
 }
 
+/** Teto alinhado a AGENT_PID_WALK_MAX em privileges.ts (não exportado). */
+const PEER_OS_WALK_MAX = 10;
+
+/** Fatos do SO por conexão Unix — nunca o resultado da autorização. */
+type PeerOsFacts = {
+  peerPid?: number | null;
+  parentByPid: Map<number, number | null>;
+  walked: boolean;
+};
+
 export class BridgeRelay {
   public readonly socketPath: string;
   private server: http.Server;
   private orchUrl: string;
   private dropTo: DropTarget | null;
+  /** T-071: peer pid + cadeia ppid chaveados por `req.socket`. */
+  private readonly peerOsBySocket = new Map<object, PeerOsFacts>();
   /** Lookup the project this agent belongs to, so we can E2EE-encrypt
    *  agent-to-agent message bodies before letting them traverse the
    *  server. Wired by the daemon at startup. */
@@ -219,6 +231,13 @@ export class BridgeRelay {
     }
     this.socketPath = path.join(this.socketDir, "bridge.sock");
     this.server = http.createServer((req, res) => this.handle(req, res));
+    // T-071: a chave do cache é o socket do servidor (`req.socket` ===
+    // o objeto do evento `connection`). `close` do cliente não é
+    // síncrono com o do servidor — amarra a liberação no accept.
+    this.server.on("connection", (sock) => {
+      const forget = () => { this.peerOsBySocket.delete(sock); };
+      sock.once("close", forget);
+    });
   }
 
   setAgentProjectLookup(fn: (agentId: string) => string | null) {
@@ -296,10 +315,65 @@ export class BridgeRelay {
   }
 
   stop() {
+    this.peerOsBySocket.clear();
     try { this.server.close(); } catch {}
     try { if (existsSync(this.socketPath)) unlinkSync(this.socketPath); } catch {}
     // Limpa dir random criado por mkdtempSync no shutdown.
     try { rmSync(this.socketDir, { recursive: true, force: true }); } catch {}
+  }
+
+  /** T-071 testes A3: entradas vivas no cache OS-facts (por socket). */
+  unixPeerOsCacheSize(): number {
+    return this.peerOsBySocket.size;
+  }
+
+  private bindPeerOsFacts(sock: object): PeerOsFacts {
+    let facts = this.peerOsBySocket.get(sock);
+    if (facts) return facts;
+    facts = { parentByPid: new Map(), walked: false };
+    this.peerOsBySocket.set(sock, facts);
+    const s = sock as net.Socket;
+    const forget = () => { this.peerOsBySocket.delete(sock); };
+    if (typeof s.once === "function") {
+      if (s.destroyed) forget();
+      else s.once("close", forget);
+    }
+    return facts;
+  }
+
+  /**
+   * Resolve o agentId do peer desta conexão. Cacheia só fatos do SO
+   * (pid + ppid); o registro de autorização é consultado a cada request.
+   */
+  private resolvePeerAgentId(sock: object): string | null {
+    const facts = this.bindPeerOsFacts(sock);
+    if (facts.peerPid === undefined) {
+      facts.peerPid = getUnixPeerPid(sock);
+    }
+    const peerPid = facts.peerPid;
+    if (peerPid == null) return null;
+
+    if (!facts.walked) {
+      let current: number | null = peerPid;
+      const seen = new Set<number>();
+      for (let i = 0; i < PEER_OS_WALK_MAX; i++) {
+        if (!current || current <= 1 || seen.has(current)) break;
+        seen.add(current);
+        const ppid = getParentPid(current);
+        facts.parentByPid.set(current, ppid);
+        current = ppid;
+      }
+      facts.walked = true;
+    }
+
+    // Walk de resolveAgentIdFromPid usa só o cache desta conexão — o
+    // reader global volta ao default em seguida (testes re-injetam via afterEach).
+    setParentPidReader((pid) => (facts.parentByPid.has(pid) ? facts.parentByPid.get(pid) ?? 0 : 0));
+    try {
+      return resolveAgentIdFromPid(peerPid);
+    } finally {
+      setParentPidReader(null);
+    }
   }
 
   /** Cap defensivo no body relayed pelo Unix socket. Qualquer processo do
@@ -343,8 +417,7 @@ export class BridgeRelay {
     }
     if (this.peerPidEnforced) {
       const urlAgent = parsed.pathname.match(/^\/api\/bridge\/([^/]+)/)?.[1];
-      const peerPid = getUnixPeerPid(req.socket);
-      const peerAgent = peerPid != null ? resolveAgentIdFromPid(peerPid) : null;
+      const peerAgent = this.resolvePeerAgentId(req.socket);
       if (!peerAgent || !urlAgent || peerAgent !== urlAgent) {
         res.writeHead(403, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "bridge peer does not match agent" }));
