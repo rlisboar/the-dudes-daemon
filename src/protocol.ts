@@ -15,6 +15,7 @@ import type {
   RepoSummary,
   SkillDefinition,
 } from "./types.js";
+import { aadV2, resolveAgentSendCipherAad } from "@the-dudes/protocol/e2ee-fields";
 
 /* ---------- handshake / heartbeat ---------- */
 
@@ -192,9 +193,44 @@ export interface MCPServerConfig {
 }
 
 export interface AgentStop { type: "agent:stop"; agentId: string }
+/** T-117: cipher part pode anunciar table/field; ambos ausentes = legado messages.content. */
 export type AgentSendPart =
   | { kind: "plain"; text: string }
-  | { kind: "cipher"; text: string };
+  | { kind: "cipher"; text: string; table?: string; field?: string };
+
+export function cipherWirePrefix(text: string): "e2e:v2" | "e2e:v1" | "e2e" | "none" {
+  if (text.startsWith("e2e:v2:")) return "e2e:v2";
+  if (text.startsWith("e2e:v1:")) return "e2e:v1";
+  if (text.startsWith("e2e:")) return "e2e";
+  return "none";
+}
+
+export type AssemblePartsResult =
+  | { ok: true; content: string }
+  | { ok: false; reason: "missing_project" | "partial" | "invalid" | "decrypt"; prefix: "e2e:v2" | "e2e:v1" | "e2e" | "none" };
+
+/** Concatena parts; cada cipher usa AAD declarado ou fallback legado messages.content. Sem varredura. */
+export function assembleAgentSendParts(
+  parts: AgentSendPart[],
+  projectId: string | undefined,
+  decrypt: (blob: string, projectId: string, aad: string) => string | null,
+  isEncrypted: (s: string) => boolean,
+): AssemblePartsResult {
+  const out: string[] = [];
+  for (const p of parts) {
+    if (p.kind === "plain") { out.push(p.text); continue; }
+    if (!isEncrypted(p.text)) { out.push(p.text); continue; }
+    const prefix = cipherWirePrefix(p.text);
+    if (!projectId) return { ok: false, reason: "missing_project", prefix };
+    const resolved = resolveAgentSendCipherAad(p);
+    if (!resolved.ok) return { ok: false, reason: resolved.reason, prefix };
+    const aad = aadV2({ projectId, table: resolved.table, field: resolved.field });
+    const dec = decrypt(p.text, projectId, aad);
+    if (dec === null) return { ok: false, reason: "decrypt", prefix };
+    out.push(dec);
+  }
+  return { ok: true, content: out.join("") };
+}
 
 export interface AgentSend {
   type: "agent:send";

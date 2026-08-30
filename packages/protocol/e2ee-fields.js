@@ -149,6 +149,55 @@ export function isPlainCatalogText(v) {
   return typeof v === "string" && v.length > 0 && !v.startsWith(E2E_PREFIX);
 }
 
+/**
+ * T-117: pares AAD permitidos em agent:send.parts cipher.
+ * Lista fechada — o daemon NÃO varre o catálogo.
+ */
+export const AGENT_SEND_CIPHER_AADS = Object.freeze([
+  Object.freeze({ table: E2EE_TABLE.TASKS, field: "title" }),
+  Object.freeze({ table: E2EE_TABLE.TASKS, field: "description" }),
+  Object.freeze({ table: E2EE_TABLE.GOALS, field: "title" }),
+  Object.freeze({ table: E2EE_TABLE.GOALS, field: "description" }),
+  Object.freeze({ table: E2EE_TABLE.MEMORIES, field: "title" }),
+  Object.freeze({ table: E2EE_TABLE.MEMORIES, field: "body" }),
+  Object.freeze({ table: E2EE_TABLE.MESSAGES, field: "content" }),
+]);
+
+export function isAgentSendCipherAad(table, field) {
+  return AGENT_SEND_CIPHER_AADS.some((p) => p.table === table && p.field === field);
+}
+
+function nonEmptyString(v) {
+  return typeof v === "string" && v.trim().length > 0;
+}
+
+/**
+ * Resolve table/field de um cipher part.
+ * - ambos ausentes/vazios → legado messages.content
+ * - só um presente, ou inválido → drop (sem tentar outros AADs)
+ */
+export function resolveAgentSendCipherAad(part) {
+  const table = typeof part?.table === "string" ? part.table.trim() : "";
+  const field = typeof part?.field === "string" ? part.field.trim() : "";
+  const hasT = nonEmptyString(table);
+  const hasF = nonEmptyString(field);
+  if (!hasT && !hasF) {
+    return { ok: true, table: E2EE_TABLE.MESSAGES, field: "content", legacy: true };
+  }
+  if (!hasT || !hasF) return { ok: false, reason: "partial" };
+  if (!isAgentSendCipherAad(table, field)) return { ok: false, reason: "invalid" };
+  return { ok: true, table, field, legacy: false };
+}
+
+/** Construtor do produtor: cipher part com AAD explícito (fail-closed se o par não for permitido). */
+export function agentSendCipherPart(text, table, field) {
+  if (typeof text !== "string") throw new Error("agentSendCipherPart: text obrigatório");
+  if (!isAgentSendCipherAad(table, field)) {
+    throw new Error("agentSendCipherPart: table/field não permitido em agent:send.parts");
+  }
+  return { kind: "cipher", text, table, field };
+}
+
 function collectFields(obj, fields, prefix) {
   const hits = [];
   if (!obj || typeof obj !== "object") return hits;

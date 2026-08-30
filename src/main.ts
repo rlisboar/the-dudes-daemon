@@ -32,7 +32,7 @@ import { ensureGraphWatch, stopAllGraphWatches } from "./graph-watcher.js";
 import { detectDropTarget, spawnDropped, type DropTarget } from "./privileges.js";
 import { BridgeRelay } from "./bridge-relay.js";
 import { defaultDaemonConfigPath, formatCliStatus, loadDaemonCliConfig, mergeCliConfig, resolveCliCommands, type DaemonCliConfig, type ResolvedCliCommands } from "./cli-config.js";
-import type { FromDaemon, FromOrch } from "./protocol.js";
+import { assembleAgentSendParts, type FromDaemon, type FromOrch } from "./protocol.js";
 import { runSummarizer } from "./summarizer-runner.js";
 import { aadV2, E2EE_TABLE } from "@the-dudes/protocol/e2ee-fields";
 import { decryptForProject, decryptImageAttachments, encryptForProject, countUsableProjectKeys, forgetAllProjectKeys, getDaemonPublicKey, hasProjectKey, isE2eEncrypted, isE2eeRequired, rememberProjectKey, setE2eeRequired } from "./daemon-crypto.js";
@@ -700,16 +700,30 @@ class DaemonClient {
           } else log("error", `agent:error recusado: e2ee-required sem chave project=${msg.projectId}`);
         };
         if (msg.parts && msg.parts.length > 0) {
-          const out: string[] = [];
-          for (const p of msg.parts) {
-            if (p.kind === "plain") { out.push(p.text); continue; }
-            if (!isE2eEncrypted(p.text)) { out.push(p.text); continue; }
-            if (!msg.projectId) { dropMissingKey(); return; }
-            const dec = decryptForProject(p.text, msg.projectId, aadV2({ projectId: msg.projectId, table: E2EE_TABLE.MESSAGES, field: "content" }));
-            if (dec === null) { dropMissingKey(); return; }
-            out.push(dec);
+          const assembled = assembleAgentSendParts(
+            msg.parts,
+            msg.projectId,
+            decryptForProject,
+            isE2eEncrypted,
+          );
+          if (!assembled.ok) {
+            const hasKey = !!(msg.projectId && hasProjectKey(msg.projectId));
+            if (hasKey) {
+              log(
+                "warn",
+                `agent:send to ${msg.agentId} cipher drop reason=${assembled.reason} prefix=${assembled.prefix} hasKey=true`,
+              );
+              const plain = "agent:send cipher recusado";
+              const sealed = sealAgentErrorMessage(msg.projectId, plain);
+              if (sealed) {
+                this.send({ type: "agent:error", agentId: msg.agentId, message: sealed, errorKind: agentErrorKind(plain) });
+              } else log("error", `agent:error recusado: e2ee-required sem chave project=${msg.projectId}`);
+            } else {
+              dropMissingKey();
+            }
+            return;
           }
-          content = out.join("");
+          content = assembled.content;
         } else {
           content = msg.content;
           if (msg.projectId && isE2eEncrypted(content)) {

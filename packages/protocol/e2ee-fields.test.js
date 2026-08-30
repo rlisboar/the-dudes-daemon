@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { aadV2, aadReadChain, AAD_READ_FALLBACK, E2EE_TABLE, E2E_V2_PREFIX, isE2eV2, isE2eV1Rejected, AGENT_FIELDS, CREDENTIAL_FIELDS, SUMMARIZE_FIELDS, MESSAGE_IMAGE_FIELD } from "./e2ee-fields.js";
+import { aadV2, aadReadChain, AAD_READ_FALLBACK, E2EE_TABLE, E2E_V2_PREFIX, isE2eV2, isE2eV1Rejected, AGENT_FIELDS, CREDENTIAL_FIELDS, SUMMARIZE_FIELDS, MESSAGE_IMAGE_FIELD, resolveAgentSendCipherAad, isAgentSendCipherAad, agentSendCipherPart, AGENT_SEND_CIPHER_AADS } from "./e2ee-fields.js";
 
 test("aadV2: string canônica v2|projectId|table|field", () => {
   assert.equal(
@@ -129,4 +129,27 @@ test("T-083 AAD_READ_FALLBACK: exatamente 4 pares; destino primeiro", () => {
     aadReadChain({ projectId: "p", table: E2EE_TABLE.GOALS, field: "title" }),
     [aadV2({ projectId: "p", table: E2EE_TABLE.GOALS, field: "title" })],
   );
+});
+
+test("T-117 resolveAgentSendCipherAad: legado, par válido, parcial, inválido", () => {
+  assert.equal(AGENT_SEND_CIPHER_AADS.length, 7);
+  assert.equal(isAgentSendCipherAad(E2EE_TABLE.TASKS, "title"), true);
+  assert.equal(isAgentSendCipherAad(E2EE_TABLE.BOARDS, "title"), false);
+  assert.deepEqual(resolveAgentSendCipherAad({}), {
+    ok: true, table: E2EE_TABLE.MESSAGES, field: "content", legacy: true,
+  });
+  assert.deepEqual(resolveAgentSendCipherAad({ table: "  ", field: "" }), {
+    ok: true, table: E2EE_TABLE.MESSAGES, field: "content", legacy: true,
+  });
+  assert.deepEqual(resolveAgentSendCipherAad({ table: E2EE_TABLE.TASKS, field: "title" }), {
+    ok: true, table: "tasks", field: "title", legacy: false,
+  });
+  assert.equal(resolveAgentSendCipherAad({ table: E2EE_TABLE.TASKS }).ok, false);
+  assert.equal(resolveAgentSendCipherAad({ table: E2EE_TABLE.TASKS }).reason, "partial");
+  assert.equal(resolveAgentSendCipherAad({ field: "title" }).reason, "partial");
+  assert.equal(resolveAgentSendCipherAad({ table: E2EE_TABLE.BOARDS, field: "title" }).reason, "invalid");
+  assert.equal(resolveAgentSendCipherAad({ table: E2EE_TABLE.MISSIONS, field: "title" }).reason, "invalid");
+  const part = agentSendCipherPart("e2e:v2:x", E2EE_TABLE.TASKS, "title");
+  assert.deepEqual(part, { kind: "cipher", text: "e2e:v2:x", table: "tasks", field: "title" });
+  assert.throws(() => agentSendCipherPart("x", E2EE_TABLE.BOARDS, "title"));
 });

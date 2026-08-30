@@ -54,5 +54,18 @@ export declare function aadReadChain(args: { projectId: string; table: string; f
 export declare function isE2eV2(stored: string): boolean;
 export declare function isE2eV1Rejected(stored: string): boolean;
 export declare function isPlainCatalogText(v: unknown): boolean;
+
+export declare const AGENT_SEND_CIPHER_AADS: ReadonlyArray<Readonly<{ table: string; field: string }>>;
+export declare function isAgentSendCipherAad(table: string, field: string): boolean;
+export type AgentSendCipherAadResult =
+  | { ok: true; table: string; field: string; legacy: boolean }
+  | { ok: false; reason: "partial" | "invalid" };
+export declare function resolveAgentSendCipherAad(part: { table?: unknown; field?: unknown } | null | undefined): AgentSendCipherAadResult;
+export declare function agentSendCipherPart(text: string, table: string, field: string): {
+  kind: "cipher";
+  text: string;
+  table: string;
+  field: string;
+};
 /** Campos do catálogo em claro num write (comando WS ou op do bridge). */
 export declare function catalogPlainHits(kind: string, payload: unknown): string[];
