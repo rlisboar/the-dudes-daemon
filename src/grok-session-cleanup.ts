@@ -12,6 +12,7 @@
 import { readdirSync, rmSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { grokHomePath } from "./runners/runtime-files.js";
 
 /** Prefixo do mkdtemp no summarizer-runner (`the-dudes-cli-` + random). */
 export const THE_DUDES_CLI_PREFIX = "the-dudes-cli-";
@@ -62,14 +63,16 @@ export function isTheDudesCliSessionDir(encodedName: string): boolean {
   return base.startsWith(THE_DUDES_CLI_PREFIX) && base.length > THE_DUDES_CLI_PREFIX.length;
 }
 
-/** Path canônico de sessions sob um home (ou GROK_HOME explícito). */
-export function grokSessionsRoot(homeOrGrokHome: string, isGrokHome = false): string {
-  const root = isGrokHome ? homeOrGrokHome : path.join(homeOrGrokHome, ".grok");
+/** Path canônico de sessions sob um home (ou GROK_HOME explícito).
+ *  `runner` escolhe o dir name (T-166/T-168: grok-custom → ~/.grok-custom). */
+export function grokSessionsRoot(homeOrGrokHome: string, isGrokHome = false, runner?: string): string {
+  const root = isGrokHome ? homeOrGrokHome : grokHomePath(homeOrGrokHome, runner);
   return path.join(root, "sessions");
 }
 
 /**
  * Homes a varrer: home efetivo do processo + dropTo (sudo) + GROK_HOME se set.
+ * T-168: inclui ~/.grok-custom (wrapper grok-custom / helper T-166).
  * Deduplica por realpath lógico (string).
  */
 export function resolveGrokSessionRoots(opts: {
@@ -81,8 +84,10 @@ export function resolveGrokSessionRoots(opts: {
   const homes = new Set<string>();
   const home = opts.home ?? process.env.HOME ?? os.homedir();
   homes.add(grokSessionsRoot(home));
+  homes.add(grokSessionsRoot(home, false, "grok-custom"));
   if (opts.dropToHome && opts.dropToHome !== home) {
     homes.add(grokSessionsRoot(opts.dropToHome));
+    homes.add(grokSessionsRoot(opts.dropToHome, false, "grok-custom"));
   }
   // nullish-coalesce quebraria `null` explícito (testes) → cairia no env do host.
   const gh = opts.grokHomeEnv !== undefined ? opts.grokHomeEnv : process.env.GROK_HOME;

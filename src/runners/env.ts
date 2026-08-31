@@ -87,6 +87,11 @@ export function buildGrokEnv(input: {
   }
   if (input.runner !== "grok-custom") {
     env.GROK_HOME = input.grokHome;
+  } else {
+    // T-168 residual QA: não basta omitir o set — GROK_HOME herdado de
+    // base/passthrough (ex. ~/.grok do daemon) vaza pro wrapper e anula
+    // "${GROK_HOME:-$HOME/.grok-custom}".
+    delete env.GROK_HOME;
   }
   env.GROK_DISABLE_AUTOUPDATER = "1";
   return env;

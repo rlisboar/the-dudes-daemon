@@ -52,7 +52,7 @@ test("resolveGrokSessionRoots: dedup home + dropTo + GROK_HOME", () => {
     dropToHome: "/Users/me",
     grokHomeEnv: null,
   });
-  assert.deepEqual(roots, ["/Users/me/.grok/sessions"]);
+  assert.deepEqual(roots, ["/Users/me/.grok/sessions", "/Users/me/.grok-custom/sessions"]);
 
   const withDrop = resolveGrokSessionRoots({
     home: "/root",
@@ -60,9 +60,11 @@ test("resolveGrokSessionRoots: dedup home + dropTo + GROK_HOME", () => {
     grokHomeEnv: "/opt/grok-home",
   });
   assert.ok(withDrop.includes("/root/.grok/sessions"));
+  assert.ok(withDrop.includes("/root/.grok-custom/sessions"));
   assert.ok(withDrop.includes("/Users/me/.grok/sessions"));
+  assert.ok(withDrop.includes("/Users/me/.grok-custom/sessions"));
   assert.ok(withDrop.includes("/opt/grok-home/sessions"));
-  assert.equal(withDrop.length, 3);
+  assert.equal(withDrop.length, 5);
 });
 
 function memFs(dirs: Record<string, { mtimeMs: number; isDir?: boolean }>): {

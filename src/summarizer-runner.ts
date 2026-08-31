@@ -20,8 +20,24 @@ import { extractOneShotText } from "./agent-runner.js";
 import { spawnDropped, type DropTarget } from "./privileges.js";
 import { normalizeGrokEffort } from "./runners/model-policy.js";
 import { isGrokFamily } from "./runners/index.js";
+import { grokHomePath } from "./runners/runtime-files.js";
 import { acquireTurnSlot } from "./runners/turn-gate.js";
 import type { CliRunner } from "./types.js";
+
+/** Env Grok do one-shot (summarizer/reply-suggester). T-164/T-168:
+ *  grok-custom NÃO aponta pra ~/.grok — GROK_HOME vem do helper T-166
+ *  (`~/.grok-custom`, o default do wrapper). grok oficial: `~/.grok`. */
+export function applyGrokFamilySummarizerEnv(
+  env: NodeJS.ProcessEnv,
+  runner: CliRunner,
+  dropTo?: DropTarget | null,
+): NodeJS.ProcessEnv {
+  const home = dropTo?.home ?? env.HOME ?? process.env.HOME ?? homedir();
+  env.HOME = home;
+  env.GROK_HOME = grokHomePath(home, runner);
+  env.GROK_DISABLE_AUTOUPDATER = "1";
+  return env;
+}
 
 export interface SummarizerArgs {
   runner: CliRunner;
@@ -304,10 +320,7 @@ async function runCliTextWithSlot(
   }
   if (isGrokFamily(args.runner)) {
     // Auth/sessões no home real do user — nunca no tmpdir efêmero do summarizer.
-    const home = args.dropTo?.home ?? process.env.HOME ?? homedir();
-    env.HOME = home;
-    env.GROK_HOME = join(home, ".grok");
-    env.GROK_DISABLE_AUTOUPDATER = "1";
+    applyGrokFamilySummarizerEnv(env, args.runner, args.dropTo);
   }
 
   // opencode usa o transporte serve (igual aos agentes), não `opencode run`.
@@ -341,7 +354,7 @@ async function runCliTextWithSlot(
   } else if (isGrokFamily(args.runner)) {
     // Grok Build headless (docs: 14-headless-mode.md): -p + json + always-approve.
     // GROK_HOME explícito pro auth do user (não o tmpdir efêmero do summarizer).
-    // Effort: só low|medium|high no wire.
+    // T-162/T-168: passa runner — grok-custom não degrada xhigh.
     argv = [
       "-p", promptText,
       "--output-format", "json",
@@ -353,7 +366,7 @@ async function runCliTextWithSlot(
       "--cwd", cwd,
     ];
     if (args.model) argv.push("-m", args.model);
-    const grokEffort = normalizeGrokEffort(args.effort);
+    const grokEffort = normalizeGrokEffort(args.effort, args.model, args.runner);
     if (grokEffort) argv.push("--effort", grokEffort);
   } else {
     return { ok: false, error: `runner inválido: ${args.runner}` };

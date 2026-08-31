@@ -5,6 +5,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { normalizeBoardUpsertArgs } from "./board-upsert-args.js";
 import { withBridgeRetry } from "./bridge-retry.js";
+import { POLICY_GATED_RUNNERS } from "./runner-policy.js";
 
 const AGENT_ID = process.env.THE_DUDES_AGENT_ID;
 const AGENT_NAME = process.env.THE_DUDES_AGENT_NAME ?? AGENT_ID ?? "unknown";
@@ -210,7 +211,7 @@ server.tool(
     context: z.string().optional().describe("Optional background/inputs the sub-agent needs (paths, constraints, prior findings)."),
     task_type: z.enum(["coding", "research", "analysis", "review", "testing", "documentation", "general"]).describe("Dominant kind of work; drives runner selection."),
     complexity: z.enum(["simple", "moderate", "complex", "critical"]).describe("Minimum capability required. Prefer the lowest reliable tier."),
-    preferred_runner: z.enum(["claude", "codex", "opencode", "gemini", "crush", "grok"]).optional().describe("Optional override; used only if installed."),
+    preferred_runner: z.enum(POLICY_GATED_RUNNERS).optional().describe("Optional override; used only if installed."),
     preferred_model: z.string().optional().describe("Optional exact model override for advanced cases."),
   },
   async ({ goal, context, task_type, complexity, preferred_runner, preferred_model }) => {

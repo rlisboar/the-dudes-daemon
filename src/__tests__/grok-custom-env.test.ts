@@ -43,3 +43,23 @@ test("comportamento legado preservado: sem runner informado, GROK_HOME é setado
   });
   assert.equal(env.GROK_HOME, "/home/u/.the-dudes/grok");
 });
+
+test("buildGrokEnv grok-custom apaga GROK_HOME herdado (T-168 residual QA)", () => {
+  const env = buildGrokEnv({
+    base: { PATH: "/usr/bin", HOME: "/home/u", GROK_HOME: "/home/u/.grok" },
+    tokenFile: "/tmp/token",
+    features: {},
+    grokHome: "/home/u/.the-dudes/grok",
+    runner: "grok-custom",
+  });
+  assert.equal("GROK_HOME" in env, false);
+  assert.notEqual(env.GROK_HOME, "/home/u/.grok");
+  const official = buildGrokEnv({
+    base: { PATH: "/usr/bin", HOME: "/home/u", GROK_HOME: "/stale" },
+    tokenFile: "/tmp/token",
+    features: {},
+    grokHome: "/home/u/.the-dudes/grok",
+    runner: "grok",
+  });
+  assert.equal(official.GROK_HOME, "/home/u/.the-dudes/grok");
+});

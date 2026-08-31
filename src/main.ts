@@ -32,7 +32,7 @@ import { ensureGraphWatch, stopAllGraphWatches } from "./graph-watcher.js";
 import { detectDropTarget, spawnDropped, type DropTarget } from "./privileges.js";
 import { BridgeRelay } from "./bridge-relay.js";
 import { defaultDaemonConfigPath, formatCliStatus, loadDaemonCliConfig, mergeCliConfig, resolveCliCommands, type DaemonCliConfig, type ResolvedCliCommands } from "./cli-config.js";
-import { applyRunnerPolicy, buildInstalledRunnerAvailability, helloRunnerLists, type InstalledRunnerAvailability } from "./runner-policy.js";
+import { applyRunnerPolicy, buildInstalledRunnerAvailability, helloRunnerLists, POLICY_GATED_RUNNERS, type InstalledRunnerAvailability } from "./runner-policy.js";
 import { assembleAgentSendParts, type FromDaemon, type FromOrch } from "./protocol.js";
 import { runSummarizer } from "./summarizer-runner.js";
 import { aadV2, E2EE_TABLE } from "@the-dudes/protocol/e2ee-fields";
@@ -295,7 +295,7 @@ class DaemonClient {
     } catch (e) {
       log("warn", `bridge relay failed to start (${(e as Error).message}) — agents will fetch orch directly`);
     }
-    (["claude", "opencode", "gemini", "codex", "crush", "grok"] as const).forEach((runner) => {
+    POLICY_GATED_RUNNERS.forEach((runner) => {
       const status = this.cliCommands[runner];
       log(status.available ? "info" : "warn", formatCliStatus(runner, status));
     });
