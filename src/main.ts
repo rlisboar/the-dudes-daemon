@@ -32,6 +32,7 @@ import { ensureGraphWatch, stopAllGraphWatches } from "./graph-watcher.js";
 import { detectDropTarget, spawnDropped, type DropTarget } from "./privileges.js";
 import { BridgeRelay } from "./bridge-relay.js";
 import { defaultDaemonConfigPath, formatCliStatus, loadDaemonCliConfig, mergeCliConfig, resolveCliCommands, type DaemonCliConfig, type ResolvedCliCommands } from "./cli-config.js";
+import { applyRunnerPolicy, buildInstalledRunnerAvailability, type InstalledRunnerAvailability } from "./runner-policy.js";
 import { assembleAgentSendParts, type FromDaemon, type FromOrch } from "./protocol.js";
 import { runSummarizer } from "./summarizer-runner.js";
 import { aadV2, E2EE_TABLE } from "@the-dudes/protocol/e2ee-fields";
@@ -145,7 +146,7 @@ Options:
 
 class DaemonClient {
   private args: Args;
-  private readonly installedRunnerAvailability: Record<string, boolean>;
+  private readonly installedRunnerAvailability: InstalledRunnerAvailability;
   private ws: WebSocket | null = null;
   private reconnectDelay = 1_000;
   private static readonly RECONNECT_CAP_MS = 60_000;
@@ -200,10 +201,7 @@ class DaemonClient {
     this.orchUrl = args.orch.replace(/\/$/, "");
     this.dropTo = detectDropTarget();
     this.cliCommands = cliCommands;
-    this.installedRunnerAvailability = Object.fromEntries(
-      (["claude", "codex", "opencode", "gemini", "crush", "grok"] as const)
-        .map((runner) => [runner, cliCommands[runner].available]),
-    );
+    this.installedRunnerAvailability = buildInstalledRunnerAvailability(cliCommands);
     this.modelDiscovery = new ModelDiscovery(cliCommands, this.dropTo);
     if (this.dropTo) {
       log("info", `running as root via sudo — child processes will drop to uid=${this.dropTo.uid} (${this.dropTo.user}) home=${this.dropTo.home}`);
@@ -537,11 +535,8 @@ class DaemonClient {
         return;
       }
       case "runner-policy:set": {
-        const allowed = new Set(msg.allowedRunners);
-        for (const runner of ["claude", "codex", "opencode", "gemini", "crush", "grok"] as const) {
-          this.cliCommands[runner].available = this.installedRunnerAvailability[runner] === true && allowed.has(runner);
-        }
-        log("info", `runner policy synced: ${[...allowed].join(", ") || "none"}`);
+        applyRunnerPolicy(this.cliCommands, this.installedRunnerAvailability, msg.allowedRunners);
+        log("info", `runner policy synced: ${[...new Set(msg.allowedRunners)].join(", ") || "none"}`);
         return;
       }
       case "daemon:challenge": {
