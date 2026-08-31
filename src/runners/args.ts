@@ -54,6 +54,8 @@ export interface GrokHeadlessArgs extends OneShotArgs {
    *  Sem isto todos os agentes dividem `~/.grok/leader.sock` — inclusive com
    *  o `grok` interativo do usuário e com outro daemon na mesma máquina. */
   leaderSocket?: string;
+  /** T-162: identidade do runner — grok-custom aceita xhigh universal. */
+  runner?: string;
 }
 
 export function grokHeadlessArgs(input: GrokHeadlessArgs): string[] {
@@ -70,7 +72,8 @@ export function grokHeadlessArgs(input: GrokHeadlessArgs): string[] {
   if (input.leaderSocket) args.push("--leader-socket", input.leaderSocket);
   if (input.model) args.push("-m", input.model);
   // T-057: effort wire depende do modelo (4.6+ aceita xhigh).
-  const effort = grokThinkingEffort(input.effort, !!input.collectThinking, !!input.forCompact, input.model);
+  // T-162: runner grok-custom aceita xhigh com qualquer model.
+  const effort = grokThinkingEffort(input.effort, !!input.collectThinking, !!input.forCompact, input.model, input.runner);
   if (effort) args.push("--effort", effort);
   if (input.sessionId) args.push("--resume", input.sessionId);
   if (input.planMode && !input.forCompact) {

@@ -1620,7 +1620,7 @@ export type ClientCommand =
   | { type: "write_file"; path: string; content: string }
   | { type: "file_operation"; op: "create_file" | "create_directory" | "rename" | "delete"; path: string; newPath?: string }
   | { type: "search_files"; query: string }
-  | { type: "summarize"; correlationId: string; runner: "claude" | "codex" | "opencode" | "gemini" | "crush" | "grok"; model?: string; effort?: string; systemPrompt?: string; text: string; dedupKey?: string; claudeConfigDir?: string; agentId?: string; probe?: boolean }
+  | { type: "summarize"; correlationId: string; runner: "claude" | "codex" | "opencode" | "gemini" | "crush" | "grok" | "grok-custom"; model?: string; effort?: string; systemPrompt?: string; text: string; dedupKey?: string; claudeConfigDir?: string; agentId?: string; probe?: boolean }
   | { type: "crypto:get_setup" }
   | { type: "crypto:init"; publicKey: string; wrappedPrivateKey: string; wrappedPrivateKeyRecovery: string; kekSalt: string; recoveryCodeHash: string }
   | { type: "crypto:rotate_passphrase"; wrappedPrivateKey: string; kekSalt: string }

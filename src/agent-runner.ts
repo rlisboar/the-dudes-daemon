@@ -2360,6 +2360,7 @@ export class AgentRunner {
       sessionId: opts.resume,
       forCompact: opts.forCompact,
       leaderSocket: this.runtimeFiles.grokLeaderSocket(),
+      runner: this.opts.cliRunner,
     });
   }
 

@@ -114,25 +114,32 @@ export function grok4Minor(model?: string | null): number | null {
   return match ? parseInt(match[1]!, 10) : null;
 }
 
-/** grok-4.6 e posteriores aceitam xhigh no wire (CLI ≥0.2.118 / API). */
-export function grokSupportsXhigh(model?: string | null): boolean {
+/**
+ * grok-4.6 e posteriores aceitam xhigh no wire (CLI ≥0.2.118 / API).
+ * T-162: runner grok-custom do dono aceita --effort xhigh com QUALQUER model
+ * (binário custom grok 1.0.0-fcustom — provado empiricamente), então a
+ * checagem por versão vale só pro grok oficial.
+ */
+export function grokSupportsXhigh(model?: string | null, runner?: string): boolean {
+  if (runner === "grok-custom") return true;
   const minor = grok4Minor(model);
   return minor != null && minor >= 6;
 }
 
-export function grokWireEfforts(model?: string | null): readonly GrokWireEffort[] {
-  return grokSupportsXhigh(model) ? GROK_WIRE_EFFORTS_XHIGH : GROK_WIRE_EFFORTS;
+export function grokWireEfforts(model?: string | null, runner?: string): readonly GrokWireEffort[] {
+  return grokSupportsXhigh(model, runner) ? GROK_WIRE_EFFORTS_XHIGH : GROK_WIRE_EFFORTS;
 }
 
 export function normalizeGrokEffort(
   effort: string | undefined | null,
   model?: string | null,
+  runner?: string,
 ): GrokWireEffort | undefined {
   if (!effort) return undefined;
   if (effort === "low" || effort === "medium" || effort === "high") return effort;
   if (effort === "none" || effort === "minimal" || effort === "off") return "low";
   if (effort === "xhigh" || effort === "max") {
-    return grokSupportsXhigh(model) ? "xhigh" : "high";
+    return grokSupportsXhigh(model, runner) ? "xhigh" : "high";
   }
   return "medium";
 }
@@ -142,11 +149,12 @@ export function grokThinkingEffort(
   collectThinking: boolean,
   forCompact: boolean,
   model?: string | null,
+  runner?: string,
 ): GrokWireEffort | undefined {
   // Com thinking coletado, sobe effort fraco pra high (mesmo padrão do claude).
   const lifted =
     !forCompact && collectThinking && (!effort || ["none", "minimal", "low", "medium"].includes(effort))
       ? "high"
       : effort;
-  return normalizeGrokEffort(lifted, model);
+  return normalizeGrokEffort(lifted, model, runner);
 }
