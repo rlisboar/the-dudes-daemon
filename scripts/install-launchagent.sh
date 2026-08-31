@@ -30,6 +30,8 @@ LIST_ONLY=0
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEMPLATE="${THE_DUDES_PLIST_TEMPLATE:-$SCRIPT_DIR/com.the-dudes.daemon.plist.template}"
 RUN_DAEMON_SRC="${THE_DUDES_RUN_DAEMON_SRC:-$SCRIPT_DIR/run-daemon.sh}"
+# T-149: pubkey p/ verificar a assinatura Ed25519 no seed (fonte única release/).
+SEED_PUBKEY="${THE_DUDES_SEED_PUBKEY:-$SCRIPT_DIR/../signing-pub.pem}"
 PLIST_DIR="${THE_DUDES_LAUNCH_AGENTS_DIR:-$HOME_DIR/Library/LaunchAgents}"
 UID_NUM="$(id -u)"
 DOMAIN="gui/$UID_NUM"
@@ -312,9 +314,7 @@ render_plist() {
 }
 
 # Verifica sha256 de um bundle contra seu .sha256. Retorna 0=ok, 1=mismatch,
-# 2=sem arquivo .sha256, 3=sem ferramenta de hash. O caminho de self-update
-# (self-update.ts) já verifica assinatura Ed25519; aqui garantimos ao menos
-# integridade no seed, que antes copiava cego.
+# 2=sem arquivo .sha256, 3=sem ferramenta de hash.
 verify_sha256() {
   local file="$1" shafile="$2" expected actual
   [ -f "$shafile" ] || return 2
@@ -329,52 +329,65 @@ verify_sha256() {
   [ -n "$expected" ] && [ "$expected" = "$actual" ]
 }
 
-# Gate de integridade antes de copiar um binário semeado. Fail-closed em
-# corrupção; warn (não bloqueia install) quando não há sha/ferramenta.
+# T-149: assinatura Ed25519 (mesmo esquema de build.mjs/deploy.yml —
+# sign(null, data) em base64; openssl pkeyutl NÃO casa com esse esquema).
+verify_sig() {
+  local file="$1" sigfile="$2" pub="$3" node
+  node="$(resolve_node)"
+  "$node" -e '
+    const { verify, createPublicKey } = require("crypto");
+    const fs = require("fs");
+    const [file, sigfile, pub] = process.argv.slice(1);
+    const data = fs.readFileSync(file);
+    const sig = Buffer.from(fs.readFileSync(sigfile, "utf8").trim(), "base64");
+    process.exit(verify(null, data, createPublicKey(fs.readFileSync(pub)), sig) ? 0 : 1);
+  ' "$file" "$sigfile" "$pub"
+}
+
+# Gate do seed (T-149): integridade (sha256) E autenticidade (Ed25519),
+# ambos fail-closed — nada de "copiar sem verificar" (incidente 2026-08-29:
+# sidecar .sha256 desatualizado instalado em silêncio).
 seed_check() {
   local file="$1" name="$2" rc=0
   # `|| rc=$?` é obrigatório: sob `set -e`, chamar verify_sha256 solto abortaria
-  # o install em QUALQUER retorno ≠0 (inclusive 2/3 = "sem sha/ferramenta"),
-  # transformando os warns em código morto. O `||` captura o código e desliga
+  # o install em QUALQUER retorno ≠0. O `||` captura o código e desliga
   # o errexit pra esta chamada.
   verify_sha256 "$file" "$file.sha256" || rc=$?
   case $rc in
     0) : ;;
-    1) die "seed $name FALHOU sha256 — bundle corrompido em $file, abortando" ;;
-    2) warn "seed $name sem .sha256 — copiando sem verificar integridade" ;;
-    3) warn "seed $name: sem sha256sum/shasum — copiando sem verificar integridade" ;;
+    1) die "seed $name FALHOU sha256 — sidecar desatualizado ou bundle corrompido em $file, abortando" ;;
+    2) die "seed $name sem .sha256 — release incompleta, abortando (nunca copiar sem verificar)" ;;
+    3) die "seed $name: sem sha256sum/shasum — abortando (nunca copiar sem verificar)" ;;
   esac
+  [ -f "$SEED_PUBKEY" ] || die "seed: pubkey ausente em $SEED_PUBKEY — abortando (nunca copiar não verificado)"
+  [ -f "$file.sig" ] || die "seed $name sem .sig — release não assinada, abortando (nunca copiar não verificado)"
+  verify_sig "$file" "$file.sig" "$SEED_PUBKEY" || \
+    die "seed $name: assinatura Ed25519 INVÁLIDA ($file.sig vs $SEED_PUBKEY) — abortando"
 }
 
 seed_binaries() {
-  # Copia binários para o home do perfil se ausentes — isolamento de self-update.
-  local seed_dir=""
-  if [ -f "$HOME_DIR/.the-dudes/daemon.cjs" ] && [ "$TD_DIR" != "$HOME_DIR/.the-dudes" ]; then
-    seed_dir="$HOME_DIR/.the-dudes"
-  elif [ -f "$SCRIPT_DIR/../release/daemon.cjs" ]; then
-    seed_dir="$(cd "$SCRIPT_DIR/../release" && pwd)"
-  elif [ -f "$SCRIPT_DIR/../dist/daemon.cjs" ]; then
-    seed_dir="$(cd "$SCRIPT_DIR/../dist" && pwd)"
+  # Fonte ÚNICA: daemon/release/ do repo (T-149). Nunca ~/.the-dudes (pode
+  # estar desatualizado — incidente 2026-08-29) nem dist/ (não assinado).
+  # Release ausente = erro claro; nunca cópia não verificada.
+  local seed_dir="$SCRIPT_DIR/../release"
+  if [ ! -f "$seed_dir/daemon.cjs" ]; then
+    die "seed: daemon/release/ sem daemon.cjs em $seed_dir — faça git pull / publique a release assinada antes de instalar"
   fi
 
   if [ ! -f "$DAEMON_BIN" ]; then
-    if [ -n "$seed_dir" ] && [ -f "$seed_dir/daemon.cjs" ]; then
-      seed_check "$seed_dir/daemon.cjs" "daemon.cjs"
-      cp "$seed_dir/daemon.cjs" "$DAEMON_BIN"
-      chmod 755 "$DAEMON_BIN"
-      log "seed daemon.cjs ← $seed_dir"
-      if [ -f "$seed_dir/mcp-bridge.cjs" ]; then
-        seed_check "$seed_dir/mcp-bridge.cjs" "mcp-bridge.cjs"
-        cp "$seed_dir/mcp-bridge.cjs" "$MCP_BIN"
-        chmod 755 "$MCP_BIN"
-      fi
-      for ext in sha256 sig; do
-        [ -f "$seed_dir/daemon.cjs.$ext" ] && cp "$seed_dir/daemon.cjs.$ext" "$TD_DIR/" || true
-        [ -f "$seed_dir/mcp-bridge.cjs.$ext" ] && cp "$seed_dir/mcp-bridge.cjs.$ext" "$TD_DIR/" || true
-      done
-    else
-      warn "sem daemon.cjs em $TD_DIR — rode install-daemon apontando DEST=$TD_DIR antes do load"
+    seed_check "$seed_dir/daemon.cjs" "daemon.cjs"
+    cp "$seed_dir/daemon.cjs" "$DAEMON_BIN"
+    chmod 755 "$DAEMON_BIN"
+    log "seed daemon.cjs ← $seed_dir (sha256 + Ed25519 OK)"
+    if [ -f "$seed_dir/mcp-bridge.cjs" ]; then
+      seed_check "$seed_dir/mcp-bridge.cjs" "mcp-bridge.cjs"
+      cp "$seed_dir/mcp-bridge.cjs" "$MCP_BIN"
+      chmod 755 "$MCP_BIN"
     fi
+    for ext in sha256 sig; do
+      [ -f "$seed_dir/daemon.cjs.$ext" ] && cp "$seed_dir/daemon.cjs.$ext" "$TD_DIR/" || true
+      [ -f "$seed_dir/mcp-bridge.cjs.$ext" ] && cp "$seed_dir/mcp-bridge.cjs.$ext" "$TD_DIR/" || true
+    done
   fi
 }
 
