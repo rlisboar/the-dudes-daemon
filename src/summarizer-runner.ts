@@ -19,6 +19,7 @@ import type { ResolvedCliCommands } from "./cli-config.js";
 import { extractOneShotText } from "./agent-runner.js";
 import { spawnDropped, type DropTarget } from "./privileges.js";
 import { normalizeGrokEffort } from "./runners/model-policy.js";
+import { isGrokFamily } from "./runners/index.js";
 import { acquireTurnSlot } from "./runners/turn-gate.js";
 import type { CliRunner } from "./types.js";
 
@@ -80,7 +81,7 @@ function extractUsage(out: string, runner: CliRunner, promptLen: number, outputL
         }
       } catch { /* skip */ }
     }
-  } else if (runner === "grok") {
+  } else if (isGrokFamily(runner)) {
     // Grok json/stream não expõe usage confiável — heurística por chars abaixo.
   }
   if (input === 0 && output === 0) {
@@ -301,7 +302,7 @@ async function runCliTextWithSlot(
   if (args.runner === "gemini") {
     env.GEMINI_CLI_TRUST_WORKSPACE = "true";
   }
-  if (args.runner === "grok") {
+  if (isGrokFamily(args.runner)) {
     // Auth/sessões no home real do user — nunca no tmpdir efêmero do summarizer.
     const home = args.dropTo?.home ?? process.env.HOME ?? homedir();
     env.HOME = home;
@@ -337,7 +338,7 @@ async function runCliTextWithSlot(
     argv = ["run", "--quiet", "--data-dir", join(cwd, ".crush")];
     if (args.model) argv.push("-m", args.model);
     argv.push(promptText);
-  } else if (args.runner === "grok") {
+  } else if (isGrokFamily(args.runner)) {
     // Grok Build headless (docs: 14-headless-mode.md): -p + json + always-approve.
     // GROK_HOME explícito pro auth do user (não o tmpdir efêmero do summarizer).
     // Effort: só low|medium|high no wire.

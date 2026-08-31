@@ -1028,7 +1028,7 @@ export interface DaemonInfo {
   /** graphify-mcp (serve) disponível no daemon. */
   graphifyMcp?: boolean;
   /** CLIs de agente instalados no daemon (p/ UI do + docs). */
-  availableRunners?: Array<"claude" | "codex" | "opencode" | "gemini" | "crush" | "grok">;
+  availableRunners?: Array<CliRunner>;
 }
 
 export interface DaemonStatus {

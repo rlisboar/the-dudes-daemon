@@ -1,4 +1,5 @@
-import type { ImageAttachment } from "../types.js";
+import type { CliRunner, ImageAttachment } from "../types.js";
+import { isGrokFamily } from "./index.js";
 
 const IMAGE_EXTENSIONS: Record<string, string> = {
   "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif",
@@ -95,11 +96,11 @@ export function codexImageArgs(paths: string[]): string[] {
 export function appendPathAttachmentPrompt(
   content: string,
   files: Array<{ path: string; name: string }>,
-  runner: "gemini" | "grok" | "crush",
+  runner: CliRunner,
 ): string {
   if (!files.length) return content;
   if (runner === "gemini") return `${content}\n\n${files.map((f) => `@${f.path}`).join(" ")}`;
-  const viewer = runner === "grok" ? "reader" : "viewer";
+  const viewer = isGrokFamily(runner) ? "reader" : "viewer";
   const lista = files.map((f) => `- ${f.name}: ${f.path}`).join("\n");
   return `${content}\n\nAttached file(s) — open with your file ${viewer} tool:\n${lista}`;
 }

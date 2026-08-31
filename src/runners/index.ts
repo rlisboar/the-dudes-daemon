@@ -33,7 +33,16 @@ export const RUNNER_ADAPTERS: Readonly<Record<CliRunner, RunnerAdapter>> = {
   gemini: adapter("gemini", "per-message", (id) => id.trim().length > 0),
   crush: adapter("crush", "per-message", (id) => UUID.test(id)),
   grok: adapter("grok", "per-message", (id) => UUID.test(id)),
+  // T-150: grok-custom = grok em tudo (spawn args/env, efforts/wire,
+  // signals.json, watchdog/turn-gate) — só muda o binário, apontado pelo
+  // dono via cliPaths/userRunnerBinDirs (T-032), sem path hardcoded.
+  "grok-custom": adapter("grok-custom", "per-message", (id) => UUID.test(id)),
 };
+
+/** T-150: família grok — comportamento idêntico entre grok e grok-custom. */
+export function isGrokFamily(runner: CliRunner | string | undefined): boolean {
+  return runner === "grok" || runner === "grok-custom";
+}
 
 export function runnerAdapter(runner: CliRunner): RunnerAdapter {
   return RUNNER_ADAPTERS[runner];

@@ -52,15 +52,30 @@ export function contextLimitFor(model: string | undefined): number {
   return lookupContextLimit(model) ?? DEFAULT_CONTEXT_LIMIT;
 }
 
+/**
+ * T-147: resolve a janela SEM fallback — undefined quando a única fonte
+ * disponível é o default (modelo desconhecido pré-catálogo). É o que o
+ * tracker expõe como UNKNOWN (0) no payload de usage.
+ */
+export function resolveContextLimitKnown(input: {
+  configuredModel?: string;
+  resolvedModel?: string;
+  catalogLimit?: number;
+}): number | undefined {
+  const configured = (input.configuredModel || "").trim().replace(EFFORT_SUFFIX_RE, "");
+  if (configured.endsWith("[1m]")) return 1_000_000;
+  if (input.catalogLimit && input.catalogLimit > 0) return input.catalogLimit;
+  return lookupContextLimit(input.resolvedModel) ?? lookupContextLimit(configured);
+}
+
 export function resolveContextLimit(input: {
   configuredModel?: string;
   resolvedModel?: string;
   catalogLimit?: number;
 }): number {
-  const configured = (input.configuredModel || "").trim().replace(EFFORT_SUFFIX_RE, "");
-  if (configured.endsWith("[1m]")) return 1_000_000;
-  if (input.catalogLimit && input.catalogLimit > 0) return input.catalogLimit;
-  return lookupContextLimit(input.resolvedModel) ?? contextLimitFor(configured);
+  // T-147: o default 200k é fallback de CÁLCULO interno (auto-compact/pct),
+  // nunca valor exibido como janela real do modelo.
+  return resolveContextLimitKnown(input) ?? DEFAULT_CONTEXT_LIMIT;
 }
 
 export function providerModelParts(model: string | undefined): { providerID: string; modelID: string } {

@@ -12,6 +12,8 @@ export interface CliPathConfig {
   codex?: string;
   crush?: string;
   grok?: string;
+  /** T-150: binário do runner grok-custom (apontado pelo dono). */
+  "grok-custom"?: string;
   graphify?: string;
   graphifyMcp?: string;
 }
@@ -35,6 +37,8 @@ export interface ResolvedCliCommands {
   crush: ResolvedCliCommand;
   /** Grok Build CLI (xAI) — headless `grok -p` / resume. */
   grok: ResolvedCliCommand;
+  /** T-150: binário do runner grok-custom (semântica grok, executável do dono). */
+  "grok-custom": ResolvedCliCommand;
   /** graphify CLI (build/index do knowledge graph) — opcional, só usado
    *  quando a feature graph está ligada no projeto. */
   graphify: ResolvedCliCommand;
@@ -84,6 +88,9 @@ export function resolveCliCommands(config: DaemonCliConfig = {}): ResolvedCliCom
     // grok (xAI Grok Build) instala em ~/.grok/bin (installer oficial) e às
     // vezes em ~/.local/bin / homebrew — fora do PATH do daemon.
     grok: resolveOne("grok", config.cliPaths?.grok, userDirs),
+    // T-150: grok-custom — semântica grok, binário apontado pelo dono
+    // (cliPaths["grok-custom"] ou binário `grok-custom` em userRunnerBinDirs).
+    "grok-custom": resolveOne("grok-custom", config.cliPaths?.["grok-custom"], userDirs),
     // graphify/graphify-mcp costumam ser instalados via pip --user/pipx em
     // dirs FORA do PATH herdado pelo daemon (ex: ~/Library/Python/X.Y/bin,
     // ~/.local/bin). Além do `which`, varre esses dirs de script do pip.
@@ -230,6 +237,7 @@ function sanitizeCliConfig(cfg: DaemonCliConfig): DaemonCliConfig {
       codex: normalizePath(cliPaths.codex),
       crush: normalizePath(cliPaths.crush),
       grok: normalizePath(cliPaths.grok),
+      "grok-custom": normalizePath(cliPaths["grok-custom"]),
       graphify: normalizePath(cliPaths.graphify),
       graphifyMcp: normalizePath(cliPaths.graphifyMcp),
     },

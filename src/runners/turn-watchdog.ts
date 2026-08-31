@@ -3,6 +3,8 @@
  * Grok headless é o pior caso (busy preso sem stream) → soft/hard mais curtos.
  */
 
+import { isGrokFamily } from "./index.js";
+
 export type HangPhase = "ok" | "soft" | "hard";
 
 export interface HangThresholds {
@@ -15,7 +17,7 @@ export interface HangThresholds {
 }
 
 export function hangThresholds(runner?: string): HangThresholds {
-  if (runner === "grok") {
+  if (isGrokFamily(runner)) {
     // Headless + swap thrash: o CLI pode ficar minutos emitindo stderr/stdout
     // de ruído (spinner, logs) sem NENHUM evento semântico (text/tool/result).
     // Se o activity clock contar bytes brutos, soft/hard NUNCA disparam —

@@ -1,6 +1,7 @@
 import path from "node:path";
 import { realpathSync } from "node:fs";
 import type { CliRunner } from "../types.js";
+import { isGrokFamily } from "./index.js";
 
 export interface GrokContextSignals {
   contextTokensUsed: number;
@@ -193,7 +194,7 @@ export function extractOneShotText(out: string, runner: CliRunner): string {
       return event.type === "text" && typeof part?.text === "string" ? part.text : undefined;
     }).join("\n").trim();
   }
-  if (runner === "grok") {
+  if (isGrokFamily(runner)) {
     const trimmed = out.trim();
     if (trimmed.startsWith("{")) {
       try {

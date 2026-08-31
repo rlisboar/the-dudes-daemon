@@ -11,7 +11,7 @@ import { resolvePython3 } from "./cli-config.js";
 import { buildGraph, graphExists, graphMtime, graphPath, hasSemanticMarker, needsSemanticUpdate } from "./graph-indexer.js";
 import { acquireTurnSlot } from "./runners/turn-gate.js";
 import { recordHang, recordHardRecover, recordTurnEnd, recordTurnStart } from "./health-monitor.js";
-import { isPerMessageRunner, runnerAdapter } from "./runners/index.js";
+import { isGrokFamily, isPerMessageRunner, runnerAdapter } from "./runners/index.js";
 import { claudeOneShotArgs, codexOneShotArgs, crushOneShotArgs, geminiOneShotArgs, grokHeadlessArgs, opencodeOneShotArgs } from "./runners/args.js";
 import { buildBaseRunnerEnv, buildBridgeAwareEnv, buildGeminiEnv, buildGrokEnv } from "./runners/env.js";
 import {
@@ -42,7 +42,7 @@ import { OpenCodeTransport } from "./runners/opencode-transport.js";
 import { buildOpenCodeAgentConfig, OPENCODE_MANAGED_AGENT } from "./runners/opencode-effort.js";
 import { PerMessageSessionState } from "./runners/message-session.js";
 import { buildAgentContext, buildInitialMessage, buildSystemPromptHeader, buildWorkspacePrompt } from "./runners/prompts.js";
-import { claudeThinkingEffort, codexEffort, providerModelParts, resolveContextLimit } from "./runners/model-policy.js";
+import { claudeThinkingEffort, codexEffort, providerModelParts, resolveContextLimit, resolveContextLimitKnown } from "./runners/model-policy.js";
 import { resolveOcCatalogContextLimit } from "./model-discovery.js";
 import { classifyRunnerFailure, isAbortedFailure, isApiErrorMessage, isAuthenticationFailure, isLoopStopMessage, isMissingSessionFailure as isMissingSessionMessage } from "./runners/error-classifier.js";
 import { appendFilePrompt, appendPathAttachmentPrompt, attachmentExtension, buildClaudeUserContent, buildOpenCodeParts, codexImageArgs, imageExtension, isInlineImage, safeAttachmentName } from "./runners/attachments.js";
@@ -302,6 +302,11 @@ export class AgentRunner {
     });
     this.contextTracker = new ContextTracker({
       resolveLimit: (resolvedModel, catalogLimit) => resolveContextLimit({
+        configuredModel: this.info.model, resolvedModel, catalogLimit,
+      }),
+      // T-147: resolução sem fallback — pré-uso, sem fonte real, o payload
+      // de usage expõe UNKNOWN (0) em vez do default 200k fabricado.
+      resolveLimitKnown: (resolvedModel, catalogLimit) => resolveContextLimitKnown({
         configuredModel: this.info.model, resolvedModel, catalogLimit,
       }),
       onUsage: opts.onContextUsage,
@@ -629,7 +634,7 @@ export class AgentRunner {
           env: this.crushTurnEnv(),
           stdio: ["ignore", "pipe", "pipe"],
         }, this.opts.dropTo ?? null);
-      } else if (runner === "grok") {
+      } else if (isGrokFamily(runner)) {
         // Headless one-shot: plain text (compact/summarize). Session resume
         // via --resume; --always-approve = non-interactive tool approval.
         const args = this.buildGrokHeadlessArgs(prompt, {
@@ -637,9 +642,9 @@ export class AgentRunner {
           outputFormat: "json",
           forCompact: true,
         });
-        this.traceCli("grok", "argv", prompt);
-        this.traceSpawn("grok", args);
-        proc = spawnDropped(this.runnerCommand("grok"), args, {
+        this.traceCli(runner, "argv", prompt);
+        this.traceSpawn(runner, args);
+        proc = spawnDropped(this.runnerCommand(runner), args, {
           cwd: this.opts.workspaceRoot,
           env: this.grokTurnEnv(),
           stdio: ["ignore", "pipe", "pipe"],
@@ -951,8 +956,8 @@ export class AgentRunner {
       this.bootPerMessageRunner();
       return;
     }
-    if (this.opts.cliRunner === "grok") {
-      if (!this.ensureRunnerAvailable("grok")) return;
+    if (isGrokFamily(this.opts.cliRunner)) {
+      if (!this.ensureRunnerAvailable(this.opts.cliRunner)) return;
       this.writeGrokConfig();
       this.bootPerMessageRunner();
       return;
@@ -1092,7 +1097,7 @@ export class AgentRunner {
       else if (r === "opencode") this.writeOpenCodeConfig();
       else if (r === "gemini") this.writeGeminiConfig();
       else if (r === "crush") this.writeCrushConfig();
-      else if (r === "grok") this.writeGrokConfig();
+      else if (isGrokFamily(r)) this.writeGrokConfig();
       // codex: MCP args montados a cada turno a partir de extraMcpServers
       this.opts.log("info", `[graph:${this.info.name}] MCP graphify injetado/atualizado (hot) → ${gPath}`);
       return true;
@@ -2423,7 +2428,7 @@ export class AgentRunner {
 
   private async runGrokMessage(content: string, images?: ImageAttachment[]) {
     if (this.stopped) { this.messageSession.busy = false; return; }
-    if (!this.ensureRunnerAvailable("grok")) { this.messageSession.busy = false; return; }
+    if (!this.ensureRunnerAvailable(this.opts.cliRunner)) { this.messageSession.busy = false; return; }
     // Nunca manda ciphertext pro CLI — hang/resposta lixo. Decryption falhou
     // no spawn (sem project key): aborta o turno em vez de travar o runner.
     if (typeof this.info.systemPrompt === "string" && this.info.systemPrompt.startsWith("e2e:")) {
@@ -2451,14 +2456,14 @@ export class AgentRunner {
     // 'close' do processo; o guard interno do gate cobre o "close não veio".
     // T-055: ephemeral (Brain subagent) compete no pool `bg`, não no main.
     const pool = this.info.ephemeral ? "bg" as const : "main" as const;
-    const releaseSlot = await acquireTurnSlot(`grok:${this.info.name}`, this.opts.log, pool);
+    const releaseSlot = await acquireTurnSlot(`${this.opts.cliRunner}:${this.info.name}`, this.opts.log, pool);
     this.waitingTurnGate = false;
     if (this.stopped || !this.messageSession.owns(epoch0)) { releaseSlot(); return; }
     // Guarda o release pro hard recover: close pós-SIGKILL não é garantido
     // (netos herdam pipes) e sem isto o slot trava a fila por até 15min.
     this.activeTurnRelease = releaseSlot;
     this.setState("thinking");
-    recordTurnStart("grok");
+    recordTurnStart(this.opts.cliRunner);
     const grokTurnT0 = Date.now();
     this.writeGrokConfig();
 
@@ -2480,7 +2485,7 @@ export class AgentRunner {
     if (images && images.length) {
       const { files, cleanup } = this.writeAttachmentFiles(images);
       imgCleanup = cleanup;
-      message = appendPathAttachmentPrompt(message, files, "grok");
+      message = appendPathAttachmentPrompt(message, files, this.opts.cliRunner);
     }
 
     // Prime do dedupe de tool_calls: em resume de sessão com histórico,
@@ -2494,12 +2499,12 @@ export class AgentRunner {
       resume: this.messageSession.sessionId,
       outputFormat: "streaming-json",
     });
-    this.traceCli("grok", "argv", message);
-    this.traceSpawn("grok", args);
+    this.traceCli(this.opts.cliRunner, "argv", message);
+    this.traceSpawn(this.opts.cliRunner, args);
 
     let proc: ChildProcess;
     try {
-      proc = spawnDropped(this.runnerCommand("grok"), args, {
+      proc = spawnDropped(this.runnerCommand(this.opts.cliRunner), args, {
         cwd: this.opts.workspaceRoot,
         env: this.grokTurnEnv(),
         stdio: ["ignore", "pipe", "pipe"],
@@ -2515,7 +2520,7 @@ export class AgentRunner {
     }
     proc.once("close", (code: number | null) => {
       this.releaseActiveTurnSlot();
-      recordTurnEnd("grok", Date.now() - grokTurnT0, code === 0);
+      recordTurnEnd(this.opts.cliRunner, Date.now() - grokTurnT0, code === 0);
     });
     this.ocActiveProc = proc;
     const grokTurnStartedAt = Date.now();
@@ -2659,8 +2664,8 @@ export class AgentRunner {
     // stderr/stdout sem evento útil e o soft/hard nunca disparavam (prod
     // 2026-08-04: zero linhas [hang] no log). Só ingestLine semântico conta.
     proc.stdout!.on("data", (chunk: string) => {
-      this.traceCli("grok", "stdout", chunk);
-      buf = this.capAccum("grok", buf, chunk);
+      this.traceCli(this.opts.cliRunner, "stdout", chunk);
+      buf = this.capAccum(this.opts.cliRunner, buf, chunk);
       let idx: number;
       while ((idx = buf.indexOf("\n")) >= 0) {
         const line = buf.slice(0, idx).trim();
@@ -2671,8 +2676,8 @@ export class AgentRunner {
     proc.stderr!.on("data", (chunk: string) => {
       const msg = chunk.trim();
       if (!msg) return;
-      this.traceCli("grok", "stderr", msg);
-      errOut = this.capAccum("grok", errOut, chunk);
+      this.traceCli(this.opts.cliRunner, "stderr", msg);
+      errOut = this.capAccum(this.opts.cliRunner, errOut, chunk);
       this.checkContextFullError(msg);
     });
 
@@ -3174,7 +3179,7 @@ export class AgentRunner {
       this.runCodexMessage(content, images);
     } else if (this.opts.cliRunner === "crush") {
       void this.runCrushMessage(content, images);
-    } else if (this.opts.cliRunner === "grok") {
+    } else if (isGrokFamily(this.opts.cliRunner)) {
       void this.runGrokMessage(content, images);
     } else {
       this.runOpenCodeMessage(content, images);
@@ -3245,7 +3250,7 @@ export class AgentRunner {
     this.oneShotProc = null;
     // Grok: mata também o leader persistente (não é o ocActiveProc). Sem isto
     // o leader fica zumbi entre restarts — só era morto no HARD recover.
-    if (this.opts.cliRunner === "grok") {
+    if (isGrokFamily(this.opts.cliRunner)) {
       try { killGrokLeader(this.runtimeFiles.grokLeaderSocket()); } catch { /* best-effort */ }
     }
     if (isPerMessageRunner(this.opts.cliRunner)) {
@@ -3478,7 +3483,7 @@ export class AgentRunner {
     // clear acabou de descartar (a "latest" no storage do tmpdir ainda é
     // ela); no codex, exec sem sid "resumiria" uma thread nova vazia.
     // Espelha os guards do claude (oldSession) e do opencode (sessionId).
-    if (this.messageSession.firstTurn || ((this.opts.cliRunner === "codex" || this.opts.cliRunner === "crush" || this.opts.cliRunner === "grok") && !this.messageSession.sessionId)) {
+    if (this.messageSession.firstTurn || ((this.opts.cliRunner === "codex" || this.opts.cliRunner === "crush" || isGrokFamily(this.opts.cliRunner)) && !this.messageSession.sessionId)) {
       this.opts.onError("[ctx] compact: sessão ainda não ativa — manda uma mensagem primeiro");
       return;
     }
@@ -3995,7 +4000,7 @@ export class AgentRunner {
       // T-055: cliente headless morto NÃO mata o leader do Grok — se o leader
       // travou, o próximo turno fica mudo até restart. Mata o processo no
       // --leader-socket deste agente e limpa o sock.
-      if (this.opts.cliRunner === "grok") {
+      if (isGrokFamily(this.opts.cliRunner)) {
         const sock = this.runtimeFiles.grokLeaderSocket();
         const n = killGrokLeader(sock);
         if (n > 0) {
@@ -4021,7 +4026,7 @@ export class AgentRunner {
       this.messageSession.busy = false;
 
       // Grok: limpa sessionId pra não re-travar no mesmo state zumbi.
-      if (this.opts.cliRunner === "grok") {
+      if (isGrokFamily(this.opts.cliRunner)) {
         if (this.messageSession.sessionId) {
           this.opts.log("warn", `[hang:${this.info.name}] limpando sessionId grok após hard recover`);
         }

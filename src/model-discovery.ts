@@ -7,13 +7,14 @@ import type { DiscoveredRunnerModel, RunnerModelCatalog } from "./protocol.js";
 import { killProcess } from "./runners/process-lifecycle.js";
 import { openCodeEffortsFor } from "./runners/opencode-effort.js";
 import { EFFORT_SUFFIX_RE, grokWireEfforts, providerModelParts } from "./runners/model-policy.js";
+import { isGrokFamily } from "./runners/index.js";
 import { withModelCapability } from "./model-capability.js";
 
 const CACHE_TTL_MS = 5 * 60_000;
 const COMMAND_TIMEOUT_MS = 12_000;
 const MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
 const MAX_MODELS = 2_000;
-const RUNNERS: CliRunner[] = ["claude", "opencode", "gemini", "codex", "crush", "grok"];
+const RUNNERS: CliRunner[] = ["claude", "opencode", "gemini", "codex", "crush", "grok", "grok-custom"];
 const ANSI_RE = /\x1b\[[0-?]*[ -/]*[@-~]/g;
 const MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:/+\-]{0,199}$/;
 
@@ -96,7 +97,7 @@ export function resolveOcCatalogContextLimit(args: {
   return undefined;
 }
 
-export function parseLineModelCatalog(output: string, runner: "opencode" | "crush" | "grok"): DiscoveredRunnerModel[] {
+export function parseLineModelCatalog(output: string, runner: "opencode" | "crush" | "grok" | "grok-custom"): DiscoveredRunnerModel[] {
   const models: DiscoveredRunnerModel[] = [];
   const seen = new Set<string>();
   let advertisedDefault = "";
@@ -106,7 +107,7 @@ export function parseLineModelCatalog(output: string, runner: "opencode" | "crus
     if (defaultHeader) advertisedDefault = defaultHeader[1];
     let id = line;
     let isDefault = false;
-    if (runner === "grok") {
+    if (isGrokFamily(runner)) {
       const bullet = line.match(/^\*\s+([^\s]+)(?:\s+\(default\))?$/i);
       if (!bullet) continue;
       id = bullet[1];
@@ -122,7 +123,7 @@ export function parseLineModelCatalog(output: string, runner: "opencode" | "crus
       // caía no fallback estático e xhigh não aparecia pra grok-4.6 (T-059).
       ...(runner === "opencode"
         ? { efforts: openCodeEffortsFor(id) }
-        : runner === "grok"
+        : isGrokFamily(runner)
           ? { efforts: [...grokWireEfforts(id)] }
           : {}),
     }));
@@ -324,7 +325,7 @@ export class ModelDiscovery {
         ? await discoverCodex(resolved.command, this.dropTo)
         : parseLineModelCatalog(
           await runCommand(resolved.command, ["models"], this.dropTo),
-          runner as "opencode" | "crush" | "grok",
+          runner as "opencode" | "crush" | "grok" | "grok-custom",
         );
       if (models.length === 0) throw new Error("CLI retornou catálogo vazio");
       const catalog: RunnerModelCatalog = {

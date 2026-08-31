@@ -2,7 +2,7 @@ import type { z } from "zod";
 
 export type AgentRuntimeState = "idle" | "queued" | "thinking" | "speaking" | "sending" | "stopping" | "stalled";
 export type EffortLevel = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-export type CliRunner = "claude" | "opencode" | "gemini" | "codex" | "crush" | "grok";
+export type CliRunner = "claude" | "opencode" | "gemini" | "codex" | "crush" | "grok" | "grok-custom";
 export type ProjectMemberRole = "admin" | "member";
 
 export declare const MAX_WIRE_MESSAGE_BYTES: number;

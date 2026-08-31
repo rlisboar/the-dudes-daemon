@@ -43,11 +43,11 @@ export interface DaemonHello {
    *  0/ausente = primeira conn ou buffer expirou. */
   resumeFromSeq?: number;
   /** CLIs resolvidos como executáveis neste daemon. */
-  availableRunners?: Array<"claude" | "codex" | "opencode" | "gemini" | "crush" | "grok">;
+  availableRunners?: Array<"claude" | "codex" | "opencode" | "gemini" | "crush" | "grok" | "grok-custom">;
   /** Disponibilidade do graphify (build) e graphify-mcp (serve) no PATH do daemon. */
   graphify?: { cli: boolean; mcp: boolean };
   /** CLIs instalados (espelho de availableRunners) p/ a UI do mapa. */
-  installedRunners?: Array<"claude" | "codex" | "opencode" | "gemini" | "crush" | "grok">;
+  installedRunners?: Array<"claude" | "codex" | "opencode" | "gemini" | "crush" | "grok" | "grok-custom">;
 }
 
 export interface ProjectE2eeRequired {
@@ -91,7 +91,7 @@ export interface ReleaseAvailable {
 /** Política definida no dashboard e persistida no servidor. */
 export interface RunnerPolicySet {
   type: "runner-policy:set";
-  allowedRunners: Array<"claude" | "codex" | "opencode" | "gemini" | "crush" | "grok">;
+  allowedRunners: Array<"claude" | "codex" | "opencode" | "gemini" | "crush" | "grok" | "grok-custom">;
 }
 
 /* H-18 proof-of-possession da pubkey RSA do daemon. Server gera nonce
@@ -645,7 +645,7 @@ export interface GitResult {
 export interface SummarizeRequest {
   type: "summarize:request";
   correlationId: string;
-  runner: "claude" | "codex" | "opencode" | "gemini" | "crush" | "grok";
+  runner: "claude" | "codex" | "opencode" | "gemini" | "crush" | "grok" | "grok-custom";
   model?: string;
   effort?: string;
   systemPrompt?: string;
@@ -861,7 +861,7 @@ export interface DiscoveredRunnerModel {
 }
 
 export interface RunnerModelCatalog {
-  runner: "claude" | "codex" | "opencode" | "gemini" | "crush" | "grok";
+  runner: "claude" | "codex" | "opencode" | "gemini" | "crush" | "grok" | "grok-custom";
   models: DiscoveredRunnerModel[];
   source: "codex-app-server" | "cli-command" | "unsupported";
   fetchedAt: number;
