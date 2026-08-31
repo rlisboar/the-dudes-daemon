@@ -22,6 +22,7 @@ import {
   parseGrokContextSignals,
   parseGrokTurnBillingFromUpdates,
   parseGrokUpdatesContextTokens,
+  type GrokChatToolCall,
   type GrokContextSignals,
   type GrokTurnBilling,
 } from "./runners/parsers.js";
@@ -56,6 +57,7 @@ export {
   parseGrokTurnBillingFromUpdates,
   parseGrokUpdatesContextTokens,
 } from "./runners/parsers.js";
+export type { GrokChatToolCall } from "./runners/parsers.js";
 export { CONTEXT_FULL_PATTERNS, RATE_LIMIT_TEXT_RE, contextTokensOf } from "./runners/context-tracker.js";
 export { DEFAULT_CONTEXT_LIMIT, MODEL_CONTEXT_LIMITS, contextLimitFor, lookupContextLimit } from "./runners/model-policy.js";
 
@@ -171,6 +173,111 @@ export interface AgentRunnerOptions {
   }) => void;
   /** Liga watch debounced do workspace (root, graphifyBin). Idempotente. */
   onGraphWatch?: (workspaceRoot: string, graphifyBin: string) => void;
+}
+
+/** Paths candidatos do signals.json (cwd canônico + raw + realpath variants). */
+export function grokSignalsCandidatesFor(grokHome: string, cwd: string, sessionId: string): string[] {
+  const out = new Set<string>();
+  out.add(grokSignalsPath(grokHome, cwd, sessionId));
+  out.add(path.join(grokHome, "sessions", encodeURIComponent(cwd), sessionId, "signals.json"));
+  out.add(path.join(grokHome, "sessions", encodeURIComponent(path.resolve(cwd || ".")), sessionId, "signals.json"));
+  try {
+    out.add(path.join(grokHome, "sessions", encodeURIComponent(realpathSync(path.resolve(cwd || "."))), sessionId, "signals.json"));
+  } catch { /* noop */ }
+  return [...out];
+}
+
+/** Resolve o chat_history.jsonl da sessão (mesma cadeia de candidatos
+ *  do signals.json + fallback de scan por sessionId). */
+export function resolveGrokChatHistoryPath(grokHome: string, cwd: string, sessionId: string): string | null {
+  for (const sigPath of grokSignalsCandidatesFor(grokHome, cwd, sessionId)) {
+    const p = path.join(path.dirname(sigPath), "chat_history.jsonl");
+    if (existsSync(p)) return p;
+  }
+  try {
+    const sessionsRoot = path.join(grokHome, "sessions");
+    if (existsSync(sessionsRoot)) {
+      for (const enc of readdirSync(sessionsRoot)) {
+        const p = path.join(sessionsRoot, enc, sessionId, "chat_history.jsonl");
+        if (existsSync(p)) return p;
+      }
+    }
+  } catch { /* best-effort */ }
+  return null;
+}
+
+/** Caminhos candidatos de updates.jsonl da sessão Grok (cwd variants + scan). */
+export function grokUpdatesCandidatesFor(grokHome: string, cwd: string, sessionId: string): string[] {
+  const tryFiles: string[] = [];
+  for (const sigPath of grokSignalsCandidatesFor(grokHome, cwd, sessionId)) {
+    tryFiles.push(path.join(path.dirname(sigPath), "updates.jsonl"));
+  }
+  try {
+    const sessionsRoot = path.join(grokHome, "sessions");
+    if (existsSync(sessionsRoot)) {
+      for (const enc of readdirSync(sessionsRoot)) {
+        tryFiles.push(path.join(sessionsRoot, enc, sessionId, "updates.jsonl"));
+      }
+    }
+  } catch { /* noop */ }
+  return tryFiles;
+}
+
+export interface GrokChatSweepCursor {
+  path: string;
+  offset: number;
+}
+
+/**
+ * Lê bytes novos do chat_history.jsonl e devolve as tool_calls ainda não
+ * vistas. `onToolUse` ausente = só marca ids (prime de resume).
+ * Retorna null se o arquivo sumiu no meio (stat/read falhou).
+ */
+export function sweepGrokChatToolCallsFromPath(
+  filePath: string,
+  cursor: GrokChatSweepCursor | null,
+  seenIds: Set<string>,
+  onToolUse?: (call: GrokChatToolCall) => void,
+): { cursor: GrokChatSweepCursor; emitted: boolean } | null {
+  let size: number;
+  try { size = statSync(filePath).size; } catch { return null; }
+  const prev = cursor?.path === filePath ? cursor.offset : 0;
+  // Arquivo encolheu = truncado/reescrito → recomeça do zero (dedupe por id
+  // segura re-emissão do que já foi visto).
+  const start = size >= prev ? prev : 0;
+  if (size <= start) return { cursor: { path: filePath, offset: start }, emitted: false };
+  let buf: Buffer;
+  try {
+    const fd = openSync(filePath, "r");
+    try {
+      const want = size - start;
+      buf = Buffer.allocUnsafe(want);
+      const n = readSync(fd, buf, 0, want, start);
+      buf = buf.subarray(0, n);
+    } finally { closeSync(fd); }
+  } catch { return null; }
+  // Só linhas completas avançam o offset (offset sempre em fronteira de
+  // linha → nunca corta um code point UTF-8 no início da próxima leitura).
+  const lastNl = buf.lastIndexOf(0x0a);
+  let consumed = lastNl >= 0 ? lastNl + 1 : 0;
+  const lines = consumed > 0 ? buf.subarray(0, consumed).toString("utf8").split("\n") : [];
+  const tail = buf.subarray(consumed).toString("utf8").trim();
+  if (tail) {
+    // Tail sem \n: consome só se já é JSON completo (senão espera o resto).
+    try { JSON.parse(tail); lines.push(tail); consumed = buf.length; } catch { /* parcial */ }
+  }
+  let emitted = false;
+  for (const line of lines) {
+    for (const call of parseGrokChatToolCalls(line)) {
+      if (seenIds.has(call.id)) continue;
+      seenIds.add(call.id);
+      if (onToolUse) {
+        onToolUse(call);
+        emitted = true;
+      }
+    }
+  }
+  return { cursor: { path: filePath, offset: start + consumed }, emitted };
 }
 
 
@@ -299,6 +406,7 @@ export class AgentRunner {
       agentId: info.id,
       agentToken: opts.agentToken,
       home: opts.dropTo?.home ?? process.env.HOME ?? os.homedir(),
+      runner: opts.cliRunner,
     });
     this.contextTracker = new ContextTracker({
       resolveLimit: (resolvedModel, catalogLimit) => resolveContextLimit({
@@ -701,16 +809,7 @@ export class AgentRunner {
 
   /** Paths candidatos do signals.json (cwd canônico + raw + realpath variants). */
   private grokSignalsCandidates(sessionId: string): string[] {
-    const home = this.runtimeFiles.grokHome();
-    const cwd = this.opts.workspaceRoot;
-    const out = new Set<string>();
-    out.add(grokSignalsPath(home, cwd, sessionId));
-    out.add(path.join(home, "sessions", encodeURIComponent(cwd), sessionId, "signals.json"));
-    out.add(path.join(home, "sessions", encodeURIComponent(path.resolve(cwd || ".")), sessionId, "signals.json"));
-    try {
-      out.add(path.join(home, "sessions", encodeURIComponent(realpathSync(path.resolve(cwd || "."))), sessionId, "signals.json"));
-    } catch { /* noop */ }
-    return [...out];
+    return grokSignalsCandidatesFor(this.runtimeFiles.grokHome(), this.opts.workspaceRoot, sessionId);
   }
 
   /** Lê `signals.json` da sessão Grok (ocupação real da janela). */
@@ -739,20 +838,7 @@ export class AgentRunner {
   /** Resolve o chat_history.jsonl da sessão (mesma cadeia de candidatos
    *  do signals.json + fallback de scan por sessionId). */
   private grokChatHistoryPath(sessionId: string): string | null {
-    for (const sigPath of this.grokSignalsCandidates(sessionId)) {
-      const p = path.join(path.dirname(sigPath), "chat_history.jsonl");
-      if (existsSync(p)) return p;
-    }
-    try {
-      const sessionsRoot = path.join(this.runtimeFiles.grokHome(), "sessions");
-      if (existsSync(sessionsRoot)) {
-        for (const enc of readdirSync(sessionsRoot)) {
-          const p = path.join(sessionsRoot, enc, sessionId, "chat_history.jsonl");
-          if (existsSync(p)) return p;
-        }
-      }
-    } catch { /* best-effort */ }
-    return null;
+    return resolveGrokChatHistoryPath(this.runtimeFiles.grokHome(), this.opts.workspaceRoot, sessionId);
   }
 
   /** Tool calls do grok: o streaming-json do CLI (0.2.x) NÃO emite eventos
@@ -772,68 +858,29 @@ export class AgentRunner {
   private grokSweepToolCalls(sessionId: string, emit: boolean): boolean {
     const p = this.grokChatHistoryPath(sessionId);
     if (!p) return false;
-    let size: number;
-    try { size = statSync(p).size; } catch { return false; }
-    const prev = this.grokChatSweepState?.path === p ? this.grokChatSweepState.offset : 0;
-    // Arquivo encolheu = truncado/reescrito → recomeça do zero (dedupe por id
-    // segura re-emissão do que já foi visto).
-    const start = size >= prev ? prev : 0;
-    if (size <= start) { this.grokChatSweepState = { path: p, offset: start }; return false; }
-    let buf: Buffer;
-    try {
-      const fd = openSync(p, "r");
-      try {
-        const want = size - start;
-        buf = Buffer.allocUnsafe(want);
-        const n = readSync(fd, buf, 0, want, start);
-        buf = buf.subarray(0, n);
-      } finally { closeSync(fd); }
-    } catch { return false; }
-    // Só linhas completas avançam o offset (offset sempre em fronteira de
-    // linha → nunca corta um code point UTF-8 no início da próxima leitura).
-    const lastNl = buf.lastIndexOf(0x0a);
-    let consumed = lastNl >= 0 ? lastNl + 1 : 0;
-    const lines = consumed > 0 ? buf.subarray(0, consumed).toString("utf8").split("\n") : [];
-    const tail = buf.subarray(consumed).toString("utf8").trim();
-    if (tail) {
-      // Tail sem \n: consome só se já é JSON completo (senão espera o resto).
-      try { JSON.parse(tail); lines.push(tail); consumed = buf.length; } catch { /* parcial */ }
-    }
-    this.grokChatSweepState = { path: p, offset: start + consumed };
-    let emittedTool = false;
-    for (const line of lines) {
-      for (const call of parseGrokChatToolCalls(line)) {
-        if (this.grokSeenToolCallIds.has(call.id)) continue;
-        this.grokSeenToolCallIds.add(call.id);
-        if (emit) {
+    const result = sweepGrokChatToolCallsFromPath(
+      p,
+      this.grokChatSweepState,
+      this.grokSeenToolCallIds,
+      emit
+        ? (call) => {
           this.opts.onToolUse(call.name, call.input);
-          emittedTool = true;
           // Poll 3s de chat_history: tool em andamento sem stream JSON.
           this.noteGrokToolInFlight();
           // Volta pra thinking/sending: o stream pode ter marcado "speaking"
           // com text intermediário, mas o agente ainda está no tool-loop.
           this.setState(call.name.includes("send_message") ? "sending" : "thinking");
         }
-      }
-    }
-    return emittedTool;
+        : undefined,
+    );
+    if (!result) return false;
+    this.grokChatSweepState = result.cursor;
+    return result.emitted;
   }
 
   /** Caminhos candidatos de updates.jsonl da sessão Grok (cwd variants + scan). */
   private grokUpdatesCandidates(sessionId: string): string[] {
-    const tryFiles: string[] = [];
-    for (const sigPath of this.grokSignalsCandidates(sessionId)) {
-      tryFiles.push(path.join(path.dirname(sigPath), "updates.jsonl"));
-    }
-    try {
-      const sessionsRoot = path.join(this.runtimeFiles.grokHome(), "sessions");
-      if (existsSync(sessionsRoot)) {
-        for (const enc of readdirSync(sessionsRoot)) {
-          tryFiles.push(path.join(sessionsRoot, enc, sessionId, "updates.jsonl"));
-        }
-      }
-    } catch { /* noop */ }
-    return tryFiles;
+    return grokUpdatesCandidatesFor(this.runtimeFiles.grokHome(), this.opts.workspaceRoot, sessionId);
   }
 
   /**

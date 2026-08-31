@@ -32,6 +32,15 @@ test("runtime files provide stable runner homes and clean temporary images", () 
   const files = new RunnerRuntimeFiles({ workspaceRoot: root, agentId: "../b", agentToken: "token", home, tempRoot: root });
   try {
     assert.equal(files.grokHome(), path.join(home, ".grok"));
+    const custom = new RunnerRuntimeFiles({
+      workspaceRoot: root, agentId: "c", agentToken: "token", home, tempRoot: root, runner: "grok-custom",
+    });
+    assert.equal(custom.grokHome(), path.join(home, ".grok-custom"));
+    assert.equal(
+      new RunnerRuntimeFiles({ workspaceRoot: root, agentId: "g", agentToken: "token", home, tempRoot: root, runner: "grok" }).grokHome(),
+      path.join(home, ".grok"),
+    );
+    custom.cleanup();
     assert.equal(files.crushDataDir(), path.join(root, ".crush", "agents", "%2E%2E%2Fb"));
     assert.equal(readFileSync(path.join(root, ".crush", ".gitignore"), "utf8"), "*\n");
     const first = files.writeImages([{ mimeType: "image/png", base64: "aGk=" }], () => "png");

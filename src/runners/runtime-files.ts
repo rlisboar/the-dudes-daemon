@@ -9,6 +9,15 @@ export interface RuntimeImage {
   mimeType: string;
 }
 
+/** Dir name sob $HOME. grok-custom isola do home do CLI oficial. */
+export function grokHomeDirName(runner?: string): string {
+  return runner === "grok-custom" ? ".grok-custom" : ".grok";
+}
+
+export function grokHomePath(home: string, runner?: string): string {
+  return path.join(home, grokHomeDirName(runner));
+}
+
 /** Arquivos e diretórios pertencentes a uma única instância de runner.
  * O tmpdir aleatório evita paths previsíveis; segredos e configs ficam 0600. */
 export class RunnerRuntimeFiles {
@@ -21,6 +30,8 @@ export class RunnerRuntimeFiles {
     agentToken: string;
     home?: string;
     tempRoot?: string;
+    /** Identidade do runner — grok-custom isola sessões em ~/.grok-custom. */
+    runner?: string;
   }) {}
 
   tempDir(): string {
@@ -55,8 +66,15 @@ export class RunnerRuntimeFiles {
     return path.join(this.tempDir(), "opencode.json");
   }
 
+  /**
+   * Home do CLI Grok (auth.json, sessions, signals, updates).
+   *
+   * grok-custom (T-164/T-166): o wrapper grava em `$HOME/.grok-custom` e o
+   * daemon NÃO seta GROK_HOME — os leitores de sessão precisam do mesmo
+   * path, senão RUNS/ocupação/billing ficam vazios. grok oficial: `~/.grok`.
+   */
   grokHome(): string {
-    return path.join(this.input.home ?? os.homedir(), ".grok");
+    return grokHomePath(this.input.home ?? os.homedir(), this.input.runner);
   }
 
   /**
