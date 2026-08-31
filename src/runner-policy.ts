@@ -32,3 +32,14 @@ export function applyRunnerPolicy(
     cliCommands[runner].available = installedRunnerAvailability[runner] === true && allowed.has(runner);
   }
 }
+
+/**
+ * Listas de runners reportadas no daemon:hello (T-159: cobrem grok-custom —
+ * mesmo universo da runner policy, sem lista hardcoded paralela).
+ */
+export function helloRunnerLists(cliCommands: ResolvedCliCommands): { availableRunners: PolicyRunner[]; installedRunners: PolicyRunner[] } {
+  return {
+    availableRunners: POLICY_GATED_RUNNERS.filter((runner) => cliCommands[runner].available),
+    installedRunners: POLICY_GATED_RUNNERS.filter((runner) => cliCommands[runner].available),
+  };
+}

@@ -32,7 +32,7 @@ import { ensureGraphWatch, stopAllGraphWatches } from "./graph-watcher.js";
 import { detectDropTarget, spawnDropped, type DropTarget } from "./privileges.js";
 import { BridgeRelay } from "./bridge-relay.js";
 import { defaultDaemonConfigPath, formatCliStatus, loadDaemonCliConfig, mergeCliConfig, resolveCliCommands, type DaemonCliConfig, type ResolvedCliCommands } from "./cli-config.js";
-import { applyRunnerPolicy, buildInstalledRunnerAvailability, type InstalledRunnerAvailability } from "./runner-policy.js";
+import { applyRunnerPolicy, buildInstalledRunnerAvailability, helloRunnerLists, type InstalledRunnerAvailability } from "./runner-policy.js";
 import { assembleAgentSendParts, type FromDaemon, type FromOrch } from "./protocol.js";
 import { runSummarizer } from "./summarizer-runner.js";
 import { aadV2, E2EE_TABLE } from "@the-dudes/protocol/e2ee-fields";
@@ -375,10 +375,8 @@ class DaemonClient {
         // persistente per-tokenId. 0/ausente = primeira conn / buffer
         // expirou (server faz nothing, comportamento legado).
         resumeFromSeq: this.lastSeenSeq,
-        availableRunners: (["claude", "codex", "opencode", "gemini", "crush", "grok"] as const)
-          .filter((runner) => this.cliCommands[runner].available),
-        installedRunners: (["claude", "codex", "opencode", "gemini", "crush", "grok"] as const)
-          .filter((runner) => this.cliCommands[runner].available),
+        availableRunners: helloRunnerLists(this.cliCommands).availableRunners,
+        installedRunners: helloRunnerLists(this.cliCommands).installedRunners,
         graphify: {
           cli: !!this.cliCommands.graphify?.available,
           mcp: !!this.cliCommands.graphifyMcp?.available,
