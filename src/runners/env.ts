@@ -73,6 +73,10 @@ export function buildGrokEnv(input: {
   features: Record<string, string>;
   grokHome: string;
   dropTo?: DropTarget | null;
+  /** T-164: grok-custom gerencia o próprio home isolado (wrapper do dono) —
+   *  setar GROK_HOME aqui sobrescreve o fallback "${GROK_HOME:-$HOME/.grok-custom}"
+   *  do wrapper e o CLI sobe sem credenciais ("xAI rejected its API key"). */
+  runner?: string;
 }): NodeJS.ProcessEnv {
   const env = buildBridgeAwareEnv(input.base, input.tokenFile, input.features);
   if (input.dropTo) {
@@ -81,7 +85,9 @@ export function buildGrokEnv(input: {
     env.LOGNAME = input.dropTo.user;
     if (input.dropTo.path) env.PATH = input.dropTo.path;
   }
-  env.GROK_HOME = input.grokHome;
+  if (input.runner !== "grok-custom") {
+    env.GROK_HOME = input.grokHome;
+  }
   env.GROK_DISABLE_AUTOUPDATER = "1";
   return env;
 }

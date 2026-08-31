@@ -2424,6 +2424,7 @@ export class AgentRunner {
       features: this.featuresEnv(),
       grokHome: this.runtimeFiles.grokHome(),
       dropTo: this.opts.dropTo,
+      runner: this.opts.cliRunner,
     });
   }
 
