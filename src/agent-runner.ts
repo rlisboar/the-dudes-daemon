@@ -43,6 +43,7 @@ import { buildOpenCodeAgentConfig, OPENCODE_MANAGED_AGENT } from "./runners/open
 import { PerMessageSessionState } from "./runners/message-session.js";
 import { buildAgentContext, buildInitialMessage, buildSystemPromptHeader, buildWorkspacePrompt } from "./runners/prompts.js";
 import { claudeThinkingEffort, codexEffort, providerModelParts, resolveContextLimit } from "./runners/model-policy.js";
+import { resolveOcCatalogContextLimit } from "./model-discovery.js";
 import { classifyRunnerFailure, isAbortedFailure, isApiErrorMessage, isAuthenticationFailure, isLoopStopMessage, isMissingSessionFailure as isMissingSessionMessage } from "./runners/error-classifier.js";
 import { appendFilePrompt, appendPathAttachmentPrompt, attachmentExtension, buildClaudeUserContent, buildOpenCodeParts, codexImageArgs, imageExtension, isInlineImage, safeAttachmentName } from "./runners/attachments.js";
 export {
@@ -1613,40 +1614,40 @@ export class AgentRunner {
     return this.openCodeTransport.ensureServer();
   }
 
-  /** Janela de contexto do catálogo do opencode serve (/config/providers):
-   *  coleta automática — é a janela que o próprio CLI aplica, cobre qualquer
-   *  provider/modelo (inclusive novos) sem depender do mapa estático, que
-   *  envelhece. Uma busca por vida do runner (o model do agente não muda). */
+  /** Janela de contexto do catálogo do opencode serve (/config/providers +
+   *  /config): coleta automática — é a janela que o próprio CLI aplica,
+   *  cobre qualquer provider/modelo (inclusive novos e display names sem
+   *  prefixo provider/) sem depender do mapa estático, que envelhece. Uma
+   *  busca por vida do runner (o model do agente não muda). */
   private ocCatalogLimitFetch?: Promise<void>;
   private fetchOcCatalogLimit(): Promise<void> {
     if (this.contextTracker.catalogLimitValue() !== undefined) return Promise.resolve();
     if (this.ocCatalogLimitFetch) return this.ocCatalogLimitFetch;
     this.ocCatalogLimitFetch = (async () => {
       try {
-        const { providerID, modelID } = providerModelParts(this.info.model);
-        // Sem prefixo de provider o POST do turno nem envia `model` (o serve
-        // roda no default DELE) — casar o modelID em provider arbitrário
-        // fixaria a janela de um modelo que não está rodando (ex. glm-5.2 do
-        // fireworks = 1M pro turno que roda no deepseek de 128k). Nesse caso
-        // fica no mapa estático.
-        if (!providerID || !modelID) return;
         const cfg = await this.ocServeFetch("/config/providers", "GET");
-        const provs = Array.isArray(cfg?.providers) ? cfg.providers : [];
-        for (const p of provs) {
-          if (p?.id !== providerID) continue;
-          const ctx = Number(p?.models?.[modelID]?.limit?.context ?? 0);
-          if (Number.isFinite(ctx) && ctx > 0) {
-            this.contextTracker.setCatalogLimit(ctx);
-            this.opts.log("info", `[opencode:${this.info.name}] janela do catálogo: ${this.contextTracker.catalogLimitValue()} (${providerID}/${modelID})`);
-            // UI: re-emite a ocupação com o denominador certo já — sem isto,
-            // a barra só corrigiria o teto no próximo turno. NUNCA re-emitir
-            // 0 (pós-restart sem ocupação apagaria a barra que o server
-            // ainda tem — mesmo invariante do finishGrokTurn).
-            if (this.contextTracker.lastUsed() > 0) {
-              this.opts.onContextUsage?.(this.contextTracker.lastUsed(), this.contextLimit());
-            }
-            return;
+        // T-137: modelo SEM prefixo `provider/` (ex.: display name colado da
+        // UI) roda o default do serve — em vez de abortar, resolve a janela
+        // pelos catálogos do próprio CLI: (a) provider/modelo explícito,
+        // (b) match por display name, (c) default do serve (/config.model).
+        let config: unknown;
+        try { config = await this.ocServeFetch("/config", "GET"); } catch { /* best-effort */ }
+        const resolvido = resolveOcCatalogContextLimit({
+          configuredModel: this.info.model,
+          config,
+          providers: cfg,
+        });
+        if (resolvido) {
+          this.contextTracker.setCatalogLimit(resolvido.limit);
+          this.opts.log("info", `[opencode:${this.info.name}] janela do catálogo: ${this.contextTracker.catalogLimitValue()} (via ${resolvido.via}: ${this.info.model})`);
+          // UI: re-emite a ocupação com o denominador certo já — sem isto,
+          // a barra só corrigiria o teto no próximo turno. NUNCA re-emitir
+          // 0 (pós-restart sem ocupação apagaria a barra que o server
+          // ainda tem — mesmo invariante do finishGrokTurn).
+          if (this.contextTracker.lastUsed() > 0) {
+            this.opts.onContextUsage?.(this.contextTracker.lastUsed(), this.contextLimit());
           }
+          return;
         }
       } catch { /* best-effort — mapa estático cobre o fallback */ }
       finally { this.ocCatalogLimitFetch = undefined; }

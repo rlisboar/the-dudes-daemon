@@ -6,7 +6,7 @@ import { spawnDropped, type DropTarget } from "./privileges.js";
 import type { DiscoveredRunnerModel, RunnerModelCatalog } from "./protocol.js";
 import { killProcess } from "./runners/process-lifecycle.js";
 import { openCodeEffortsFor } from "./runners/opencode-effort.js";
-import { grokWireEfforts } from "./runners/model-policy.js";
+import { EFFORT_SUFFIX_RE, grokWireEfforts, providerModelParts } from "./runners/model-policy.js";
 import { withModelCapability } from "./model-capability.js";
 
 const CACHE_TTL_MS = 5 * 60_000;
@@ -27,6 +27,73 @@ function safeDiscoveryEnv(): NodeJS.ProcessEnv {
   env.NO_COLOR = "1";
   env.CI = "1";
   return env;
+}
+
+/**
+ * T-137: resolve a janela de contexto EFETIVA do modelo configurado a partir
+ * dos catálogos do próprio CLI opencode serve (fonte real — o mapa estático
+ * envelhece e display names não têm prefixo `provider/modelo`).
+ *
+ * Ordem de resolução (mesma semântica do que o turno executa):
+ *  (a) configuredModel parseia `provider/modelo` → match direto em providers;
+ *  (b) configuredModel é display name → match exato por `name` do modelo;
+ *  (c) sem prefixo e sem name-match → o turno roda o DEFAULT do serve
+ *      (`config.model`) → resolve esse provider/modelo em providers.
+ *
+ * @returns janela (tokens) + como foi resolvida, ou undefined se os
+ *          catálogos não souberem (fallback: mapa estático → 200k).
+ */
+export function resolveOcCatalogContextLimit(args: {
+  configuredModel?: string;
+  /** Resposta de GET /config do opencode serve (campo `model` = default). */
+  config?: unknown;
+  /** Resposta de GET /config/providers do opencode serve. */
+  providers?: unknown;
+}): { limit: number; via: "provider-model" | "display-name" | "serve-default" } | undefined {
+  const provs = (args.providers as { providers?: unknown } | null | undefined)?.providers;
+  if (!Array.isArray(provs)) return undefined;
+  const ctxOf = (providerID: string, modelID: string): number | undefined => {
+    for (const p of provs as Array<Record<string, any>>) {
+      if (p?.id !== providerID) continue;
+      const models = p?.models;
+      const ctx = Number(models?.[modelID]?.limit?.context ?? 0);
+      if (Number.isFinite(ctx) && ctx > 0) return Math.floor(ctx);
+      return undefined;
+    }
+    return undefined;
+  };
+  const configured = args.configuredModel?.trim();
+  if (configured) {
+    const base = configured.replace(EFFORT_SUFFIX_RE, "");
+    // (a) id completo `provider/modelo` — comportamento anterior preservado.
+    const parts = providerModelParts(base);
+    if (parts.providerID && parts.modelID) {
+      const limit = ctxOf(parts.providerID, parts.modelID);
+      if (limit) return { limit, via: "provider-model" };
+    }
+    // (b) display name (o serve registra o agente com o nome configurado e
+    // resolve pelo campo `name` do catálogo — ex.: "GLM-5.3-Flash (…)"). Só
+    // match EXATO de name: sem isso cairíamos no erro de casar um modelID
+    // igual em provider arbitrário (janela de um modelo que não está rodando).
+    for (const p of provs as Array<Record<string, any>>) {
+      const models = p?.models ?? {};
+      for (const modelID of Object.keys(models)) {
+        if (models[modelID]?.name !== base) continue;
+        const limit = ctxOf(p.id, modelID);
+        if (limit) return { limit, via: "display-name" };
+      }
+    }
+  }
+  // (c) default do serve — sem `model` no POST do turno é isso que roda.
+  const def = (args.config as { model?: unknown } | null | undefined)?.model;
+  if (typeof def === "string" && def.trim()) {
+    const parts = providerModelParts(def.trim());
+    if (parts.providerID && parts.modelID) {
+      const limit = ctxOf(parts.providerID, parts.modelID);
+      if (limit) return { limit, via: "serve-default" };
+    }
+  }
+  return undefined;
 }
 
 export function parseLineModelCatalog(output: string, runner: "opencode" | "crush" | "grok"): DiscoveredRunnerModel[] {
