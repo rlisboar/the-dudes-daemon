@@ -9,12 +9,12 @@ import { openCodeEffortsFor } from "./runners/opencode-effort.js";
 import { EFFORT_SUFFIX_RE, grokWireEfforts, providerModelParts } from "./runners/model-policy.js";
 import { isGrokFamily } from "./runners/index.js";
 import { withModelCapability } from "./model-capability.js";
+import { RUNNERS } from "@the-dudes/protocol";
 
 const CACHE_TTL_MS = 5 * 60_000;
 const COMMAND_TIMEOUT_MS = 12_000;
 const MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
 const MAX_MODELS = 2_000;
-const RUNNERS: CliRunner[] = ["claude", "opencode", "gemini", "codex", "crush", "grok", "grok-custom"];
 const ANSI_RE = /\x1b\[[0-?]*[ -/]*[@-~]/g;
 const MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:/+\-]{0,199}$/;
 

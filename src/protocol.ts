@@ -10,6 +10,7 @@ import type {
   AgentRepoSpec,
   AgentRuntimeState,
   AgentUsage,
+  CliRunner,
   ImageAttachment,
   MCPDefinition,
   RepoSummary,
@@ -43,11 +44,11 @@ export interface DaemonHello {
    *  0/ausente = primeira conn ou buffer expirou. */
   resumeFromSeq?: number;
   /** CLIs resolvidos como executáveis neste daemon. */
-  availableRunners?: Array<"claude" | "codex" | "opencode" | "gemini" | "crush" | "grok" | "grok-custom">;
+  availableRunners?: CliRunner[];
   /** Disponibilidade do graphify (build) e graphify-mcp (serve) no PATH do daemon. */
   graphify?: { cli: boolean; mcp: boolean };
   /** CLIs instalados (espelho de availableRunners) p/ a UI do mapa. */
-  installedRunners?: Array<"claude" | "codex" | "opencode" | "gemini" | "crush" | "grok" | "grok-custom">;
+  installedRunners?: CliRunner[];
 }
 
 export interface ProjectE2eeRequired {
@@ -91,7 +92,7 @@ export interface ReleaseAvailable {
 /** Política definida no dashboard e persistida no servidor. */
 export interface RunnerPolicySet {
   type: "runner-policy:set";
-  allowedRunners: Array<"claude" | "codex" | "opencode" | "gemini" | "crush" | "grok" | "grok-custom">;
+  allowedRunners: CliRunner[];
 }
 
 /* H-18 proof-of-possession da pubkey RSA do daemon. Server gera nonce
@@ -645,7 +646,7 @@ export interface GitResult {
 export interface SummarizeRequest {
   type: "summarize:request";
   correlationId: string;
-  runner: "claude" | "codex" | "opencode" | "gemini" | "crush" | "grok" | "grok-custom";
+  runner: CliRunner;
   model?: string;
   effort?: string;
   systemPrompt?: string;
@@ -861,7 +862,7 @@ export interface DiscoveredRunnerModel {
 }
 
 export interface RunnerModelCatalog {
-  runner: "claude" | "codex" | "opencode" | "gemini" | "crush" | "grok" | "grok-custom";
+  runner: CliRunner;
   models: DiscoveredRunnerModel[];
   source: "codex-app-server" | "cli-command" | "unsupported";
   fetchedAt: number;

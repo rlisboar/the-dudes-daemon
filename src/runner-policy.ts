@@ -1,11 +1,12 @@
 import type { ResolvedCliCommands } from "./cli-config.js";
+import { RUNNERS } from "@the-dudes/protocol";
 
 /**
  * Runners sujeitos à runner policy do Dashboard (runner-policy:set).
- * T-157: grok-custom entra na lista — antes ficava sempre disponível
- * quando o binário existia, ignorando a policy.
+ * T-187: lista derivada do RUNNER_CATALOG (@the-dudes/protocol) — a cópia
+ * hardcoded aqui já esqueceu o grok-custom antes (T-157).
  */
-export const POLICY_GATED_RUNNERS = ["claude", "codex", "opencode", "gemini", "crush", "grok", "grok-custom"] as const;
+export const POLICY_GATED_RUNNERS = RUNNERS;
 
 export type PolicyRunner = (typeof POLICY_GATED_RUNNERS)[number];
 

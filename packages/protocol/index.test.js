@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   MAX_WIRE_MESSAGE_BYTES,
   WireMessageTooLargeError,
@@ -88,4 +89,48 @@ test("estouro de tamanho é distinguível de JSON malformado", () => {
     // essa distinção pra decidir entre "avisa o usuário" e "descarta".
     assert.throws(() => parse("{nao é json"), (e) => e.name !== "WireMessageTooLargeError");
   }
+});
+
+/* ---------- T-187: catálogo único de runners ---------- */
+
+test("catálogo de runners: 7 runners, valores únicos, incluindo grok-custom", () => {
+  assert.equal(node.RUNNER_CATALOG.length, 7);
+  const values = node.RUNNER_CATALOG.map((r) => r.value);
+  assert.equal(new Set(values).size, values.length, "valores duplicados no catálogo");
+  for (const value of values) assert.equal(typeof value, "string");
+  assert.ok(values.includes("grok-custom"), "grok-custom esquecido de novo?");
+  // cada entry tem label não-vazio
+  for (const entry of node.RUNNER_CATALOG) {
+    assert.equal(typeof entry.label, "string");
+    assert.ok(entry.label.length > 0);
+  }
+});
+
+test("RUNNERS deriva do catálogo na mesma ordem", () => {
+  assert.deepEqual([...node.RUNNERS], node.RUNNER_CATALOG.map((r) => r.value));
+});
+
+test("isKnownCliRunner aceita os do catálogo e rejeita o resto", () => {
+  for (const value of node.RUNNERS) assert.equal(node.isKnownCliRunner(value), true);
+  for (const bad of [undefined, null, "", "Claude", "cursor", "aider", ["claude"], 42]) {
+    assert.equal(node.isKnownCliRunner(bad), false, `deveria rejeitar ${JSON.stringify(bad)}`);
+  }
+});
+
+test("parity: CliRunner no index.d.ts cobre exatamente o catálogo", () => {
+  // Se este teste falhou, alguém adicionou runner só no .d.ts (ou só no
+  // catálogo). A fonte única vale pros DOIS lados — atualize os dois (é a
+  // mesma linha) ou, melhor, use RUNNER_CATALOG como fonte e derive o tipo.
+  const dts = readFileSync(new URL("./index.d.ts", import.meta.url), "utf8");
+  const match = dts.match(/export type CliRunner = ([^;]+);/);
+  assert.ok(match, "declaração de CliRunner não encontrada em index.d.ts");
+  const typeValues = match[1].split("|").map((s) => s.trim().replaceAll('"', ""));
+  assert.deepEqual(typeValues, [...node.RUNNERS]);
+
+  // RUNNERS é tupla literal no .d.ts (z.enum e Record no server/daemon
+  // dependem disso) — os elementos da tupla também têm que cobrir o catálogo.
+  const tuple = dts.match(/export declare const RUNNERS: readonly \[([^\]]+)\];/);
+  assert.ok(tuple, "tupla literal de RUNNERS não encontrada em index.d.ts");
+  const tupleValues = tuple[1].split(",").map((s) => s.trim().replaceAll('"', ""));
+  assert.deepEqual(tupleValues, [...node.RUNNERS]);
 });
