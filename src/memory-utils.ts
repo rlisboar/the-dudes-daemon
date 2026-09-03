@@ -67,18 +67,63 @@ export function applyMemoryCharBudget(
   return { kept, dropped, used };
 }
 
+/** Normalizador compartilhado: lowercase + NFD + strip diacritics +
+ *  pontuação→espaço + colapso de whitespace. Usado por near-dup de título,
+ *  comparação de corpo e fold de query no recall (tolerância a acento). */
+export function normalizeMemoryText(s: string): string {
+  return s
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/\p{M}/gu, "")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** Corpo "essencialmente igual": normalização compartilhada (acentos e
+ *  pontuação ignorados) comparando o prefixo de 400 chars — mesmo critério
+ *  do skip near-dup do saveExtractedMemory (auto-extract). */
+export function memoryBodySame(a: string, b: string): boolean {
+  return normalizeMemoryText(a).slice(0, 400) === normalizeMemoryText(b).slice(0, 400);
+}
+
+/** Orçamento do hot-set (pinned) e limiar de warning por entrada. */
+export const MEMORY_HOTSET_BUDGET_CHARS = 8000;
+export const MEMORY_PIN_WARN_CHARS = 2000;
+
+/** Feedback de tamanho no pin: entrada pinned com corpo grande consome
+ *  desproporcionalmente o orçamento de 8000 chars do hot-set — warning
+ *  vai no texto da tool remember, sem bloquear o save. */
+export function memoryPinBudgetWarning(pinned: boolean | undefined, body: string): string {
+  if (pinned !== true || body.length <= MEMORY_PIN_WARN_CHARS) return "";
+  return ` ⚠️ body=${body.length} chars (>${MEMORY_PIN_WARN_CHARS}); hot-set budget = ${MEMORY_HOTSET_BUDGET_CHARS} chars no total — considere encurtar ou deixar unpinned`;
+}
+
+/** Decisão de duplicidade p/ remember MANUAL: near-dup de título
+ *  (Jaccard ≥0.72) + corpo essencialmente igual → skip; near-dup com
+ *  corpo novo → supersede (a nova entrada substitui a antiga). */
+export type MemoryDupDecision =
+  | { action: "skip"; nearId: string; nearTitle: string }
+  | { action: "supersede"; nearId: string; nearTitle: string }
+  | { action: "create" };
+
+export function memoryManualDupDecision(
+  existing: Array<{ id: string; title?: string; body?: string }>,
+  title: string,
+  body: string,
+): MemoryDupDecision {
+  const near = existing.find((e) => e.title && memoryTitleNearDup(e.title, title));
+  if (!near?.title) return { action: "create" };
+  if (memoryBodySame(near.body ?? "", body)) {
+    return { action: "skip", nearId: near.id, nearTitle: near.title };
+  }
+  return { action: "supersede", nearId: near.id, nearTitle: near.title };
+}
+
 /** Similaridade grosseira de título (near-dup) sem embeddings. */
 export function memoryTitleNearDup(a: string, b: string): boolean {
-  const norm = (s: string) =>
-    s
-      .toLowerCase()
-      .normalize("NFD")
-      .replace(/\p{M}/gu, "")
-      .replace(/[^a-z0-9\s]/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-  const na = norm(a);
-  const nb = norm(b);
+  const na = normalizeMemoryText(a);
+  const nb = normalizeMemoryText(b);
   if (!na || !nb) return false;
   if (na === nb) return true;
   if (na.includes(nb) || nb.includes(na)) return true;
@@ -155,7 +200,9 @@ export function parseAndStripMemory(summary: string): { clean: string; items: Me
   return { clean, items };
 }
 
-/** Multi-termo: mode "and" (default) ou "or". */
+/** Multi-termo: mode "and" (default) ou "or". Query e haystack passam pelo
+ *  normalizador compartilhado (NFD + strip diacritics + pontuação→espaço):
+ *  'configuracao' acha 'Configuração', 't-230' acha 'T 230'. */
 export function memoryQueryMatch(
   haystack: string,
   query: string | undefined,
@@ -163,11 +210,10 @@ export function memoryQueryMatch(
 ): boolean {
   if (!query?.trim()) return true;
   const terms = query
-    .toLowerCase()
     .split(/\s+/)
-    .map((t) => t.trim())
+    .map((t) => normalizeMemoryText(t))
     .filter((t) => t.length > 0);
   if (terms.length === 0) return true;
-  const hay = haystack.toLowerCase();
+  const hay = normalizeMemoryText(haystack);
   return mode === "or" ? terms.some((t) => hay.includes(t)) : terms.every((t) => hay.includes(t));
 }

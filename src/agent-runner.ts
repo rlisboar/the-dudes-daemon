@@ -31,7 +31,7 @@ import { buildBridgeEnv, buildClaudeMcpConfig, buildCodexMcpArgs, buildCrushMcpC
 import { RunnerRuntimeFiles } from "./runners/runtime-files.js";
 import { ContextTracker, CumulativeUsageTracker, type UsageSemantics } from "./runners/context-tracker.js";
 import { armHardTimeout, appendCapped, collectProcessOutput, killGrokLeader, killProcess, processAlive as procAlive, RUNNER_OUTPUT_CAP_BYTES, terminateAndWait, terminateWithEscalation } from "./runners/process-lifecycle.js";
-import { memoryTitleNearDup, parseAndStripMemory } from "./memory-utils.js";
+import { memoryBodySame, memoryTitleNearDup, parseAndStripMemory } from "./memory-utils.js";
 import {
   createActivityClock,
   hangPhase,
@@ -3609,10 +3609,10 @@ export class AgentRunner {
         const supersedes = [...it.supersedes];
         if (near && !supersedes.includes(near.id)) supersedes.push(near.id);
 
-        // Skip se near-dup e body essencialmente igual
+        // Skip se near-dup e body essencialmente igual (normalizador
+        // compartilhado — tolerante a acento/pontuação, igual ao manual)
         if (near) {
-          const bn = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim();
-          if (bn(near.body).slice(0, 400) === bn(it.body).slice(0, 400)) {
+          if (memoryBodySame(near.body, it.body)) {
             skippedNear++;
             continue;
           }

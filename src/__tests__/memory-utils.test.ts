@@ -2,9 +2,13 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   applyMemoryCharBudget,
+  memoryBodySame,
+  memoryManualDupDecision,
+  memoryPinBudgetWarning,
   memoryQueryMatch,
   memoryTitleNearDup,
   memoryTypePriority,
+  normalizeMemoryText,
   parseAndStripMemory,
   sortByMemoryTypePriority,
 } from "../memory-utils.js";
@@ -67,4 +71,71 @@ test("memoryQueryMatch and/or modes", () => {
   assert.equal(memoryQueryMatch(hay, "postgres redis", "and"), false);
   assert.equal(memoryQueryMatch(hay, "postgres redis", "or"), true);
   assert.equal(memoryQueryMatch(hay, "", "and"), true);
+});
+
+test("normalizeMemoryText folds accents and punctuation", () => {
+  assert.equal(normalizeMemoryText("Configuração"), "configuracao");
+  assert.equal(normalizeMemoryText("backend/T-230"), "backend t 230");
+  assert.equal(normalizeMemoryText("  AÇÃO   crua! "), "acao crua");
+});
+
+test("memoryQueryMatch folds accents: 'configuracao' acha 'Configuração'", () => {
+  const hay = "T-230: Configuração do hot-set de memória";
+  assert.equal(memoryQueryMatch(hay, "configuracao", "and"), true);
+  assert.equal(memoryQueryMatch(hay, "CONFIGURACAO memoria", "and"), true);
+  assert.equal(memoryQueryMatch(hay, "configuracao", "or"), true);
+  assert.equal(memoryQueryMatch(hay, "inexistente", "and"), false);
+});
+
+test("memoryQueryMatch folds punctuation: 't-230' acha 'T-230'", () => {
+  const hay = "Summarizer grok-custom: branch backend/T-230";
+  assert.equal(memoryQueryMatch(hay, "t-230", "and"), true);
+  assert.equal(memoryQueryMatch(hay, "backend t 230", "and"), true);
+});
+
+test("memoryTitleNearDup tolerates accents via shared normalizer", () => {
+  assert.equal(memoryTitleNearDup("Configuração do proxy", "configuracao do proxy"), true);
+  assert.equal(memoryTitleNearDup("Memória: hot-set", "memoria hot set"), true);
+});
+
+test("memoryBodySame ignores accents and whitespace collapse", () => {
+  assert.equal(memoryBodySame("Usar Postgres na Configuração", "usar postgres na configuracao"), true);
+  assert.equal(memoryBodySame("linha 1\nlinha 2", "linha 1 linha 2"), true);
+  assert.equal(memoryBodySame("corpo completamente diferente", "outro corpo"), false);
+});
+
+test("memoryManualDupDecision: near-dup com corpo igual → skip", () => {
+  const existing = [{ id: "mem_abc", title: "Deploy produção", body: "rsync server/dist para /opt/the-dudes" }];
+  const d = memoryManualDupDecision(existing, "deploy producao", "rsync server/dist para /opt/the-dudes");
+  assert.equal(d.action, "skip");
+  if (d.action === "skip") {
+    assert.equal(d.nearId, "mem_abc");
+    assert.equal(d.nearTitle, "Deploy produção");
+  }
+});
+
+test("memoryManualDupDecision: near-dup com corpo novo → supersede", () => {
+  const existing = [{ id: "mem_def", title: "Deploy produção", body: "ftp antigo, obsoleto" }];
+  const d = memoryManualDupDecision(existing, "Deploy produção", "agora é rsync + systemctl restart");
+  assert.equal(d.action, "supersede");
+  if (d.action === "supersede") {
+    assert.equal(d.nearId, "mem_def");
+    assert.equal(d.nearTitle, "Deploy produção");
+  }
+});
+
+test("memoryManualDupDecision: sem near-dup → create", () => {
+  const existing = [{ id: "mem_x", title: "Lunch menu", body: "pizza" }];
+  assert.equal(memoryManualDupDecision(existing, "Deploy produção", "rsync").action, "create");
+  assert.equal(memoryManualDupDecision([], "Qualquer título", "corpo").action, "create");
+});
+
+test("memoryPinBudgetWarning: pinned com body > 2000 chars avisa", () => {
+  const big = "x".repeat(2001);
+  const warn = memoryPinBudgetWarning(true, big);
+  assert.ok(warn.includes("2001"));
+  assert.ok(warn.includes("8000"));
+  assert.equal(memoryPinBudgetWarning(true, "x".repeat(2000)), "");
+  assert.equal(memoryPinBudgetWarning(false, big), "");
+  assert.equal(memoryPinBudgetWarning(undefined, big), "");
 });

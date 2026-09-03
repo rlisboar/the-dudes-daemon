@@ -5,6 +5,11 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { normalizeBoardUpsertArgs } from "./board-upsert-args.js";
 import { withBridgeRetry } from "./bridge-retry.js";
+import {
+  memoryManualDupDecision,
+  memoryPinBudgetWarning,
+  memoryQueryMatch,
+} from "./memory-utils.js";
 import { POLICY_GATED_RUNNERS } from "./runner-policy.js";
 
 const AGENT_ID = process.env.THE_DUDES_AGENT_ID;
@@ -911,7 +916,7 @@ const MEMORY_TYPES = ["fact", "decision", "reference", "preference", "task_state
 
 server.tool(
   "remember",
-  "Save a durable note to YOUR agent memory (default scope=agent). Default is NOT pinned (catalog/recall only). Set pinned=true only if it must re-inject into YOUR system prompt every restart (hot-set quota ~15). Use scope 'project' only for shared catalog facts others may recall (never auto-injected into all agents). Keep entries short and atomic. Use supersedes to replace an older mem_ id of the same fact.",
+  "Save a durable note to YOUR agent memory (default scope=agent). Default is NOT pinned (catalog/recall only). Set pinned=true only if it must re-inject into YOUR system prompt every restart (hot-set quota ~15, budget 8000 chars). Use scope 'project' only for shared catalog facts others may recall (never auto-injected into all agents). Keep entries short and atomic. Use supersedes to replace an older mem_ id of the same fact. Near-dup guard: an existing entry with a similar title and essentially the same body is SKIPPED; with a new body, the new entry supersedes the old one automatically.",
   {
     title: z.string().describe("Short one-line title"),
     body: z.string().describe("The fact/decision/reference to remember"),
@@ -924,17 +929,50 @@ server.tool(
   async ({ title, body, type, scope, pinned, tags, supersedes }) => {
     try {
       const sup = (supersedes ?? []).filter((id) => /^mem_[a-z0-9]+$/i.test(id)).slice(0, 5);
+      // Near-dup manual: título parecido (Jaccard ≥0.72) contra memórias
+      // existentes → skip (corpo igual) ou supersede (corpo novo).
+      let existing: Array<{ id: string; title?: string; body?: string }> = [];
+      try {
+        const lr = await postJSON("memory_list", { limit: 80, touch: false });
+        existing = (lr.memories ?? []).map((m: any) => ({
+          id: typeof m?.id === "string" ? m.id : "",
+          title: typeof m?.title === "string" ? m.title : "",
+          body: typeof m?.body === "string" ? m.body : "",
+        }));
+      } catch {
+        // lista indisponível → segue como create (não bloqueia o save)
+      }
+      const dup = memoryManualDupDecision(existing, title, body);
+      if (dup.action === "skip") {
+        console.error(
+          `[mcp-bridge] ${AGENT_NAME} remember skip near-dup: "${title}" ≈ ${dup.nearId} ("${dup.nearTitle}") — corpo essencialmente igual`,
+        );
+        return {
+          content: [{
+            type: "text",
+            text: `skipped — near-dup of ${dup.nearId} ("${dup.nearTitle}") with essentially the same body (nothing saved)`,
+          }],
+        };
+      }
+      if (dup.action === "supersede") {
+        console.error(
+          `[mcp-bridge] ${AGENT_NAME} remember near-dup: "${title}" ≈ ${dup.nearId} ("${dup.nearTitle}") — corpo novo, nova entrada supersedes a antiga`,
+        );
+      }
+      const supList = dup.action === "supersede" && !sup.includes(dup.nearId)
+        ? [dup.nearId, ...sup].slice(0, 5)
+        : sup;
       const r = await postJSON("memory_add", {
         title, body, type,
         scope: scope ?? "agent",
         pinned: pinned === true,
         tags: tags?.slice(0, 12),
-        supersedesId: sup[0],
+        supersedesId: supList[0],
       });
       const newId = r.memory?.id as string | undefined;
       let merged = 0;
-      if (newId && sup.length > 0) {
-        for (const oldId of sup) {
+      if (newId && supList.length > 0) {
+        for (const oldId of supList) {
           if (oldId === newId) continue;
           try {
             await postJSON("memory_remove", { id: oldId });
@@ -943,8 +981,9 @@ server.tool(
         }
       }
       const pin = r.memory?.pinned ? " pinned" : "";
+      const pinWarn = memoryPinBudgetWarning(pinned, body);
       const mrg = merged > 0 ? ` superseded ${merged}` : "";
-      return { content: [{ type: "text", text: `remembered ${newId ?? ""} [${r.memory?.type ?? type ?? "fact"}/${r.memory?.scope ?? scope ?? "agent"}]${pin}${mrg}` }] };
+      return { content: [{ type: "text", text: `remembered ${newId ?? ""} [${r.memory?.type ?? type ?? "fact"}/${r.memory?.scope ?? scope ?? "agent"}]${pin}${mrg}${pinWarn}` }] };
     } catch (e) {
       return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
     }
@@ -970,13 +1009,9 @@ server.tool(
       }>;
       const matchMode = mode === "or" ? "or" : "and";
       if (query?.trim()) {
-        const terms = query.toLowerCase().split(/\s+/).map((t) => t.trim()).filter(Boolean);
-        if (terms.length > 0) {
-          entries = entries.filter((e) => {
-            const hay = `${e.title ?? ""}\n${e.body ?? ""}\n${(e.tags ?? []).join(" ")}`.toLowerCase();
-            return matchMode === "or" ? terms.some((t) => hay.includes(t)) : terms.every((t) => hay.includes(t));
-          });
-        }
+        entries = entries.filter((e) =>
+          memoryQueryMatch(`${e.title ?? ""}\n${e.body ?? ""}\n${(e.tags ?? []).join(" ")}`, query, matchMode),
+        );
       }
       // Boost sticky types after pin sort (server already ranks; re-boost filtered set)
       entries.sort((a, b) => {
