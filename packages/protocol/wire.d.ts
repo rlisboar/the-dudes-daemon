@@ -643,6 +643,18 @@ export interface MemoryEntry {
   expiresAt?: string | null;
 }
 
+/** T-235/T-231: métricas de memória do snapshot de projeto — mesma fonte de
+ *  `memory_list` meta (memoryMetricsSnapshot()). Contadores absolutos desde
+ *  o boot da instância do projeto; o web exibe o valor do último snapshot
+ *  (sem evento por touch — chatty demais — e sem comando novo). */
+export interface MemoryMetricsSnapshot {
+  injects: number;
+  injectDropped: number;
+  recalls: number;
+  touches: number;
+  bulkOps: number;
+}
+
 export interface GitLabIntegrationPublic {
   configured: boolean;
   baseUrl?: string;
@@ -1154,6 +1166,10 @@ export type ServerEvent =
       tasks: Task[];
       goals: Goal[];
       memories: MemoryEntry[];
+      /** T-235/T-231: métricas de memória (memoryMetricsSnapshot()). Opcional —
+       *  servers antigos não enviam. UI mostra o valor do último snapshot
+       *  (sem evento por touch, sem comando novo). */
+      memoryMetrics?: MemoryMetricsSnapshot;
       credentials: CredentialPublic[];
       schedules: ScheduledPrompt[];
       explanationBoard?: ExplanationBoard;

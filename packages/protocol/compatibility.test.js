@@ -55,6 +55,17 @@ test("os campos que tinham divergido continuam no contrato", () => {
   assert.match(wire, /title\?: string;\s*\n\s*body\?: string;/, "MemoryEntry perdeu title/body");
 });
 
+test("T-235: memoryMetrics no snapshot tem tipo formal no wire", () => {
+  // T-231 adendo / T-235: campo opcional no snapshot + interface exportada.
+  assert.match(wire, /memoryMetrics\?: MemoryMetricsSnapshot/, "snapshot perdeu memoryMetrics");
+  assert.match(wire, /export interface MemoryMetricsSnapshot \{/, "MemoryMetricsSnapshot não exportada");
+  // Formato congelado = exatamente o que o server emite (memoryMetricsSnapshot).
+  const iface = wire.match(/export interface MemoryMetricsSnapshot \{[\s\S]*?\}/)?.[0] ?? "";
+  for (const campo of ["injects", "injectDropped", "recalls", "touches", "bulkOps"]) {
+    assert.match(iface, new RegExp(`${campo}: number`), `MemoryMetricsSnapshot perdeu ${campo}`);
+  }
+});
+
 test("primitivos continuam vindo do index, não redeclarados", () => {
   for (const src of [serverTypes, webTypes]) {
     assert.match(src, /from "@the-dudes\/protocol"/);
