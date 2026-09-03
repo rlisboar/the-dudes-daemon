@@ -66,6 +66,32 @@ test("T-235: memoryMetrics no snapshot tem tipo formal no wire", () => {
   }
 });
 
+test("T-238: approve_review no enum do bulk_memories (schema + wire)", async () => {
+  // Resíduo T-231: o handler do server aceitava approve_review, mas o schema
+  // zod rejeitava o comando no validateCommand — caminho morto pelo wire.
+  const { validateCommand } = await import("./commands.js");
+
+  // Caminho VIVO: comando passa pelo validateCommand (antes: "campo inválido").
+  const cmd = {
+    type: "bulk_memories",
+    ids: ["mem_abc123"],
+    action: "approve_review",
+  };
+  const v = validateCommand(cmd);
+  assert.deepEqual(v, { ok: true }, `approve_review rejeitado no validateCommand: ${JSON.stringify(v)}`);
+
+  // Negativa: action fora do enum continua rejeitada.
+  const bad = validateCommand({ type: "bulk_memories", ids: ["mem_abc123"], action: "foo" });
+  assert.equal(bad.ok, false, "action inválida deveria ser rejeitada");
+
+  // Shape da union no wire: approve_review presente no bulk_memories.
+  assert.match(
+    wire,
+    /type: "bulk_memories"; ids: string\[\]; action: [^;]*"approve_review"/,
+    "union do bulk_memories no wire sem approve_review",
+  );
+});
+
 test("primitivos continuam vindo do index, não redeclarados", () => {
   for (const src of [serverTypes, webTypes]) {
     assert.match(src, /from "@the-dudes\/protocol"/);

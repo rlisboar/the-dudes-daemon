@@ -1414,7 +1414,7 @@ export type ClientCommand =
   | { type: "update_memory"; id: string; patch: { titleCipher?: string; bodyCipher?: string; type?: MemoryType; scope?: MemoryScope; agentId?: string | null; tags?: string[]; pinned?: boolean; confidence?: number | null; supersedesId?: string | null; goalId?: string | null; taskId?: string | null; planId?: string | null; archivedAt?: string | null; expiresAt?: string | null } }
   | { type: "remove_memory"; id: string }
   | { type: "clear_memories" }
-  | { type: "bulk_memories"; ids: string[]; action: "pin" | "unpin" | "archive" | "unarchive" | "delete" | "set_scope_project" | "set_scope_agent"; agentId?: string | null }
+  | { type: "bulk_memories"; ids: string[]; action: "pin" | "unpin" | "archive" | "unarchive" | "delete" | "set_scope_project" | "set_scope_agent" | "approve_review"; agentId?: string | null }
   | { type: "memory_hygiene"; mode?: "unpin_non_sticky" | "enforce_quota" }
   | { type: "set_memory_enabled"; value: boolean }
   | { type: "set_memory_max_pinned"; value: number }

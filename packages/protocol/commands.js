@@ -174,7 +174,9 @@ export const commandSchemas = {
   clear_memories: cmd({}),
   bulk_memories: cmd({
     ids: z.array(id),
-    action: z.enum(["pin", "unpin", "archive", "unarchive", "delete", "set_scope_project", "set_scope_agent"]),
+    // T-238 (resíduo T-231): approve_review seta needs_review=false —
+    // gate dono/admin vive no server (bulkMemories, requireAdmin fail-closed).
+    action: z.enum(["pin", "unpin", "archive", "unarchive", "delete", "set_scope_project", "set_scope_agent", "approve_review"]),
     agentId: id.nullable().optional(),
   }),
   memory_hygiene: cmd({ mode: z.enum(["unpin_non_sticky", "enforce_quota"]).optional() }),
