@@ -631,6 +631,12 @@ export interface MemoryEntry {
   goalId?: string | null;
   taskId?: string | null;
   planId?: string | null;
+  /** T-234/T-231: sinal de utilidade — incrementado SOMENTE em touch de
+   *  origem recall (touch de inject não conta). Retrocompat: campo ausente = 0. */
+  recallHits?: number;
+  /** T-234/T-231: add scope=project criado por AGENTE nasce true — marca
+   *  revisão na UI sem bloquear recall. Retrocompat: campo ausente = false. */
+  needsReview?: boolean;
   /** Arquivada: some do recall/hot-set default; permanece no audit/UI com filtro. */
   archivedAt?: string | null;
   /** Expiração opcional (ISO); após expires some do hot-set/recall ativo. */
