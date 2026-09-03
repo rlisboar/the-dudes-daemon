@@ -730,7 +730,23 @@ class DaemonClient {
         const images = decryptImageAttachments(msg.images, msg.projectId);
         if (images === null) { dropMissingKey(); return; }
         if (msg.telegram !== undefined) this.host.setTelegramMirror(msg.agentId, msg.telegram);
+        // T-233: proveniência de task ativa — SOMENTE pelo sinal autoritativo
+        // do server (taskId explícito em agent:send task-linked). Nunca parse
+        // de texto. Campo opcional: daemons/servers antigos não enviam.
+        if (typeof msg.taskId === "string" && msg.taskId.trim()) {
+          this.host.setActiveTask(msg.agentId, msg.taskId);
+        }
         this.host.send_message(msg.agentId, content, images, msg.deliveryId);
+        return;
+      }
+      case "task:updated": {
+        // T-233: task done → limpa a task ativa do agente atribuído (sem
+        // staleness de proveniência). Done atrasado de task antiga não apaga
+        // reatribuição mais nova (clear só se bate com a ativa).
+        const t = (msg as { task?: { id?: unknown; status?: unknown; assigneeAgentId?: unknown } }).task;
+        if (t && t.status === "done" && typeof t.assigneeAgentId === "string" && t.assigneeAgentId) {
+          this.host.clearActiveTask(t.assigneeAgentId, typeof t.id === "string" ? t.id : undefined);
+        }
         return;
       }
       case "agent:clear":

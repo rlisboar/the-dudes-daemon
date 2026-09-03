@@ -151,6 +151,16 @@ export class AgentHost {
     return this.entries.get(agentId)?.projectId ?? null;
   }
 
+  /** T-233: task ativa do agente — pass-through pro runner. Fonte
+   *  autoritativa: server via agent:send.taskId / task:updated done. */
+  setActiveTask(agentId: string, taskId: string): void {
+    this.entries.get(agentId)?.runner?.setActiveTask(taskId);
+  }
+
+  clearActiveTask(agentId: string, taskId?: string): void {
+    this.entries.get(agentId)?.runner?.clearActiveTask(taskId);
+  }
+
   /** Vincula/desvincula o agente a um chat do Telegram (espelho de saída). */
   setTelegramMirror(agentId: string, mirror: { botToken: string; chatId: string } | null): void {
     const e = this.entries.get(agentId);

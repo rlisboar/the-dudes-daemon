@@ -3580,6 +3580,39 @@ export class AgentRunner {
     return parseAndStripMemory(summary);
   }
 
+  /**
+   * T-233: task ativa do agente — fonte AUTORITATIVA é o server, via
+   * agent:send com taskId nas notificações de task (assignment/conclusão).
+   * Nunca derivado de parse do texto (TASK_ASSIGN em texto livre não conta).
+   * In-memory: restart perde — server re-notifica na próxima atribuição.
+   */
+  private activeTaskId: string | null = null;
+  private static readonly ACTIVE_TASK_ID_RE = /^[\w.:/-]{1,128}$/;
+
+  /** Define a task ativa (wire do main em agent:send com taskId explícito).
+   *  Reatribuição sobrescreve a anterior. Id malformado é ignorado (log). */
+  setActiveTask(taskId: string): void {
+    const id = typeof taskId === "string" ? taskId.trim() : "";
+    if (!AgentRunner.ACTIVE_TASK_ID_RE.test(id)) {
+      this.opts.onError(`[active-task] taskId inválido ignorado: ${String(taskId).slice(0, 64)}`);
+      return;
+    }
+    if (this.activeTaskId !== id) {
+      this.activeTaskId = id;
+      this.opts.onError(`[active-task] set ${id}`);
+    }
+  }
+
+  /** Limpa a task ativa em task:updated (status done). Com taskId, só limpa
+   *  se for a ativa — done atrasado de task antiga não apaga reatribuição
+   *  mais nova. Sem taskId (defensivo), limpa incondicionalmente. */
+  clearActiveTask(taskId?: string): void {
+    if (!this.activeTaskId) return;
+    if (taskId && this.activeTaskId !== taskId) return;
+    this.opts.onError(`[active-task] clear ${this.activeTaskId}`);
+    this.activeTaskId = null;
+  }
+
   private memoryTitleNearDup(a: string, b: string): boolean {
     return memoryTitleNearDup(a, b);
   }
@@ -3628,6 +3661,9 @@ export class AgentRunner {
           scope: "agent",
           pinned: pin,
           supersedesId: supersedes[0] ?? undefined,
+          // T-233: proveniência da task ativa — sinal autoritativo do server
+          // (agent:send com taskId); ausente = sem o campo (retrocompat).
+          ...(this.activeTaskId ? { taskId: this.activeTaskId } : {}),
         });
         saved++;
         const newId = r?.memory?.id as string | undefined;
