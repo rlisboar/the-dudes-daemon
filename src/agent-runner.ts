@@ -36,6 +36,8 @@ import {
   createActivityClock,
   hangPhase,
   hangThresholds,
+  hardRecoverNotifyPolicy,
+  toolsInFlightHardDue,
   touchActivityClock,
   type TurnActivityClock,
 } from "./runners/turn-watchdog.js";
@@ -389,8 +391,11 @@ export class AgentRunner {
   private toolsInFlight = 0;
   /** Quando toolsInFlight passou de 0 → >0 (ms). */
   private toolsInFlightSince: number | null = null;
-  /** Cap de quanto tempo toolsInFlight pode bloquear o hang watch sem I/O. */
-  private static readonly TOOLS_IN_FLIGHT_MAX_MS = 20 * 60_000;
+  /** T-240 (d): janela de agregação de notificações de hard recover (1h,
+   *  por agente). 1º attempt não notifica individualmente; ≥3 na janela
+   *  vira 1 resumo. attempt≥2 notifica individualmente. */
+  private hardRecoverTimes: number[] = [];
+  private static readonly HARD_RECOVER_WINDOW_MS = 60 * 60_000;
   /** Teto do compact. Acima disso o watchdog assume que travou e libera a
    *  fila — folga sobre o pior caso legítimo (one-shot 300s + summarize). */
   private static readonly COMPACT_STUCK_MS = 15 * 60_000;
@@ -3990,39 +3995,11 @@ export class AgentRunner {
     const runner = this.opts.cliRunner;
     const t = hangThresholds(runner);
     const now = Date.now();
-
-    // Tools em execução (Claude continuous + Grok tool loop): silêncio de
-    // stream é esperado por minutos (shell, MCP, peer wait). softMs do grok
-    // é 60s — se usássemos softMs pra derrubar toolsInFlight, tool legítima
-    // de 2–10min sofria hard recover (QA T-009 critério 5). Protege até
-    // TOOLS_IN_FLIGHT_MAX_MS; só então assume tool_result perdido.
-    if (this.toolsInFlight > 0) {
-      const toolsAge = this.toolsInFlightSince != null ? now - this.toolsInFlightSince : 0;
-      if (toolsAge >= AgentRunner.TOOLS_IN_FLIGHT_MAX_MS) {
-        this.opts.log(
-          "warn",
-          `[hang:${this.info.name}] toolsInFlight=${this.toolsInFlight} aberto há ${Math.round(toolsAge / 1000)}s ` +
-            `(teto ${AgentRunner.TOOLS_IN_FLIGHT_MAX_MS / 60000}min) — forçando 0 (tool_result perdido ou MCP travado)`,
-        );
-        this.toolsInFlight = 0;
-        this.toolsInFlightSince = null;
-        // não return — cai no hangPhase abaixo
-      } else {
-        // tools legítimas: não soft/hard; idle semântico NÃO mata o turno
-        if (this.currentState === "stalled") this.setState("thinking");
-        return;
-      }
-    }
-
-    // Grok: NÃO resetar idle por mtime de signals/updates/chat_history.
-    // O poll de tools + o CLI escrevem nesses arquivos a cada poucos
-    // segundos MESMO quando o turno está zumbi sem resposta pro user —
-    // isso fazia hangPhase nunca chegar em hard e busy ficar preso até
-    // restart manual. Só stdout/stderr (touchActivity nos handlers) conta.
-
     const idleMs = now - this.activityClock.lastActivityAt;
 
-    // Processo do turno morreu mas busy/estado não limpou
+    // T-240 (b): processo do turno MORTO com busy → hard em deadProcMs
+    // (~12s grok) — detecção real de morte fica rápida MESMO com tool
+    // in-flight (antes o bloqueio de tool adiava a morte até o teto).
     const proc = this.ocActiveProc;
     if (this.messageSession.busy && proc && !procAlive(proc)) {
       if (this.activityClock.deadSince == null) this.activityClock.deadSince = now;
@@ -4040,6 +4017,36 @@ export class AgentRunner {
       void this.recoverClaudeContinuousHang(`claude process dead while state=${this.currentState}`, idleMs);
       return;
     }
+
+    // Tools em execução (Claude continuous + Grok tool loop): silêncio de
+    // stream é esperado por minutos (shell, MCP, peer wait). T-240 (a): COM
+    // tool em voo e processo VIVO, hard só no teto absoluto toolsHardMs
+    // (~10min grok) — tsc/suíte/watch de CI rodam minutos sem evento e o
+    // hard de 120s matava turnos saudáveis (119 falsos positivos em prod).
+    // Passado o teto: assume tool_result perdido e reavalia o hang abaixo.
+    if (this.toolsInFlight > 0) {
+      const toolsAge = this.toolsInFlightSince != null ? now - this.toolsInFlightSince : 0;
+      if (toolsInFlightHardDue(toolsAge, t)) {
+        this.opts.log(
+          "warn",
+          `[hang:${this.info.name}] toolsInFlight=${this.toolsInFlight} aberto há ${Math.round(toolsAge / 1000)}s ` +
+            `(teto absoluto ${Math.round(t.toolsHardMs / 60000)}min) — tool_result perdido ou teto; reavaliando hang`,
+        );
+        this.toolsInFlight = 0;
+        this.toolsInFlightSince = null;
+        // não return — cai no hangPhase abaixo
+      } else {
+        // tool viva + processo vivo: não soft/hard; idle semântico NÃO mata
+        if (this.currentState === "stalled") this.setState("thinking");
+        return;
+      }
+    }
+
+    // Grok: NÃO resetar idle por mtime de signals/updates/chat_history.
+    // O poll de tools + o CLI escrevem nesses arquivos a cada poucos
+    // segundos MESMO quando o turno está zumbi sem resposta pro user —
+    // isso fazia hangPhase nunca chegar em hard e busy ficar preso até
+    // restart manual. Só stdout/stderr (touchActivity nos handlers) conta.
 
     const phase = hangPhase(idleMs, t);
     if (phase === "hard") {
@@ -4123,6 +4130,7 @@ export class AgentRunner {
       // Re-enfileira a mensagem em voo (1 retry). Sem isso a instrução
       // Claude→Grok some e o agente fica idle sem processar nada.
       const inflight = this.inflightPerMessage;
+      const attemptBefore = inflight ? inflight.attempt : Number.MAX_SAFE_INTEGER;
       let retried = false;
       if (inflight && inflight.attempt < 1) {
         this.inflightPerMessage = { ...inflight, attempt: inflight.attempt + 1 };
@@ -4138,8 +4146,33 @@ export class AgentRunner {
       const full = retried
         ? `[hang] turno abortado: ${reason} — reenviando a última mensagem automaticamente (1×)`
         : `[hang] turno abortado: ${reason}` + (inflight ? " — retry esgotado; envie de novo se necessário" : "");
-      this.opts.onHung?.({ soft: false, reason: full, idleMs });
-      this.opts.onError(full);
+
+      // T-240 (d): 1º attempt não notifica individualmente (67/119 falsos
+      // positivos em prod eram exatamente isso e TODOS completavam). Agrega:
+      // ≥3 hard recovers de 1º attempt na janela de 1h → 1 resumo. A partir
+      // do 2º attempt (ou sem mensagem pra re-enfileirar) notifica na hora.
+      const nowTs = Date.now();
+      this.hardRecoverTimes = this.hardRecoverTimes.filter(
+        (ts) => nowTs - ts < AgentRunner.HARD_RECOVER_WINDOW_MS,
+      );
+      this.hardRecoverTimes.push(nowTs);
+      const policy = hardRecoverNotifyPolicy(attemptBefore, this.hardRecoverTimes.length);
+      if (policy === "suppress") {
+        this.opts.log(
+          "warn",
+          `[hang:${this.info.name}] notificação suprimida (1º attempt; ${this.hardRecoverTimes.length}/${3} na janela) — turno re-enfileirado`,
+        );
+      } else if (policy === "summary") {
+        const summary =
+          `[hang] ${this.hardRecoverTimes.length} hard recovers (1º attempt) na última hora — ` +
+          `turnos re-enfileirados automaticamente (runner=${this.opts.cliRunner})`;
+        this.opts.onHung?.({ soft: false, reason: summary, idleMs });
+        this.opts.onError(summary);
+        this.hardRecoverTimes = []; // janela nova após o resumo
+      } else {
+        this.opts.onHung?.({ soft: false, reason: full, idleMs });
+        this.opts.onError(full);
+      }
 
       this.touchActivity();
       this.setState("idle");
