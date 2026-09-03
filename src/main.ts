@@ -33,7 +33,7 @@ import { detectDropTarget, spawnDropped, type DropTarget } from "./privileges.js
 import { BridgeRelay } from "./bridge-relay.js";
 import { defaultDaemonConfigPath, formatCliStatus, loadDaemonCliConfig, mergeCliConfig, resolveCliCommands, type DaemonCliConfig, type ResolvedCliCommands } from "./cli-config.js";
 import { applyRunnerPolicy, buildInstalledRunnerAvailability, helloRunnerLists, POLICY_GATED_RUNNERS, type InstalledRunnerAvailability } from "./runner-policy.js";
-import { assembleAgentSendParts, type FromDaemon, type FromOrch } from "./protocol.js";
+import { assembleAgentSendParts, type FromDaemon, type FromOrch, type TaskUpdatedEv } from "./protocol.js";
 import { runSummarizer } from "./summarizer-runner.js";
 import { aadV2, E2EE_TABLE } from "@the-dudes/protocol/e2ee-fields";
 import { decryptForProject, decryptImageAttachments, encryptForProject, countUsableProjectKeys, forgetAllProjectKeys, getDaemonPublicKey, hasProjectKey, isE2eEncrypted, isE2eeRequired, rememberProjectKey, setE2eeRequired } from "./daemon-crypto.js";
@@ -743,9 +743,9 @@ class DaemonClient {
         // T-233: task done → limpa a task ativa do agente atribuído (sem
         // staleness de proveniência). Done atrasado de task antiga não apaga
         // reatribuição mais nova (clear só se bate com a ativa).
-        const t = (msg as { task?: { id?: unknown; status?: unknown; assigneeAgentId?: unknown } }).task;
-        if (t && t.status === "done" && typeof t.assigneeAgentId === "string" && t.assigneeAgentId) {
-          this.host.clearActiveTask(t.assigneeAgentId, typeof t.id === "string" ? t.id : undefined);
+        const t = (msg as TaskUpdatedEv).task;
+        if (t.status === "done" && t.assigneeAgentId) {
+          this.host.clearActiveTask(t.assigneeAgentId, t.id);
         }
         return;
       }

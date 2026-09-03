@@ -267,6 +267,21 @@ export interface AgentSend {
    *  Telegram. O daemon passa a encaminhar TODA saída do agente (texto em
    *  claro, pré-E2EE) pra esse chat via sendMessage. null desvincula. */
   telegram?: { botToken: string; chatId: string } | null;
+  /** T-233: id real da task quando a notificação é task-linked (assignment/
+   *  conclusão — contrato T-231). Fonte autoritativa de proveniência: o
+   *  daemon mantém a task ativa do agente por este sinal, NUNCA por parse
+   *  de texto. Opcional (retrocompat: servers antigos não enviam). */
+  taskId?: string;
+}
+
+/** T-233: task:updated encaminhado pelo server — espelho do wire
+ *  (packages/protocol/wire.d.ts:1191 usa a Task completa; o daemon consome
+ *  apenas id/status/assigneeAgentId, então o local é o mínimo compatível).
+ *  Uso: status=done + assigneeAgentId → limpa a task ativa do agente
+ *  atribuído (sem staleness de proveniência). */
+export interface TaskUpdatedEv {
+  type: "task:updated";
+  task: { id: string; status?: string; assigneeAgentId?: string | null };
 }
 export interface AgentClear { type: "agent:clear"; agentId: string }
 export interface AgentCompact { type: "agent:compact"; agentId: string; saveMemory?: boolean }
@@ -961,6 +976,7 @@ export type FromOrch =
   | SummarizeRequest
   | ProjectKeyForDaemon
   | ProjectE2eeRequired
+  | TaskUpdatedEv
   | WebhookDispatchRequest
   | SkillsRescanRequest
   | SkillReadFileRequest
