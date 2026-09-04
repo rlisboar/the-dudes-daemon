@@ -108,7 +108,12 @@ export function parseLineModelCatalog(output: string, runner: "opencode" | "crus
     let id = line;
     let isDefault = false;
     if (isGrokFamily(runner)) {
-      const bullet = line.match(/^\*\s+([^\s]+)(?:\s+\(default\))?$/i);
+      // T-246: o `grok` oficial lista TUDO com `*`; o `grok-custom` do dono
+      // lista só o default com `*` e os não-defaults com bullet `-`. Sem
+      // aceitar `-`, o catálogo do grok-custom ficava com 1 modelo e os
+      // demais sumiam da UI. `\(default\)` em linha `-` não ocorre no
+      // formato atual, mas é tolerado por segurança.
+      const bullet = line.match(/^[*-]\s+([^\s]+)(?:\s+\(default\))?$/i);
       if (!bullet) continue;
       id = bullet[1];
       isDefault = /\(default\)$/i.test(line);

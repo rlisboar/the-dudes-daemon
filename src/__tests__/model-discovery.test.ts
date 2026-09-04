@@ -79,3 +79,56 @@ test("Codex parser tolerates malformed responses", () => {
   assert.deepEqual(parseCodexModelList(null), []);
   assert.deepEqual(parseCodexModelList({ result: { data: "nope" } }), []);
 });
+
+/* ---------- T-246: grok-custom lista não-defaults com bullet "-" ---------- */
+
+/** Fixture REAL do output de `grok-custom models` (binário do dono,
+ *  ~/.local/bin/grok-custom — prova empírica do PM, 2026-09-04). */
+const GROK_CUSTOM_MODELS_OUTPUT = `You are logged in with grok.com.
+
+Default model: rezulto:rezulto/glm5.3-flash
+
+Available models:
+  - grok-4.6
+  * rezulto:rezulto/glm5.3-flash (default)
+  - omlx:Qwen3.8-27B-MLX-oQ4e-mtp
+  - rezulto-qwen:rezulto/qwen3.8-lite
+  - chatgpt-gpt-5.6-sol
+  - chatgpt-gpt-5.6-terra
+  - chatgpt-gpt-5.6-luna
+  - chatgpt-gpt-5.5
+  - chatgpt-gpt-5.4
+  - chatgpt-gpt-5.4-mini
+`;
+
+test("T-246: fixture REAL do grok-custom — 10 modelos, default apenas no marcado com *", () => {
+  const models = parseLineModelCatalog(GROK_CUSTOM_MODELS_OUTPUT, "grok-custom");
+  assert.deepEqual(
+    models.map((m) => m.id),
+    [
+      "grok-4.6",
+      "rezulto:rezulto/glm5.3-flash",
+      "omlx:Qwen3.8-27B-MLX-oQ4e-mtp",
+      "rezulto-qwen:rezulto/qwen3.8-lite",
+      "chatgpt-gpt-5.6-sol",
+      "chatgpt-gpt-5.6-terra",
+      "chatgpt-gpt-5.6-luna",
+      "chatgpt-gpt-5.5",
+      "chatgpt-gpt-5.4",
+      "chatgpt-gpt-5.4-mini",
+    ],
+    "todos os 10 modelos (bullet - E *), não só o default",
+  );
+  assert.equal(models.filter((m) => m.isDefault).map((m) => m.id).join(","), "rezulto:rezulto/glm5.3-flash");
+});
+
+test("T-246: ruído do output (login, header, 'Available models:', vazias) não vira modelo", () => {
+  const ids = parseLineModelCatalog(GROK_CUSTOM_MODELS_OUTPUT, "grok-custom").map((m) => m.id);
+  assert.ok(!ids.some((id) => /available|logged|default model/i.test(id)), "nenhuma linha de ruído no catálogo");
+  assert.equal(ids.length, 10);
+});
+
+test("T-246: retrocompat — formato antigo (todos com *) segue parseando igual", () => {
+  const models = parseLineModelCatalog("Default model: grok-build\n* grok-build (default)\n* grok-fast\n", "grok-custom");
+  assert.deepEqual(models.map((m) => [m.id, m.isDefault]), [["grok-build", true], ["grok-fast", undefined]]);
+});
