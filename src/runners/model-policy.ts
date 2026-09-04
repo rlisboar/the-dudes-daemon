@@ -14,6 +14,10 @@ export const MODEL_CONTEXT_LIMITS: Record<string, number> = {
   "gemini-2.5-flash": 1_000_000, "gemini-2.5-flash-lite": 1_000_000, "gemini-2.5-pro": 1_000_000,
   // Codex CLI exposes a 272k runtime window for the 5.6 family. This is
   // intentionally different from the larger context advertised by the API.
+  // T-245: a janela REAL reportada pelo codex (model_context_window no
+  // rollout, event_msg token_count) é 272k − 5% de reserve = 258.400 — o
+  // caminho codex do agent-runner promove esse valor a catalogLimit quando
+  // o rollout está disponível; este mapa é só o fallback.
   "gpt-5.6": 272_000, "gpt-5.6-sol": 272_000, "gpt-5.6-terra": 272_000, "gpt-5.6-luna": 272_000,
   "gpt-5.5": 272_000, "gpt-5.4": 272_000, "gpt-5.4-mini": 272_000, "gpt-5.4-nano": 400_000,
   "gpt-5.3-codex": 400_000, "gpt-5.2-codex": 400_000, "gpt-5.2": 400_000,

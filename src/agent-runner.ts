@@ -26,7 +26,7 @@ import {
   type GrokContextSignals,
   type GrokTurnBilling,
 } from "./runners/parsers.js";
-import { parseCodexTurnEvent, parseCrushSessionMeta, parseGeminiTurnEvent, parseGrokStreamEvent, parseOpenCodeTurnEvent } from "./runners/turn-parsers.js";
+import { parseCodexTurnEvent, parseCodexRolloutSignals, parseCodexRolloutSessionId, parseCrushSessionMeta, parseGeminiTurnEvent, parseGrokStreamEvent, parseOpenCodeTurnEvent } from "./runners/turn-parsers.js";
 import { buildBridgeEnv, buildClaudeMcpConfig, buildCodexMcpArgs, buildCrushMcpConfig, buildGeminiMcpServers, buildGrokMcpToml, buildOpenCodeMcpConfig } from "./runners/mcp-config.js";
 import { RunnerRuntimeFiles } from "./runners/runtime-files.js";
 import { ContextTracker, CumulativeUsageTracker, type UsageSemantics } from "./runners/context-tracker.js";
@@ -2346,6 +2346,11 @@ export class AgentRunner {
       this.messageSession.busy = false;
       if (this.stopped) { this.emitExit(code); return; }
       this.setState("idle");
+      // T-245: ocupação REAL pós-turno (último token_count do rollout). O
+      // billing do turn.completed já reportado acima é substituído pelo
+      // valor absoluto do último step — se o rollout não tiver sinal, o
+      // comportamento atual permanece (fallback).
+      void this.pollCodexContextOccupancy(epoch);
       this.drainOcQueue();
     });
   }
@@ -2383,6 +2388,84 @@ export class AgentRunner {
         this.checkContextFullError(normalized.message);
         this.opts.onError(`codex: ${normalized.message}`);
       }
+    }
+  }
+
+  /* ---------- T-245: contexto real do codex via rollout ---------- */
+
+  /** Raiz dos rollouts do codex (~/.codex/sessions/YYYY/MM/DD/*.jsonl).
+   *  CODEX_HOME respeitado (mesmo contrato do próprio CLI). */
+  private codexSessionsRoot(): string {
+    const home = process.env.CODEX_HOME?.trim();
+    return path.join(home && home.length > 0 ? home : path.join(os.homedir(), ".codex"), "sessions");
+  }
+
+  /** Lê o sinal de contexto REAL do rollout da sessão (último event_msg
+   *  token_count): last_token_usage.total_tokens (contexto do último step,
+   *  não billing) + model_context_window (janela real do codex, ex. 258.400).
+   *  null se o rollout não existir / não tiver token_count — fallback é o
+   *  comportamento atual (billing do turn.completed + janela do mapa).
+   *  Padrão do readGrokContextSignals (fonte de verdade em arquivo do CLI). */
+  private readCodexRolloutSignals(sessionId: string): { used: number; window?: number } | null {
+    if (!sessionId) return null;
+    const root = this.codexSessionsRoot();
+    let candidates: string[] = [];
+    try {
+      // rollouts ficam em YYYY/MM/DD (3 níveis); varre do mais recente pro
+      // mais antigo — o turno acabou de terminar, o arquivo é de hoje.
+      const years = readdirSync(root).sort().reverse();
+      for (const year of years) {
+        const yearDir = path.join(root, year);
+        let months: string[] = [];
+        try { months = readdirSync(yearDir).sort().reverse(); } catch { continue; }
+        for (const month of months) {
+          const monthDir = path.join(yearDir, month);
+          let days: string[] = [];
+          try { days = readdirSync(monthDir).sort().reverse(); } catch { continue; }
+          for (const day of days) {
+            let files: string[] = [];
+            try { files = readdirSync(path.join(monthDir, day)); } catch { continue; }
+            for (const f of files) {
+              if (f.endsWith(".jsonl") && f.includes(sessionId)) candidates.push(path.join(monthDir, day, f));
+            }
+          }
+          // O rollout do turno em curso costuma estar no mês mais recente;
+          // varrer meses anteriores só se nada encontrado neles.
+          if (candidates.length > 0) break;
+        }
+        if (candidates.length > 0) break;
+      }
+    } catch { return null; }
+    for (const p of candidates) {
+      try {
+        const text = readFileSync(p, "utf8");
+        if (parseCodexRolloutSessionId(text) !== sessionId) continue;
+        const sig = parseCodexRolloutSignals(text);
+        if (sig) return { used: sig.usedTokens, window: sig.contextWindow };
+      } catch { /* tenta próximo */ }
+    }
+    return null;
+  }
+
+  /** Poll pós-turno: o rollout pode ser flushado um pouco depois do exit
+   *  (mesma janela de corrida do signals.json do grok). Só reporta com
+   *  sinal válido; turno de epoch antigo (clear/compact) é descartado. */
+  private async pollCodexContextOccupancy(epoch: number): Promise<void> {
+    for (let i = 0; i < 6; i++) {
+      if (i > 0) await new Promise((r) => setTimeout(r, 200));
+      if (this.stopped) return;
+      // Sessão resetada durante o poll: o rollout é da conversa descartada.
+      if (!this.messageSession.owns(epoch)) return;
+      const sessionId = this.messageSession.sessionId;
+      if (!sessionId) return;
+      const sig = this.readCodexRolloutSignals(sessionId);
+      if (!sig) continue;
+      // Janela REAL do codex (ex. 258.400) vira catálogo: vence o mapa
+      // estático (272k) no resolveContextLimit — resolve o defeito 2 da T-245.
+      if (sig.window && sig.window > 0) this.contextTracker.setCatalogLimit(sig.window);
+      // Ocupação ABSOLUTA do último step (não delta de billing) — defeito 1.
+      this.reportContextOccupancy(sig.used);
+      return;
     }
   }
 

@@ -41,6 +41,70 @@ export function parseCodexTurnEvent(raw: unknown): NormalizedTurnEvent[] {
   return [];
 }
 
+/* ---------- T-245: sinais reais de contexto do rollout do codex ---------- */
+
+export interface CodexRolloutSignals {
+  /** Contexto REAL do último step (last_token_usage.total_tokens do último
+   *  event_msg token_count) — NÃO o billing do turno (soma dos steps). */
+  usedTokens: number;
+  /** Janela REAL reportada pelo codex (model_context_window; ex. 258.400 =
+   *  272k − 5% de reserve). Ausente em rollouts velhos. */
+  contextWindow?: number;
+}
+
+/**
+ * Extrai o último `event_msg token_count` de um rollout codex
+ * (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl). O stdout de `exec --json`
+ * NÃO emite token_count — essa é a única fonte do contexto real:
+ * `turn.completed.usage.input_tokens` é BILLING do turno inteiro (soma dos
+ * prompts re-enviados a cada step/tool call), não a ocupação da janela.
+ * Linha por linha (JSONL append-only); linhas malformadas são ignoradas.
+ * null = arquivo sem token_count utilizável (fallback: comportamento atual).
+ */
+export function parseCodexRolloutSignals(text: string): CodexRolloutSignals | null {
+  let best: CodexRolloutSignals | null = null;
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) continue;
+    let parsed: unknown;
+    try { parsed = JSON.parse(trimmed); } catch { continue; }
+    const event = record(parsed);
+    if (!event || event.type !== "event_msg") continue;
+    const payload = record(event.payload);
+    if (!payload || payload.type !== "token_count") continue;
+    const info = record(payload.info);
+    if (!info) continue;
+    const last = record(info.last_token_usage);
+    if (!last) continue;
+    const usedTokens = Number(last.total_tokens);
+    if (!Number.isFinite(usedTokens) || usedTokens <= 0) continue;
+    const contextWindow = Number(info.model_context_window);
+    best = {
+      usedTokens: Math.floor(usedTokens),
+      ...(Number.isFinite(contextWindow) && contextWindow > 0 ? { contextWindow: Math.floor(contextWindow) } : {}),
+    };
+  }
+  return best;
+}
+
+/** ID da sessão no rollout (1ª linha, session_meta) — usado pra confirmar
+ *  que o arquivo é do thread procurado (o nome contém o id, mas o conteúdo
+ *  é o vínculo forte). null se a linha não for session_meta legível. */
+export function parseCodexRolloutSessionId(text: string): string | null {
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) continue;
+    let parsed: unknown;
+    try { parsed = JSON.parse(trimmed); } catch { continue; }
+    const event = record(parsed);
+    if (!event || event.type !== "session_meta") continue;
+    const payload = record(event.payload);
+    const id = payload && (payload.id ?? payload.session_id);
+    return typeof id === "string" && id ? id : null;
+  }
+  return null;
+}
+
 export function parseGeminiTurnEvent(raw: unknown): NormalizedTurnEvent[] {
   const event = record(raw);
   if (!event || typeof event.type !== "string") return [];
