@@ -144,7 +144,9 @@ Options:
   -h, --help Show this help`);
 }
 
-class DaemonClient {
+/** Exportado p/ teste unitário (T-252) — o bootstrap real continua privado
+ *  ao módulo via SELF_BOOTSTRAP (abaixo). */
+export class DaemonClient {
   private args: Args;
   private readonly installedRunnerAvailability: InstalledRunnerAvailability;
   private ws: WebSocket | null = null;
@@ -678,8 +680,12 @@ class DaemonClient {
         return;
       case "agent:send": {
         log("info", `agent:send recebido agent=${msg.agentId} bytes=${String(msg.content ?? "").length} imgs=${(msg.images ?? []).length}`);
-        // T-037: reentrega do server (pending + resume) usa o mesmo deliveryId
-        if (!this.deliveryDedup.accept(msg.deliveryId)) {
+        // T-037: reentrega do server (pending + resume) usa o mesmo deliveryId.
+        // T-252: só CONSULTA aqui — marcar cedo descartava o retry do server
+        // como duplicata quando o decrypt falhava (ex.: chave em rotação),
+        // perdendo a mensagem. markSeen acontece no aceite, após
+        // decrypt+processamento (fim do case).
+        if (this.deliveryDedup.isSeen(msg.deliveryId)) {
           log("info", `agent:send deliveryId=${msg.deliveryId?.slice(0, 8)} — duplicata ignorada`);
           return;
         }
@@ -737,6 +743,10 @@ class DaemonClient {
           this.host.setActiveTask(msg.agentId, msg.taskId);
         }
         this.host.send_message(msg.agentId, content, images, msg.deliveryId);
+        // T-252: visto só agora — decrypt ok + processamento aceito
+        // (entregue ao runner ou enfileirado pelo host). Falhas de decrypt
+        // acima retornam sem marcar, deixando o retry do server ser processado.
+        this.deliveryDedup.markSeen(msg.deliveryId);
         return;
       }
       case "task:updated": {
@@ -2183,15 +2193,38 @@ function cliLog(level: "info" | "warn" | "error", msg: string) {
   stream.write(`${prefix}${msg}\n`);
 }
 
-const args = parseCli();
+/**
+ * T-252: seam de teste. THE_DUDES_DAEMON_TEST=1 (só em teste) pula parseCli +
+ * bootstrap: no `node --test` o argv carrega paths posicionais que fariam
+ * parseCli throw (allowPositionals:false) e o start() abriria conexões reais.
+ * Em produção a variável nunca é definida (nem no launcher, nem no LaunchAgent,
+ * nem no self-update — todos executam o bundle sem ela) → comportamento
+ * 100% idêntico ao de antes.
+ */
+const SELF_BOOTSTRAP = process.env.THE_DUDES_DAEMON_TEST !== "1";
+const args: Args = SELF_BOOTSTRAP
+  ? parseCli()
+  : {
+      orch: "ws://127.0.0.1:1",
+      token: "test",
+      name: "t252-test",
+      pingMs: 30_000,
+      verbose: false,
+      verboseHuman: false,
+      verboseHumanIo: true,
+      cliConfigPath: `/tmp/t252-nonexistent-${process.pid}.json`,
+      cliPaths: {},
+    };
 const cliConfig = mergeCliConfig(
   loadDaemonCliConfig(args.cliConfigPath),
   { cliPaths: args.cliPaths },
 );
 const cliCommands = resolveCliCommands(cliConfig);
-new DaemonClient(args, cliCommands).start().catch(async (e) => {
-  capture(e, { phase: "startup" });
-  log("error", `failed to start: ${(e as Error).message}`);
-  await flushSentry();
-  process.exit(1);
-});
+if (SELF_BOOTSTRAP) {
+  new DaemonClient(args, cliCommands).start().catch(async (e) => {
+    capture(e, { phase: "startup" });
+    log("error", `failed to start: ${(e as Error).message}`);
+    await flushSentry();
+    process.exit(1);
+  });
+}

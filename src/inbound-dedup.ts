@@ -14,23 +14,37 @@ export interface BufferedInbound {
 }
 
 export function createDeliveryDeduper(maxSeen = 500): {
-  /** true se deve processar; false se duplicata. */
+  /** true se deve processar; false se duplicata. Marca como visto na hora. */
   accept: (deliveryId: string | undefined) => boolean;
+  /** T-252: só consulta (não marca) — usado quando o "aceite" da mensagem só
+   *  existe após decrypt+processamento; marcar cedo descartaria o retry do
+   *  server como duplicata quando o decrypt falha (chave em rotação). */
+  isSeen: (deliveryId: string | undefined) => boolean;
+  /** T-252: registra como visto no ponto de aceite (após decrypt+process). */
+  markSeen: (deliveryId: string | undefined) => void;
   size: () => number;
   clear: () => void;
 } {
   const seen = new Set<string>();
   const order: string[] = [];
   return {
-    accept(deliveryId) {
-      if (!deliveryId) return true; // legado sem id — processa
-      if (seen.has(deliveryId)) return false;
+    isSeen(deliveryId) {
+      return !!deliveryId && seen.has(deliveryId);
+    },
+    markSeen(deliveryId) {
+      if (!deliveryId) return; // legado sem id — nada a deduplicar
+      if (seen.has(deliveryId)) return;
       seen.add(deliveryId);
       order.push(deliveryId);
       while (order.length > maxSeen) {
         const old = order.shift();
         if (old) seen.delete(old);
       }
+    },
+    accept(deliveryId) {
+      if (!deliveryId) return true; // legado sem id — processa
+      if (seen.has(deliveryId)) return false;
+      this.markSeen(deliveryId);
       return true;
     },
     size: () => seen.size,
