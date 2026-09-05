@@ -1,11 +1,11 @@
 import os from "node:os";
 import type { ChildProcess } from "node:child_process";
-import type { CliRunner } from "./types.js";
+import type { CliRunner, EffortLevel } from "./types.js";
 import type { ResolvedCliCommands } from "./cli-config.js";
 import { spawnDropped, type DropTarget } from "./privileges.js";
 import type { DiscoveredRunnerModel, RunnerModelCatalog } from "./protocol.js";
 import { killProcess } from "./runners/process-lifecycle.js";
-import { openCodeEffortsFor } from "./runners/opencode-effort.js";
+import { openCodeEffortsFor, openCodeHeuristicEffortsFor, parseOpenCodeModelVariants, registerOpenCodeVariants } from "./runners/opencode-effort.js";
 import { EFFORT_SUFFIX_RE, grokWireEfforts, providerModelParts } from "./runners/model-policy.js";
 import { isGrokFamily } from "./runners/index.js";
 import { withModelCapability } from "./model-capability.js";
@@ -13,6 +13,11 @@ import { RUNNERS } from "@the-dudes/protocol";
 
 const CACHE_TTL_MS = 5 * 60_000;
 const COMMAND_TIMEOUT_MS = 12_000;
+// T-262 r1 (QA): tentativa `models --verbose` com timeout PRÓPRIO e curto —
+// sem isto, um CLI que trava no modo verbose estoura os 12s e o fallback de
+// lista simples estoura mais 12s → scan inteiro demora ~24s pra falhar.
+// 8s limita o pior caso a ~8s (verbose) + 12s (fallback) e falha antes.
+const OPENCODE_VERBOSE_TIMEOUT_MS = 8_000;
 const MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
 const MAX_MODELS = 2_000;
 const ANSI_RE = /\x1b\[[0-?]*[ -/]*[@-~]/g;
@@ -141,6 +146,81 @@ export function parseLineModelCatalog(output: string, runner: "opencode" | "crus
   return models;
 }
 
+/**
+ * T-262: parseia `opencode models --verbose`, que imprime para cada modelo uma
+ * linha com o id seguida de um bloco JSON (multi-linha) com os metadados do
+ * models.dev — incluindo o objeto `variants` que define o que o TUI expõe em
+ * /variants. Formato observado (opencode 1.18.29):
+ *
+ *   flashnext/rezulto/qwen3.8-flash
+ *   { "id": "rezulto/qwen3.8-flash", ... "variants": { "low": {...}, "xhigh": {...} } }
+ *
+ * Ids são linhas sozinhas que casam MODEL_ID_RE e NÃO começam com `{`/`}`; o
+ * JSON vai acumulando até fechar (balanceamento de chaves). Um bloco inválido
+ * só derruba aquele modelo (esforços caem no heurístico), não a lista toda.
+ */
+export function parseOpenCodeVerboseCatalog(output: string): DiscoveredRunnerModel[] {
+  const models: DiscoveredRunnerModel[] = [];
+  const variantsForRegistry: Array<{ id: string; variants: EffortLevel[] }> = [];
+  const seen = new Set<string>();
+  let currentId: string | null = null;
+  let depth = 0;
+  let buf = "";
+
+  const flush = (): void => {
+    if (!currentId) return;
+    const closed = depth === 0;
+    depth = 0; // bloco truncado: o próximo id começa limpo
+    let variants: EffortLevel[] = [];
+    let parsedOk = false;
+    if (closed && buf) {
+      try {
+        const parsed = JSON.parse(buf) as { variants?: unknown };
+        variants = parseOpenCodeModelVariants(parsed.variants);
+        parsedOk = true;
+      } catch { /* bloco malformado → heurístico por família */ }
+    }
+    buf = "";
+    const id = currentId;
+    currentId = null;
+    if (seen.has(id)) return;
+    seen.add(id);
+    // T-262 r1: só observações CONFIRMADAS (JSON parseado) atualizam o
+    // registry — um bloco truncado não apaga variants já conhecidos.
+    if (parsedOk) variantsForRegistry.push({ id, variants });
+    const efforts = variants.length > 0
+      ? ["none" as const, ...variants]
+      : parsedOk
+        ? openCodeHeuristicEffortsFor(id) // confirmado sem variants reais → heurístico da família
+        : openCodeEffortsFor(id); // truncado → último conhecimento (registry) ou heurístico
+    models.push(withModelCapability({ id, label: id, efforts }));
+  };
+
+  for (const raw of output.split(/\r?\n/)) {
+    const line = cleanLine(raw);
+    if (!line) continue;
+    if (line.startsWith("{") || depth > 0) {
+      // dentro de um bloco JSON do modelo corrente
+      if (currentId === null) continue; // JSON sem id predecessor → ignora
+      buf += line;
+      for (const ch of line) {
+        if (ch === "{") depth++;
+        else if (ch === "}") depth = Math.max(0, depth - 1);
+      }
+      if (depth === 0) flush();
+      continue;
+    }
+    // linha de id (fecha bloco anterior se ficou aberto por JSON quebrado)
+    if (depth > 0) flush();
+    if (!MODEL_ID_RE.test(line)) continue;
+    currentId = line;
+  }
+  if (currentId) flush();
+  registerOpenCodeVariants(variantsForRegistry);
+  if (models.length > MAX_MODELS) models.length = MAX_MODELS;
+  return models;
+}
+
 export function parseCodexModelList(message: unknown): DiscoveredRunnerModel[] {
   const data = (message as { result?: { data?: unknown } })?.result?.data;
   if (!Array.isArray(data)) return [];
@@ -173,7 +253,7 @@ export function parseCodexModelList(message: unknown): DiscoveredRunnerModel[] {
   return models;
 }
 
-function runCommand(command: string, args: string[], dropTo: DropTarget | null): Promise<string> {
+function runCommand(command: string, args: string[], dropTo: DropTarget | null, timeoutMs = COMMAND_TIMEOUT_MS): Promise<string> {
   return new Promise((resolve, reject) => {
     let child: ChildProcess;
     try {
@@ -216,7 +296,7 @@ function runCommand(command: string, args: string[], dropTo: DropTarget | null):
     const timer = setTimeout(() => {
       killProcess(child, "SIGKILL");
       finish(new Error("timeout consultando modelos"));
-    }, COMMAND_TIMEOUT_MS);
+    }, timeoutMs);
   });
 }
 
@@ -326,12 +406,30 @@ export class ModelDiscovery {
       return catalog;
     }
     try {
-      const models = runner === "codex"
-        ? await discoverCodex(resolved.command, this.dropTo)
-        : parseLineModelCatalog(
+      let models: DiscoveredRunnerModel[];
+      if (runner === "codex") {
+        models = await discoverCodex(resolved.command, this.dropTo);
+      } else if (runner === "opencode") {
+        // T-262: --verbose traz os variants reais por modelo (fonte do
+        // /variants). CLI antigo sem a flag → exit≠0 → fallback p/ lista
+        // simples + heurístico por família (comportamento pré-T-262).
+        models = [];
+        try {
+          models = parseOpenCodeVerboseCatalog(
+            await runCommand(resolved.command, ["models", "--verbose"], this.dropTo, OPENCODE_VERBOSE_TIMEOUT_MS),
+          );
+        } catch {
+          models = [];
+        }
+        if (models.length === 0) {
+          models = parseLineModelCatalog(await runCommand(resolved.command, ["models"], this.dropTo), "opencode");
+        }
+      } else {
+        models = parseLineModelCatalog(
           await runCommand(resolved.command, ["models"], this.dropTo),
-          runner as "opencode" | "crush" | "grok" | "grok-custom",
+          runner as "crush" | "grok" | "grok-custom",
         );
+      }
       if (models.length === 0) throw new Error("CLI retornou catálogo vazio");
       const catalog: RunnerModelCatalog = {
         runner,
