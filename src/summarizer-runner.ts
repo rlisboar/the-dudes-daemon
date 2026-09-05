@@ -20,6 +20,7 @@ import { extractOneShotText } from "./agent-runner.js";
 import { spawnDropped, type DropTarget } from "./privileges.js";
 import { normalizeGrokEffort } from "./runners/model-policy.js";
 import { isGrokFamily } from "./runners/index.js";
+import { buildSummarizerEnv } from "./runners/env.js";
 import { grokHomePath } from "./runners/runtime-files.js";
 import { acquireTurnSlot } from "./runners/turn-gate.js";
 import type { CliRunner } from "./types.js";
@@ -302,17 +303,17 @@ async function runCliTextWithSlot(
   timeoutMs: number,
 ): Promise<CliTextResult> {
   const cwd = mkdtempSync(join(tmpdir(), "the-dudes-cli-"));
-  // Scrub secrets do daemon antes de spawn — summarizer CLI process
-  // veria THE_DUDES_DAEMON_TOKEN via /proc/<pid>/environ. Prompt
-  // injection no agente que dispara summarize ataca o summarizer
-  // process e exfiltra. Mesmo motivo do scrub em agent-runner.buildEnv.
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  delete env.THE_DUDES_DAEMON_TOKEN;
-  delete env.THE_DUDES_TOKEN;
-  delete env.THE_DUDES_ENCRYPTION_KEY;
+  // T-253 (era: `{ ...process.env }` + 3 deletes): allowlist canônica como no
+  // buildBaseRunnerEnv dos agentes. Copiar o env INTEIRO do daemon deixava
+  // tokens e cloud keys (API keys, DATABASE_URL, …) visíveis em
+  // /proc/<pid>/environ do CLI do summarizer — prompt injection no agente que
+  // dispara o summarize atacava o summarizer e exfiltrava. Auth dos CLIs mora
+  // em HOME/config dir (na allowlist); keys que PRECISAM vir de env usam o
+  // passthrough explícito THE_DUDES_AGENT_ENV_PASSTHROUGH.
+  const env: NodeJS.ProcessEnv = buildSummarizerEnv(process.env);
   if (args.runner === "claude") {
-    const claudeHome = args.dropTo?.home ?? homedir();
     delete env.CLAUDE_CONFIG_DIR;
+    const claudeHome = args.dropTo?.home ?? homedir();
     if (args.claudeConfigDir) env.CLAUDE_CONFIG_DIR = expandHome(args.claudeConfigDir, claudeHome);
   }
   if (args.runner === "gemini") {

@@ -1723,14 +1723,22 @@ export class AgentRunner {
     return providerID.startsWith("anthropic") ? "anthropic" : "auto";
   }
 
-  private runOpenCodeMessage(content: string, images?: ImageAttachment[], retry = 0) {
+  private async runOpenCodeMessage(content: string, images?: ImageAttachment[], retry = 0) {
     if (this.stopped) return;
     if (!this.ensureRunnerAvailable("opencode")) return;
+    // T-251: gate de turno também para o opencode — o processo serve é
+    // persistente, mas o POST /message SÍNCRONO é o turno (tools, minutes).
+    // Sem isto o gate ficava vazio com turno opencode vivo e o self-update
+    // (idle = gate vazio, T-088) matava o serve no meio.
+    if (!(await this.gateTurn())) { this.messageSession.busy = false; return; }
     this.setState("thinking");
 
     this.ensureOcServer().then(
-      () => this.runOpenCodeMessageAttached(content, images, retry),
+      () => void this.runOpenCodeMessageAttached(content, images, retry)
+        .catch((e) => this.opts.log("warn", `[cli:${this.info.id}:opencode] attached threw: ${(e as Error).message}`))
+        .finally(() => this.releaseActiveTurnSlot()),
       (err) => {
+        this.releaseActiveTurnSlot();
         this.opts.onError(`opencode serve falhou: ${err?.message ?? err}`);
         this.messageSession.busy = false;
         this.setState("idle");
@@ -2090,9 +2098,12 @@ export class AgentRunner {
 
   /* ---------- Gemini per-message model ---------- */
 
-  private runGeminiMessage(content: string, images?: ImageAttachment[]) {
+  private async runGeminiMessage(content: string, images?: ImageAttachment[]) {
     if (this.stopped) return;
     if (!this.ensureRunnerAvailable("gemini")) return;
+    // T-251: gate de turno para TODOS os runners (antes só Grok) — sem isto
+    // o self-update (idle = gate vazio) matava o CLI gemini em turno vivo.
+    if (!(await this.gateTurn())) { this.messageSession.busy = false; return; }
     this.setState("thinking");
 
     const tmpDir = this.runtimeFiles.tempDir();
@@ -2227,6 +2238,7 @@ export class AgentRunner {
     });
 
     proc.on("close", (code) => {
+      this.releaseActiveTurnSlot(); // T-251: slot do gate volta com o processo
       flush();
       imgCleanup();
       this.ocActiveProc = null;
@@ -2256,9 +2268,11 @@ export class AgentRunner {
     return built.args;
   }
 
-  private runCodexMessage(content: string, images?: ImageAttachment[]) {
+  private async runCodexMessage(content: string, images?: ImageAttachment[]) {
     if (this.stopped) return;
     if (!this.ensureRunnerAvailable("codex")) return;
+    // T-251: gate de turno para todos os runners (antes só Grok).
+    if (!(await this.gateTurn())) { this.messageSession.busy = false; return; }
     this.setState("thinking");
 
     let message = content;
@@ -2338,6 +2352,7 @@ export class AgentRunner {
     });
 
     proc.on("close", (code) => {
+      this.releaseActiveTurnSlot(); // T-251: slot do gate volta com o processo
       if (buf.trim().startsWith("{")) {
         try { this.handleCodexEvent(JSON.parse(buf.trim()), epoch); } catch {}
       }
@@ -3062,6 +3077,8 @@ export class AgentRunner {
   private async runCrushMessage(content: string, images?: ImageAttachment[]) {
     if (this.stopped) { this.messageSession.busy = false; return; }
     if (!this.ensureRunnerAvailable("crush")) { this.messageSession.busy = false; return; }
+    // T-251: gate de turno para todos os runners (antes só Grok).
+    if (!(await this.gateTurn())) { this.messageSession.busy = false; return; }
     this.setState("thinking");
     this.writeCrushConfig();
 
@@ -3144,6 +3161,7 @@ export class AgentRunner {
     });
 
     proc.on("close", (code) => {
+      this.releaseActiveTurnSlot(); // T-251: slot volta com o processo (o pós-turno não spawnada CLI)
       imgCleanup();
       this.ocActiveProc = null;
       if (this.stopped) { this.messageSession.busy = false; this.emitExit(code); return; }
@@ -3311,15 +3329,15 @@ export class AgentRunner {
     if (!next) { this.messageSession.busy = false; return; }
     const { content, images } = next;
     if (this.opts.cliRunner === "gemini") {
-      this.runGeminiMessage(content, images);
+      void this.runGeminiMessage(content, images);
     } else if (this.opts.cliRunner === "codex") {
-      this.runCodexMessage(content, images);
+      void this.runCodexMessage(content, images);
     } else if (this.opts.cliRunner === "crush") {
       void this.runCrushMessage(content, images);
     } else if (isGrokFamily(this.opts.cliRunner)) {
       void this.runGrokMessage(content, images);
     } else {
-      this.runOpenCodeMessage(content, images);
+      void this.runOpenCodeMessage(content, images);
     }
   }
 
@@ -3861,7 +3879,14 @@ export class AgentRunner {
   }
 
   private async runOneShotWithSession(prompt: string, sessionId: string): Promise<string> {
-    return new Promise((resolve) => {
+    // T-251: compact com sessão também passa pelo gate (pool bg) — o
+    // self-update usa o gate como prova de idle; sem isto mataria o
+    // one-shot de resumo no meio. Release LOCAL (não activeTurnRelease: o
+    // slot do turno principal pode estar em voo e o campo é um só).
+    const releaseSlot = await acquireTurnSlot(`${this.opts.cliRunner}:${this.info.name}`, this.opts.log, "bg");
+    if (this.stopped) { releaseSlot(); return ""; }
+    return new Promise((resolveRaw) => {
+      const resolve = (v: string): void => { releaseSlot(); resolveRaw(v); };
       if (this.stopped) { resolve(""); return; } // mesmo guard do runOneShot
       if (!this.ensureRunnerAvailable("claude")) {
         resolve("");
@@ -3927,6 +3952,28 @@ export class AgentRunner {
     const r = this.activeTurnRelease;
     this.activeTurnRelease = null;
     try { r?.(); } catch { /* release do gate é best-effort */ }
+  }
+
+  /**
+   * T-251: gate de turno para TODOS os runners per-message (antes só o
+   * Grok gateava — gemini/codex/crush/opencode fugiam do semáforo e o
+   * self-update, que usa o gate como prova de idle (T-088), matava o CLI em
+   * turno alheio). Mesmo contrato do caminho Grok: estado "queued" + flag
+   * suspendem o watchdog de hang (T-055), o release é amarrado ao 'close'
+   * do processo (ou ao fim do POST no opencode serve) via activeTurnRelease,
+   * e o hard recover/idempotência cuidam do resto. Retorna false se o
+   * runner parou enquanto esperava slot.
+   */
+  private async gateTurn(): Promise<boolean> {
+    if (this.stopped) return false;
+    this.waitingTurnGate = true;
+    this.setState("queued");
+    const pool = this.info.ephemeral ? "bg" as const : "main" as const;
+    const release = await acquireTurnSlot(`${this.opts.cliRunner}:${this.info.name}`, this.opts.log, pool);
+    this.waitingTurnGate = false;
+    if (this.stopped) { release(); return false; }
+    this.activeTurnRelease = release;
+    return true;
   }
 
   /** Grok: tool_call abriu — protege hang watch até result/text/teto. */

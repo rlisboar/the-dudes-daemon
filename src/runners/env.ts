@@ -59,6 +59,20 @@ export function buildBaseRunnerEnv(input: BaseRunnerEnvInput): NodeJS.ProcessEnv
   return env;
 }
 
+/**
+ * T-253: env do summarizer/shim (runCliText no summarizer-runner).
+ * Mesmo contrato de buildBaseRunnerEnv — allowlist + passthrough opt-in
+ * (THE_DUDES_AGENT_ENV_PASSTHROUGH). O histórico era `{ ...process.env }`
+ * com 3 deletes: qualquer token/cloud key do daemon (API keys, tokens de
+ * git/nuvem, DATABASE_URL…) ficava visível em /proc/<pid>/environ do CLI do
+ * summarizer — prompt injection no agente que dispara o summarize podia
+ * exfiltrar. Auth dos CLIs mora em HOME/config dir (cobertos pela allowlist),
+ * então nada funcional se perde; keys via env usam o passthrough explícito.
+ */
+export function buildSummarizerEnv(inherited: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return pickInherited(inherited, parsePassthrough(inherited[AGENT_ENV_PASSTHROUGH_VAR]));
+}
+
 export function buildGeminiEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return { ...base, GEMINI_CLI_TRUST_WORKSPACE: "true" };
 }
