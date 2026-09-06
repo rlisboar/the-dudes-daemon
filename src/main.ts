@@ -1086,7 +1086,10 @@ export class DaemonClient {
   }
 
   /** MCP server discovery — Phase 1 (read-only). Scans claude/codex/opencode/
-   *  gemini configs + workspace + ~/.config/the-dudes overrides. */
+   *  gemini configs + workspace + ~/.config/the-dudes overrides.
+   *  T-308: fontes inválidas viram warning explícito no payload (path+motivo,
+   *  sem env/headers) e no log do daemon — configuração corrompida não pode
+   *  sumir com MCP da Integração em silêncio. */
   private async reportMCPsScan(workspaceRoot?: string) {
     const { scanMCPs } = await import("./mcps-scanner.js");
     const result = await scanMCPs({ workspaceRoot });
@@ -1094,9 +1097,11 @@ export class DaemonClient {
       type: "mcps:scan",
       mcps: result.mcps,
       scannedSources: result.scannedSources,
+      ...(result.warnings.length ? { warnings: result.warnings } : {}),
       ts: Date.now(),
     });
     log("info", `mcps scan: ${result.mcps.length} (sources: ${result.scannedSources.length})`);
+    for (const w of result.warnings) log("warn", `[mcps-scanner] ${w.path}: ${w.reason}`);
   }
 
   /**

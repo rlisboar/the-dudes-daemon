@@ -787,6 +787,10 @@ export interface MCPsScanResult {
   /** Paths inspecionados, mesmo quando vazios — útil pro UI mostrar onde
    *  o user pode adicionar config. */
   scannedSources: string[];
+  /** T-308: fontes ilegíveis/entradas inválidas — fail-closed acionável.
+   *  Conteúdo só path+motivo (NUNCA env/headers). Opcional (retrocompat:
+   *  server antigo ignora campo desconhecido). */
+  warnings?: Array<{ path: string; reason: string }>;
   ts: number;
 }
 

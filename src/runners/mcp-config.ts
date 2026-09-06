@@ -14,6 +14,14 @@ export interface BridgeConfig {
   env: Record<string, string>;
 }
 
+/** T-308: resumo DE INJEÇÃO pra log diagnóstico — só nome+transporte.
+ *  NUNCA incluir env/headers aqui (tokens/credenciais não podem vazar
+ *  em log). Formato: [a(stdio), b(http)]. */
+export function summarizeMcpServers(extras: Record<string, McpServerConfig> | undefined): string {
+  const parts = Object.entries(extras ?? {}).map(([name, config]) => `${name}(${config.type ?? "stdio"})`);
+  return `[${parts.join(", ")}]`;
+}
+
 export function buildBridgeEnv(input: {
   agentId: string; agentName: string; orchestratorUrl: string; tokenFile: string;
   features?: Record<string, string>; socketPath?: string;
@@ -31,10 +39,22 @@ export function buildBridgeEnv(input: {
   return env;
 }
 
+/** T-308: gemini-cli distingue SSE (url) de streamable HTTP (httpUrl) —
+ *  mandar url pra um MCP "http" fazia o CLI tentar SSE e o servidor nunca
+ *  conectava (descarte silencioso por transporte errado). Headers valem
+ *  pros dois transportes remotos. */
 export function buildGeminiMcpServers(extras: Record<string, McpServerConfig> | undefined, bridge: BridgeConfig): Record<string, unknown> {
   const servers: Record<string, unknown> = {};
   for (const [name, config] of Object.entries(extras ?? {})) {
     if (name === "the-dudes") continue;
+    const type = config.type ?? "stdio";
+    if (type === "http" && config.url) {
+      servers[name] = {
+        httpUrl: config.url,
+        ...(config.headers && Object.keys(config.headers).length ? { headers: config.headers } : {}),
+      };
+      continue;
+    }
     const copy: Record<string, unknown> = { ...config };
     delete copy.type;
     servers[name] = copy;
@@ -85,8 +105,19 @@ export function buildOpenCodeMcpConfig(extras: Record<string, McpServerConfig> |
   const warnings: string[] = [];
   for (const [name, config] of Object.entries(extras ?? {})) {
     if (name === "the-dudes") continue;
-    if ((config.type ?? "stdio") !== "stdio" || !config.command) {
-      warnings.push(`skipping MCP "${name}" — only stdio transport is supported`);
+    const type = config.type ?? "stdio";
+    // T-308: opencode suporta MCP remoto (type remote + url/headers) —
+    // http/sse antes eram descartados com "only stdio" (skip silencioso
+    // na prática). Só segue warning quando o transporte não tem url.
+    if ((type === "http" || type === "sse") && config.url) {
+      mcp[name] = {
+        type: "remote", enabled: true, url: config.url,
+        ...(config.headers && Object.keys(config.headers).length ? { headers: config.headers } : {}),
+      };
+      continue;
+    }
+    if (type !== "stdio" || !config.command) {
+      warnings.push(`skipping MCP "${name}" — transport "${type}" requires ${type === "stdio" ? "command" : "url"}`);
       continue;
     }
     mcp[name] = {
@@ -155,8 +186,26 @@ export function buildCodexMcpArgs(extras: Record<string, McpServerConfig> | unde
   const warnings: string[] = [];
   for (const [name, config] of Object.entries(extras ?? {})) {
     if (name === "the-dudes") continue;
-    if ((config.type ?? "stdio") !== "stdio" || !config.command) {
-      warnings.push(`skipping MCP "${name}" — only stdio transport is supported`);
+    const type = config.type ?? "stdio";
+    // T-308: codex (≥0.153, confirmado `codex mcp add --url` + coluna Bearer
+    // Token Env Var no `codex mcp list`) suporta streamable HTTP via
+    // mcp_servers.<id>.url. SSE não é suportado — warning com nome+transporte
+    // (nunca skip silencioso). Headers não entram no config do codex: o CLI
+    // usa bearer_token_env_var — se a Integração define headers, avisa.
+    if ((type === "http" || type === "sse") && config.url) {
+      if (type === "sse") {
+        warnings.push(`skipping MCP "${name}" — codex supports stdio and streamable http (url), not sse`);
+        continue;
+      }
+      const key = tomlKey(name);
+      args.push("-c", `mcp_servers.${key}.url=${tomlString(config.url)}`);
+      if (config.headers && Object.keys(config.headers).length) {
+        warnings.push(`MCP "${name}" (http): codex não aplica headers custom — use bearer_token_env_var no config do codex`);
+      }
+      continue;
+    }
+    if (type !== "stdio" || !config.command) {
+      warnings.push(`skipping MCP "${name}" — transport "${type}" requires ${type === "stdio" ? "command" : "url"}`);
       continue;
     }
     const key = tomlKey(name);

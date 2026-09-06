@@ -27,7 +27,7 @@ import {
   type GrokTurnBilling,
 } from "./runners/parsers.js";
 import { parseCodexTurnEvent, parseCodexRolloutSignals, parseCodexRolloutSessionId, parseCrushSessionMeta, parseGeminiTurnEvent, parseGrokStreamEvent, parseOpenCodeTurnEvent } from "./runners/turn-parsers.js";
-import { buildBridgeEnv, buildClaudeMcpConfig, buildCodexMcpArgs, buildCrushMcpConfig, buildGeminiMcpServers, buildGrokMcpToml, buildOpenCodeMcpConfig } from "./runners/mcp-config.js";
+import { buildBridgeEnv, buildClaudeMcpConfig, buildCodexMcpArgs, buildCrushMcpConfig, buildGeminiMcpServers, buildGrokMcpToml, buildOpenCodeMcpConfig, summarizeMcpServers } from "./runners/mcp-config.js";
 import { RunnerRuntimeFiles } from "./runners/runtime-files.js";
 import { ContextTracker, CumulativeUsageTracker, type UsageSemantics } from "./runners/context-tracker.js";
 import { armHardTimeout, appendCapped, collectProcessOutput, killGrokLeader, killProcess, processAlive as procAlive, RUNNER_OUTPUT_CAP_BYTES, terminateAndWait, terminateWithEscalation } from "./runners/process-lifecycle.js";
@@ -427,6 +427,12 @@ export class AgentRunner {
       onFull: opts.onContextFull,
       onError: opts.onError,
     });
+    // T-308: rastro de injeção MCP por spawn — nomes+transportes apenas
+    // (NUNCA env/headers/tokens). Skips por transporte ficam nos warnings
+    // dos builders (cada um com nome+motivo).
+    if (opts.extraMcpServers && Object.keys(opts.extraMcpServers).length > 0) {
+      this.opts.log("info", `[mcp:inject] runner=${opts.cliRunner} agent=${info.name} servers=${summarizeMcpServers(opts.extraMcpServers)}`);
+    }
     this.startHangWatch();
     this.openCodeTransport = new OpenCodeTransport({
       spawnServer: () => spawnDropped(

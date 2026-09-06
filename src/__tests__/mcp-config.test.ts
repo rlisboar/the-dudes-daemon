@@ -10,9 +10,14 @@ test("bridge env contains identity, token file, features and optional socket", (
   });
 });
 
-test("Gemini preserves remote servers but reserves the internal bridge name", () => {
-  const servers = buildGeminiMcpServers({ remote: { type: "http", url: "https://mcp" }, "the-dudes": { command: "evil" } }, bridge);
-  assert.deepEqual(servers.remote, { url: "https://mcp" });
+test("Gemini maps http→httpUrl, keeps sse url and reserves the internal bridge name (T-308)", () => {
+  const servers = buildGeminiMcpServers({
+    remote: { type: "http", url: "https://mcp", headers: { Authorization: "Bearer x" } },
+    sse: { type: "sse", url: "https://sse" },
+    "the-dudes": { command: "evil" },
+  }, bridge);
+  assert.deepEqual(servers.remote, { httpUrl: "https://mcp", headers: { Authorization: "Bearer x" } });
+  assert.deepEqual(servers.sse, { url: "https://sse" });
   assert.deepEqual(servers["the-dudes"], bridge);
 });
 
@@ -47,10 +52,19 @@ test("Grok emits escaped TOML for local, remote and interpolated bridge entries"
   assert.equal(result.warnings.length, 1);
 });
 
-test("OpenCode keeps stdio only and returns actionable warnings", () => {
-  const result = buildOpenCodeMcpConfig({ local: { command: "tool", args: ["--x"] }, remote: { type: "http", url: "https://mcp" } }, bridge, false, { model: "openai/gpt-5", reasoningEffort: "high" });
+test("OpenCode serializes stdio as local and http/sse as remote (T-308); only missing url warns", () => {
+  const result = buildOpenCodeMcpConfig({
+    local: { command: "tool", args: ["--x"] },
+    remote: { type: "http", url: "https://mcp", headers: { "X-Key": "v" } },
+    sse: { type: "sse", url: "https://sse" },
+    broken: { type: "http" },
+  }, bridge, false, { model: "openai/gpt-5", reasoningEffort: "high" });
+  const mcp = result.config.mcp as Record<string, unknown>;
+  assert.deepEqual(mcp.local, { type: "local", enabled: true, command: ["tool", "--x"] });
+  assert.deepEqual(mcp.remote, { type: "remote", enabled: true, url: "https://mcp", headers: { "X-Key": "v" } });
+  assert.deepEqual(mcp.sse, { type: "remote", enabled: true, url: "https://sse" });
   assert.equal(result.warnings.length, 1);
-  assert.deepEqual((result.config.mcp as Record<string, unknown>).local, { type: "local", enabled: true, command: ["tool", "--x"] });
+  assert.match(result.warnings[0], /"broken".*requires url/);
   assert.deepEqual(result.config.permission, { edit: "ask", bash: "ask", webfetch: "ask", external_directory: "ask" });
   assert.deepEqual((result.config.agent as Record<string, unknown>)["the-dudes-managed"], { model: "openai/gpt-5", reasoningEffort: "high" });
 });
@@ -58,6 +72,7 @@ test("OpenCode keeps stdio only and returns actionable warnings", () => {
 test("Codex TOML args escape quoted names and values without shell interpolation", () => {
   const result = buildCodexMcpArgs({ "odd.name": { command: "a\"b", args: ["$HOME"] }, remote: { type: "sse", url: "https://mcp" } }, bridge);
   assert.equal(result.warnings.length, 1);
+  assert.match(result.warnings[0], /"remote".*not sse/);
   assert.ok(result.args.some((arg) => arg.includes('mcp_servers."odd.name".command="a\\"b"')));
   assert.ok(result.args.some((arg) => arg.includes('["$HOME"]')));
 });
