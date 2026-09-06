@@ -74,6 +74,12 @@ rotate_log() {
 
 while true; do
   rotate_log
+  # T-261 (F-8): o log do launcher leva token/emails/paths — nasce 0644 pelo
+  # umask e fica legível a qualquer usuário. Após o rotate (ou no primeiro
+  # start) o `>>` recria o arquivo com o umask, então o aperto é reafirmado a
+  # cada loop. `>>` do node usa fd próprio; chmod não quebra append.
+  touch "$LOG_FILE" 2>/dev/null || true
+  chmod go-rwx "$LOG_FILE" 2>/dev/null || true
   # Blindagem do env: daemon.env guarda THE_DUDES_DAEMON_TOKEN. Se ficar
   # legível por grupo/outros, o token vaza; se ficar gravável, vira execução
   # arbitrária sob launchd (source de conteúdo controlado). Força 0600 antes.

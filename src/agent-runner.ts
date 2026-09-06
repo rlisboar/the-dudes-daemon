@@ -2398,7 +2398,12 @@ export class AgentRunner {
             cacheRead: normalized.cacheRead,
           };
           this.opts.onUsageDelta?.(delta);
-          this.checkContextUsage(delta, "inclusive");
+          // T-271: billing do turn.completed NÃO vira ocupação aqui — é a
+          // soma dos prompts re-enviados no turno (multi-step) e cravava
+          // 100% do mapa fallback, pedindo compact antes do poll pós-turno
+          // aplicar o last_token_usage real do rollout. Guardado pro poll
+          // usar como fallback (rollout ausente).
+          this.codexTurnBilling = { epoch, delta };
       } else if (normalized.type === "error") {
         this.checkContextFullError(normalized.message);
         this.opts.onError(`codex: ${normalized.message}`);
@@ -2407,6 +2412,13 @@ export class AgentRunner {
   }
 
   /* ---------- T-245: contexto real do codex via rollout ---------- */
+
+  /** T-271: billing do turn.completed do turno em voo, com o epoch do spawn.
+   *  NÃO aplica ocupação sincronamente (podia cravar 100% do mapa fallback e
+   *  pedir compact antes do poll pós-turno ler o rollout — billing multi-step
+   *  soma os prompts re-enviados, não é ocupação de janela). O poll decide:
+   *  sinal real do rollout vence; sem rollout, billing+mapa segue fallback. */
+  private codexTurnBilling: { epoch: number; delta: AgentUsage } | null = null;
 
   /** Raiz dos rollouts do codex (~/.codex/sessions/YYYY/MM/DD/*.jsonl).
    *  CODEX_HOME respeitado (mesmo contrato do próprio CLI). */
@@ -2464,15 +2476,21 @@ export class AgentRunner {
 
   /** Poll pós-turno: o rollout pode ser flushado um pouco depois do exit
    *  (mesma janela de corrida do signals.json do grok). Só reporta com
-   *  sinal válido; turno de epoch antigo (clear/compact) é descartado. */
+   *  sinal válido; turno de epoch antigo (clear/compact) é descartado.
+   *  T-271: billing do turn.completed (guardado em codexTurnBilling) só é
+   *  aplicado como fallback se o rollout NÃO der sinal — e só se o epoch
+   *  continua dono da sessão (billing de conversa descartada não envenena
+   *  a contabilidade nova). */
   private async pollCodexContextOccupancy(epoch: number): Promise<void> {
+    const billing = this.codexTurnBilling?.epoch === epoch ? this.codexTurnBilling.delta : null;
+    this.codexTurnBilling = null;
     for (let i = 0; i < 6; i++) {
       if (i > 0) await new Promise((r) => setTimeout(r, 200));
       if (this.stopped) return;
       // Sessão resetada durante o poll: o rollout é da conversa descartada.
       if (!this.messageSession.owns(epoch)) return;
       const sessionId = this.messageSession.sessionId;
-      if (!sessionId) return;
+      if (!sessionId) break; // sem thread não há rollout → fallback billing
       const sig = this.readCodexRolloutSignals(sessionId);
       if (!sig) continue;
       // Janela REAL do codex (ex. 258.400) vira catálogo: vence o mapa
@@ -2481,6 +2499,10 @@ export class AgentRunner {
       // Ocupação ABSOLUTA do último step (não delta de billing) — defeito 1.
       this.reportContextOccupancy(sig.used);
       return;
+    }
+    // Fallback: rollout indisponível → comportamento anterior (billing+mapa).
+    if (billing && !this.stopped && this.messageSession.owns(epoch)) {
+      this.checkContextUsage(billing, "inclusive");
     }
   }
 
