@@ -83,7 +83,7 @@ test("T-168 A3: resolveGrokSessionRoots inclui ~/.grok-custom; tmp é candidato,
   const r = cleanGrokTempSessions({ roots: [customRoot], nowMs: now, ttlMs: ttl, fs });
   assert.equal(r.removed, 1);
   assert.equal(r.scanned, 2);
-  assert.equal(r.skipped, 1);
+  assert.equal(r.kept, 1);
   assert.deepEqual(removed, [`${customRoot}/${cliOld}`]);
   assert.ok(dirs[`${customRoot}/${project}`], "sessão real intocada");
 });
