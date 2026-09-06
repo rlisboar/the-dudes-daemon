@@ -63,6 +63,36 @@ interface Args {
   cliPaths: DaemonCliConfig["cliPaths"];
 }
 
+type CliPathsMap = NonNullable<DaemonCliConfig["cliPaths"]>;
+
+/** T-306: composição cliPaths de flags de CLI + env — SÓ campos com valor
+ *  entram no objeto. Antes, o literal em parseCli mantinha TODAS as chaves
+ *  (valor undefined quando sem flag/env) e o spread do mergeCliConfig
+ *  clobberava o cliPaths do daemon-config.json (ex.: cliPaths.claude do
+ *  arquivo virava undefined) — o dono perdia override de arquivo e o QA
+ *  precisava de workaround via THE_DUDES_CLAUDE_PATH (T-274). Precedência
+ *  resultante: flag/env explícito > daemon-config.json > default. */
+export function cliPathsFromFlags(
+  flags: { claude?: string; opencode?: string; gemini?: string; codex?: string; crush?: string; grok?: string },
+  env: NodeJS.ProcessEnv = process.env,
+): CliPathsMap {
+  const out: CliPathsMap = {};
+  const pairs: Array<[keyof CliPathsMap, string | undefined]> = [
+    ["claude", flags.claude ?? env.THE_DUDES_CLAUDE_PATH],
+    ["opencode", flags.opencode ?? env.THE_DUDES_OPENCODE_PATH],
+    ["gemini", flags.gemini ?? env.THE_DUDES_GEMINI_PATH],
+    ["codex", flags.codex ?? env.THE_DUDES_CODEX_PATH],
+    ["crush", flags.crush ?? env.THE_DUDES_CRUSH_PATH],
+    ["grok", flags.grok ?? env.THE_DUDES_GROK_PATH],
+  ];
+  for (const [key, value] of pairs) {
+    // Vazio/whitespace não é override — nem sequer entra (normalizePath do
+    // cli-config trataria como undefined do mesmo jeito).
+    if (value && value.trim()) out[key] = value;
+  }
+  return out;
+}
+
 function parseCli(): Args {
   const argv = process.argv.slice(2);
   const verboseHumanIo = argv.includes("-vh") || argv.includes("-vhio") || argv.includes("--verbose-human-io");
@@ -102,14 +132,14 @@ function parseCli(): Args {
   const verbose = !!values.verbose || verboseHuman || verboseHumanIo;
   const verboseHumanIoFlag = !!values["verbose-human-io"] || verboseHumanIo;
   const cliConfigPath = values["cli-config"] ?? process.env.THE_DUDES_DAEMON_CONFIG ?? defaultDaemonConfigPath();
-  const cliPaths = {
-    claude: values["claude-path"] ?? process.env.THE_DUDES_CLAUDE_PATH,
-    opencode: values["opencode-path"] ?? process.env.THE_DUDES_OPENCODE_PATH,
-    gemini: values["gemini-path"] ?? process.env.THE_DUDES_GEMINI_PATH,
-    codex: values["codex-path"] ?? process.env.THE_DUDES_CODEX_PATH,
-    crush: values["crush-path"] ?? process.env.THE_DUDES_CRUSH_PATH,
-    grok: values["grok-path"] ?? process.env.THE_DUDES_GROK_PATH,
-  };
+  const cliPaths = cliPathsFromFlags({
+    claude: values["claude-path"],
+    opencode: values["opencode-path"],
+    gemini: values["gemini-path"],
+    codex: values["codex-path"],
+    crush: values["crush-path"],
+    grok: values["grok-path"],
+  });
   if (!orch) { console.error("error: --orch required (or THE_DUDES_ORCHenv)"); printHelp(); process.exit(1); }
   if (!token) { console.error("error: --token required (or THE_DUDES_DAEMON_TOKEN env)"); printHelp(); process.exit(1); }
   return { orch, token, name, pingMs, verbose, verboseHuman, verboseHumanIo: verboseHumanIoFlag, cliConfigPath, cliPaths };
