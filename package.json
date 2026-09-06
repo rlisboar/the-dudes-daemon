@@ -26,7 +26,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
-    "@sentry/node": "^10.52.0",
+    "@sentry/node": "^10.71.0",
     "@the-dudes/net-guard": "file:packages/net-guard",
     "@the-dudes/protocol": "file:packages/protocol",
     "undici": "^6.21.0",
@@ -36,7 +36,7 @@
   "devDependencies": {
     "@types/node": "^22.7.4",
     "@types/ws": "^8.5.12",
-    "esbuild": "0.28.1",
+    "esbuild": "0.28.2",
     "tsx": "^4.19.1",
     "typescript": "^5.6.2"
   }
