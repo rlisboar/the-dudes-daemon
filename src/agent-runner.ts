@@ -4082,26 +4082,36 @@ export class AgentRunner {
     const socket = this.opts.bridgeSocketPath;
     if (!socket) return [];
     try {
-      const r = await this.postBridgeJson(socket, "memory_list", {});
-      const mems = Array.isArray(r?.memories) ? r.memories : [];
+      // T-342: paginado (200/página até meta.total, teto 1000) — com um único
+      // list o bloco "já existe" via só o top-80 e o modelo re-emitia factos
+      // fora dele. A lista vai toda; o bloco de prompt é cortado em 60 títulos.
+      const mems: any[] = [];
+      for (let page = 0; page < 5; page++) {
+        const r = await this.postBridgeJson(socket, "memory_list", { limit: 200, offset: page * 200 });
+        const chunk = Array.isArray(r?.memories) ? r.memories : [];
+        mems.push(...chunk);
+        const total = Number(r?.meta?.total);
+        if (chunk.length < 200 || (Number.isFinite(total) && mems.length >= total)) break;
+      }
       return mems
         .map((m: any) => ({
           id: typeof m.id === "string" ? m.id : "",
           title: typeof m.title === "string" ? m.title.trim() : "",
           body: typeof m.body === "string" ? m.body.trim() : "",
         }))
-        .filter((m: { id: string; title: string }) => m.id && m.title)
-        .slice(0, 40);
+        .filter((m: { id: string; title: string }) => m.id && m.title);
     } catch {
       return [];
     }
   }
 
   /** Bloco de prompt: lista as memórias existentes indexadas por id e instrui o
-   *  modelo a marcar `supersedes` quando a nova entrada atualiza/substitui uma. */
+   *  modelo a marcar `supersedes` quando a nova entrada atualiza/substitui uma.
+   *  T-342: com catálogo grande, os 60 primeiros (ranked) bastam p/ o modelo
+   *  não repetir; o dedup duro (near-dup/skip) corre sobre a lista completa. */
   private memoryAlreadyBlock(existing: Array<{ id: string; title: string; body: string }>): string {
     if (existing.length === 0) return "";
-    const list = existing
+    const list = existing.slice(0, 60)
       .map((m) => `[id=${m.id}] ${m.title}${m.body ? ` — ${m.body.slice(0, 160)}` : ""}`)
       .join("\n");
     return `\n\nEXISTING MEMORY (a new entry may UPDATE/REPLACE one of these):\n${list}\n` +

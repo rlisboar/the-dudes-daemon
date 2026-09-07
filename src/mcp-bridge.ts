@@ -914,6 +914,26 @@ server.tool(
 
 const MEMORY_TYPES = ["fact", "decision", "reference", "preference", "task_state"] as const;
 
+/**
+ * T-342: varre TODAS as memórias visíveis (paginado, 200/página até `meta.total`,
+ * teto 2000). Antes o recall/dedup via um único list limit 80: catálogo maior
+ * ficava invisível e o auto-extract re-emitnear-dups fora do top-80.
+ */
+async function fetchAllVisibleMemories(
+  type?: string,
+  maxPages = 10,
+): Promise<Array<Record<string, any>>> {
+  const all: Array<Record<string, any>> = [];
+  for (let page = 0; page < maxPages; page++) {
+    const r = await postJSON("memory_list", { type, limit: 200, offset: page * 200, touch: false });
+    const chunk = (r.memories ?? []) as Array<Record<string, any>>;
+    all.push(...chunk);
+    const total = Number(r?.meta?.total);
+    if (chunk.length < 200 || (Number.isFinite(total) && all.length >= total)) break;
+  }
+  return all;
+}
+
 server.tool(
   "remember",
   "Save a durable note to YOUR agent memory (default scope=agent). Default is NOT pinned (catalog/recall only). Set pinned=true only if it must re-inject into YOUR system prompt every restart (hot-set quota ~15, budget 8000 chars). Use scope 'project' only for shared catalog facts others may recall (never auto-injected into all agents). Keep entries short and atomic. Use supersedes to replace an older mem_ id of the same fact. Near-dup guard: an existing entry with a similar title and essentially the same body is SKIPPED; with a new body, the new entry supersedes the old one automatically.",
@@ -933,7 +953,7 @@ server.tool(
       // existentes → skip (corpo igual) ou supersede (corpo novo).
       let existing: Array<{ id: string; title?: string; body?: string }> = [];
       try {
-        const lr = await postJSON("memory_list", { limit: 80, touch: false });
+        const lr = await fetchAllVisibleMemories();
         existing = (lr.memories ?? []).map((m: any) => ({
           id: typeof m?.id === "string" ? m.id : "",
           title: typeof m?.title === "string" ? m.title : "",
@@ -1001,40 +1021,57 @@ server.tool(
   },
   async ({ query, type, limit, mode }) => {
     try {
-      // touch:false no list — só touch dos IDs que passaram no filtro (ranking honesto)
-      const r = await postJSON("memory_list", { type, limit: limit ?? 80, touch: false });
-      let entries = (r.memories ?? []) as Array<{
-        id: string; type: string; scope: string; agentId?: string | null;
-        pinned?: boolean; title?: string; body?: string; tags?: string[];
-      }>;
+      // T-342: varredura paginada (não só o top-80). touch:false no list —
+      // só touch dos IDs que passaram no filtro (ranking honesto).
+      const all = await fetchAllVisibleMemories(type);
+      const explicitMode = mode === "or" || mode === "and";
       const matchMode = mode === "or" ? "or" : "and";
-      if (query?.trim()) {
-        entries = entries.filter((e) =>
-          memoryQueryMatch(`${e.title ?? ""}\n${e.body ?? ""}\n${(e.tags ?? []).join(" ")}`, query, matchMode),
-        );
+      const filterWith = (mm: "and" | "or") => all.filter((e) =>
+        memoryQueryMatch(
+          `${typeof e.title === "string" ? e.title : ""}\n${typeof e.body === "string" ? e.body : ""}\n${(e.tags ?? []).join(" ")}`,
+          query, mm,
+        ),
+      );
+      let entries = (query?.trim() ? filterWith(matchMode) : all) as Array<Record<string, any>>;
+      // OR-fallback automático (só quando o modo é o default): "deploy staging"
+      // AND sem hit não devia devolver vazio se "staging" sozinho é útil.
+      let orFallback = false;
+      if (query?.trim() && !explicitMode && entries.length === 0 && /\s/.test(query.trim())) {
+        const relaxed = filterWith("or");
+        if (relaxed.length > 0) { entries = relaxed; orFallback = true; }
       }
-      // Boost sticky types after pin sort (server already ranks; re-boost filtered set)
+      // Boost sticky types after pin sort (server já rankou; re-boost do filtrado)
       entries.sort((a, b) => {
         const pa = a.pinned ? 0 : 1;
         const pb = b.pinned ? 0 : 1;
         if (pa !== pb) return pa - pb;
         const sa = a.type === "decision" || a.type === "preference" ? 0 : 1;
         const sb = b.type === "decision" || b.type === "preference" ? 0 : 1;
-        return sa - sb;
+        if (sa !== sb) return sa - sb;
+        // T-342: desempate por utilidade/idade (o agente tem de ponderar).
+        const ha = Number(a.recallHits ?? 0);
+        const hb = Number(b.recallHits ?? 0);
+        if (ha !== hb) return hb - ha;
+        return String(b.lastAccessedAt ?? b.createdAt ?? "").localeCompare(String(a.lastAccessedAt ?? a.createdAt ?? ""));
       });
       entries = entries.slice(0, limit ?? 40);
       if (entries.length > 0 && (query?.trim() || entries.length <= 15)) {
-        void postJSON("memory_touch", { ids: entries.map((e) => e.id) }).catch(() => {});
+        void postJSON("memory_touch", { ids: entries.map((e) => String(e.id)) }).catch(() => {});
       }
       if (entries.length === 0) return { content: [{ type: "text", text: "(no matching memory)" }] };
       const text = entries
         .map((e) => {
-          const tagStr = e.tags?.length ? ` tags:${e.tags.join(",")}` : "";
+          const tagStr = Array.isArray(e.tags) && e.tags.length ? ` tags:${e.tags.join(",")}` : "";
           const hot = e.pinned && e.scope === "agent" ? " 📌hot" : "";
-          return `- ${e.id} [${e.type}/${e.scope}]${hot}${tagStr} ${e.title ?? "🔒"}\n    ${(e.body ?? "").replace(/\n/g, "\n    ")}`;
+          // T-342: idade + hits — o prompt manda "verificar antes de confiar";
+          // sem estes dados o agente não tem como fazê-lo.
+          const created = String(e.createdAt ?? "").slice(0, 10);
+          const age = created ? ` (${created}, ${Number(e.recallHits ?? 0)} hits)` : "";
+          return `- ${e.id} [${e.type}/${e.scope}]${hot}${tagStr}${age} ${e.title ?? "🔒"}\n    ${(e.body ?? "").replace(/\n/g, "\n    ")}`;
         })
         .join("\n");
-      return { content: [{ type: "text", text }] };
+      const header = orFallback ? "(busca AND sem hit; mostramos matches OR das palavras)\n" : "";
+      return { content: [{ type: "text", text: `${header}${text}` }] };
     } catch (e) {
       return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
     }
