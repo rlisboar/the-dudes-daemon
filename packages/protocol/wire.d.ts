@@ -435,6 +435,19 @@ export interface AgentInfo {
   /** Subagente efêmero criado por delegação (mcp delegate). Reapeado ao concluir
    *  a mission/TTL/pai-morto. parent = managerAgentId; depth = hierarchyLevel. */
   ephemeral?: boolean;
+  /** T-360 migração cross-runner: contexto portátil (markdown ≤ 8 KB) do agente
+   *  que morreu. CRU — sob E2EE chega CIFRADO, porque o `summarize:result` já o
+   *  devolve selado com a chave do projeto e o server não sabe abri-lo. Quem
+   *  decripta, mede o limite em plaintext e escreve a tag `<migrated-context …>`
+   *  é o daemon (T-365): tag à volta de base64 não é contexto nenhum.
+   *  Ausente em troca de modelo na mesma runner. */
+  seedDigest?: string;
+  /** T-365: origem do seed, para o daemon escrever a tag depois de decriptar.
+   *  `migrationId` é o elo do evento de metadados fixos (seed caído por falta de
+   *  chave — H-092) ao `agent:migrate` correspondente; é um ID, nunca conteúdo. */
+  seedFrom?: { runner: string; model?: string; ts: number; migrationId?: string };
+  /** T-360: instrução opcional pedida por quem migrou; entregue junto do seed. */
+  seedInstruction?: string;
   repo?: AgentRepo;
   cwdOverride?: string;
   usage: AgentUsage;
@@ -1208,6 +1221,17 @@ export type ServerEvent =
   | { type: "agent:session"; id: string; sessionId: string }
   | { type: "agent:usage"; id: string; usage: AgentUsage }
   | { type: "agent:context"; id: string; used: number; limit: number }
+  /** T-360 migração de contexto entre runners. Máquina de fases vive no
+   *  ProjectInstance; `from`/`to` são os endpoints no momento do pedido. */
+  | {
+      type: "agent:migrate";
+      migrationId: string;
+      agentId: string;
+      phase: "digesting" | "stopping" | "starting" | "ready" | "failed";
+      error?: string;
+      from: { runner: string; model?: string };
+      to: { runner: string; model?: string };
+    }
   | { type: "message"; msg: MessageEntry }
   | { type: "task:added"; task: Task }
   | { type: "task:updated"; task: Task }
@@ -1661,6 +1685,10 @@ export type ClientCommand =
       /** Chave ATUAL cifrada com a NOVA (vira entrada do key ring — ver project_keys:current). */
       ringEntry?: string;
     }
+  /** #354: reparação do key ring — admin faz subir entrada(s) que um cliente
+   *  ainda consegue produzir (chave antiga cifrada com a sua sucessora).
+   *  `ringEntries` preserva ordem de cadeia (mais antiga → mais nova). */
+  | { type: "project_keys:add_ring_entry"; projectId: string; ringEntry?: string; ringEntries?: string[] }
   | { type: "totp:status" }
   | { type: "totp:setup_init" }
   | { type: "totp:setup_confirm"; code: string }

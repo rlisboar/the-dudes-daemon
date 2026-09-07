@@ -12,6 +12,8 @@
  * default. A composição replicada aqui é a mesma de main.ts (mergeCliConfig(
  * loadDaemonCliConfig(path), { cliPaths: cliPathsFromFlags(...) })).
  */
+import "./scratch-home.js";
+
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync, chmodSync } from "node:fs";

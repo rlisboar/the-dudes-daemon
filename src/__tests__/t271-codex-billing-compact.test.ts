@@ -15,6 +15,8 @@
  * anterior preservado). Sinal real (last_token_usage + model_context_window)
  * vence. Contratos AgentUsage/onContextUsage/checkContextUsage intactos.
  */
+import "./scratch-home.js";
+
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync, chmodSync } from "node:fs";

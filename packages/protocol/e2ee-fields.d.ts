@@ -55,6 +55,17 @@ export declare function isE2eV2(stored: string): boolean;
 export declare function isE2eV1Rejected(stored: string): boolean;
 export declare function isPlainCatalogText(v: unknown): boolean;
 
+/**
+ * T-365/H-092: agent:error de metadados fixos — constantes do código (zero
+ * transcript, zero texto de CLI, zero digest). Passam o guard de claro do
+ * e2ee-required por comparação EXATA; IDs viajam em campos próprios.
+ */
+export declare const MIGRATE_SEED_DROPPED_REASON: string;
+/** T-370: resume com seed pendurado — decisão legítima, nunca silenciosa. */
+export declare const MIGRATE_SEED_RESUME_SKIPS_REASON: string;
+export declare const METADATA_AGENT_ERROR_TEXTS: ReadonlyArray<string>;
+export declare function isMetadataAgentErrorText(v: unknown): boolean;
+
 export declare const AGENT_SEND_CIPHER_AADS: ReadonlyArray<Readonly<{ table: string; field: string }>>;
 export declare function isAgentSendCipherAad(table: string, field: string): boolean;
 export type AgentSendCipherAadResult =

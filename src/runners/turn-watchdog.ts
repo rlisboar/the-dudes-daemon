@@ -17,6 +17,11 @@ export interface HangThresholds {
   /** T-240 (a): teto ABSOLUTO de tool in-flight com processo VIVO — passado
    *  isso, assume tool_result perdido e reavalia o hang (grok: ~10min). */
   toolsHardMs: number;
+  /** T-371 (d): teto ABSOLUTO de LIFETIME do turno (elapsed desde o início,
+   *  não ociosidade). O relógio de soft/hard é de OCIOSIDADE SEMÂNTICA: um
+   *  stream em loop de tokens renova-o para sempre e nenhum hardMs o apanha.
+   *  Ausente = sem teto (comportamento anterior preservado). */
+  lifetimeMs?: number;
 }
 
 export function hangThresholds(runner?: string): HangThresholds {
@@ -39,6 +44,22 @@ export function hangThresholds(runner?: string): HangThresholds {
     // Continuous: tools longas (build, test, MCP) não emitem stream por minutos.
     // Soft alto evita "stalled" falso; hard só mata per-message (busy), não o proc contínuo.
     return { softMs: 12 * 60_000, hardMs: 25 * 60_000, deadProcMs: 20_000, toolsHardMs: 20 * 60_000 };
+  }
+  if (runner === "qwen") {
+    // T-371: per-message com resume. Rodadas de API do provedor degradado
+    // medem ~85s sem emitir texto — com (e) cada evento de stream repõe o
+    // clock, e soft 6min dá margem ao thinking profundo sem esconder o resto.
+    // Lifetime 8min alinha com o QWEN_STREAM_MAX_LIFETIME_MS que o DEVOPS pôs
+    // no ambiente: o daemon corta o loop ANTES do cap do CLI (15min), e por
+    // elapsed — um loop que cospe tokens renova o relógio de ociosidade para
+    // sempre (F4), logo hardMs nenhum, nem 720s, o apanhava.
+    return {
+      softMs: 6 * 60_000,
+      hardMs: 10 * 60_000,
+      deadProcMs: 20_000,
+      toolsHardMs: 20 * 60_000,
+      lifetimeMs: 8 * 60_000,
+    };
   }
   // codex / crush / gemini (per-message)
   return { softMs: 5 * 60_000, hardMs: 12 * 60_000, deadProcMs: 20_000, toolsHardMs: 20 * 60_000 };
@@ -77,16 +98,30 @@ export interface TurnActivityClock {
   softReported: boolean;
   /** Desde quando o processo do turno está morto (busy sem PID). */
   deadSince: number | null;
+  /** T-371 (d): início do turno corrente — base do teto de lifetime.
+   *  `touchActivityClock` NÃO o move: o teto não se renova com atividade. */
+  turnStartedAt: number;
 }
 
 export function createActivityClock(now = Date.now()): TurnActivityClock {
-  return { lastActivityAt: now, softReported: false, deadSince: null };
+  return { lastActivityAt: now, softReported: false, deadSince: null, turnStartedAt: now };
 }
 
 export function touchActivityClock(clock: TurnActivityClock, now = Date.now()): void {
   clock.lastActivityAt = now;
   clock.softReported = false;
   clock.deadSince = null;
+}
+
+/** T-371 (d): marca o início do turno corrente (chamar no spawn do turno). */
+export function markTurnStart(clock: TurnActivityClock, now = Date.now()): void {
+  clock.turnStartedAt = now;
+}
+
+/** T-371 (d): o turno já passou do teto absoluto de lifetime? Runners sem
+ *  `lifetimeMs` nunca vencem (comportamento anterior preservado). */
+export function turnLifetimeDue(clock: TurnActivityClock, t: HangThresholds, now = Date.now()): boolean {
+  return t.lifetimeMs != null && now - clock.turnStartedAt >= t.lifetimeMs;
 }
 
 /**

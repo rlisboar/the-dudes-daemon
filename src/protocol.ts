@@ -315,6 +315,12 @@ export interface AgentErrorEv {
    * Ausente = daemon velho: em E2EE o server NÃO dispara auto-retry até atualizar.
    */
   errorKind?: "rate_limit" | "other";
+  /**
+   * T-365/H-092: presente só no evento de metadados fixos (message é uma
+   * METADATA_AGENT_ERROR_TEXTS) — elo do seed caído ao agent:migrate. É um ID,
+   * nunca conteúdo: não precisa de selo e não entra no transcript.
+   */
+  migrationId?: string;
 }
 /** Runner sem atividade / processo morto — soft=aviso; hard=turno abortado. */
 export interface AgentHungEv {
@@ -685,6 +691,32 @@ export interface SummarizeResult {
   usage?: { input: number; output: number };
 }
 
+export interface TranscriptRequest {
+  type: "transcript:request";
+  correlationId: string;
+  projectId: string;
+  /**
+   * T-360 (quinto ruling) + T-368: blobs CRUS, como guardados — sem label de
+   * kind, sem corte. Um label na frente (`user: e2e:…`) deixa o blob
+   * irreconhecível como cifra no daemon, que o devolve verbatim; e truncar
+   * base64 parte a autenticação. O servidor formata a linha `kind: plaintext`
+   * depois do decrypt (corte no plaintext). Ordem preservada: a resposta é um
+   * plaintext por blob, na mesma ordem.
+   */
+  blobs: string[];
+}
+
+export interface TranscriptResult {
+  type: "transcript:result";
+  correlationId: string;
+  ok: boolean;
+  /** Plaintext na ordem pedida, um por blob (T-368: array — um `text` único
+   *  não sobrevive a mensagens com `\n`). */
+  lines?: string[];
+  /** Razão constante no falho (metadados, zero conteúdo do transcript). */
+  error?: string;
+}
+
 export interface WebhookDispatchRequest {
   type: "webhook:dispatch";
   /** Server-issued correlation id; daemon echoes back in delivery_result. */
@@ -953,6 +985,7 @@ export type FromDaemon =
   | GitLogResult | GitStatusResult | GitDiffResult
   | GitResult
   | SummarizeResult
+  | TranscriptResult
   | WebhookDeliveryResult
   | SkillsScanResult
   | SkillReadFileResult
@@ -981,6 +1014,7 @@ export type FromOrch =
   | GitBlameRequest | GitStashListRequest | GitStashRequest | GitStashPopRequest
   | GitlabApiRequest
   | SummarizeRequest
+  | TranscriptRequest
   | ProjectKeyForDaemon
   | ProjectE2eeRequired
   | TaskUpdatedEv

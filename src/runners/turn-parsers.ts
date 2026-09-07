@@ -265,6 +265,71 @@ export function parseGrokStreamEvent(raw: unknown): NormalizedTurnEvent[] {
   return [];
 }
 
+/**
+ * T-371 (c): janela anti-repetição para o stream de texto.
+ *
+ * O caso da forense: provider degradado emite um loop de tokens ('ductduct…')
+ * que renova qualquer relógio de ociosidade — o turno morria aos 12-15min.
+ * Detecção: quando o TOTAL alimentado passa `minFeedChars` (um turno são
+ * chega lá com conteúdo VARIADO; um loop chega em segundos), o fim da janela
+ * deslizante é verificado contra periodicidade curta: existir um período
+ * p ≤ `maxPeriod` que cobre ≥ `coverage` dos últimos `windowChars` é um
+ * degenerado — não prosa, não tabela, não código (essas repetem LINHAS
+ * diferentes, não um período único). Abaixo do piso de feed NADA dispara:
+ * saída legítima repetitiva de baixo volume é o negativo vinculativo.
+ *
+ * Uma instância por turno (estado de sliding window). `feed` devolve true
+ * no momento em que o loop fica inequívoco — o caller aborta o turno.
+ */
+export class TextLoopGuard {
+  private windowBuf = "";
+  private fed = 0;
+  private sinceCheck = 0;
+  private tripped = false;
+  private readonly minFeedChars: number;
+  private readonly windowChars: number;
+  private readonly maxPeriod: number;
+  private readonly coverage: number;
+  private readonly checkEvery: number;
+
+  constructor(opts: { minFeedChars?: number; windowChars?: number; maxPeriod?: number; coverage?: number } = {}) {
+    this.minFeedChars = opts.minFeedChars ?? 32_768;
+    this.windowChars = opts.windowChars ?? 16_384;
+    this.maxPeriod = opts.maxPeriod ?? 64;
+    this.coverage = opts.coverage ?? 0.95;
+    this.checkEvery = Math.floor(this.windowChars / 2);
+  }
+
+  /** Alimenta o delta de texto do turno; true = loop degenerado detectado. */
+  feed(text: string): boolean {
+    if (this.tripped || !text) return this.tripped;
+    this.fed += text.length;
+    this.sinceCheck += text.length;
+    this.windowBuf = this.windowBuf.length + text.length > this.windowChars
+      ? this.windowBuf.slice(this.windowBuf.length + text.length - this.windowChars) + text
+      : this.windowBuf + text;
+    if (this.fed < this.minFeedChars || this.sinceCheck < this.checkEvery) return false;
+    this.sinceCheck = 0;
+    if (this.isDegenerate(this.windowBuf)) this.tripped = true;
+    return this.tripped;
+  }
+
+  /** Existe período ≤ maxPeriod cobrindo ≥ coverage do fim da janela? */
+  private isDegenerate(tail: string): boolean {
+    if (tail.length < this.windowChars / 2) return false;
+    const sample = tail.slice(-this.windowChars);
+    for (let p = 1; p <= this.maxPeriod; p++) {
+      let mismatches = 0;
+      const budget = Math.ceil(sample.length * (1 - this.coverage));
+      for (let i = p; i < sample.length && mismatches <= budget; i++) {
+        if (sample[i] !== sample[i - p]) mismatches++;
+      }
+      if (mismatches <= budget) return true;
+    }
+    return false;
+  }
+}
+
 export interface CrushSessionMeta { sessionId?: string; prompt: number; completion: number }
 
 export function parseCrushSessionMeta(raw: unknown): CrushSessionMeta {

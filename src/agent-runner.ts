@@ -26,7 +26,7 @@ import {
   type GrokContextSignals,
   type GrokTurnBilling,
 } from "./runners/parsers.js";
-import { parseCodexTurnEvent, parseCodexRolloutSignals, parseCodexRolloutSessionId, parseCrushSessionMeta, parseGeminiTurnEvent, parseGrokStreamEvent, parseOpenCodeTurnEvent, parseQwenTurnEvent } from "./runners/turn-parsers.js";
+import { parseCodexTurnEvent, parseCodexRolloutSignals, parseCodexRolloutSessionId, parseCrushSessionMeta, parseGeminiTurnEvent, parseGrokStreamEvent, parseOpenCodeTurnEvent, parseQwenTurnEvent, TextLoopGuard } from "./runners/turn-parsers.js";
 import { buildBridgeEnv, buildClaudeMcpConfig, buildCodexMcpArgs, buildCrushMcpConfig, buildGeminiMcpServers, buildGrokMcpToml, buildOpenCodeMcpConfig, buildQwenMcpServers, summarizeMcpServers } from "./runners/mcp-config.js";
 import { RunnerRuntimeFiles } from "./runners/runtime-files.js";
 import { ContextTracker, CumulativeUsageTracker, type UsageSemantics } from "./runners/context-tracker.js";
@@ -37,11 +37,19 @@ import {
   hangPhase,
   hangThresholds,
   hardRecoverNotifyPolicy,
+  markTurnStart,
   toolsInFlightHardDue,
   touchActivityClock,
+  turnLifetimeDue,
   type TurnActivityClock,
 } from "./runners/turn-watchdog.js";
 import { OpenCodeTransport } from "./runners/opencode-transport.js";
+import {
+  HANG_RECOVER_NUDGE_BACKOFF_MS,
+  HANG_RECOVER_NUDGE_MAX,
+  deliverHangRecoverNudge,
+  planHangRecoverNudge,
+} from "./runners/hang-nudge.js";
 import { buildOpenCodeAgentConfig, OPENCODE_MANAGED_AGENT } from "./runners/opencode-effort.js";
 import { randomUUID } from "node:crypto";
 import { PerMessageSessionState } from "./runners/message-session.js";
@@ -397,6 +405,10 @@ export class AgentRunner {
    *  vira 1 resumo. attempt≥2 notifica individualmente. */
   private hardRecoverTimes: number[] = [];
   private static readonly HARD_RECOVER_WINDOW_MS = 60 * 60_000;
+  /** T-364: timestamps (janela rolante de 30min) dos auto-continues já gastos. */
+  private hangNudgeTimes: number[] = [];
+  private hangNudgeTimer: ReturnType<typeof setTimeout> | null = null;
+  private hangNudgeBackoffs: number[] = HANG_RECOVER_NUDGE_BACKOFF_MS;
   /** Teto do compact. Acima disso o watchdog assume que travou e libera a
    *  fila — folga sobre o pior caso legítimo (one-shot 300s + summarize). */
   private static readonly COMPACT_STUCK_MS = 15 * 60_000;
@@ -2346,6 +2358,19 @@ export class AgentRunner {
 
     this.writeQwenConfig();
 
+    // T-371 (b): o hard recover só re-enfileira se houver inflight registrado
+    // (mecanismo herdado do caminho grok, :2898). O turno qwen nunca o
+    // populava ⇒ null ⇒ zero prepend ⇒ mensagem perdida. (d): o teto de
+    // lifetime é medida desde o início deste turno, não do último evento.
+    const prevAttempt =
+      this.inflightPerMessage?.content === content
+        ? this.inflightPerMessage.attempt
+        : 0;
+    this.inflightPerMessage = { content, images, attempt: prevAttempt };
+    markTurnStart(this.activityClock);
+    // T-371 (c): janela anti-repetição sobre os deltas de texto do turno.
+    const loopGuard = new TextLoopGuard();
+
     let message = content;
     const firstTurnSnapshot = this.messageSession.consumeFirstTurnIfNeeded();
     const firstTurn = firstTurnSnapshot.firstTurn;
@@ -2409,6 +2434,7 @@ export class AgentRunner {
     let buf = "";
     let pendingText = "";
     let sawResult = false;
+    let loopAborted = false;
     let errOut = "";
 
     const flush = () => {
@@ -2434,6 +2460,11 @@ export class AgentRunner {
         if (!this.messageSession.owns(epoch)) continue;
         try {
           for (const event of parseQwenTurnEvent(JSON.parse(line))) {
+            // T-371 (e): TODO evento semântico do stream é uma rodada de API
+            // concluída ou progresso real — repõe o clock de ociosidade.
+            // O complementar do teto absoluto de lifetime (d): thinking
+            // profundo com rodadas de ~85s deixa de ser "stalled" falso.
+            this.touchActivity();
             if (event.type === "session") {
               // uuid ecoado = o que já registramos; adota se divergir (CLI
               // gerou o dele — só possível se --session-id for rejeitado).
@@ -2441,7 +2472,16 @@ export class AgentRunner {
                 this.messageSession.sessionId = event.sessionId;
                 this.opts.onSessionId?.(event.sessionId);
               }
-            } else if (event.type === "text") pendingText += event.text;
+            } else if (event.type === "text") {
+              pendingText += event.text;
+              // T-371 (c): 'ductduct…' morre aos primeiros segundos de loop,
+              // não aos 12-15min de watchdog/CLI cap.
+              if (!loopAborted && loopGuard.feed(event.text)) {
+                loopAborted = true;
+                this.opts.log("warn", `[qwen:${this.info.name}] token loop detectado (janela anti-repetição) — SIGKILL`);
+                killProcess(proc, "SIGKILL");
+              }
+            }
             else if (event.type === "thought") {
               this.traceInternalCli("info", `[cli:${this.info.id}:qwen:thinking] block_received len=${event.text.length} collectFlag=${this.info.collectThinking}`);
               if (this.info.collectThinking) this.opts.onThinkingText?.(event.text);
@@ -2484,9 +2524,26 @@ export class AgentRunner {
       this.releaseActiveTurnSlot(); // T-251
       flush();
       imgCleanup();
-      this.ocActiveProc = null;
-      this.messageSession.busy = false;
+      // T-371: close TARDIO de um turno já recuperado (SIGKILL do hard
+      // recover) não pode zerar busy/proc do turno NOVO que o drain do
+      // recover pôs em voo — o guarda que o caminho grok aprendeu na T-240.
+      // Em stop(), o teardown completo é do stop(), não daqui.
+      if (this.messageSession.owns(epoch) || this.stopped) {
+        this.ocActiveProc = null;
+        this.messageSession.busy = false;
+      }
       if (this.stopped) { this.emitExit(code); return; }
+      // T-371 (c): loop abortado por janela anti-repetição = hard recover
+      // completo (sessão neutralizada (a) + mensagem re-enfileirada (b)),
+      // não um close qualquer.
+      if (loopAborted && this.messageSession.owns(epoch)) {
+        this.recoverHungTurn(
+          `token loop detectado (janela anti-repetição, turno ${Math.round((Date.now() - this.activityClock.turnStartedAt) / 1000)}s)`,
+          Date.now() - this.activityClock.lastActivityAt,
+        );
+        return;
+      }
+      if (sawResult) this.inflightPerMessage = null; // T-371 (b): turno completo
       // Resume apontando pra sessão que sumiu do disco (reboot limpou o
       // QWEN_HOME efêmero antigo, delete manual): "No saved session found".
       // Larga o id e re-tenta o turno UMA vez como sessão nova (mesmo
@@ -2496,6 +2553,7 @@ export class AgentRunner {
         this.messageSession.resetForRetry(firstTurnSnapshot.pendingSummary);
         this.info.sessionId = undefined;
         this.opts.onSessionId?.("");
+        this.inflightPerMessage = null; // a mensagem acaba de ser re-posta
         this.messageSession.prepend({ content, images });
         this.setState("idle");
         this.drainOcQueue();
@@ -3681,6 +3739,10 @@ export class AgentRunner {
   stop() {
     this.stopped = true;
     this.stopHangWatch();
+    if (this.hangNudgeTimer) {
+      clearTimeout(this.hangNudgeTimer);
+      this.hangNudgeTimer = null;
+    }
     // Limpa buffers pendentes — sem isso, mensagens bufferadas durante
     // restart ficam em memory por toda vida do AgentRunner (mesmo após
     // stop). Cleanup explicit pra GC.
@@ -4520,6 +4582,18 @@ export class AgentRunner {
       return;
     }
 
+    // T-371 (d): teto ABSOLUTO de lifetime do turno — elapsed desde
+    // markTurnStart, não se renova com atividade. É o que apanha o loop de
+    // tokens que renova o relógio de ociosidade semântica para sempre (F4);
+    // tools em voo também não o adiam — 8min de turno qwen é o contrato.
+    if (this.messageSession.busy && turnLifetimeDue(this.activityClock, t, now)) {
+      this.recoverHungTurn(
+        `turn lifetime ${Math.round((now - this.activityClock.turnStartedAt) / 1000)}s ≥ ${Math.round((t.lifetimeMs ?? 0) / 1000)}s`,
+        idleMs,
+      );
+      return;
+    }
+
     // Tools em execução (Claude continuous + Grok tool loop): silêncio de
     // stream é esperado por minutos (shell, MCP, peer wait). T-240 (a): COM
     // tool em voo e processo VIVO, hard só no teto absoluto toolsHardMs
@@ -4628,6 +4702,17 @@ export class AgentRunner {
         this.info.sessionId = undefined;
         this.opts.onSessionId?.("");
       }
+      // T-371 (a): qwen é resume por sessão (`-r <id>`): a parcial degenerada
+      // do turno morto ficou gravada no jsonl do CLI e voltava no turno
+      // seguinte. Neutralizar a sessão ⇒ o próximo spawn abre `--session-id`
+      // novo em vez de replayar o lixo. (gemini/codex/crush seguem o mesmo
+      // padrão quando houver medição análoga — declarado na entrega.)
+      if (this.opts.cliRunner === "qwen" && this.messageSession.sessionId) {
+        this.opts.log("warn", `[hang:${this.info.name}] neutralizando sessão qwen pós-hard recover (parcial não será replayada)`);
+        this.messageSession.resetForRetry(this.messageSession.pendingSummary);
+        this.info.sessionId = undefined;
+        this.opts.onSessionId?.("");
+      }
 
       // Re-enfileira a mensagem em voo (1 retry). Sem isso a instrução
       // Claude→Grok some e o agente fica idle sem processar nada.
@@ -4680,9 +4765,54 @@ export class AgentRunner {
       this.setState("idle");
       // Continua fila (inclui re-fila acima)
       try { this.drainOcQueue(); } catch { /* */ }
+      this.scheduleHangNudge(idleMs);
     } finally {
       this.recoveringHung = false;
     }
+  }
+
+  /**
+   * T-364: hard stall sem trabalho na fila deixa o agente idle pra sempre —
+   * o turno morreu, não há mensagem pra drenar. Enfileira UM nudge sintético
+   * (orçamento 2 / 30min por agente) pro respawn com resume retomar o trabalho.
+   * Chamado só de recoverHungTurn, ou seja, nunca na fase soft.
+   */
+  private scheduleHangNudge(idleMs: number): void {
+    if (this.stopped || !isPerMessageRunner(this.opts.cliRunner)) return;
+    const plan = planHangRecoverNudge({
+      queueLength: this.messageSession.queuedCount(),
+      now: Date.now(),
+      sentTimes: this.hangNudgeTimes,
+      backoffMs: this.hangNudgeBackoffs,
+    });
+    this.hangNudgeTimes = plan.sentTimes;
+    if (plan.notify) {
+      const reason =
+        `[hang] auto-continue esgotado (${HANG_RECOVER_NUDGE_MAX} por 30min, ` +
+        `runner=${this.opts.cliRunner}) — agente parado, envia mensagem pra retomar`;
+      this.opts.log("warn", `[hang:${this.info.name}] ${reason}`);
+      this.opts.onHung?.({ soft: false, reason, idleMs });
+      return;
+    }
+    if (!plan.nudge) return;
+    this.opts.log(
+      "warn",
+      `[hang:${this.info.name}] auto-continue ${plan.used}/${HANG_RECOVER_NUDGE_MAX} ` +
+        `em ${Math.round(plan.backoffMs / 1000)}s (fila vazia após hard recover)`,
+    );
+    if (this.hangNudgeTimer) clearTimeout(this.hangNudgeTimer);
+    this.hangNudgeTimer = setTimeout(() => {
+      this.hangNudgeTimer = null;
+      if (this.stopped) return;
+      if (!deliverHangRecoverNudge(this.messageSession, AgentRunner.MAX_BUFFERED_MESSAGES)) {
+        this.opts.log("warn", `[hang:${this.info.name}] nudge descartado (fila já tinha trabalho)`);
+        return;
+      }
+      this.opts.log("warn", `[hang:${this.info.name}] nudge sintético enfileirado — retomando turno`);
+      this.touchActivity();
+      try { this.drainOcQueue(); } catch { /* */ }
+    }, plan.backoffMs);
+    this.hangNudgeTimer.unref?.();
   }
 
   /**

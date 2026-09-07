@@ -557,6 +557,16 @@ export const commandSchemas = {
   }),
   "project_keys:set_for_member": cmd({ projectId: id, userId: id, wrappedProjectKey: text }),
   "project_keys:enable_e2ee": cmd({ projectId: id, wrappedProjectKey: text }),
+  "project_keys:add_ring_entry": cmd({
+    projectId: id,
+    ringEntry: text.optional(),
+    ringEntries: z.array(text).optional(),
+  }),
+  "project_key:send_to_daemon": cmd({
+    projectId: id,
+    wrappedProjectKey: text,
+    keyRing: z.array(text).optional(),
+  }),
 
   /* ---------- file locks (tabela file_locks) ---------- */
   lock_file: cmd({ path: text }),
@@ -607,6 +617,7 @@ export const DB_WRITE_COMMANDS = Object.freeze([
   "crypto:init", "crypto:rotate_passphrase", "crypto:reset_with_recovery", "crypto:dev_reset",
   "totp:setup_init", "totp:setup_confirm", "totp:disable",
   "project_keys:rotate", "project_keys:set_for_member", "project_keys:enable_e2ee",
+  "project_keys:add_ring_entry", "project_key:send_to_daemon",
   "lock_file", "unlock_file",
   "workspace_create", "workspace_remove",
 ]);

@@ -3,6 +3,8 @@ import type { ImageAttachment } from "../types.js";
 export interface QueuedMessage {
   content: string;
   images?: ImageAttachment[];
+  /** T-364: origem não-user na fila (ex.: "hang-recover"). */
+  synthetic?: string;
 }
 
 export interface FirstTurnSnapshot {

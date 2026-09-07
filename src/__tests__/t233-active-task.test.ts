@@ -11,6 +11,8 @@
  * A captura do memory_add é real: unix socket com HTTP server (mesmo
  * caminho do postBridgeJson do AgentRunner).
  */
+import "./scratch-home.js";
+
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";

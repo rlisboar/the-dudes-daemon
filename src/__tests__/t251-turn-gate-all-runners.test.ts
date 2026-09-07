@@ -8,6 +8,8 @@
  * quando o processo/POST do turno termina, o slot volta. A guarda estática
  * amarra o idle do self-update ao mesmo turnGateStats.
  */
+import "./scratch-home.js";
+
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, writeFileSync } from "node:fs";

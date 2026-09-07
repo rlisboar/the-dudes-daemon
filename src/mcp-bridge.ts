@@ -154,7 +154,7 @@ const _enabledGroups = _featuresRaw === undefined
   : new Set(_featuresRaw.split(",").map((s) => s.trim()).filter(Boolean));
 const TOOL_GROUP: Record<string, string> = {
   send_message: "teammates", list_agents: "teammates", delegate: "teammates",
-  list_tasks: "tasks", add_task: "tasks", update_task: "tasks",
+  list_tasks: "tasks", get_task: "tasks", add_task: "tasks", update_task: "tasks",
   lock_task: "tasks", unlock_task: "tasks",
   add_task_comment: "tasks", list_task_comments: "tasks",
   lock_file: "filelock", unlock_file: "filelock", list_file_locks: "filelock",
@@ -262,11 +262,16 @@ server.tool(
 
 server.tool(
   "list_tasks",
-  "List all tasks of the current project. Returns id, title, status, assignee, description, lock, blocker, and goal.",
-  {},
-  async () => {
+  "List tasks of the current project in BRIEF form (id, number, title, status, assignee, lock/blocker/goal markers) — descriptions are NOT included to keep the payload small. Filter with status/assignee/limit; pass full=true to include descriptions, or call get_task for one task's details.",
+  {
+    status: z.enum(["todo", "doing", "done", "blocked"]).optional(),
+    assignee: z.string().optional().describe("Teammate name or id"),
+    limit: z.number().int().positive().max(500).optional().describe("Return at most N tasks"),
+    full: z.boolean().optional().describe("Include descriptions (heavier payload)"),
+  },
+  async ({ status, assignee, limit, full }) => {
     try {
-      const r = await postJSON("tasks_list", {});
+      const r = await postJSON("tasks_list", { status, assignee, limit, brief: !full });
       const tasks = r.tasks ?? [];
       if (tasks.length === 0) {
         return { content: [{ type: "text", text: "(no tasks yet)" }] };
@@ -277,11 +282,41 @@ server.tool(
           const locked = t.lockedByAgentId ? ` 🔒` : "";
           const blocked = t.blockedByTaskId ? ` ⛔#${t.blockedByTaskNumber ?? t.blockedByTaskId}` : "";
           const goal = t.goalId ? ` 🎯${t.goalId}` : "";
-          const desc = t.description ? `\n    ${t.description}` : "";
-          return `- [${t.status}] ${t.id}${locked}${blocked}${goal} · ${t.title}${assignee}${desc}`;
+          const num = t.taskNumber ? ` #${t.taskNumber}` : "";
+          const desc = full && t.description ? `\n    ${t.description}` : "";
+          return `- [${t.status}] ${t.id}${num}${locked}${blocked}${goal} · ${t.title}${assignee}${desc}`;
         })
         .join("\n");
       return { content: [{ type: "text", text }] };
+    } catch (e) {
+      return {
+        content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+server.tool(
+  "get_task",
+  "Get the full detail of ONE task (description, lock, blocker, goal, comment count) — the companion of the brief list_tasks. Read comments with list_task_comments.",
+  { id: z.string().describe("Task id (e.g. task_xxxx)") },
+  async ({ id }) => {
+    try {
+      const r = await postJSON("tasks_get", { id });
+      if (r.error) return { content: [{ type: "text", text: `get_task: ${r.error}` }], isError: true };
+      const t = r.task;
+      const lines = [
+        `#${t.taskNumber ?? "?"} ${t.id} · ${t.title}`,
+        `status: ${t.status}${t.assigneeAgentId ? `; assignee: @${t.assigneeAgentId}` : ""}`,
+        `created: ${t.createdAt ?? "?"} by ${t.createdBy}${t.updatedAt ? `; updated: ${t.updatedAt}` : ""}`,
+        t.lockedByAgentId ? `lock: 🔒 ${t.lockedByAgentId}` : "lock: —",
+        t.blockedByTaskId ? `blocked by: ⛔#${t.blockedByTaskNumber ?? t.blockedByTaskId}` : "blocked by: —",
+        t.goalId ? `goal: 🎯${t.goalId}` : "goal: —",
+        `comments: ${r.commentCount ?? 0}`,
+        t.description ? `description:\n${t.description}` : "description: —",
+      ];
+      return { content: [{ type: "text", text: lines.join("\n") }] };
     } catch (e) {
       return {
         content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }],

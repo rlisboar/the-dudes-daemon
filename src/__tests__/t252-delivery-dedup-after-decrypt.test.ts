@@ -12,6 +12,8 @@
  *  3. duplicata pós-aceite → continua sendo descartada (dedup T-037 preservado).
  *  4. legado sem deliveryId → sempre processa.
  */
+import "./scratch-home.js";
+
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import os from "node:os";

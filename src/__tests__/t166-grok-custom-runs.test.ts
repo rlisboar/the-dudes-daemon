@@ -3,6 +3,8 @@
  * ~/.grok-custom, o home onde o wrapper grava. grok oficial continua em ~/.grok.
  * T-164 intacto: buildGrokEnv NÃO seta GROK_HOME para grok-custom.
  */
+import "./scratch-home.js";
+
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";

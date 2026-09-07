@@ -37,6 +37,7 @@ import { assembleAgentSendParts, type FromDaemon, type FromOrch, type TaskUpdate
 import { runSummarizer } from "./summarizer-runner.js";
 import { aadV2, E2EE_TABLE } from "@the-dudes/protocol/e2ee-fields";
 import { decryptForProject, decryptImageAttachments, encryptForProject, countUsableProjectKeys, forgetAllProjectKeys, getDaemonPublicKey, hasProjectKey, isE2eEncrypted, isE2eeRequired, rememberProjectKey, setE2eeRequired } from "./daemon-crypto.js";
+import { decryptTranscriptBlobs, TRANSCRIPT_DECRYPT_REASONS } from "./transcript-decrypt.js";
 import { dispatchWebhook } from "./webhook-dispatch.js";
 import { ModelDiscovery } from "./model-discovery.js";
 import { parseGitPorcelain } from "./git-status.js";
@@ -832,6 +833,39 @@ export class DaemonClient {
       case "summarize:request":
         await this.handleSummarize(msg);
         return;
+      case "transcript:request": {
+        // T-360 (quinto ruling) + T-368: sob E2EE o servidor guarda o transcript
+        // cifrado e não tem a chave. Os blobs chegam CRUS (sem label, sem corte):
+        // o plaintext nasce aqui e morre na resposta — nunca é escrito em disco.
+        // O log é só corrId + contagens + razão constante: zero conteúdo no ring.
+        const blobs = Array.isArray(msg.blobs) ? msg.blobs : [];
+        const res = decryptTranscriptBlobs(blobs, {
+          projectId: msg.projectId,
+          hasKey: hasProjectKey(msg.projectId),
+          decrypt: (blob, pid) => decryptForProject(
+            blob, pid, aadV2({ projectId: pid, table: E2EE_TABLE.MESSAGES, field: "content" }),
+          ),
+        });
+        if (!res.ok) {
+          log("warn", `transcript:result corrId=${msg.correlationId} ok=false blobs=${blobs.length} cifrados=${res.cipherCount} falha=${res.index} motivo=${res.reason}`);
+          this.send({
+            type: "transcript:result",
+            correlationId: msg.correlationId,
+            ok: false,
+            error: TRANSCRIPT_DECRYPT_REASONS[res.reason],
+          });
+          return;
+        }
+        log("info", `transcript:request blobs=${blobs.length} corrId=${msg.correlationId}`);
+        log("info", `transcript:result corrId=${msg.correlationId} ok=true blobs=${blobs.length} cifrados=${res.cipherCount}`);
+        this.send({
+          type: "transcript:result",
+          correlationId: msg.correlationId,
+          ok: true,
+          lines: res.lines,
+        });
+        return;
+      }
       case "daemon:logs:get": {
         // Visor de debug da UI: as últimas linhas do ring (pós-scrub).
         const m = msg as { correlationId?: string; limit?: number };

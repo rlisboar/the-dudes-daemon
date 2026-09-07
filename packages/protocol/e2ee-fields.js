@@ -150,6 +150,33 @@ export function isPlainCatalogText(v) {
 }
 
 /**
+ * T-365/H-092 — agent:error de metadados fixos. Sem a chave, o daemon não pode
+ * selar, e um evento descartado deixaria a migração incompleta invisível ao dono
+ * (só um warn num log que não é dele). Estas strings são constantes do código:
+ * zero conteúdo de transcript, zero texto de CLI, zero bytes do digest — por isso
+ * o server deixa-as passar no guard de claro do e2ee-required. Os IDs (agente,
+ * migração) viajam em campos próprios; o texto é constante para sempre, e a
+ * comparação é EXATA: concatenar qualquer coisa com uma delas volta a ser claro.
+ */
+export const MIGRATE_SEED_DROPPED_REASON = "daemon sem chave do projeto — seed não injectado";
+/**
+ * T-370: spawn com sessão retomada E seed de migração pendurado. Antes era
+ * silêncio; o premain provou que o id retomado pode ter nascido noutra família
+ * de CLI e o contexto migrado evaporou. Decisão legítima (sessão viva já
+ * carrega contexto), mas nunca muda em segredo — o primo do `no_key`.
+ */
+export const MIGRATE_SEED_RESUME_SKIPS_REASON = "sessão retomada — seed de migração deixado de lado";
+export const METADATA_AGENT_ERROR_TEXTS = Object.freeze([
+  MIGRATE_SEED_DROPPED_REASON,
+  MIGRATE_SEED_RESUME_SKIPS_REASON,
+]);
+
+/** agent:error cuja mensagem é uma destas constantes é metadado, não conteúdo. */
+export function isMetadataAgentErrorText(v) {
+  return typeof v === "string" && METADATA_AGENT_ERROR_TEXTS.includes(v);
+}
+
+/**
  * T-117: pares AAD permitidos em agent:send.parts cipher.
  * Lista fechada — o daemon NÃO varre o catálogo.
  */

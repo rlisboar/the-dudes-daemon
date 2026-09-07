@@ -4,9 +4,10 @@ import { spawnSync } from "node:child_process";
 import { AgentRunner, type AgentRunnerOptions } from "./agent-runner.js";
 import { breadcrumb, captureWarn } from "./sentry.js";
 import { assertWorkspaceScoped, autoWorkspaceCwd, cloneRepoIfMissing, expandBasePath, findGitRoot, getWorkspaceRoot, isInsideRoot, repoCwd } from "./workspace.js";
-import { aadV2, E2EE_TABLE } from "@the-dudes/protocol/e2ee-fields";
+import { aadV2, E2EE_TABLE, MIGRATE_SEED_DROPPED_REASON, MIGRATE_SEED_RESUME_SKIPS_REASON } from "@the-dudes/protocol/e2ee-fields";
 import { decryptForProject, encryptForProject, isE2eEncrypted, isE2eeRequired, setE2eeRequired, redactCredentials, redactCredentialsDeep } from "./daemon-crypto.js";
 import { classifyRunnerFailure } from "./runners/error-classifier.js";
+import { migratedSeedFor, MIGRATED_SEED_LIMIT_BYTES } from "./migrated-seed.js";
 
 /** 1 enum operacional (paridade hung.soft). Classifica no plaintext ANTES do seal. */
 export type AgentErrorKind = "rate_limit" | "other";
@@ -32,6 +33,7 @@ export function sealAgentErrorMessage(projectId: string | undefined, message: st
   if (isE2eeRequired(projectId)) return null;
   return red;
 }
+
 import type { ResolvedCliCommands } from "./cli-config.js";
 import type { AgentInfo, ImageAttachment } from "./types.js";
 import type { AgentSpawn, FromDaemon } from "./protocol.js";
@@ -593,6 +595,48 @@ export class AgentHost {
       agentToken: msg.agentToken,
     });
     this.send({ type: "agent:running", agentId: msg.agent.id, running: true });
+    // T-360/T-365: seed de migração cross-runner. É o PRIMEIRO input do usuário —
+    // antes do flush do buffer, senão a mensagem que originou o spawn chegaria na
+    // frente do contexto migrado. O digest chega CRU (cifrado sob E2EE): abrir a
+    // chave, medir o limite e escrever a tag é trabalho daqui.
+    const seedResult = migratedSeedFor(msg.agent, resumeSessionId, {
+      projectId: msg.projectId,
+      decrypt: (blob, projectId) => decryptForProject(
+        blob,
+        projectId,
+        aadV2({ projectId, table: E2EE_TABLE.SUMMARIES, field: "summary" }),
+      ),
+    });
+    if (seedResult.seed) {
+      runner.pushUserMessage(seedResult.seed);
+      this.log(
+        "info",
+        `migrate seed agent=${msg.agent.id} runner=${cliRunner} bytes=${seedResult.seed.length}`
+        + (seedResult.truncated ? " (digest cortado ao limite de 8 KB)" : ""),
+      );
+      if (seedResult.truncated) {
+        this.log("warn", `[migrate:${msg.agent.name}] digest excedia ${MIGRATED_SEED_LIMIT_BYTES} bytes em plaintext — cortado antes de injetar`);
+      }
+    } else if (seedResult.dropped) {
+      // T-370: toda queda do seed é declarada — `no_key` (injetar era alimentar
+      // o runner com base64) e `resume_skips_seed` (o resume ganhou; pode ter
+      // nascido noutra família de CLI). O evento vai SEMPRE sem selo (H-092):
+      // metadados fixos — constante do código + ids, zero bytes de conteúdo.
+      const reason = seedResult.reason;
+      this.log(
+        "warn",
+        reason === "resume_skips_seed"
+          ? `[migrate:${msg.agent.name}] sessão retomada no runner alvo — seed de migração deixado de lado`
+          : `[migrate:${msg.agent.name}] seed de migração cifrado sem chave do projeto — agente arranca sem contexto migrado`,
+      );
+      this.deliver({
+        type: "agent:error",
+        agentId: msg.agent.id,
+        message: reason === "resume_skips_seed" ? MIGRATE_SEED_RESUME_SKIPS_REASON : MIGRATE_SEED_DROPPED_REASON,
+        errorKind: "other",
+        migrationId: msg.agent.seedFrom?.migrationId,
+      });
+    }
     // T-037: agent:send que chegou no gap pré-spawn (self-update / auto-resume)
     this.flushInboundBuffer(msg.agent.id);
   }

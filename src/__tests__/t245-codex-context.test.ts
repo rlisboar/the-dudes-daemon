@@ -16,6 +16,8 @@
  * model_context_window. O stdout de exec --json NÃO emite token_count.
  * Fallback: rollout ausente/ilegível → comportamento atual (billing + mapa).
  */
+import "./scratch-home.js";
+
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync, chmodSync } from "node:fs";

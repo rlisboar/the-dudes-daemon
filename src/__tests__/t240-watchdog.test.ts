@@ -6,6 +6,8 @@
  * Testes de tick usam AgentRunner REAL (padrão T-233) com processo filho
  * real (procAlive via kill(pid,0)).
  */
+import "./scratch-home.js";
+
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";

@@ -44,6 +44,16 @@ export interface AgentInfo {
   collectThinking?: boolean;
   /** Subagente Brain (mcp delegate) — usa pool turn-gate `bg` (T-055). */
   ephemeral?: boolean;
+  /** T-360 migração cross-runner: contexto portátil (markdown ≤ 8 KB) do agente
+   *  que morreu, CRU — sob E2EE cifrado. Presente e sessão descartada → o daemon
+   *  decripta (T-365), mede o limite em plaintext, embrulha na tag e entrega como
+   *  PRIMEIRO input do usuário após init. */
+  seedDigest?: string;
+  /** T-365: origem do seed, para o daemon escrever a tag. migrationId é o elo do
+   *  evento de metadados fixos (seed caído por falta de chave) ao agent:migrate. */
+  seedFrom?: { runner: string; model?: string; ts: number; migrationId?: string };
+  /** T-360: instrução opcional pedida por quem migrou, entregue junto do seed. */
+  seedInstruction?: string;
 }
 
 export interface ImageAttachment {
