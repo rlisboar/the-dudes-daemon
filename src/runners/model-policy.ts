@@ -131,7 +131,7 @@ export function codexEffort(level: string): "low" | "medium" | "high" | "xhigh" 
  */
 export type QwenReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh" | "max";
 
-export function qwenReasoningEffort(level: EffortLevel | undefined | null): QwenReasoningEffort | undefined {
+export function qwenReasoningEffort(level: string | undefined | null): QwenReasoningEffort | undefined {
   if (!level) return undefined;
   if (level === "none" || level === "minimal") return "none";
   switch (level) {

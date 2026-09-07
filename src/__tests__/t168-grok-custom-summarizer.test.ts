@@ -4,11 +4,12 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { grokHomePath } from "../runners/runtime-files.js";
-import { applyGrokFamilySummarizerEnv } from "../summarizer-runner.js";
+import { applyGrokFamilySummarizerEnv, applyQwenSummarizerEnv } from "../summarizer-runner.js";
 import { normalizeGrokEffort } from "../runners/model-policy.js";
 import { cleanGrokTempSessions, DEFAULT_GROK_SESSION_TTL_MS, resolveGrokSessionRoots } from "../grok-session-cleanup.js";
 import { buildGrokEnv } from "../runners/env.js";
@@ -121,4 +122,35 @@ test("T-168: log de CLI status lista grok-custom (POLICY_GATED_RUNNERS)", () => 
     MAIN_SRC,
     /\(\["claude", "opencode", "gemini", "codex", "crush", "grok"\] as const\)\.forEach/,
   );
+});
+
+/* ── T-343: qwen no summarizer — effort via QWEN_HOME efémero ─────────── */
+
+test("T-343: summarizer qwen sem effort usa ~/.qwen do dono tal-e-qual (sem QWEN_HOME)", () => {
+  const env = applyQwenSummarizerEnv({ PATH: "/usr/bin" }, undefined, "/home/u", "/tmp/x");
+  assert.equal(env.QWEN_HOME, undefined);
+  assert.equal(env.QWEN_CODE_SUPPRESS_YOLO_WARNING, "1");
+});
+
+test("T-343: summarizer qwen com effort monta QWEN_HOME com fundo do dono + reasoningEffort", () => {
+  const dir = mkdtempSync(join(tmpdir(), "qwen-eff-"));
+  const owner = join(dir, "owner", ".qwen");
+  mkdirSync(owner, { recursive: true });
+  writeFileSync(join(owner, "settings.json"), JSON.stringify({ model: { name: "m1", baseUrl: "https://x/v1" }, security: { auth: { selectedType: "openai" } } }));
+  const cwd = join(dir, "run");
+  mkdirSync(cwd);
+  const env = applyQwenSummarizerEnv({ PATH: "/usr/bin" }, "high", join(dir, "owner"), cwd);
+  assert.ok(env.QWEN_HOME && env.QWEN_HOME.startsWith(cwd));
+  const written = JSON.parse(readFileSync(join(env.QWEN_HOME as string, "settings.json"), "utf8")) as { model: Record<string, unknown>; security: unknown };
+  assert.equal(written.model.reasoningEffort, "high");
+  assert.equal(written.model.name, "m1"); // fundo do dono preservado
+  assert.ok(written.security);
+});
+
+test("T-343: summarizer qwen sem settings do dono → effort na mesma (settings só com model)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "qwen-nohome-"));
+  const env = applyQwenSummarizerEnv({ PATH: "/usr/bin" }, "none", join(dir, "missing"), dir);
+  assert.ok(env.QWEN_HOME);
+  const written = JSON.parse(readFileSync(join(env.QWEN_HOME as string, "settings.json"), "utf8")) as { model: Record<string, unknown> };
+  assert.equal(written.model.reasoningEffort, "none");
 });

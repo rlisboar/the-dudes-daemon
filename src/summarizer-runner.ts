@@ -12,13 +12,13 @@
  */
 
 import http from "node:http";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ResolvedCliCommands } from "./cli-config.js";
 import { extractOneShotText } from "./agent-runner.js";
 import { spawnDropped, type DropTarget } from "./privileges.js";
-import { normalizeGrokEffort } from "./runners/model-policy.js";
+import { normalizeGrokEffort, qwenReasoningEffort } from "./runners/model-policy.js";
 import { isGrokFamily } from "./runners/index.js";
 import { buildSummarizerEnv } from "./runners/env.js";
 import { grokHomePath } from "./runners/runtime-files.js";
@@ -37,6 +37,44 @@ export function applyGrokFamilySummarizerEnv(
   env.HOME = home;
   env.GROK_HOME = grokHomePath(home, runner);
   env.GROK_DISABLE_AUTOUPDATER = "1";
+  return env;
+}
+
+/**
+ * Env qwen do one-shot (summarizer/reply-suggester). T-343: sem effort, o
+ * ~/.qwen do dono é usado tal-e-qual (auth/model nativos) e só se silencia o
+ * aviso yolo. COM effort, monta um QWEN_HOME efémero no tmpdir do summarizer
+ * com o settings do dono como FUNDO + model.reasoningEffort por cima — não há
+ * flag CLI p/ reasoning (medido no bundle 0.23.0) e o summarizer não pode
+ * mutar o settings do dono (processo partilhado). Settings do dono ilegível →
+ * segue sem override.
+ */
+export function applyQwenSummarizerEnv(
+  env: NodeJS.ProcessEnv,
+  effort: string | undefined,
+  ownerHome: string,
+  cwd: string,
+): NodeJS.ProcessEnv {
+  env.QWEN_CODE_SUPPRESS_YOLO_WARNING = "1";
+  const qEffort = qwenReasoningEffort(effort);
+  if (!qEffort) return env;
+  try {
+    const qwenDir = join(cwd, "qwen-home");
+    mkdirSync(qwenDir, { recursive: true });
+    const merged: Record<string, unknown> = {};
+    const userCfg = join(ownerHome, ".qwen", "settings.json");
+    if (existsSync(userCfg)) {
+      const parsed = JSON.parse(readFileSync(userCfg, "utf8")) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) Object.assign(merged, parsed);
+    }
+    const modelCfg = (merged.model && typeof merged.model === "object" && !Array.isArray(merged.model))
+      ? merged.model as Record<string, unknown>
+      : {};
+    modelCfg.reasoningEffort = qEffort;
+    merged.model = modelCfg;
+    writeFileSync(join(qwenDir, "settings.json"), JSON.stringify(merged), { mode: 0o600 });
+    env.QWEN_HOME = qwenDir;
+  } catch { /* sem override — o effort extra simplesmente não se aplica */ }
   return env;
 }
 
@@ -340,9 +378,7 @@ async function runCliTextWithSlot(
     env.GEMINI_CLI_TRUST_WORKSPACE = "true";
   }
   if (args.runner === "qwen") {
-    // Sem QWEN_HOME por summarizer: o auth/model do dono (~/.qwen) é o que se
-    // quer usar aqui; só o aviso yolo é silenciado.
-    env.QWEN_CODE_SUPPRESS_YOLO_WARNING = "1";
+    applyQwenSummarizerEnv(env, args.effort, args.dropTo?.home ?? homedir(), cwd);
   }
   if (isGrokFamily(args.runner)) {
     // Auth/sessões no home real do user — nunca no tmpdir efêmero do summarizer.
