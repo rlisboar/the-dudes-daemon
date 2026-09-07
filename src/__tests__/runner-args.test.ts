@@ -55,3 +55,22 @@ test("grok leader socket isolates the agent when informed", () => {
   assert.ok(idx >= 0);
   assert.equal(isolated[idx + 1], "/tmp/td-grok/abc.sock");
 });
+
+test("qwen: headless stream-json com sessão uuid própria (criação vs resume), prompt via STDIN", async () => {
+  const { qwenOneShotArgs } = await import("../runners/args.js");
+  const uuid = "123e4567-e89b-12d3-a456-426614174000";
+  // criação: --session-id (sem -r); SEM `-p`/posicional — o prompt vai pelo stdin
+  assert.deepEqual(
+    qwenOneShotArgs({ prompt: "oi", newSessionId: uuid }),
+    ["--output-format", "stream-json", "-y", "--session-id", uuid],
+  );
+  // resume: -r (sem --session-id)
+  assert.deepEqual(
+    qwenOneShotArgs({ prompt: "oi", model: "qwen3-coder-plus", sessionId: uuid }),
+    ["--output-format", "stream-json", "-y", "--model", "qwen3-coder-plus", "-r", uuid],
+  );
+  // resume vence criação se ambos vierem
+  assert.ok(qwenOneShotArgs({ prompt: "x", sessionId: uuid, newSessionId: "outra" }).includes("-r"));
+  // regressão: prompt iniciado por `-` nunca chega ao argv (yargs partia-o)
+  assert.ok(!qwenOneShotArgs({ prompt: "- bullet", sessionId: uuid }).some((a) => a.includes("bullet")));
+});

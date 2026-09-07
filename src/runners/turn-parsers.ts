@@ -124,6 +124,47 @@ export function parseGeminiTurnEvent(raw: unknown): NormalizedTurnEvent[] {
   return [];
 }
 
+/** Qwen Code 0.23+ (stream-json): JSONL estilo Claude — init com session_id,
+ *  assistant com message.content[] (text/thinking/tool_use) e usage POR
+ *  REQUEST (igual Claude: input_tokens ≈ ocupação da janela, não delta de
+ *  turno — o route "anthropic" de billing/ocupação é o mesmo). O evento
+ *  `result` traz usage ACUMULADO do processo (não usar p/ delta) e is_error.
+ *  `stream_event` (parciais) e eventos de telemetria são ignorados. */
+export function parseQwenTurnEvent(raw: unknown): NormalizedTurnEvent[] {
+  const event = record(raw);
+  if (!event || typeof event.type !== "string") return [];
+  const out: NormalizedTurnEvent[] = [];
+  if (typeof event.session_id === "string" && event.session_id) out.push({ type: "session", sessionId: event.session_id });
+  if (event.type === "assistant") {
+    const message = record(event.message);
+    const blocks = Array.isArray(message?.content) ? (message!.content as unknown[]) : [];
+    for (const b of blocks) {
+      const block = record(b);
+      if (!block) continue;
+      if (block.type === "text" && typeof block.text === "string" && block.text) out.push({ type: "text", text: block.text });
+      else if (block.type === "thinking" && typeof block.thinking === "string" && block.thinking.trim()) out.push({ type: "thought", text: block.thinking.trim() });
+      else if (block.type === "tool_use") out.push({ type: "tool", name: typeof block.name === "string" ? block.name : "", input: block.input ?? {}, ...(typeof block.id === "string" && block.id ? { id: block.id } : {}) });
+    }
+    const usage = record(message?.usage);
+    if (usage) {
+      const input = Number(usage.input_tokens ?? 0);
+      const output = Number(usage.output_tokens ?? 0);
+      // Eventos de streaming com usage zerado não são billing; ignorar.
+      if (input || output) {
+        out.push({ type: "usage", input, output, cacheCreate: Number(usage.cache_creation_input_tokens ?? 0), cacheRead: Number(usage.cache_read_input_tokens ?? 0), cumulative: false });
+      }
+    }
+    return out;
+  }
+  if (event.type === "result") {
+    out.push({ type: "result" });
+    return out;
+  }
+  if (event.type === "assistant") return out;
+  // init/stream_event/telemetria: só o session_id (se havia) interessa.
+  return out;
+}
+
 function usageFromTokens(tokens: Record<string, unknown>): NormalizedTurnEvent {
   const cache = record(tokens.cache) ?? {};
   return { type: "usage", input: Number(tokens.input ?? 0), output: Number(tokens.output ?? 0), cacheCreate: Number(cache.write ?? 0), cacheRead: Number(cache.read ?? 0), cumulative: false };

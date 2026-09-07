@@ -57,6 +57,33 @@ export function contextLimitFor(model: string | undefined): number {
 }
 
 /**
+ * Janela de contexto que o PRÓPRIO Qwen Code usa, lida da mesma fonte que ele:
+ * `modelProviders[].generationConfig.contextWindowSize` do settings.json para o
+ * modelo configurado. Medido no bundle 0.23.0: compact/thresholds usam
+ * `contextWindowSize ?? DEFAULT_TOKEN_LIMIT` com DEFAULT_TOKEN_LIMIT = 200k —
+ * por isso a ausência NÃO é UNKNOWN: 200k é a janela real com que o CLI opera
+ * (e o limite que ele usa para disparar compressão).
+ */
+export function qwenConfigContextLimit(settings: unknown, modelId: string | undefined): number {
+  const wanted = (modelId ?? "").trim().replace(EFFORT_SUFFIX_RE, "");
+  const providers = (settings as { modelProviders?: Record<string, unknown> })?.modelProviders;
+  if (providers && typeof providers === "object") {
+    const entries = Object.values(providers).flatMap((v) => (Array.isArray(v) ? v : [])) as Array<Record<string, unknown>>;
+    const gens = entries
+      .filter((e) => e && typeof e === "object")
+      .map((e) => ({
+        id: typeof e.id === "string" ? e.id : "",
+        win: (e.generationConfig as { contextWindowSize?: unknown } | undefined)?.contextWindowSize,
+      }))
+      .filter((g) => typeof g.win === "number" && Number.isFinite(g.win) && g.win > 0);
+    const exact = wanted ? gens.find((g) => g.id === wanted) : undefined;
+    const pick = exact ?? (gens.length === 1 ? gens[0] : undefined);
+    if (pick) return Math.floor(pick.win as number);
+  }
+  return DEFAULT_CONTEXT_LIMIT;
+}
+
+/**
  * T-147: resolve a janela SEM fallback — undefined quando a única fonte
  * disponível é o default (modelo desconhecido pré-catálogo). É o que o
  * tracker expõe como UNKNOWN (0) no payload de usage.

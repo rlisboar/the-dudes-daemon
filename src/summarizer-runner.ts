@@ -98,6 +98,26 @@ function extractUsage(out: string, runner: CliRunner, promptLen: number, outputL
         }
       } catch { /* skip */ }
     }
+  } else if (runner === "qwen") {
+    // --output-format json: array de eventos (linha única) com usage em cada
+    // assistant e o acumulado no result — max() cobre ambos os shapes.
+    const lines = out.includes("\n") ? out.split("\n") : [out];
+    const feed = (ev: any) => {
+      const u = ev?.usage;
+      if (u) {
+        input = Math.max(input, Number(u.input_tokens ?? 0));
+        output = Math.max(output, Number(u.output_tokens ?? 0));
+      }
+    };
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t.startsWith("{") && !t.startsWith("[")) continue;
+      try {
+        const parsed = JSON.parse(t);
+        if (Array.isArray(parsed)) for (const ev of parsed) feed(ev);
+        else feed(parsed);
+      } catch { /* skip */ }
+    }
   } else if (isGrokFamily(runner)) {
     // Grok json/stream não expõe usage confiável — heurística por chars abaixo.
   }
@@ -319,6 +339,11 @@ async function runCliTextWithSlot(
   if (args.runner === "gemini") {
     env.GEMINI_CLI_TRUST_WORKSPACE = "true";
   }
+  if (args.runner === "qwen") {
+    // Sem QWEN_HOME por summarizer: o auth/model do dono (~/.qwen) é o que se
+    // quer usar aqui; só o aviso yolo é silenciado.
+    env.QWEN_CODE_SUPPRESS_YOLO_WARNING = "1";
+  }
   if (isGrokFamily(args.runner)) {
     // Auth/sessões no home real do user — nunca no tmpdir efêmero do summarizer.
     applyGrokFamilySummarizerEnv(env, args.runner, args.dropTo);
@@ -344,6 +369,13 @@ async function runCliTextWithSlot(
     argv.push(promptText);
   } else if (args.runner === "gemini") {
     argv = ["--output-format", "json", "--skip-trust", "--yolo", "-p", promptText];
+    if (args.model) argv.push("--model", args.model);
+  } else if (args.runner === "qwen") {
+    // json (não stream): um array único com o evento result — extractOneShotText
+    // pega result.result e extractUsage lê usage sem heurística de chars.
+    // SEM `-p`: flag deprecated e o yargs parte prompt iniciado por `-`; o
+    // prompt vai via stdin abaixo (via canónica do doc headless).
+    argv = ["--output-format", "json", "-y"];
     if (args.model) argv.push("--model", args.model);
   } else if (args.runner === "crush") {
     // crush run é texto puro no stdout (sem JSON) — extractOneShotText cai no
@@ -397,8 +429,14 @@ async function runCliTextWithSlot(
       proc = spawnDropped(cmd, argv, {
         cwd,
         env,
-        stdio: ["ignore", "pipe", "pipe"],
+        // qwen recebe o prompt pelo stdin (ver argv acima) — os demais continuam
+        // com stdin fechado para não haver canal de interação.
+        stdio: args.runner === "qwen" ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
       }, args.dropTo ?? null);
+      if (args.runner === "qwen") {
+        proc.stdin?.on("error", () => { /* EPIPE: a CLI morreu cedo — o close cuida */ });
+        proc.stdin?.end(promptText);
+      }
     } catch (e) {
       return finish({ ok: false, error: `spawn failed: ${(e as Error).message}` });
     }

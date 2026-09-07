@@ -9,6 +9,7 @@ function fakeCommands(installed: Record<string, boolean>): ResolvedCliCommands {
     claude: mk(installed.claude ?? false),
     opencode: mk(installed.opencode ?? false),
     gemini: mk(installed.gemini ?? false),
+    qwen: mk(installed.qwen ?? false),
     codex: mk(installed.codex ?? false),
     crush: mk(installed.crush ?? false),
     grok: mk(installed.grok ?? false),

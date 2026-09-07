@@ -5,9 +5,9 @@ import { compatibleSessionId, isPerMessageRunner, RUNNER_ADAPTERS, runnerAdapter
 const uuid = "123e4567-e89b-12d3-a456-426614174000";
 
 test("catalog contains exactly the supported runners (T-150: + grok-custom)", () => {
-  assert.deepEqual(Object.keys(RUNNER_ADAPTERS).sort(), ["claude", "codex", "crush", "gemini", "grok", "grok-custom", "opencode"]);
+  assert.deepEqual(Object.keys(RUNNER_ADAPTERS).sort(), ["claude", "codex", "crush", "gemini", "grok", "grok-custom", "opencode", "qwen"]);
   assert.equal(isPerMessageRunner("claude"), false);
-  for (const id of ["codex", "crush", "gemini", "grok", "grok-custom", "opencode"] as const) assert.equal(isPerMessageRunner(id), true);
+  for (const id of ["codex", "crush", "gemini", "grok", "grok-custom", "opencode", "qwen"] as const) assert.equal(isPerMessageRunner(id), true);
 });
 
 test("session compatibility is runner-specific", () => {
@@ -20,6 +20,8 @@ test("session compatibility is runner-specific", () => {
   assert.equal(compatibleSessionId("grok", uuid), uuid);
   assert.equal(compatibleSessionId("gemini", "opaque-session"), "opaque-session");
   assert.equal(compatibleSessionId("codex", "opaque-thread"), "opaque-thread");
+  assert.equal(compatibleSessionId("qwen", uuid), uuid, "qwen: sessão é uuid nosso");
+  assert.equal(compatibleSessionId("qwen", "opaque"), undefined);
 });
 
 test("adapter resolves its configured command", () => {

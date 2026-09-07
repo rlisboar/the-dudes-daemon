@@ -9,6 +9,7 @@ export interface CliPathConfig {
   claude?: string;
   opencode?: string;
   gemini?: string;
+  qwen?: string;
   codex?: string;
   crush?: string;
   grok?: string;
@@ -33,6 +34,8 @@ export interface ResolvedCliCommands {
   claude: ResolvedCliCommand;
   opencode: ResolvedCliCommand;
   gemini: ResolvedCliCommand;
+  /** Qwen Code CLI (QwenLM) — headless (prompt via stdin) com stream-json estilo Claude. */
+  qwen: ResolvedCliCommand;
   codex: ResolvedCliCommand;
   crush: ResolvedCliCommand;
   /** Grok Build CLI (xAI) — headless `grok -p` / resume. */
@@ -81,6 +84,7 @@ export function resolveCliCommands(config: DaemonCliConfig = {}): ResolvedCliCom
     claude: resolveOne("claude", config.cliPaths?.claude, userDirs),
     opencode: resolveOne("opencode", config.cliPaths?.opencode, userDirs),
     gemini: resolveOne("gemini", config.cliPaths?.gemini, userDirs),
+    qwen: resolveOne("qwen", config.cliPaths?.qwen, userDirs),
     codex: resolveOne("codex", config.cliPaths?.codex, userDirs),
     // crush (charmbracelet) instala via brew/go install em ~/.local/bin ou
     // /opt/homebrew/bin — dirs que o PATH herdado pelo daemon nem sempre tem.
@@ -234,6 +238,7 @@ function sanitizeCliConfig(cfg: DaemonCliConfig): DaemonCliConfig {
       claude: normalizePath(cliPaths.claude),
       opencode: normalizePath(cliPaths.opencode),
       gemini: normalizePath(cliPaths.gemini),
+      qwen: normalizePath(cliPaths.qwen),
       codex: normalizePath(cliPaths.codex),
       crush: normalizePath(cliPaths.crush),
       grok: normalizePath(cliPaths.grok),

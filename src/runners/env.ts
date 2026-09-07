@@ -24,6 +24,9 @@ export interface BaseRunnerEnvInput {
   bridgeSocketPath?: string;
   claudeConfigDir?: string;
   opencodeConfigPath?: string;
+  /** Qwen Code: config dir POR AGENTE (QWEN_HOME; auth do dono fica no
+   *  ~/.qwen real — só o settings.json de MCP é isolado). */
+  qwenHome?: string;
   /** Extra keys a copiar de inherited (além da allowlist e do env var). */
   passthrough?: string[];
 }
@@ -56,6 +59,7 @@ export function buildBaseRunnerEnv(input: BaseRunnerEnvInput): NodeJS.ProcessEnv
   if (input.bridgeSocketPath) env.THE_DUDES_BRIDGE_SOCKET = input.bridgeSocketPath;
   if (input.runner === "claude" && input.claudeConfigDir) env.CLAUDE_CONFIG_DIR = input.claudeConfigDir;
   if (input.runner === "opencode" && input.opencodeConfigPath) env.OPENCODE_CONFIG = input.opencodeConfigPath;
+  if (input.runner === "qwen" && input.qwenHome) env.QWEN_HOME = input.qwenHome;
   return env;
 }
 
@@ -75,6 +79,13 @@ export function buildSummarizerEnv(inherited: NodeJS.ProcessEnv): NodeJS.Process
 
 export function buildGeminiEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return { ...base, GEMINI_CLI_TRUST_WORKSPACE: "true" };
+}
+
+/** Qwen Code: silencia o aviso "yolo sem sandbox" (stderr) — o daemon roda o
+ *  CLI headless deliberadamente. Auth/model vêm do ~/.qwen do user (QWEN_HOME
+ *  por agente entra via buildBaseRunnerEnv quando há config dir isolado). */
+export function buildQwenEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return { ...base, QWEN_CODE_SUPPRESS_YOLO_WARNING: "1" };
 }
 
 export function buildBridgeAwareEnv(base: NodeJS.ProcessEnv, tokenFile: string, features: Record<string, string>): NodeJS.ProcessEnv {

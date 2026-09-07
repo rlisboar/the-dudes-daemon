@@ -12,8 +12,8 @@ import { buildGraph, graphExists, graphMtime, graphPath, hasSemanticMarker, need
 import { acquireTurnSlot } from "./runners/turn-gate.js";
 import { recordHang, recordHardRecover, recordTurnEnd, recordTurnStart } from "./health-monitor.js";
 import { isGrokFamily, isPerMessageRunner, runnerAdapter } from "./runners/index.js";
-import { claudeOneShotArgs, codexOneShotArgs, crushOneShotArgs, geminiOneShotArgs, grokHeadlessArgs, opencodeOneShotArgs } from "./runners/args.js";
-import { buildBaseRunnerEnv, buildBridgeAwareEnv, buildGeminiEnv, buildGrokEnv } from "./runners/env.js";
+import { claudeOneShotArgs, codexOneShotArgs, crushOneShotArgs, geminiOneShotArgs, grokHeadlessArgs, opencodeOneShotArgs, qwenOneShotArgs } from "./runners/args.js";
+import { buildBaseRunnerEnv, buildBridgeAwareEnv, buildGeminiEnv, buildGrokEnv, buildQwenEnv } from "./runners/env.js";
 import {
   extractOneShotText,
   grokSignalsPath,
@@ -26,8 +26,8 @@ import {
   type GrokContextSignals,
   type GrokTurnBilling,
 } from "./runners/parsers.js";
-import { parseCodexTurnEvent, parseCodexRolloutSignals, parseCodexRolloutSessionId, parseCrushSessionMeta, parseGeminiTurnEvent, parseGrokStreamEvent, parseOpenCodeTurnEvent } from "./runners/turn-parsers.js";
-import { buildBridgeEnv, buildClaudeMcpConfig, buildCodexMcpArgs, buildCrushMcpConfig, buildGeminiMcpServers, buildGrokMcpToml, buildOpenCodeMcpConfig, summarizeMcpServers } from "./runners/mcp-config.js";
+import { parseCodexTurnEvent, parseCodexRolloutSignals, parseCodexRolloutSessionId, parseCrushSessionMeta, parseGeminiTurnEvent, parseGrokStreamEvent, parseOpenCodeTurnEvent, parseQwenTurnEvent } from "./runners/turn-parsers.js";
+import { buildBridgeEnv, buildClaudeMcpConfig, buildCodexMcpArgs, buildCrushMcpConfig, buildGeminiMcpServers, buildGrokMcpToml, buildOpenCodeMcpConfig, buildQwenMcpServers, summarizeMcpServers } from "./runners/mcp-config.js";
 import { RunnerRuntimeFiles } from "./runners/runtime-files.js";
 import { ContextTracker, CumulativeUsageTracker, type UsageSemantics } from "./runners/context-tracker.js";
 import { armHardTimeout, appendCapped, collectProcessOutput, killGrokLeader, killProcess, processAlive as procAlive, RUNNER_OUTPUT_CAP_BYTES, terminateAndWait, terminateWithEscalation } from "./runners/process-lifecycle.js";
@@ -43,9 +43,10 @@ import {
 } from "./runners/turn-watchdog.js";
 import { OpenCodeTransport } from "./runners/opencode-transport.js";
 import { buildOpenCodeAgentConfig, OPENCODE_MANAGED_AGENT } from "./runners/opencode-effort.js";
+import { randomUUID } from "node:crypto";
 import { PerMessageSessionState } from "./runners/message-session.js";
 import { buildAgentContext, buildInitialMessage, buildSystemPromptHeader, buildWorkspacePrompt } from "./runners/prompts.js";
-import { claudeThinkingEffort, codexEffort, providerModelParts, resolveContextLimit, resolveContextLimitKnown } from "./runners/model-policy.js";
+import { claudeThinkingEffort, codexEffort, providerModelParts, qwenConfigContextLimit, resolveContextLimit, resolveContextLimitKnown } from "./runners/model-policy.js";
 import { resolveOcCatalogContextLimit } from "./model-discovery.js";
 import { classifyRunnerFailure, isAbortedFailure, isApiErrorMessage, isAuthenticationFailure, isLoopStopMessage, isMissingSessionFailure as isMissingSessionMessage } from "./runners/error-classifier.js";
 import { appendFilePrompt, appendPathAttachmentPrompt, attachmentExtension, buildClaudeUserContent, buildOpenCodeParts, codexImageArgs, imageExtension, isInlineImage, safeAttachmentName } from "./runners/attachments.js";
@@ -735,6 +736,23 @@ export class AgentRunner {
           env: buildGeminiEnv(this.buildEnv()),
           stdio: ["ignore", "pipe", "pipe"],
         }, this.opts.dropTo ?? null);
+      } else if (runner === "qwen") {
+        // Compact/one-shot na MESMA sessão do agente (resume + stream-json).
+        // Prompt via STDIN: `-p` é deprecated e rebenta com prompt iniciado
+        // por `-` (yargs); stdin é a via canónica do doc headless.
+        // cwd = qwenCwdDir (estável): sessões qwen são project-scoped pelo
+        // cwd — com tempDir aleatório o `-r` não acha a sessão pós-restart.
+        const args = qwenOneShotArgs({ prompt, model: this.info.model, sessionId: sid });
+        this.writeQwenConfig();
+        this.traceCli("qwen", "argv", prompt);
+        this.traceSpawn("qwen", args);
+        proc = spawnDropped(this.runnerCommand("qwen"), args, {
+          cwd: this.runtimeFiles.qwenCwdDir(),
+          env: buildQwenEnv(this.buildEnv()),
+          stdio: ["pipe", "pipe", "pipe"],
+        }, this.opts.dropTo ?? null);
+        proc.stdin?.on("error", () => { /* EPIPE: CLI morreu cedo */ });
+        proc.stdin?.end(prompt);
       } else if (runner === "codex") {
         const args = codexOneShotArgs({ prompt, model: this.info.model, sessionId: sid });
         this.traceCli("codex", "argv", prompt);
@@ -1003,6 +1021,12 @@ export class AgentRunner {
       this.bootPerMessageRunner();
       return;
     }
+    if (this.opts.cliRunner === "qwen") {
+      if (!this.ensureRunnerAvailable("qwen")) return;
+      this.writeQwenConfig();
+      this.bootPerMessageRunner();
+      return;
+    }
     if (this.opts.cliRunner === "codex") {
       if (!this.ensureRunnerAvailable("codex")) return;
       this.bootPerMessageRunner();
@@ -1246,6 +1270,39 @@ export class AgentRunner {
     writeFileSync(path.join(dir, "settings.json"), JSON.stringify(config, null, 2), { mode: 0o600 });
   }
 
+  /** Qwen Code: QWEN_HOME POR AGENTE com settings.json = config do dono
+   *  (~/.qwen/settings.json, auth/model/baseUrl) FUNDO com o mcpServers do
+   *  bridge por cima. Copiar o config do usuário é o que mantém o auth vivo:
+   *  QWEN_HOME substitui o dir inteiro, não faz overlay. Re-escrito a cada
+   *  start/turno (o dono pode editar o dele; o daemon respira a mudança no
+   *  próximo turno). */
+  private writeQwenConfig() {
+    const dir = this.runtimeFiles.qwenHomeDir();
+    const mcpServers = buildQwenMcpServers(this.opts.extraMcpServers, {
+      command: this.opts.bridgeCommand,
+      args: this.opts.bridgeArgs,
+      env: this.bridgeEnv(),
+    });
+    let merged: Record<string, unknown> = {};
+    try {
+      const home = this.opts.dropTo?.home ?? process.env.HOME ?? "";
+      const userCfg = path.join(home, ".qwen", "settings.json");
+      if (home && existsSync(userCfg)) {
+        const parsed = JSON.parse(readFileSync(userCfg, "utf8")) as unknown;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) merged = parsed as Record<string, unknown>;
+      }
+    } catch { /* config do dono ilegível → só mcpServers (o dono pode autenticar depois) */ }
+    merged.mcpServers = mcpServers;
+    // Janela de contexto: a mesma fonte que o próprio CLI usa (medido no
+    // bundle 0.23.0: compact/thresholds = generationConfig.contextWindowSize
+    // ?? 200k). Sem esta linha a barra de contexto fica UNKNOWN para sempre
+    // — o init do stream-json NÃO traz janela e o modelo custom (baseUrl)
+    // não está no mapa estático.
+    this.contextTracker.setCatalogLimit(qwenConfigContextLimit(merged, this.info.model));
+    // mode 0o600: o config do DONO pode trazer apiKey inline + o nosso env do bridge.
+    writeFileSync(path.join(dir, "settings.json"), JSON.stringify(merged, null, 2), { mode: 0o600 });
+  }
+
   /** Path do config do opencode POR AGENTE (dir privado, fora do workspace).
    *  Passado ao serve/run via env OPENCODE_CONFIG (suportado no 1.17.x). */
   private writeOpenCodeConfig() {
@@ -1396,6 +1453,7 @@ export class AgentRunner {
       bridgeSocketPath: this.opts.bridgeSocketPath ?? undefined,
       claudeConfigDir: this.opts.cliRunner === "claude" ? this.resolveClaudeConfigDir() : undefined,
       opencodeConfigPath: this.opts.cliRunner === "opencode" ? this.runtimeFiles.openCodeConfigPath() : undefined,
+      qwenHome: this.opts.cliRunner === "qwen" ? this.runtimeFiles.qwenHomeDir() : undefined,
     });
   }
 
@@ -2257,6 +2315,194 @@ export class AgentRunner {
       // descartou — e o delta contra gemStatsBase=0 re-fatura o histórico
       // inteiro. Só restaura no MESMO epoch (reset no meio já re-armou tudo).
       if (!sawResult && this.messageSession.owns(epoch)) this.messageSession.restoreFirstTurn(firstTurnSnapshot);
+      this.setState("idle");
+      this.drainOcQueue();
+    });
+  }
+
+  /* ---------- Qwen Code per-message model (fork do Gemini CLI, stream JSONL
+     estilo Claude; sessão uuid própria — primeiro turno cria com --session-id,
+     seguintes retomam com -r; medido na 0.23.0) ---------- */
+
+  private async runQwenMessage(content: string, images?: ImageAttachment[]) {
+    if (this.stopped) return;
+    if (!this.ensureRunnerAvailable("qwen")) return;
+    // T-251: gate de turno para todos os runners per-message.
+    if (!(await this.gateTurn())) { this.messageSession.busy = false; return; }
+    this.setState("thinking");
+
+    this.writeQwenConfig();
+
+    let message = content;
+    const firstTurnSnapshot = this.messageSession.consumeFirstTurnIfNeeded();
+    const firstTurn = firstTurnSnapshot.firstTurn;
+    const epoch = this.messageSession.epoch;
+    if (firstTurn) message = this.initialMessage(content, firstTurnSnapshot.pendingSummary);
+    // Anexos: qwen (herança Gemini CLI) lê arquivos referenciados por @<path>.
+    let imgCleanup = () => {};
+    if (images && images.length) {
+      const { files, cleanup } = this.writeAttachmentFiles(images);
+      imgCleanup = cleanup;
+      message = appendPathAttachmentPrompt(message, files, "qwen");
+    }
+    this.traceCli("qwen", "argv", message);
+
+    // Sessão: uuid NOSSO. Primeira vez gera e registra (persistimos só quando
+    // o turno completa — ver close); seguintes retomam com -r. Se o primeiro
+    // turno morrer antes do evento result, a sessão pode não ter sido gravada:
+    // restoreFirstTurn + sessionId=undefined (turno falho = como se não tivesse
+    // acontecido, mesmo contrato do gemini/codex).
+    let createdSessionId: string | undefined;
+    if (!this.messageSession.sessionId) {
+      createdSessionId = randomUUID();
+      this.messageSession.sessionId = createdSessionId;
+      this.opts.onSessionId?.(createdSessionId);
+    }
+    const resumeSessionId = createdSessionId ? undefined : this.messageSession.sessionId;
+
+    const allowedMcp = ["the-dudes", ...Object.keys(this.opts.extraMcpServers ?? {})]
+      .filter((n, i, a) => a.indexOf(n) === i)
+      .join(",");
+    const args = [
+      "--output-format", "stream-json",
+      "--include-directories", this.opts.workspaceRoot,
+      "--allowed-mcp-server-names", allowedMcp,
+      "-y",
+    ];
+    if (this.info.model) args.push("--model", this.info.model);
+    if (createdSessionId) args.push("--session-id", createdSessionId);
+    else if (resumeSessionId) args.push("-r", resumeSessionId);
+
+    const env = buildQwenEnv(this.buildEnv());
+
+    this.traceSpawn("qwen", args);
+    // Prompt via STDIN (não `-p`): a flag é deprecated e o parser do yargs
+    // parte um prompt iniciado por `-` (transcrições/quotes) — medido na
+    // 0.23.0. stdin é a via canónica do doc headless.
+    // cwd = qwenCwdDir (estável por agente): sessões são project-scoped pelo
+    // cwd; com tempDir aleatório o `-r` não acharia a sessão pós-restart.
+    const proc = spawnDropped(this.runnerCommand("qwen"), args, {
+      cwd: this.runtimeFiles.qwenCwdDir(),
+      env,
+      stdio: ["pipe", "pipe", "pipe"],
+    }, this.opts.dropTo ?? null);
+    proc.stdin?.on("error", () => { /* EPIPE: o CLI morreu cedo — o close cuida */ });
+    proc.stdin?.end(message);
+    this.ocActiveProc = proc;
+    armHardTimeout(proc, PER_MSG_TURN_TIMEOUT_MS, () => {
+      this.opts.log("warn", `[qwen:${this.info.name}] turno excedeu ${PER_MSG_TURN_TIMEOUT_MS / 1000}s — SIGKILL`);
+    });
+
+    let buf = "";
+    let pendingText = "";
+    let sawResult = false;
+    let errOut = "";
+
+    const flush = () => {
+      if (!this.messageSession.owns(epoch)) { pendingText = ""; return; }
+      const t = pendingText.trim();
+      if (t) {
+        this.setState("speaking");
+        this.opts.onAssistantText(t);
+      }
+      pendingText = "";
+    };
+
+    proc.stdout!.setEncoding("utf8");
+    proc.stderr!.setEncoding("utf8");
+    proc.stdout!.on("data", (chunk: string) => {
+      this.traceCli("qwen", "stdout", chunk);
+      buf = this.capAccum("qwen", buf, chunk);
+      let idx: number;
+      while ((idx = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, idx).trim();
+        buf = buf.slice(idx + 1);
+        if (!line.startsWith("{")) continue;
+        if (!this.messageSession.owns(epoch)) continue;
+        try {
+          for (const event of parseQwenTurnEvent(JSON.parse(line))) {
+            if (event.type === "session") {
+              // uuid ecoado = o que já registramos; adota se divergir (CLI
+              // gerou o dele — só possível se --session-id for rejeitado).
+              if (event.sessionId !== this.messageSession.sessionId) {
+                this.messageSession.sessionId = event.sessionId;
+                this.opts.onSessionId?.(event.sessionId);
+              }
+            } else if (event.type === "text") pendingText += event.text;
+            else if (event.type === "thought") {
+              this.traceInternalCli("info", `[cli:${this.info.id}:qwen:thinking] block_received len=${event.text.length} collectFlag=${this.info.collectThinking}`);
+              if (this.info.collectThinking) this.opts.onThinkingText?.(event.text);
+            }
+            else if (event.type === "tool") {
+              flush();
+              this.opts.onToolUse(event.name, event.input);
+              this.setState(event.name.includes("send_message") ? "sending" : "thinking");
+            } else if (event.type === "result") {
+              sawResult = true;
+              flush();
+            } else if (event.type === "usage") {
+              // usage POR REQUEST (fork do Gemini CLI emula o shape Anthropic):
+              // mesmo contrato da rota "anthropic" do Claude — billing via
+              // delta com cacheRead e ocupação pela janela do evento.
+              const delta: AgentUsage = {
+                input: event.input,
+                output: event.output,
+                cacheCreate: event.cacheCreate,
+                cacheRead: event.cacheRead,
+              };
+              this.opts.onUsageDelta?.(delta);
+              this.checkContextUsage(delta, "anthropic");
+            }
+          }
+        } catch {}
+      }
+    });
+
+    proc.stderr!.on("data", (chunk: string) => {
+      const msg = chunk.trim();
+      if (msg) {
+        if (errOut.length < 8_192) errOut += msg + "\n";
+        this.traceCli("qwen", "stderr", chunk);
+        this.checkContextFullError(msg);
+      }
+    });
+
+    proc.on("close", (code) => {
+      this.releaseActiveTurnSlot(); // T-251
+      flush();
+      imgCleanup();
+      this.ocActiveProc = null;
+      this.messageSession.busy = false;
+      if (this.stopped) { this.emitExit(code); return; }
+      // Resume apontando pra sessão que sumiu do disco (reboot limpou o
+      // QWEN_HOME efêmero antigo, delete manual): "No saved session found".
+      // Larga o id e re-tenta o turno UMA vez como sessão nova (mesmo
+      // contrato do crush/grok — a mensagem não pode se perder).
+      if (!sawResult && resumeSessionId && this.messageSession.owns(epoch) && isMissingSessionMessage(errOut)) {
+        this.opts.onError(`[qwen] sessão ${resumeSessionId.slice(0, 8)}… não existe mais — recomeçando sessão nova`);
+        this.messageSession.resetForRetry(firstTurnSnapshot.pendingSummary);
+        this.info.sessionId = undefined;
+        this.opts.onSessionId?.("");
+        this.messageSession.prepend({ content, images });
+        this.setState("idle");
+        this.drainOcQueue();
+        return;
+      }
+      // Turno fundador que morreu sem result: sessão pode não ter sido gravada
+      // — desfaz o registro e restaura firstTurn/summary (mesmo contrato gemini).
+      if (!sawResult && this.messageSession.owns(epoch)) {
+        if (createdSessionId && this.messageSession.sessionId === createdSessionId) {
+          this.messageSession.sessionId = undefined;
+          this.opts.onSessionId?.("");
+        }
+        this.messageSession.restoreFirstTurn(firstTurnSnapshot);
+        // stderr só é erro quando o turno não completou (antes era encaminhado
+        // ao vivo: warnings tipo o do yolo apareciam como erros na UI).
+        if (errOut.trim()) {
+          this.checkContextFullError(errOut);
+          this.opts.onError(`qwen: ${errOut.trim().slice(0, 500)}`);
+        }
+      }
       this.setState("idle");
       this.drainOcQueue();
     });
@@ -3358,6 +3604,8 @@ export class AgentRunner {
     const { content, images } = next;
     if (this.opts.cliRunner === "gemini") {
       void this.runGeminiMessage(content, images);
+    } else if (this.opts.cliRunner === "qwen") {
+      void this.runQwenMessage(content, images);
     } else if (this.opts.cliRunner === "codex") {
       void this.runCodexMessage(content, images);
     } else if (this.opts.cliRunner === "crush") {

@@ -394,7 +394,7 @@ export class ModelDiscovery {
       this.cache.set(runner, catalog);
       return catalog;
     }
-    if (runner === "claude" || runner === "gemini") {
+    if (runner === "claude" || runner === "gemini" || runner === "qwen") {
       const catalog: RunnerModelCatalog = {
         runner,
         models: [],

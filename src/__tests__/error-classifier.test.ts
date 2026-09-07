@@ -13,6 +13,11 @@ test("rate limit takes precedence over context-like token wording", () => {
 test("classifier recognizes context, missing sessions, auth and transient network failures", () => {
   assert.equal(classifyRunnerFailure("Your input exceeds the context window of this model"), "context_full");
   assert.equal(classifyRunnerFailure("couldn't resume session: 404 not found"), "missing_session");
+  // qwen-code 0.23.0 (texto exato medido): resume de sessão apagada do QWEN_HOME
+  assert.equal(
+    classifyRunnerFailure("No saved session found with ID 0e5f0580-b460-4728-bf1f-4a811395e524. Run qwen --resume without an ID to choose from existing sessions."),
+    "missing_session",
+  );
   assert.equal(classifyRunnerFailure("401 invalid or expired credentials"), "authentication");
   assert.equal(classifyRunnerFailure("socket hang up ECONNRESET"), "transient_network");
   assert.equal(classifyRunnerFailure("API Error: provider rejected request"), "provider_error");

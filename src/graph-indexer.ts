@@ -54,6 +54,7 @@ const CLI_SHIM_RUNNER: Record<string, CliRunner> = {
   "opencode-cli": "opencode",
   "codex-cli": "codex",
   "gemini-cli": "gemini",
+  "qwen-cli": "qwen",
   "crush-cli": "crush",
   "grok-cli": "grok",
 };

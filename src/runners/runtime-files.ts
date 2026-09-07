@@ -62,6 +62,33 @@ export class RunnerRuntimeFiles {
     return dir;
   }
 
+  /** Config dir POR AGENTE do Qwen Code (QWEN_HOME): settings.json com
+   *  mcpServers do bridge. Auth/model do dono ficam no ~/.qwen real — só o
+   *  config de MCP é isolado por agente.
+   *  ESTÁVEL por agente (hash do id, fora do `ag-*` aleatório): o qwen grava
+   *  as sessões em QWEN_HOME/projects/<cwd>/chats — com QWEN_HOME efêmero o
+   *  `-r <uuid>` morria a cada restart ("No saved session found"). */
+  qwenHomeDir(): string {
+    const parent = path.join(this.input.tempRoot ?? os.tmpdir(), "td-qwen");
+    mkdirSync(parent, { recursive: true, mode: 0o700 });
+    try { chmodSync(parent, 0o700); } catch {}
+    const slug = createHash("sha1").update(this.input.agentId).digest("hex").slice(0, 10);
+    const dir = path.join(parent, slug);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    try { chmodSync(dir, 0o700); } catch {}
+    return dir;
+  }
+
+  /** cwd ESTÁVEL por agente para o qwen: as sessões são project-scoped pela
+   *  chave do cwd; com o tempDir aleatório a chave mudava a cada arranque e
+   *  o resume falhava mesmo com QWEN_HOME estável. */
+  qwenCwdDir(): string {
+    const dir = path.join(this.qwenHomeDir(), "cwd");
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    try { chmodSync(dir, 0o700); } catch {}
+    return dir;
+  }
+
   openCodeConfigPath(): string {
     return path.join(this.tempDir(), "opencode.json");
   }

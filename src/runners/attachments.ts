@@ -99,7 +99,7 @@ export function appendPathAttachmentPrompt(
   runner: CliRunner,
 ): string {
   if (!files.length) return content;
-  if (runner === "gemini") return `${content}\n\n${files.map((f) => `@${f.path}`).join(" ")}`;
+  if (runner === "gemini" || runner === "qwen") return `${content}\n\n${files.map((f) => `@${f.path}`).join(" ")}`;
   const viewer = isGrokFamily(runner) ? "reader" : "viewer";
   const lista = files.map((f) => `- ${f.name}: ${f.path}`).join("\n");
   return `${content}\n\nAttached file(s) — open with your file ${viewer} tool:\n${lista}`;

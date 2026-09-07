@@ -93,12 +93,13 @@ test("estouro de tamanho é distinguível de JSON malformado", () => {
 
 /* ---------- T-187: catálogo único de runners ---------- */
 
-test("catálogo de runners: 7 runners, valores únicos, incluindo grok-custom", () => {
-  assert.equal(node.RUNNER_CATALOG.length, 7);
+test("catálogo de runners: 8 runners, valores únicos, incluindo grok-custom e qwen", () => {
+  assert.equal(node.RUNNER_CATALOG.length, 8);
   const values = node.RUNNER_CATALOG.map((r) => r.value);
   assert.equal(new Set(values).size, values.length, "valores duplicados no catálogo");
   for (const value of values) assert.equal(typeof value, "string");
   assert.ok(values.includes("grok-custom"), "grok-custom esquecido de novo?");
+  assert.ok(values.includes("qwen"), "qwen esquecido?");
   // cada entry tem label não-vazio
   for (const entry of node.RUNNER_CATALOG) {
     assert.equal(typeof entry.label, "string");

@@ -2,7 +2,7 @@ import type { z } from "zod";
 
 export type AgentRuntimeState = "idle" | "queued" | "thinking" | "speaking" | "sending" | "stopping" | "stalled";
 export type EffortLevel = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-export type CliRunner = "claude" | "opencode" | "gemini" | "codex" | "crush" | "grok" | "grok-custom";
+export type CliRunner = "claude" | "opencode" | "gemini" | "qwen" | "codex" | "crush" | "grok" | "grok-custom";
 export type ProjectMemberRole = "admin" | "member";
 
 /** Entrada do catálogo único de runners (T-187) — fonte de allowlist/gates. */
@@ -14,7 +14,7 @@ export interface RunnerCatalogEntry {
 export declare const RUNNER_CATALOG: readonly RunnerCatalogEntry[];
 /** Ordem canônica de iteração sobre os runners (derivada do catálogo).
  *  Tupla literal: mantém `z.enum(...)` e `Record<Runner, …` funcionando. */
-export declare const RUNNERS: readonly ["claude", "opencode", "gemini", "codex", "crush", "grok", "grok-custom"];
+export declare const RUNNERS: readonly ["claude", "opencode", "gemini", "qwen", "codex", "crush", "grok", "grok-custom"];
 /** Allowlist canônica: `runner` é um runner conhecido? */
 export declare function isKnownCliRunner(runner: unknown): runner is CliRunner;
 

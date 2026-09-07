@@ -108,6 +108,7 @@ export type MCPSource =
   | "codex"
   | "opencode"
   | "gemini"
+  | "qwen"
   | "override";
 
 export interface MCPDefinition {

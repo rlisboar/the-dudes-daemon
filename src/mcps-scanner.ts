@@ -8,6 +8,7 @@
  *   4. codex              — ~/.codex/mcp.json
  *   5. opencode           — ~/.config/opencode/mcp.json
  *   6. gemini             — ~/.config/gemini/mcp.json
+ *   6b. qwen              — ~/.qwen/settings.json (chave mcpServers)
  *   7. override           — ~/.config/the-dudes/mcp-servers.json
  *
  * Config format follows the de-facto MCP JSON used by Claude Code/Codex:
@@ -79,6 +80,8 @@ function buildSources(workspaceRoot?: string): ConfigSource[] {
     { source: "codex",          candidates: [path.join(home, ".codex", "mcp.json")] },
     { source: "opencode",       candidates: [path.join(xdg, "opencode", "mcp.json")] },
     { source: "gemini",         candidates: [path.join(xdg, "gemini", "mcp.json")] },
+    // Qwen Code: mcpServers mora no ~/.qwen/settings.json (não num mcp.json).
+    { source: "qwen",           candidates: [process.env.QWEN_HOME ? path.join(process.env.QWEN_HOME, "settings.json") : path.join(home, ".qwen", "settings.json")] },
     { source: "override",       candidates: [path.join(xdg, "the-dudes", "mcp-servers.json")] },
   ];
 }

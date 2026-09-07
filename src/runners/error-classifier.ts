@@ -19,7 +19,7 @@ export const CONTEXT_FULL_PATTERNS = [
 
 export const RATE_LIMIT_TEXT_RE = /temporarily limiting requests|·\s*rate limited|\brate.?limit\w*\b|overloaded|too many requests|\b429\b|\b529\b/i;
 
-const MISSING_SESSION_RE = /no conversation found with session id|session not found|couldn't (?:start|load|resume) session|no such session|404 not found/i;
+const MISSING_SESSION_RE = /no conversation found with session id|session not found|couldn't (?:start|load|resume) session|no such session|no saved session found|404 not found/i;
 const AUTHENTICATION_RE = /\b401\b|unauthoriz|invalid (?:or expired )?credentials|failed to authenticate|no auth context|auth_kind=bearer/i;
 const ABORT_RE = /SIGKILL|SIGTERM|timed? ?out|timeout|aborted|terminated/i;
 const TRANSIENT_NETWORK_RE = /ECONNRESET|ECONNREFUSED|EPIPE|socket hang up|network error|connection (?:reset|closed|lost)|temporar(?:y|ily) unavailable/i;

@@ -187,6 +187,28 @@ export function extractOneShotText(out: string, runner: CliRunner): string {
   if (runner === "gemini") {
     return parseNdjson(out, (event) => event.type === "message" && event.role === "assistant" ? String(event.content ?? "") : undefined).join("\n").trim();
   }
+  if (runner === "qwen") {
+    // --output-format json emite UMA array de eventos (linha única): o
+    // resultado final está no evento type==="result".result; fallback soma os
+    // blocos text dos assistant se o result não vier (CLI cortado).
+    let finalText = "";
+    const texts: string[] = [];
+    const scan = (event: Record<string, unknown>) => {
+      if (event.type === "result" && typeof event.result === "string" && event.result.trim()) finalText = event.result.trim();
+      const message = event.message as Record<string, unknown> | undefined;
+      if (event.type === "assistant" && Array.isArray(message?.content)) {
+        for (const b of message!.content as Array<Record<string, unknown>>) {
+          if (b?.type === "text" && typeof b.text === "string") texts.push(b.text);
+        }
+      }
+    };
+    const trimmed = out.trim();
+    if (trimmed.startsWith("[")) {
+      try { for (const ev of JSON.parse(trimmed) as Array<Record<string, unknown>>) scan(ev); } catch { /* cai no ndjson */ }
+    }
+    if (!finalText) parseNdjson(out, (ev) => { scan(ev); return undefined; });
+    return (finalText || texts.join("\n")).trim();
+  }
   if (runner === "opencode") {
     const clean = out.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
     return parseNdjson(clean, (event) => {

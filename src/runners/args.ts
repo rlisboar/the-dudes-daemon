@@ -20,6 +20,22 @@ export const geminiOneShotArgs = ({ prompt, model }: OneShotArgs): string[] => {
   return args;
 };
 
+/** Qwen Code (fork do Gemini CLI, CLI próprio): headless com stream JSONL
+ *  estilo Claude. `sessionId` = uuid NÓS atribuímos: primeiro turno cria com
+ *  --session-id, seguintes retomam com -r (medido na 0.23.0: o init devolve o
+ *  mesmo uuid; sem --session-id o CLI gera um que só aparece no stream).
+ *  O prompt VAI VIA STDIN (medido na 0.23.0): `-p <prompt>` é deprecated e
+ *  parte o parser do yargs com prompt iniciado por `-` (posicional com `--`
+ *  também é ignorado); stdin é a via canónica do doc headless. */
+export const qwenOneShotArgs = ({ model, sessionId, newSessionId }: OneShotArgs & { newSessionId?: string }): string[] => {
+  const args = ["--output-format", "stream-json", "-y"];
+  if (model) args.push("--model", model);
+  // criação: NÓS damos o uuid (--session-id); retomada: -r <uuid guardado>.
+  if (sessionId) args.push("-r", sessionId);
+  else if (newSessionId) args.push("--session-id", newSessionId);
+  return args;
+};
+
 export const codexOneShotArgs = ({ prompt, model, sessionId }: OneShotArgs): string[] => {
   const flags = ["--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox"];
   if (model) flags.push("-m", model);

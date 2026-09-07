@@ -73,7 +73,7 @@ type CliPathsMap = NonNullable<DaemonCliConfig["cliPaths"]>;
  *  precisava de workaround via THE_DUDES_CLAUDE_PATH (T-274). Precedência
  *  resultante: flag/env explícito > daemon-config.json > default. */
 export function cliPathsFromFlags(
-  flags: { claude?: string; opencode?: string; gemini?: string; codex?: string; crush?: string; grok?: string },
+  flags: { claude?: string; opencode?: string; gemini?: string; qwen?: string; codex?: string; crush?: string; grok?: string },
   env: NodeJS.ProcessEnv = process.env,
 ): CliPathsMap {
   const out: CliPathsMap = {};
@@ -81,6 +81,7 @@ export function cliPathsFromFlags(
     ["claude", flags.claude ?? env.THE_DUDES_CLAUDE_PATH],
     ["opencode", flags.opencode ?? env.THE_DUDES_OPENCODE_PATH],
     ["gemini", flags.gemini ?? env.THE_DUDES_GEMINI_PATH],
+    ["qwen", flags.qwen ?? env.THE_DUDES_QWEN_PATH],
     ["codex", flags.codex ?? env.THE_DUDES_CODEX_PATH],
     ["crush", flags.crush ?? env.THE_DUDES_CRUSH_PATH],
     ["grok", flags.grok ?? env.THE_DUDES_GROK_PATH],
@@ -114,6 +115,7 @@ function parseCli(): Args {
       "claude-path": { type: "string" },
       "opencode-path": { type: "string" },
       "gemini-path": { type: "string" },
+      "qwen-path": { type: "string" },
       "codex-path": { type: "string" },
       "crush-path": { type: "string" },
       "grok-path": { type: "string" },
@@ -136,6 +138,7 @@ function parseCli(): Args {
     claude: values["claude-path"],
     opencode: values["opencode-path"],
     gemini: values["gemini-path"],
+    qwen: values["qwen-path"],
     codex: values["codex-path"],
     crush: values["crush-path"],
     grok: values["grok-path"],
@@ -169,7 +172,7 @@ Options:
   -vhio
              Alias for -vh
   --cli-config  Local JSON file with cliPaths overrides (default: ~/.the-dudes/daemon-config.json)
-  --claude-path / --opencode-path / --gemini-path / --codex-path / --crush-path / --grok-path
+  --claude-path / --opencode-path / --gemini-path / --qwen-path / --codex-path / --crush-path / --grok-path
              Manual executable overrides for each CLI
   -h, --help Show this help`);
 }
@@ -1468,10 +1471,11 @@ export class DaemonClient {
     }
     // Todos os CLIs de agente que o shim cobre (graphify não tem backend nativo
     // pra eles — usamos OLLAMA_BASE_URL → shim OpenAI-compat).
-    const SHIM_CLI: Record<string, "opencode" | "codex" | "gemini" | "crush" | "grok"> = {
+    const SHIM_CLI: Record<string, "opencode" | "codex" | "gemini" | "qwen" | "crush" | "grok"> = {
       "opencode-cli": "opencode",
       "codex-cli": "codex",
       "gemini-cli": "gemini",
+      "qwen-cli": "qwen",
       "crush-cli": "crush",
       "grok-cli": "grok",
     };

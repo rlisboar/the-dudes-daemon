@@ -63,6 +63,10 @@ export function buildGeminiMcpServers(extras: Record<string, McpServerConfig> | 
   return servers;
 }
 
+/** Qwen Code: settings.json aceita mcpServers no MESMO shape do gemini
+ *  (command/args/env p/ stdio; httpUrl p/ HTTP; `type` do Claude fica fora). */
+export const buildQwenMcpServers = buildGeminiMcpServers;
+
 export function buildClaudeMcpConfig(extras: Record<string, McpServerConfig> | undefined, bridge: BridgeConfig) {
   const mcpServers: Record<string, unknown> = {};
   for (const [name, config] of Object.entries(extras ?? {})) {

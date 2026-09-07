@@ -20,7 +20,8 @@ test("T-167 A2: schema MCP delegate aceita grok-custom (POLICY_GATED_RUNNERS)", 
     /preferred_runner:\s*z\.enum\(\["claude", "codex", "opencode", "gemini", "crush", "grok"\]\)/,
   );
   assert.ok((POLICY_GATED_RUNNERS as readonly string[]).includes("grok-custom"));
-  assert.equal(POLICY_GATED_RUNNERS.length, 7);
+  assert.ok((POLICY_GATED_RUNNERS as readonly string[]).includes("qwen"));
+  assert.equal(POLICY_GATED_RUNNERS.length, 8);
 
   const schema = z.enum(POLICY_GATED_RUNNERS);
   assert.equal(schema.parse("grok-custom"), "grok-custom");

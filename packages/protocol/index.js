@@ -40,6 +40,7 @@ export const RUNNER_CATALOG = [
   { value: "claude", label: "Claude" },
   { value: "opencode", label: "OpenCode" },
   { value: "gemini", label: "Gemini" },
+  { value: "qwen", label: "Qwen" },
   { value: "codex", label: "Codex" },
   { value: "crush", label: "Crush" },
   { value: "grok", label: "Grok" },
