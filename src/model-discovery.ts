@@ -1,4 +1,6 @@
 import os from "node:os";
+import path from "node:path";
+import { existsSync, readFileSync } from "node:fs";
 import type { ChildProcess } from "node:child_process";
 import type { CliRunner, EffortLevel } from "./types.js";
 import type { ResolvedCliCommands } from "./cli-config.js";
@@ -363,8 +365,73 @@ function discoverCodex(command: string, dropTo: DropTarget | null): Promise<Disc
   });
 }
 
-export class ModelDiscovery {
-  private readonly cache = new Map<CliRunner, RunnerModelCatalog>();
+/**
+ * T-343: catálogo de modelos do qwen-code a partir do settings.json do dono
+ * ($QWEN_HOME ou ~/.qwen). Fonte da verdade do CLI (ele resolve auth/baseUrl
+ * daqui). Regras:
+ *  - `modelProviders.<protocolo>[].id/name` → entradas do catálogo;
+ *  - `model.name` → marcado default (é esse que o CLI usa sem --model);
+ *  - efforts = tiers do CLI (settings.model.reasoningEffort é clampado pelo
+ *    daemon por agente); none incluído (desliga reasoning);
+ *  - sem ficheiro/JSON inválido → unsupported com erro (a UI mostra a
+ *    lista estática como antes, sem rebentar).
+ */
+export function discoverQwenSettings(
+  homeDir: string,
+  fetchedAt = Date.now(),
+  /** Sobrepõe o path (testes); por omissão $QWEN_HOME/settings.json ou ~/.qwen/settings.json. */
+  settingsPathOverride?: string,
+): RunnerModelCatalog {
+  const base: Omit<RunnerModelCatalog, "models" | "source"> = { runner: "qwen", fetchedAt };
+  try {
+    const file = settingsPathOverride
+      ?? path.join(process.env.QWEN_HOME ? path.resolve(process.env.QWEN_HOME) : path.join(homeDir, ".qwen"), "settings.json");
+    if (!existsSync(file)) return { ...base, models: [], source: "unsupported", error: "sem ~/.qwen/settings.json — configura um provider no qwen code" };
+    const settings = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+    const providers = settings.modelProviders;
+    const models: DiscoveredRunnerModel[] = [];
+    const seen = new Set<string>();
+    const defaultId = typeof (settings.model as Record<string, unknown> | undefined)?.name === "string"
+      ? ((settings.model as Record<string, unknown>).name as string).trim()
+      : "";
+    if (providers && typeof providers === "object" && !Array.isArray(providers)) {
+      for (const list of Object.values(providers as Record<string, unknown>)) {
+        if (!Array.isArray(list)) continue;
+        for (const entry of list) {
+          if (!entry || typeof entry !== "object") continue;
+          const e = entry as Record<string, unknown>;
+          const id = typeof e.id === "string" ? e.id.trim() : "";
+          if (!id || !MODEL_ID_RE.test(id) || seen.has(id)) continue;
+          seen.add(id);
+          const label = typeof e.name === "string" && e.name.trim() ? e.name.trim() : id;
+          const gen = (e.generationConfig && typeof e.generationConfig === "object" ? e.generationConfig : {}) as Record<string, unknown>;
+          const modalities = Array.isArray(gen.modalities)
+            ? gen.modalities.filter((m): m is string => typeof m === "string")
+            : undefined;
+          models.push(withModelCapability({
+            id,
+            label,
+            isDefault: defaultId && id === defaultId ? true : undefined,
+            efforts: ["none", "low", "medium", "high", "xhigh", "max"],
+            inputModalities: modalities?.length ? modalities : undefined,
+          }));
+          if (models.length >= MAX_MODELS) break;
+        }
+      }
+    }
+    // model.name configurado sem entrada em modelProviders (provider nativo
+    // do CLI, ex.: qwen3-coder-plus) — entra na mesma, senão o default some.
+    if (defaultId && !seen.has(defaultId) && MODEL_ID_RE.test(defaultId)) {
+      models.push(withModelCapability({ id: defaultId, label: defaultId, isDefault: true, efforts: ["none", "low", "medium", "high", "xhigh", "max"] }));
+    }
+    if (models.length === 0) return { ...base, models: [], source: "unsupported", error: "settings.json sem modelProviders nem model.name" };
+    return { ...base, models, source: "cli-command" };
+  } catch (e) {
+    return { ...base, models: [], source: "unsupported", error: `settings.json ilegível: ${(e as Error).message}` };
+  }
+}
+
+export class ModelDiscovery {  private readonly cache = new Map<CliRunner, RunnerModelCatalog>();
   private readonly inFlight = new Map<CliRunner, Promise<RunnerModelCatalog>>();
 
   constructor(
@@ -394,7 +461,7 @@ export class ModelDiscovery {
       this.cache.set(runner, catalog);
       return catalog;
     }
-    if (runner === "claude" || runner === "gemini" || runner === "qwen") {
+    if (runner === "claude" || runner === "gemini") {
       const catalog: RunnerModelCatalog = {
         runner,
         models: [],
@@ -402,6 +469,16 @@ export class ModelDiscovery {
         fetchedAt,
         error: "este CLI não oferece listagem não interativa de modelos",
       };
+      this.cache.set(runner, catalog);
+      return catalog;
+    }
+    if (runner === "qwen") {
+      // T-343: o qwen-code não tem `models` não-interativo — a fonte da
+      // verdade são os providers que o DONO configurou no settings.json do
+      // ~/.qwen (o próprio CLI resolve auth/baseUrl daqui). Sem este scan a
+      // UI caía na lista estática e modelos custom (ex.:
+      // rezulto/qwen3.8-flash) nunca apareciam.
+      const catalog = discoverQwenSettings(this.dropTo?.home ?? os.homedir(), fetchedAt);
       this.cache.set(runner, catalog);
       return catalog;
     }

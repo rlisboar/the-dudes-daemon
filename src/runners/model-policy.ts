@@ -119,6 +119,40 @@ export function codexEffort(level: string): "low" | "medium" | "high" | "xhigh" 
   return level === "low" || level === "medium" || level === "high" || level === "xhigh" ? level : "xhigh";
 }
 
+/**
+ * T-343: effort no qwen-code. Não há flag CLI (medido no bundle 0.23.0: o
+ * `--help` não expõe nada de reasoning); o caminho oficial é
+ * `model.reasoningEffort` no settings.json do QWEN_HOME por agente, que o
+ * próprio CLI normaliza (normalizeReasoningEffort: low|medium|high|xhigh|max
+ * + "none" desliga o reasoning). Nós fazemos o clamp ANTES de escrever, para
+ * nunca alimentar valor inválido (o CLI avisa e ignora, mas o utilizador
+ * veria o seletor "a não fazer nada"). Sem effort definido = não escrevemos
+ * nada: o CLI usa o default do provedor (não inventamos política alheia).
+ */
+export type QwenReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh" | "max";
+
+export function qwenReasoningEffort(level: EffortLevel | undefined | null): QwenReasoningEffort | undefined {
+  if (!level) return undefined;
+  if (level === "none" || level === "minimal") return "none";
+  switch (level) {
+    case "low":
+      return "low";
+    case "medium":
+      return "medium";
+    case "high":
+      return "high";
+    case "xhigh":
+      return "xhigh";
+    case "max":
+      return "max";
+    default:
+      return undefined;
+  }
+}
+
+/** Esforços que oferecemos no seletor para qwen (espelhado na web). */
+export const QWEN_EFFORT_OPTIONS = ["none", "low", "medium", "high", "xhigh", "max"] as const;
+
 export function claudeThinkingEffort(effort: EffortLevel | undefined, collectThinking: boolean): {
   effort: EffortLevel | undefined;
   lifted: boolean;
@@ -136,7 +170,6 @@ export function claudeThinkingEffort(effort: EffortLevel | undefined, collectThi
 export const GROK_WIRE_EFFORTS = ["low", "medium", "high"] as const;
 export const GROK_WIRE_EFFORTS_XHIGH = ["low", "medium", "high", "xhigh"] as const;
 export type GrokWireEffort = "low" | "medium" | "high" | "xhigh";
-
 /** Minor version de `grok-4.N` ou null se não for família 4.x. */
 export function grok4Minor(model?: string | null): number | null {
   const m = (model ?? "").trim().toLowerCase().replace(EFFORT_SUFFIX_RE, "");

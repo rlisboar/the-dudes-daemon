@@ -602,7 +602,9 @@ export type MemoryScope = "project" | "agent";
 // T-342: "task_state" removido — nenhum produtor o emitia e nenhuma prompt
 // o descrevia (zumbi). Linhas antigas com esse type continuam a ler/funcionar
 // (são string no wire; o UI renderiza com fallback de cor).
-export type MemoryType = "fact" | "decision" | "reference" | "preference";
+// T-343: "experience" = memória EPISÓDICA (como uma tarefa parecida se
+// resolveu); emitida pela reflexão de task-done e pelo auto-extract do compact.
+export type MemoryType = "fact" | "decision" | "reference" | "preference" | "experience";
 
 /** Memory entry (E2EE title/body). Hot-set no system prompt: só
  *  scope=agent do próprio agente (evita duplicar o mesmo texto em N

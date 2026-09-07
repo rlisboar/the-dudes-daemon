@@ -31,7 +31,7 @@ import { buildBridgeEnv, buildClaudeMcpConfig, buildCodexMcpArgs, buildCrushMcpC
 import { RunnerRuntimeFiles } from "./runners/runtime-files.js";
 import { ContextTracker, CumulativeUsageTracker, type UsageSemantics } from "./runners/context-tracker.js";
 import { armHardTimeout, appendCapped, collectProcessOutput, killGrokLeader, killProcess, processAlive as procAlive, RUNNER_OUTPUT_CAP_BYTES, terminateAndWait, terminateWithEscalation } from "./runners/process-lifecycle.js";
-import { memoryBodySame, memoryTitleNearDup, parseAndStripMemory } from "./memory-utils.js";
+import { memoryBodySame, memoryTitleNearDup, parseAndStripMemory, type MemoryExtractItem } from "./memory-utils.js";
 import {
   createActivityClock,
   hangPhase,
@@ -46,7 +46,7 @@ import { buildOpenCodeAgentConfig, OPENCODE_MANAGED_AGENT } from "./runners/open
 import { randomUUID } from "node:crypto";
 import { PerMessageSessionState } from "./runners/message-session.js";
 import { buildAgentContext, buildInitialMessage, buildSystemPromptHeader, buildWorkspacePrompt } from "./runners/prompts.js";
-import { claudeThinkingEffort, codexEffort, providerModelParts, qwenConfigContextLimit, resolveContextLimit, resolveContextLimitKnown } from "./runners/model-policy.js";
+import { claudeThinkingEffort, codexEffort, providerModelParts, qwenConfigContextLimit, qwenReasoningEffort, resolveContextLimit, resolveContextLimitKnown } from "./runners/model-policy.js";
 import { resolveOcCatalogContextLimit } from "./model-discovery.js";
 import { classifyRunnerFailure, isAbortedFailure, isApiErrorMessage, isAuthenticationFailure, isLoopStopMessage, isMissingSessionFailure as isMissingSessionMessage } from "./runners/error-classifier.js";
 import { appendFilePrompt, appendPathAttachmentPrompt, attachmentExtension, buildClaudeUserContent, buildOpenCodeParts, codexImageArgs, imageExtension, isInlineImage, safeAttachmentName } from "./runners/attachments.js";
@@ -1293,6 +1293,19 @@ export class AgentRunner {
       }
     } catch { /* config do dono ilegível → só mcpServers (o dono pode autenticar depois) */ }
     merged.mcpServers = mcpServers;
+    // T-343: effort do agente → model.reasoningEffort (o CLI lê daqui; não
+    // existe flag CLI — medido no bundle 0.23.0). Sem effort no agente, o
+    // valor do dono passa tal-e-qual (fundo é do dono); "none" desliga.
+    {
+      const qEffort = qwenReasoningEffort(this.info.effort);
+      if (qEffort) {
+        const modelCfg = (merged.model && typeof merged.model === "object" && !Array.isArray(merged.model))
+          ? merged.model as Record<string, unknown>
+          : {};
+        modelCfg.reasoningEffort = qEffort;
+        merged.model = modelCfg;
+      }
+    }
     // Janela de contexto: a mesma fonte que o próprio CLI usa (medido no
     // bundle 0.23.0: compact/thresholds = generationConfig.contextWindowSize
     // ?? 200k). Sem esta linha a barra de contexto fica UNKNOWN para sempre
@@ -3797,7 +3810,7 @@ export class AgentRunner {
         const already = this.memoryAlreadyBlock(existing);
         const extractPrompt =
           "Extract NEW durable knowledge from this conversation worth keeping permanently — every explicit decision, convention, preference, architectural choice or stable fact. Be generous." + already +
-          " Respond with ONLY one line: `MEMORY_JSON:` + a single-line JSON array, each item {\"title\":\"<short>\",\"body\":\"<full>\",\"type\":\"decision\"|\"fact\"|\"reference\"|\"preference\",\"supersedes\":[\"<id>\"]?} in the conversation's language. Use `MEMORY_JSON: []` if nothing. No markdown.";
+          " Respond with ONLY one line: `MEMORY_JSON:` + a single-line JSON array, each item {\"title\":\"<short>\",\"body\":\"<full>\",\"type\":\"decision\"|\"fact\"|\"reference\"|\"preference\"|\"experience\",\"supersedes\":[\"<id>\"]?} in the conversation's language. Use `MEMORY_JSON: []` if nothing. No markdown.";
         const fork = await this.ocServeFetch(`/session/${this.messageSession.sessionId}/fork`, "POST", {});
         const forkId = fork?.id as string | undefined;
         if (forkId) {
@@ -3863,7 +3876,7 @@ export class AgentRunner {
     const summaryPrompt =
       "Two tasks. Write BOTH the summary and the memory entries in the SAME LANGUAGE as the conversation (e.g. if the conversation is in Portuguese, respond in Portuguese). Only the `MEMORY_JSON:` marker and JSON keys stay in English.\n\n" +
       "TASK 1 — Summarize this conversation concisely (decisions made, tasks in progress, key findings, context needed to continue). Be brief.\n\n" +
-      "TASK 2 — Extract NEW durable knowledge worth keeping permanently. Prefer decisions, conventions, preferences, and stable architectural facts. Skip ephemeral task chatter and one-off debug noise. Max 5 entries." + alreadyBlock + " Output it on a NEW FINAL LINE as exactly `MEMORY_JSON:` followed by a single-line JSON array. Each element MUST be {\"title\": \"<short>\", \"body\": \"<the fact in full>\", \"type\": \"decision\"|\"fact\"|\"reference\"|\"preference\", \"supersedes\": [\"<id>\"]?} where title/body are in the conversation's language. Use type decision/preference for sticky rules; fact for neutral notes. " +
+      "TASK 2 — Extract NEW durable knowledge worth keeping permanently. Prefer decisions, conventions, preferences, and stable architectural facts. Skip ephemeral task chatter and one-off debug noise. Max 5 entries." + alreadyBlock + " Output it on a NEW FINAL LINE as exactly `MEMORY_JSON:` followed by a single-line JSON array. Each element MUST be {\"title\": \"<short>\", \"body\": \"<the fact in full>\", \"type\": \"decision\"|\"fact\"|\"reference\"|\"preference\"|\"experience\", \"supersedes\": [\"<id>\"]?} where title/body are in the conversation's language. Use type decision/preference for sticky rules; fact for neutral notes; experience for \"how a similar task was solved here\" (situation → what worked → pitfall). " +
       "Example: MEMORY_JSON: [{\"title\":\"DB engine\",\"body\":\"The project uses PostgreSQL partitioned by month\",\"type\":\"decision\"}]. " +
       "Output `MEMORY_JSON: []` ONLY if there is no NEW durable info. No markdown, no code fences, single line.";
 

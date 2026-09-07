@@ -68,7 +68,7 @@ const MEMORY = `# Agent memory (durable, survives restarts & model switches)
 - Unpinned notes stay in the catalog (yours + project) — retrieve with \`recall\`, they are NOT auto-injected.
 - \`mcp__the-dudes__recall\` (args: {query?, type?, limit?}) — search private notes + project catalog. Multi-word query = all terms must match. **Call at the start of a non-trivial task** if you need shared/project facts not already under "## Project Memory".
 - \`mcp__the-dudes__remember\` (args: {title, body, type?, scope?, pinned?, tags?, supersedes?}) — save a durable note. **Default scope=\`agent\`, pinned=false** (catalog/recall). Set \`pinned:true\` only for facts you need on every restart. Use \`scope: "project"\` only for shared catalog (never auto-injected). Pass \`supersedes: ["mem_…"]\` when updating an existing fact (old entries are removed). Keep entries short and atomic; one fact per entry.
-- Prefer \`type: "decision"\` / \`"preference"\` for sticky rules; use \`"fact"\` for neutral notes.
+- Prefer \`type: "decision"\` / \`"preference"\` for sticky rules; use \`"fact"\` for neutral notes; use \`"experience"\` for "how a similar task was solved here" (situation → what worked → pitfall).
 - \`mcp__the-dudes__forget\` (args: {id}) — delete an entry you created.
 - \`mcp__the-dudes__pin\` (args: {id, pinned?}) — pin/unpin for **your** hot-set (quota enforced server-side).
 - When "## Project Memory" is present below, do not re-recall those titles; use \`recall\` for everything else.`;

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  claudeThinkingEffort, codexEffort, contextLimitFor, grokSupportsXhigh,
+  claudeThinkingEffort, codexEffort, contextLimitFor, grokSupportsXhigh, qwenReasoningEffort,
   grokThinkingEffort, normalizeGrokEffort, providerModelParts, resolveContextLimit,
 } from "../runners/model-policy.js";
 
@@ -34,6 +34,17 @@ test("runner effort policies preserve provider-specific accepted levels", () => 
   assert.equal(codexEffort("max"), "xhigh");
   assert.equal(codexEffort("minimal"), "xhigh");
   assert.equal(codexEffort("high"), "high");
+
+  // T-343: qwen — tiers do CLI (settings.model.reasoningEffort); none apaga
+  // reasoning; xhigh/max têm tier próprio (não colapsamos — medido no bundle).
+  assert.equal(qwenReasoningEffort(undefined), undefined);
+  assert.equal(qwenReasoningEffort("none"), "none");
+  assert.equal(qwenReasoningEffort("minimal"), "none");
+  assert.equal(qwenReasoningEffort("low"), "low");
+  assert.equal(qwenReasoningEffort("medium"), "medium");
+  assert.equal(qwenReasoningEffort("high"), "high");
+  assert.equal(qwenReasoningEffort("xhigh"), "xhigh");
+  assert.equal(qwenReasoningEffort("max"), "max");
   // Grok wire legado (sem modelo / 4.5): low|medium|high. xhigh/max → high.
   assert.equal(grokThinkingEffort("minimal", true, false), "high");
   assert.equal(grokThinkingEffort("minimal", true, true), "low");

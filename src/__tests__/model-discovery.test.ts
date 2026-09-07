@@ -1,6 +1,9 @@
 import { test } from "node:test";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import assert from "node:assert/strict";
-import { parseCodexModelList, parseLineModelCatalog } from "../model-discovery.js";
+import { discoverQwenSettings, parseCodexModelList, parseLineModelCatalog } from "../model-discovery.js";
 
 test("line catalogs parse plain model IDs and remove duplicates/noise", () => {
   assert.deepEqual(
@@ -131,4 +134,51 @@ test("T-246: ruído do output (login, header, 'Available models:', vazias) não 
 test("T-246: retrocompat — formato antigo (todos com *) segue parseando igual", () => {
   const models = parseLineModelCatalog("Default model: grok-build\n* grok-build (default)\n* grok-fast\n", "grok-custom");
   assert.deepEqual(models.map((m) => [m.id, m.isDefault]), [["grok-build", true], ["grok-fast", undefined]]);
+});
+
+/* ── T-343: qwen — catálogo a partir do settings.json do dono ─────────── */
+
+function writeTmpQwenSettings(name: string, obj: unknown): string {
+  const dir = mkdtempSync(path.join(tmpdir(), `qwen-cfg-${name}-`));
+  const file = path.join(dir, "settings.json");
+  writeFileSync(file, typeof obj === "string" ? obj : JSON.stringify(obj));
+  return file;
+}
+
+test("T-343 discoverQwenSettings: modelProviders do dono viram catálogo com default", () => {
+  const file = writeTmpQwenSettings("ok", {
+    model: { name: "rezulto/qwen3.8-flash", baseUrl: "https://x/v1" },
+    modelProviders: {
+      openai: [
+        { id: "rezulto/qwen3.8-flash", name: "rezulto/qwen3.8-flash", baseUrl: "https://x/v1", generationConfig: { modalities: ["image", "video"] } },
+        { id: "qwen3-coder-plus", name: "Qwen3 Coder Plus" },
+      ],
+    },
+  });
+  const cat = discoverQwenSettings("/nonexistent-home", 1, file);
+  assert.equal(cat.source, "cli-command");
+  assert.deepEqual(cat.models.map((m) => m.id), ["rezulto/qwen3.8-flash", "qwen3-coder-plus"]);
+  assert.equal(cat.models[0]!.isDefault, true);
+  assert.equal(cat.models[1]!.isDefault, undefined);
+  assert.equal(cat.models[0]!.label, "rezulto/qwen3.8-flash");
+  assert.deepEqual(cat.models[0]!.inputModalities, ["image", "video"]);
+  assert.deepEqual(cat.models[0]!.efforts, ["none", "low", "medium", "high", "xhigh", "max"]);
+});
+
+test("T-343 discoverQwenSettings: model.name sem provider entra como default (provider nativo)", () => {
+  const file = writeTmpQwenSettings("nativ", { model: { name: "qwen3-max" } });
+  const cat = discoverQwenSettings("/nonexistent-home", 1, file);
+  assert.equal(cat.source, "cli-command");
+  assert.deepEqual(cat.models.map((m) => [m.id, m.isDefault]), [["qwen3-max", true]]);
+});
+
+test("T-343 discoverQwenSettings: sem ficheiro / JSON podre / vazio → unsupported com erro legível", () => {
+  const missing = discoverQwenSettings("/nonexistent-home", 1, "/nonexistent-home/.qwen/settings.json");
+  assert.equal(missing.source, "unsupported");
+  assert.ok(missing.error && missing.error.includes("settings.json"));
+  const podre = discoverQwenSettings("/nonexistent-home", 1, writeTmpQwenSettings("podre", "{ isto não é json"));
+  assert.equal(podre.source, "unsupported");
+  assert.ok(podre.error);
+  const vazio = discoverQwenSettings("/nonexistent-home", 1, writeTmpQwenSettings("vazio", { ui: {} }));
+  assert.equal(vazio.source, "unsupported");
 });
