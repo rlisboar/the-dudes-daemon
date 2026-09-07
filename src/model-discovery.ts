@@ -405,9 +405,14 @@ export function discoverQwenSettings(
           seen.add(id);
           const label = typeof e.name === "string" && e.name.trim() ? e.name.trim() : id;
           const gen = (e.generationConfig && typeof e.generationConfig === "object" ? e.generationConfig : {}) as Record<string, unknown>;
-          const modalities = Array.isArray(gen.modalities)
-            ? gen.modalities.filter((m): m is string => typeof m === "string")
-            : undefined;
+          // modalities no settings real são OBJETO ({image:true,video:true});
+          // array também é aceite por tolerância.
+          const rawMods = gen.modalities;
+          const modalities = Array.isArray(rawMods)
+            ? rawMods.filter((m): m is string => typeof m === "string")
+            : rawMods && typeof rawMods === "object"
+              ? Object.entries(rawMods as Record<string, unknown>).filter(([, on]) => on === true).map(([k]) => k)
+              : undefined;
           models.push(withModelCapability({
             id,
             label,

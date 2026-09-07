@@ -150,8 +150,8 @@ test("T-343 discoverQwenSettings: modelProviders do dono viram catálogo com def
     model: { name: "rezulto/qwen3.8-flash", baseUrl: "https://x/v1" },
     modelProviders: {
       openai: [
-        { id: "rezulto/qwen3.8-flash", name: "rezulto/qwen3.8-flash", baseUrl: "https://x/v1", generationConfig: { modalities: ["image", "video"] } },
-        { id: "qwen3-coder-plus", name: "Qwen3 Coder Plus" },
+        { id: "rezulto/qwen3.8-flash", name: "rezulto/qwen3.8-flash", baseUrl: "https://x/v1", generationConfig: { modalities: { image: true, video: true, audio: false } } },
+        { id: "qwen3-coder-plus", name: "Qwen3 Coder Plus", generationConfig: { modalities: ["text", "image"] } },
       ],
     },
   });
@@ -162,6 +162,7 @@ test("T-343 discoverQwenSettings: modelProviders do dono viram catálogo com def
   assert.equal(cat.models[1]!.isDefault, undefined);
   assert.equal(cat.models[0]!.label, "rezulto/qwen3.8-flash");
   assert.deepEqual(cat.models[0]!.inputModalities, ["image", "video"]);
+  assert.deepEqual(cat.models[1]!.inputModalities, ["text", "image"]); // array também é aceite
   assert.deepEqual(cat.models[0]!.efforts, ["none", "low", "medium", "high", "xhigh", "max"]);
 });
 
