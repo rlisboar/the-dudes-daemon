@@ -3995,6 +3995,70 @@ export class AgentRunner {
     this.activeTaskId = null;
   }
 
+  /**
+   * T-343 — memória EPISÓDICA no momento do done. A extração do compact só
+   * acontece quando o contexto explode; o fim de uma task é o ponto de maior
+   * densidade de conhecimento ("como é que isto se resolveu aqui"). One-shot
+   * na MESMA sessão (runOneShot faz resume em todos os runners) a pedir UMA
+   * entrada `{title, body}` com situação→abordagem que funcionou→armadilha,
+   * gravada como type=experience (não-pinada: recall-only, o hot-set só a
+   * recebe se alguém a fixar). Guards: agente idle (nunca escrever na sessão
+   * em voo), uma reflexão por task, cooldown por agente, e o fail-safe E2EE
+   * do saveExtractedMemory (sem relay, nada é gravado).
+   */
+  private reflectionInFlight = false;
+  private lastReflectionAt = 0;
+  private reflectedTaskIds = new Set<string>();
+  private static readonly REFLECTION_COOLDOWN_MS = 5 * 60_000;
+
+  async noteTaskDone(taskId: string, title?: string): Promise<void> {
+    if (this.stopped || this.reflectionInFlight) return;
+    if (this.currentState !== "idle") return;
+    if (!this.activeTaskId || (this.activeTaskId !== taskId)) return;
+    if (this.reflectedTaskIds.has(taskId)) return;
+    if (Date.now() - this.lastReflectionAt < AgentRunner.REFLECTION_COOLDOWN_MS) return;
+    const sid = this.opts.cliRunner === "claude" ? this.opts.resumeSessionId : this.messageSession.sessionId;
+    if (!sid) return; // sem sessão não há o que refletir
+    this.reflectionInFlight = true;
+    this.reflectedTaskIds.add(taskId);
+    if (this.reflectedTaskIds.size > 64) this.reflectedTaskIds.clear();
+    try {
+      const titleLine = title ? `Task title: "${title}"\n` : "";
+      const prompt =
+        "Reflect on the task you just completed in this conversation. " +
+        titleLine +
+        "Write ONE lesson about HOW it was solved in THIS project (what worked, what to avoid next time a similar task shows up). " +
+        "Skip it if the task was trivial, fully automated, or taught you nothing reusable. " +
+        "Write in the conversation's language. Output exactly one line: `EPISODE_JSON:` followed by a single-line JSON array with ONE element " +
+        "{\"title\": \"<short, <=120 chars>\", \"body\": \"<situation -> what worked -> pitfall>\"} or `EPISODE_JSON: []` to skip. No markdown, no fences." +
+        (this.opts.cliRunner ? "" : "");
+      const out = await this.runOneShot(prompt);
+      if (this.stopped) return;
+      const items = this.parseEpisodeJson(out);
+      if (items.length === 0) {
+        this.opts.onError("[episode] reflexão: nada a guardar");
+        return;
+      }
+      const existing = await this.fetchExistingMemories();
+      // proveniência EXPLÍCITA: quando a reflexão grava, o activeTaskId já foi
+      // limpo pelo clearActiveTask (o save é async e o clear é síncrono).
+      await this.saveExtractedMemory(items, existing, taskId);
+      this.lastReflectionAt = Date.now();
+      this.opts.onError(`[episode] reflexão gravada (task ${taskId})`);
+    } catch (e) {
+      this.opts.onError(`[episode] reflexão falhou: ${(e as Error).message}`);
+    } finally {
+      this.reflectionInFlight = false;
+    }
+  }
+
+  /** Parse tolerante de EPISODE_JSON (mesma robustez do MEMORY_JSON). */
+  private parseEpisodeJson(raw: string): MemoryExtractItem[] {
+    const { items } = parseAndStripMemory((raw || "").replace(/EPISODE_JSON:/g, "MEMORY_JSON:"));
+    // type FORÇADO: a lição de como resolver é sempre episódica.
+    return items.map((it) => ({ ...it, type: "experience" }));
+  }
+
   private memoryTitleNearDup(a: string, b: string): boolean {
     return memoryTitleNearDup(a, b);
   }
@@ -4007,7 +4071,13 @@ export class AgentRunner {
    *  não dedup-hit). Add ANTES, remove DEPOIS (sem transação — duplicata
    *  benigna é preferível a perda).
    *  Pin: só decision/preference por default (hot-set enxuto). */
-  private async saveExtractedMemory(items: Array<{ title: string; body: string; type: string; supersedes: string[] }>, existing: Array<{ id: string; title: string; body: string }> = []): Promise<void> {
+  private async saveExtractedMemory(
+    items: Array<{ title: string; body: string; type: string; supersedes: string[] }>,
+    existing: Array<{ id: string; title: string; body: string }> = [],
+    /** T-343: forçar proveniência quando o caller já limpiu a task ativa
+     *  (reflexão de task-done); por omissão usa activeTaskId (compact). */
+    taskIdOverride?: string,
+  ): Promise<void> {
     this.opts.onError(`[compact] memory extracted=${items.length}`);
     if (items.length === 0) return;
     const socket = this.opts.bridgeSocketPath;
@@ -4036,6 +4106,9 @@ export class AgentRunner {
         // Compact: default NÃO pin. Só decision/preference sobem pro hot-set
         // (fatos genéricos ficam no catálogo — recall).
         const pin = it.type === "decision" || it.type === "preference";
+        // T-343: reflexão de task-done passa override (activeTaskId já limpo
+        // pelo clear síncrono quando o save async corre).
+        const provTask = taskIdOverride ?? this.activeTaskId ?? undefined;
         const r = await this.postBridgeJson(socket, "memory_add", {
           title: it.title,
           body: it.body,
@@ -4045,7 +4118,7 @@ export class AgentRunner {
           supersedesId: supersedes[0] ?? undefined,
           // T-233: proveniência da task ativa — sinal autoritativo do server
           // (agent:send com taskId); ausente = sem o campo (retrocompat).
-          ...(this.activeTaskId ? { taskId: this.activeTaskId } : {}),
+          ...(provTask ? { taskId: provTask } : {}),
         });
         saved++;
         const newId = r?.memory?.id as string | undefined;

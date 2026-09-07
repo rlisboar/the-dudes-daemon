@@ -182,6 +182,9 @@ export interface MemoryInjectionEntry {
   scope: string;
   titleCipher: string;
   bodyCipher: string;
+  /** T-343: "user:<nome>" | "agent:<nome>" — permite ao daemon proteger
+   *  pins do dono no corte do hot-set (plaintext, não é campo E2EE). */
+  source?: string;
 }
 
 export interface MCPServerConfig {
@@ -281,7 +284,7 @@ export interface AgentSend {
  *  atribuído (sem staleness de proveniência). */
 export interface TaskUpdatedEv {
   type: "task:updated";
-  task: { id: string; status?: string; assigneeAgentId?: string | null };
+  task: { id: string; status?: string; assigneeAgentId?: string | null; titleCipher?: string };
 }
 export interface AgentClear { type: "agent:clear"; agentId: string }
 export interface AgentCompact { type: "agent:compact"; agentId: string; saveMemory?: boolean }

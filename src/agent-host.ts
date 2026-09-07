@@ -5,7 +5,7 @@ import { AgentRunner, type AgentRunnerOptions } from "./agent-runner.js";
 import { breadcrumb, captureWarn } from "./sentry.js";
 import { assertWorkspaceScoped, autoWorkspaceCwd, cloneRepoIfMissing, expandBasePath, findGitRoot, getWorkspaceRoot, isInsideRoot, repoCwd } from "./workspace.js";
 import { aadV2, E2EE_TABLE } from "@the-dudes/protocol/e2ee-fields";
-import { encryptForProject, isE2eeRequired, setE2eeRequired, redactCredentials, redactCredentialsDeep } from "./daemon-crypto.js";
+import { decryptForProject, encryptForProject, isE2eEncrypted, isE2eeRequired, setE2eeRequired, redactCredentials, redactCredentialsDeep } from "./daemon-crypto.js";
 import { classifyRunnerFailure } from "./runners/error-classifier.js";
 
 /** 1 enum operacional (paridade hung.soft). Classifica no plaintext ANTES do seal. */
@@ -159,6 +159,21 @@ export class AgentHost {
 
   clearActiveTask(agentId: string, taskId?: string): void {
     this.entries.get(agentId)?.runner?.clearActiveTask(taskId);
+  }
+
+  /** T-343: reflexão episódica no done (best-effort; o runner impõe guards
+   *  de idle/sessão/cooldown). titleCipher é o título cifrado do task (o
+   *  daemon decripta com a key do projeto do agente). */
+  noteTaskDone(agentId: string, taskId: string, titleCipher?: string): void {
+    const e = this.entries.get(agentId);
+    if (!e?.runner || !e.projectId) return;
+    let title: string | undefined;
+    if (titleCipher) {
+      title = isE2eEncrypted(titleCipher)
+        ? decryptForProject(titleCipher, e.projectId, aadV2({ projectId: e.projectId, table: E2EE_TABLE.TASKS, field: "title" })) ?? undefined
+        : titleCipher;
+    }
+    void e.runner.noteTaskDone(taskId, title);
   }
 
   /** Vincula/desvincula o agente a um chat do Telegram (espelho de saída). */

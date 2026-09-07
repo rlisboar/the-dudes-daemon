@@ -1,8 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  applyMemoryBlockBudget,
   applyMemoryCharBudget,
   memoryBodySame,
+  memoryBlockForType,
   memoryManualDupDecision,
   memoryPinBudgetWarning,
   memoryQueryMatch,
@@ -41,6 +43,76 @@ test("applyMemoryCharBudget prefers sticky under pressure", () => {
   // decision block is "D"*300
   assert.ok(kept.some((t) => t.length === 300 && t[0] === "D"));
   assert.ok(dropped >= 1);
+});
+
+/* ── T-343: hot-set em blocos etiquetados ─────────────────────────────── */
+
+test("applyMemoryBlockBudget: bloco grande não expulsca decision pequena (floor)", () => {
+  // budget 1000: decisions floor=300, state floor=300, fact/other emprestam.
+  const entries = [
+    { type: "fact", text: "f".repeat(500), source: "agent:bot" },
+    { type: "fact", text: "g".repeat(500), source: "agent:bot" },
+    { type: "decision", text: "D".repeat(100) },
+  ];
+  const { sections, dropped } = applyMemoryBlockBudget(entries, 1000);
+  const dec = sections.find((s) => s.label === "decisions");
+  assert.ok(dec, "bloco decisions presente");
+  assert.ok(dec!.items.some((t) => t.startsWith("D")));
+  assert.ok(dropped >= 1, "facts a mais ficam de fora");
+});
+
+test("applyMemoryBlockBudget: folga de bloco vazio é emprestada", () => {
+  // Sem decisions/preferences/experiences → os 30%+20%+10% emprestam ao state.
+  const entries = Array.from({ length: 5 }, (_, i) => ({
+    type: "fact",
+    text: `f${i}` + "x".repeat(180),
+    source: "agent:bot",
+  }));
+  const { sections, dropped } = applyMemoryBlockBudget(entries, 1000);
+  const state = sections.find((s) => s.label === "state");
+  assert.ok(state);
+  // 5×~182=910 cabe tudo porque a folga dos blocos vazios foi emprestada.
+  assert.equal(state!.items.length, 5);
+  assert.equal(dropped, 0);
+});
+
+test("applyMemoryBlockBudget: pin do dono sobrevive a notas do agente no mesmo bloco", () => {
+  const entries = [
+    { type: "fact", text: "a".repeat(280), source: "agent:bot" },
+    { type: "fact", text: "u".repeat(120), source: "user:dono" },
+  ];
+  const { sections } = applyMemoryBlockBudget(entries, 300);
+  const state = sections.find((s) => s.label === "state");
+  assert.ok(state);
+  assert.ok(state!.items.some((t) => t.startsWith("u")), "pin do dono entra");
+});
+
+test("applyMemoryBlockBudget: experience tem bloco próprio; tipo legado cai em state", () => {
+  assert.equal(memoryBlockForType("experience").label, "experiences");
+  assert.equal(memoryBlockForType("task_state").label, "state");
+  assert.equal(memoryBlockForType("fact").label, "state");
+  const { sections } = applyMemoryBlockBudget(
+    [{ type: "experience", text: "e".repeat(50) }],
+    1000,
+  );
+  assert.equal(sections[0]!.label, "experiences");
+  assert.ok(sections[0]!.usage.includes("resolvidas"));
+});
+
+test("applyMemoryBlockBudget: entrada gigante única não deixa o hot-set vazio", () => {
+  const { sections, dropped } = applyMemoryBlockBudget(
+    [{ type: "decision", text: "D".repeat(5000) }],
+    1000,
+  );
+  assert.equal(sections.length, 1);
+  assert.equal(sections[0]!.items.length, 1);
+  assert.equal(dropped, 0);
+});
+
+test("ALLOWED_TYPES: experience sobrevive ao parser do auto-extract", () => {
+  const raw = 'MEMORY_JSON: [{"title":"T","body":"B","type":"experience"}]';
+  const { items } = parseAndStripMemory(raw);
+  assert.equal(items[0]!.type, "experience");
 });
 
 test("parseAndStripMemory extracts JSON line", () => {

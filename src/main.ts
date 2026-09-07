@@ -41,7 +41,7 @@ import { dispatchWebhook } from "./webhook-dispatch.js";
 import { ModelDiscovery } from "./model-discovery.js";
 import { parseGitPorcelain } from "./git-status.js";
 import { createTaskWorktree, removeTaskWorktree } from "./task-workspace.js";
-import { applyMemoryCharBudget, MEMORY_HOTSET_BUDGET_CHARS } from "./memory-utils.js";
+import { applyMemoryBlockBudget, MEMORY_HOTSET_BUDGET_CHARS, type MemoryBlockItem } from "./memory-utils.js";
 
 // Embutida no build a partir do package.json (ver build.mjs); fallback pro
 // modo dev (tsx direto, sem define).
@@ -680,7 +680,7 @@ export class DaemonClient {
           // Server é cego a tokens (cipher); corte real é aqui.
           // T-342: o budget é o MESMO valor que o bridge reporta no aviso de
           // pin — uma única fonte (memory-utils).
-          const decoded: Array<{ type: string; text: string }> = [];
+          const decoded: MemoryBlockItem[] = [];
           for (const m of msg.memory) {
             const title = isE2eEncrypted(m.titleCipher)
               ? decryptForProject(m.titleCipher, msg.projectId, aadV2({ projectId: msg.projectId, table: E2EE_TABLE.MEMORIES, field: "title" }))
@@ -689,17 +689,22 @@ export class DaemonClient {
               ? decryptForProject(m.bodyCipher, msg.projectId, aadV2({ projectId: msg.projectId, table: E2EE_TABLE.MEMORIES, field: "body" }))
               : m.bodyCipher;
             if (title === null || body === null) continue;
-            decoded.push({ type: m.type || "fact", text: `### [${m.type}] ${title}\n${body}` });
+            decoded.push({ type: m.type || "fact", text: `### [${m.type}] ${title}\n${body}`, source: m.source });
           }
-          const { kept: entries, dropped, used } = applyMemoryCharBudget(decoded, MEMORY_HOTSET_BUDGET_CHARS, 0.45);
+          // T-343: blocos etiquetados com fatia própria + empréstimo de folga
+          // (em vez do monte único por prioridade de tipo).
+          const { sections, dropped, used } = applyMemoryBlockBudget(decoded, MEMORY_HOTSET_BUDGET_CHARS);
           if (dropped > 0) {
-            log("info", `memory budget: ${entries.length} injected (~${used} chars), ${dropped} dropped (over ${MEMORY_HOTSET_BUDGET_CHARS}) for ${spec.agent.id}`);
-            entries.push(`### [system] memória truncada\n${dropped} memória(s) omitida(s) por limite (decisions/preferences têm prioridade). Use \`recall\` para o resto.`);
+            log("info", `memory budget: ${decoded.length - dropped} injected (~${used} chars), ${dropped} dropped (over ${MEMORY_HOTSET_BUDGET_CHARS}) for ${spec.agent.id}`);
           }
-          if (entries.length > 0) {
-            const block = `## Project Memory\n\nNotas duráveis **deste agente** (não são copiadas para os outros). Catálogo do projeto: use a tool \`recall\`. Verifique antes de confiar em detalhes específicos.\n\n${entries.join("\n\n")}`;
+          if (sections.length > 0 || dropped > 0) {
+            const parts = sections.map((s) => `## ${s.heading}\n<!-- ${s.usage} -->\n\n${s.items.join("\n\n")}`);
+            if (dropped > 0) {
+              parts.push(`## Nota do sistema\n${dropped} memória(s) omitida(s) por limite do hot-set (cada bloco tem fatia própria; a folga foi emprestada por ordem decision→preference→experience→reference→fact). Use \`recall\` para o resto.`);
+            }
+            const block = `## Project Memory\n\nNotas duráveis **deste agente**, em blocos (não são copiadas para os outros). Catálogo do projeto: use a tool \`recall\`. Verifique antes de confiar em detalhes específicos.\n\n${parts.join("\n\n")}`;
             spec.agent = { ...spec.agent, systemPrompt: `${spec.agent.systemPrompt}\n\n---\n\n${block}` };
-            log("info", `injected ${entries.length} memory entries into ${spec.agent.id} system prompt`);
+            log("info", `injected ${decoded.length - dropped} memory entries in ${sections.length} blocks into ${spec.agent.id} system prompt`);
           }
         }
         log("info", `spawn ${spec.agent.name} (${spec.agent.id}) cfg=${resolvedCwd} runner=${spec.agent.cliRunner ?? "claude"}`);
@@ -789,6 +794,10 @@ export class DaemonClient {
         // reatribuição mais nova (clear só se bate com a ativa).
         const t = (msg as TaskUpdatedEv).task;
         if (t.status === "done" && t.assigneeAgentId) {
+          // T-343: reflexão episódica ANTES do clear — o runner exige que a
+          // task refletida seja a ativa (best-effort; guards de idle/cooldown
+          // dentro do runner).
+          this.host.noteTaskDone(t.assigneeAgentId, t.id, t.titleCipher);
           this.host.clearActiveTask(t.assigneeAgentId, t.id);
         }
         return;
