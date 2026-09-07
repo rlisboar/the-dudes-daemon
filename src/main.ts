@@ -41,7 +41,7 @@ import { dispatchWebhook } from "./webhook-dispatch.js";
 import { ModelDiscovery } from "./model-discovery.js";
 import { parseGitPorcelain } from "./git-status.js";
 import { createTaskWorktree, removeTaskWorktree } from "./task-workspace.js";
-import { applyMemoryCharBudget } from "./memory-utils.js";
+import { applyMemoryCharBudget, MEMORY_HOTSET_BUDGET_CHARS } from "./memory-utils.js";
 
 // Embutida no build a partir do package.json (ver build.mjs); fallback pro
 // modo dev (tsx direto, sem define).
@@ -678,7 +678,8 @@ export class DaemonClient {
         if (msg.projectId && msg.memory && msg.memory.length > 0) {
           // Budget token-aware + reserva p/ decision/preference (sticky).
           // Server é cego a tokens (cipher); corte real é aqui.
-          const MEMORY_CHAR_BUDGET = 8000;
+          // T-342: o budget é o MESMO valor que o bridge reporta no aviso de
+          // pin — uma única fonte (memory-utils).
           const decoded: Array<{ type: string; text: string }> = [];
           for (const m of msg.memory) {
             const title = isE2eEncrypted(m.titleCipher)
@@ -690,9 +691,9 @@ export class DaemonClient {
             if (title === null || body === null) continue;
             decoded.push({ type: m.type || "fact", text: `### [${m.type}] ${title}\n${body}` });
           }
-          const { kept: entries, dropped, used } = applyMemoryCharBudget(decoded, MEMORY_CHAR_BUDGET, 0.45);
+          const { kept: entries, dropped, used } = applyMemoryCharBudget(decoded, MEMORY_HOTSET_BUDGET_CHARS, 0.45);
           if (dropped > 0) {
-            log("info", `memory budget: ${entries.length} injected (~${used} chars), ${dropped} dropped (over ${MEMORY_CHAR_BUDGET}) for ${spec.agent.id}`);
+            log("info", `memory budget: ${entries.length} injected (~${used} chars), ${dropped} dropped (over ${MEMORY_HOTSET_BUDGET_CHARS}) for ${spec.agent.id}`);
             entries.push(`### [system] memória truncada\n${dropped} memória(s) omitida(s) por limite (decisions/preferences têm prioridade). Use \`recall\` para o resto.`);
           }
           if (entries.length > 0) {

@@ -9,14 +9,13 @@ export type MemoryExtractItem = {
   supersedes: string[];
 };
 
-const ALLOWED_TYPES = new Set(["fact", "decision", "reference", "preference", "task_state"]);
+const ALLOWED_TYPES = new Set(["fact", "decision", "reference", "preference"]);
 
 /** Prioridade no budget de inject: decision/preference primeiro. */
 export function memoryTypePriority(type: string): number {
   if (type === "decision") return 0;
   if (type === "preference") return 1;
   if (type === "reference") return 2;
-  if (type === "task_state") return 3;
   return 4; // fact / other
 }
 

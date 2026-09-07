@@ -599,7 +599,10 @@ export interface TaskComment {
 
 export type MemoryScope = "project" | "agent";
 
-export type MemoryType = "fact" | "decision" | "reference" | "preference" | "task_state";
+// T-342: "task_state" removido — nenhum produtor o emitia e nenhuma prompt
+// o descrevia (zumbi). Linhas antigas com esse type continuam a ler/funcionar
+// (são string no wire; o UI renderiza com fallback de cor).
+export type MemoryType = "fact" | "decision" | "reference" | "preference";
 
 /** Memory entry (E2EE title/body). Hot-set no system prompt: só
  *  scope=agent do próprio agente (evita duplicar o mesmo texto em N
@@ -619,7 +622,6 @@ export interface MemoryEntry {
   bodyCipher: string;
   tags: string[];
   pinned: boolean;
-  confidence?: number | null;
   /** provenance: who/which model wrote it */
   source?: string | null;
   supersedesId?: string | null;
@@ -1412,8 +1414,8 @@ export type ClientCommand =
   | { type: "lock_task"; id: string }
   | { type: "unlock_task"; id: string }
   | { type: "add_task_comment"; taskId: string; authorName: string; content: string }
-  | { type: "add_memory"; memory: { titleCipher: string; bodyCipher: string; type?: MemoryType; scope?: MemoryScope; agentId?: string | null; tags?: string[]; pinned?: boolean; confidence?: number | null; contentHash?: string; supersedesId?: string | null; goalId?: string | null; taskId?: string | null; planId?: string | null; expiresAt?: string | null } }
-  | { type: "update_memory"; id: string; patch: { titleCipher?: string; bodyCipher?: string; type?: MemoryType; scope?: MemoryScope; agentId?: string | null; tags?: string[]; pinned?: boolean; confidence?: number | null; supersedesId?: string | null; goalId?: string | null; taskId?: string | null; planId?: string | null; archivedAt?: string | null; expiresAt?: string | null } }
+  | { type: "add_memory"; memory: { titleCipher: string; bodyCipher: string; type?: MemoryType; scope?: MemoryScope; agentId?: string | null; tags?: string[]; pinned?: boolean; contentHash?: string; supersedesId?: string | null; goalId?: string | null; taskId?: string | null; planId?: string | null; expiresAt?: string | null } }
+  | { type: "update_memory"; id: string; patch: { titleCipher?: string; bodyCipher?: string; type?: MemoryType; scope?: MemoryScope; agentId?: string | null; tags?: string[]; pinned?: boolean; supersedesId?: string | null; goalId?: string | null; taskId?: string | null; planId?: string | null; archivedAt?: string | null; expiresAt?: string | null } }
   | { type: "remove_memory"; id: string }
   | { type: "clear_memories" }
   | { type: "bulk_memories"; ids: string[]; action: "pin" | "unpin" | "archive" | "unarchive" | "delete" | "set_scope_project" | "set_scope_agent" | "approve_review"; agentId?: string | null }

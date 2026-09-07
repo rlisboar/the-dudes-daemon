@@ -912,7 +912,7 @@ server.tool(
   }
 );
 
-const MEMORY_TYPES = ["fact", "decision", "reference", "preference", "task_state"] as const;
+const MEMORY_TYPES = ["fact", "decision", "reference", "preference"] as const;
 
 /**
  * T-342: varre TODAS as memórias visíveis (paginado, 200/página até `meta.total`,
@@ -940,7 +940,7 @@ server.tool(
   {
     title: z.string().describe("Short one-line title"),
     body: z.string().describe("The fact/decision/reference to remember"),
-    type: z.enum(MEMORY_TYPES).optional().describe("fact (default) | decision | reference | preference | task_state"),
+    type: z.enum(MEMORY_TYPES).optional().describe("fact (default) | decision | reference | preference"),
     scope: z.enum(["project", "agent"]).optional().describe("agent = yours only (default); project = shared catalog (recall only)"),
     pinned: z.boolean().optional().describe("true = hot-set injection (opt-in). Default false."),
     tags: z.array(z.string()).optional().describe("Optional short tags for filtering"),
@@ -953,8 +953,8 @@ server.tool(
       // existentes → skip (corpo igual) ou supersede (corpo novo).
       let existing: Array<{ id: string; title?: string; body?: string }> = [];
       try {
-        const lr = await fetchAllVisibleMemories();
-        existing = (lr.memories ?? []).map((m: any) => ({
+        const all = await fetchAllVisibleMemories();
+        existing = all.map((m) => ({
           id: typeof m?.id === "string" ? m.id : "",
           title: typeof m?.title === "string" ? m.title : "",
           body: typeof m?.body === "string" ? m.body : "",
