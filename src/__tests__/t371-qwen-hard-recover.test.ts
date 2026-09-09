@@ -259,11 +259,14 @@ test("T-371 (c-integration): turno qwen em loop é abortado pela janela anti-rep
       5000,
       "aborto por janela anti-repetição",
     );
-    // o turno abortado foi recuperado (busy cai, ou o drain do recover já
-    // re-pôs a mensagem em voo — em ambos os casos o loop acabou):
-    assert.ok(
-      a.messageSession.busy === false || a.inflightPerMessage?.attempt === 1,
-      "loop tem de terminar em hard recover, não em turno eterno",
+    // O warn dispara no SIGKILL; recoverHungTurn só corre no `close` do
+    // filho. Assert imediato era flake (~500ms no CI) com busy ainda true
+    // e attempt 0. Espera o recover: busy cai, ou o drain já re-pôs a
+    // mensagem (attempt 1) — em ambos o loop acabou.
+    await until(
+      () => a.messageSession.busy === false || a.inflightPerMessage?.attempt === 1,
+      5000,
+      "hard recover após loop",
     );
   }));
 
