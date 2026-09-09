@@ -210,12 +210,14 @@ function footer(tasks: boolean, teammates: boolean): string {
   return parts.join(" ");
 }
 
-// T-391 — prosa do controller, no mesmo ponto único dos headers. Entra só para
-// quem tem o papel (o runner decide); não depende de features — desligar
-// `teammates` não cega o save/stop, que são as mãos do dono.
+// T-391/T-397 — prosa do controller, no mesmo ponto único dos headers. Entra só
+// para quem tem o papel (o runner decide); não depende de features — desligar
+// `teammates` não cega o roster, que são as mãos do dono.
 const CONTROLLER = `# Team roster (controller — the owner's hands)
-- \`mcp__the-dudes__save_agent\` (args: the AgentSpec itself — \`name\` + \`role\` required) — register a teammate with the same spec the UI uses. It NEVER starts: a saved agent is born idle and **the owner starts it by hand**. You cannot create another controller, nor rewrite yourself (400).
+- \`mcp__the-dudes__save_agent\` (args: the AgentSpec itself — \`name\` + \`role\` required) — register a teammate with the same spec the UI uses. It never starts the agent: a saved agent is born idle and \`start_agent\` is what turns it on. You cannot create another controller, nor rewrite yourself (400).
+- \`mcp__the-dudes__start_agent\` (args: {name, confirmName}) — start a teammate by exact name, said twice. Same guards as stop: mismatched names 400, no such name 404, ambiguous name 409 with the candidate ids, controller target (yourself included) 400. Already running is a success; a spawn that cannot happen (no daemon, no cwd, runner unavailable) comes back 400 with the reason.
 - \`mcp__the-dudes__stop_agent\` (args: {name, confirmName}) — stop a teammate by exact name, said twice. Ambiguous name → 409 with the candidate ids: pick one and retry. Stopping does not touch the task board — tasks keep their status and lock.
+- \`mcp__the-dudes__remove_agent\` (args: {name, confirmName}) — remove a teammate from the roster: it is stopped first if running, and its subordinates lose their manager. Like stop, it does not touch the task board. A controller target (yourself included) is 400.
 - You manage the roster, not the work: closing tasks and priorities are the PM's, as written in the task.`;
 
 export function buildSystemPromptHeader(features?: ContextFeatures, opts?: { controller?: boolean }): string {

@@ -1540,10 +1540,16 @@ export class AgentRunner {
       "mcp__the-dudes__send_webhook",
       "mcp__the-dudes__list_webhooks",
     ];
-    // T-391 A3/A5: as tools do controller só entram na lista de quem É
-    // controller — num projeto com teammates ligado, um BACKEND não as vê.
+    // T-391 A3/A5 (T-397: + start/remove): as tools do controller só entram na
+    // lista de quem É controller — num projeto com teammates ligado, um BACKEND
+    // não as vê.
     if (this.info.role === CONTROLLER_ROLE) {
-      baseAllowed.push("mcp__the-dudes__save_agent", "mcp__the-dudes__stop_agent");
+      baseAllowed.push(
+        "mcp__the-dudes__save_agent",
+        "mcp__the-dudes__stop_agent",
+        "mcp__the-dudes__start_agent",
+        "mcp__the-dudes__remove_agent",
+      );
     }
     const extraAllowed: string[] = [];
     if (this.opts.extraMcpServers) {

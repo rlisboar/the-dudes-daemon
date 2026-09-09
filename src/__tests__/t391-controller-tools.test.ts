@@ -44,11 +44,25 @@ test("T-391 A3/A5: backend com teammates ligado NÃO recebe save_agent/stop_agen
   assert.equal(bridgeToolAllowed("approve_action", new Set(), "member"), true, "approve_action é sempre on");
 });
 
-test("T-391 rulings: sem TOOL_GROUP \"control\", sem mapear as ops de papel a \"teammates\", só as duas tools são gated", () => {
+test("T-397 A3/A5: start_agent/remove_agent seguem o papel, não a feature (backend não as vê)", () => {
+  const on = new Set(["teammates", "tasks", "filelock", "memory", "goals", "credentials", "webhooks"]);
+  assert.equal(bridgeToolAllowed("start_agent", on, "backend"), false);
+  assert.equal(bridgeToolAllowed("remove_agent", on, "backend"), false);
+  assert.equal(bridgeToolAllowed("start_agent", on, CONTROLLER_ROLE), true);
+  assert.equal(bridgeToolAllowed("remove_agent", on, CONTROLLER_ROLE), true);
+  assert.equal(bridgeToolAllowed("start_agent", null, "backend"), false, "grupos=null não liberta quem não tem papel");
+  assert.equal(bridgeToolAllowed("start_agent", null, CONTROLLER_ROLE), true);
+  assert.equal(bridgeToolAllowed("remove_agent", on, "Controller"), false, "papel é exacto");
+});
+
+test("T-391 rulings: sem TOOL_GROUP \"control\", sem mapear as ops de papel a \"teammates\", só as tools de roster são gated", () => {
   assert.ok(!Object.values(TOOL_GROUP).includes("control"), "grupo \"control\" foi inventado");
-  assert.deepEqual(Object.keys(ROLE_GATED_TOOLS).sort(), ["save_agent", "stop_agent"]);
-  assert.ok(!("save_agent" in TOOL_GROUP) && !("stop_agent" in TOOL_GROUP), "ops de papel não têm grupo de feature");
-  assert.equal(ROLE_GATED_TOOLS.save_agent, CONTROLLER_ROLE);
+  // T-397: quatro ops de roster — criar, parar, ligar, excluir. Nenhuma é feature.
+  assert.deepEqual(Object.keys(ROLE_GATED_TOOLS).sort(), ["remove_agent", "save_agent", "start_agent", "stop_agent"]);
+  for (const tool of ["save_agent", "stop_agent", "start_agent", "remove_agent"]) {
+    assert.ok(!(tool in TOOL_GROUP), `${tool} não pode ter grupo de feature`);
+    assert.equal(ROLE_GATED_TOOLS[tool], CONTROLLER_ROLE);
+  }
   assert.equal(CONTROLLER_ROLE, "controller");
 });
 
@@ -64,7 +78,7 @@ test("T-391: env do bridge leva o papel só quando o runner o declara (ponto ún
 test("T-391: --allowed-tools do claude só lista as tools de controller para quem é controller", () => {
   assert.match(
     RUNNER,
-    /if \(this\.info\.role === CONTROLLER_ROLE\) \{\s*baseAllowed\.push\("mcp__the-dudes__save_agent", "mcp__the-dudes__stop_agent"\);\s*\}/,
+    /if \(this\.info\.role === CONTROLLER_ROLE\) \{\s*baseAllowed\.push\(\s*"mcp__the-dudes__save_agent",\s*"mcp__the-dudes__stop_agent",\s*"mcp__the-dudes__start_agent",\s*"mcp__the-dudes__remove_agent",\s*\);\s*\}/,
   );
 });
 
@@ -80,6 +94,18 @@ test("T-391: prompt do controller no ponto único, keyed só no papel (teammates
   assert.match(sozinhos, /save_agent/, "teammates desligado cegou a prosa do controller");
 });
 
+test("T-397: prompt cobre start_agent/remove_agent e o save já não diz que inicia é o dono", () => {
+  const com = buildSystemPromptHeader(undefined, { controller: true });
+  assert.match(com, /start_agent/);
+  assert.match(com, /remove_agent/);
+  // A frase congelada a remover: o save passou a apontar para o start_agent.
+  assert.doesNotMatch(com, /owner starts/i, "save_agent ainda diz que quem inicia é o dono");
+  // save_agent continua a prometer que não liga: é o start_agent que liga.
+  const saveLine = com.split("\n").find((l) => l.includes("save_agent")) ?? "";
+  assert.match(saveLine, /never starts/i);
+  assert.match(saveLine, /start_agent/);
+});
+
 test("T-391: as tools MCP chamam as ops HTTP da T-390 sem reinventar corpo nem schema", () => {
   assert.match(BRIDGE, /server\.tool\(\s*"save_agent"/);
   assert.match(BRIDGE, /postJSON\("agent_save", \{ spec \}\)/);
@@ -92,12 +118,25 @@ test("T-391: as tools MCP chamam as ops HTTP da T-390 sem reinventar corpo nem s
   assert.match(BRIDGE, /bridgeToolAllowed\(name, _enabledGroups, _agentRole\)/);
 });
 
+test("T-397: as tools MCP start/remove batem nas ops HTTP gémeas, corpo {name, confirmName}", () => {
+  assert.match(BRIDGE, /server\.tool\(\s*"start_agent"/);
+  assert.match(BRIDGE, /server\.tool\(\s*"remove_agent"/);
+  assert.match(BRIDGE, /postJSON\("agent_start", \{ name, confirmName \}\)/);
+  assert.match(BRIDGE, /postJSON\("agent_remove", \{ name, confirmName \}\)/);
+  // O save_agent já não canta a frase do dono na descrição nem no resultado.
+  assert.doesNotMatch(BRIDGE, /quem inicia é o dono/, "bridge ainda canta a frase velha");
+  assert.doesNotMatch(BRIDGE, /the OWNER starts them by hand/i, "descrição ainda aponta o dono");
+});
+
 test("T-391: kind do relay é o op do path — nunca o nome MCP save_agent; agent_stop não passa do relay", () => {
   assert.match(RELAY, /\| "agent_save"/);
   assert.match(RELAY, /kind === "agent_save"/);
   assert.match(RELAY, /plans_apply_tasks\|agent_save\)\$/);
   assert.ok(!/"save_agent"/.test(RELAY), "string literal \"save_agent\" não pode ser kind do relay");
   assert.ok(!RELAY.includes("agent_stop"), "agent_stop não tem campos de catálogo — não entra no relay");
+  // T-397: start/remove são cru como o stop — o nome é identificador.
+  assert.ok(!RELAY.includes("agent_start"), "agent_start não entra no relay de cifra");
+  assert.ok(!RELAY.includes("agent_remove"), "agent_remove não entra no relay de cifra");
 });
 
 // --- relay ponta-a-ponta: cifra em voo, 409 fail-closed, stop pass-through ---
@@ -176,12 +215,20 @@ test("T-391 relay POST: agent_save sobe cifrado, agent_stop passa cru, required 
     assert.equal(r2.status, 200);
     assert.deepEqual(JSON.parse(vistos[1]!.body), { name: "qa2", confirmName: "qa2" });
 
+    // T-397: agent_start/agent_remove são cru como o stop — mesmo corpo, sem cifra
+    const rStart = await post("a1", "agent_start", { name: "qa2", confirmName: "qa2" });
+    assert.equal(rStart.status, 200);
+    assert.deepEqual(JSON.parse(vistos[2]!.body), { name: "qa2", confirmName: "qa2" });
+    const rRemove = await post("a1", "agent_remove", { name: "qa2", confirmName: "qa2" });
+    assert.equal(rRemove.status, 200);
+    assert.deepEqual(JSON.parse(vistos[3]!.body), { name: "qa2", confirmName: "qa2" });
+
     // e2eeRequired sem chave: 409 do próprio relay, upstream nunca vê o request
     setE2eeRequired(PID_SEM_CHAVE, true);
     try {
       const r3 = await post("a-sem-chave", "agent_save", { spec: { name: "x", role: "r", systemPrompt: "claro" } });
       assert.equal(r3.status, 409);
-      assert.equal(vistos.length, 2, "409 vazou pro upstream");
+      assert.equal(vistos.length, 4, "409 vazou pro upstream");
     } finally {
       setE2eeRequired(PID_SEM_CHAVE, false);
     }

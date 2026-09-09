@@ -220,14 +220,15 @@ server.tool(
   }
 );
 
-// T-391 — Controller MVP: as duas ops batem nas HTTP `agent_save`/`agent_stop`
-// da T-390 (gate de papel lá, não aqui — aqui o runner já nem registrou estas
-// tools para não-controllers). `save_agent` nunca dá start: o server nasce com
-// running:false e quem inicia é o dono. Erros do server (400/403/404/409)
-// chegam via postJSON com status+corpo no texto — sem vazar stack, sem engolir.
+// T-391/T-397 — Controller MVP: as quatro ops batem nas HTTP `agent_save`/
+// `agent_stop`/`agent_start`/`agent_remove` da T-390/T-397 (gate de papel lá,
+// não aqui — aqui o runner já nem registrou estas tools para não-controllers).
+// `save_agent` nunca dá start: o server nasce com running:false; quem liga é o
+// `start_agent`. Erros do server (400/403/404/409) chegam via postJSON com
+// status+corpo no texto — sem vazar stack, sem engolir.
 server.tool(
   "save_agent",
-  "Register a teammate agent with the SAME AgentSpec as the UI's save_agent (name + role required; everything else optional). It does NOT start the agent: saved agents are born idle and the OWNER starts them by hand. You cannot create another controller nor rewrite yourself (both are 400).",
+  "Register a teammate agent with the SAME AgentSpec as the UI's save_agent (name + role required; everything else optional). It never starts the agent: saved agents are born idle — `start_agent` is what turns one on. You cannot create another controller nor rewrite yourself (both are 400).",
   AGENT_SPEC_SHAPE,
   async (spec: Record<string, unknown>) => {
     try {
@@ -238,7 +239,7 @@ server.tool(
       return {
         content: [{
           type: "text",
-          text: `agente ${name} salvo (id ${a.id ?? "?"}, role ${role}, running=${a.running === true}, state ${a.state ?? "?"}) — não iniciado; quem inicia é o dono.`,
+          text: `agente ${name} salvo (id ${a.id ?? "?"}, role ${role}, running=${a.running === true}, state ${a.state ?? "?"}) — parado; use start_agent para o ligar.`,
         }],
       };
     } catch (e) {
@@ -260,6 +261,44 @@ server.tool(
       };
     } catch (e) {
       return { content: [{ type: "text", text: `stop_agent falhou: ${(e as Error).message}` }], isError: true };
+    }
+  }
+);
+
+// T-397 — ligar e excluir são os gémeos do stop: mesmo corpo {name,
+// confirmName}, mesma escala de recusas (400 forma/alvo-controller, 404,
+// 409+ids). start responde 200 também quando o alvo já está vivo — o pedido é
+// "quero este vivo", não "arranca do zero".
+server.tool(
+  "start_agent",
+  "Start a teammate by exact name, said twice (name + confirmName). Same guards as stop_agent: 400 when the names differ, 404 when no agent has that name, 409 with the candidate ids when the name is ambiguous, 400 when the target is a controller (including yourself) or the spawn cannot happen (no daemon, no cwd, runner unavailable). Already running is a success, not an error.",
+  { name: z.string().describe("Exact agent name"), confirmName: z.string().describe("The same name, typed again") },
+  async ({ name, confirmName }) => {
+    try {
+      const r = await postJSON("agent_start", { name, confirmName });
+      const s = r.started ?? {};
+      return {
+        content: [{ type: "text", text: `agente ${s.name ?? name} iniciado (id ${s.id ?? "?"}).` }],
+      };
+    } catch (e) {
+      return { content: [{ type: "text", text: `start_agent falhou: ${(e as Error).message}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  "remove_agent",
+  "Remove a teammate from the roster by exact name, said twice (name + confirmName). If it is running, removal stops it first; subordinates stay but lose their manager. Does not touch the task board: tasks keep their status/lock and their removed assignee. Refuses a controller target (including yourself).",
+  { name: z.string().describe("Exact agent name"), confirmName: z.string().describe("The same name, typed again") },
+  async ({ name, confirmName }) => {
+    try {
+      const r = await postJSON("agent_remove", { name, confirmName });
+      const s = r.removed ?? {};
+      return {
+        content: [{ type: "text", text: `agente ${s.name ?? name} removido (id ${s.id ?? "?"}).` }],
+      };
+    } catch (e) {
+      return { content: [{ type: "text", text: `remove_agent falhou: ${(e as Error).message}` }], isError: true };
     }
   }
 );

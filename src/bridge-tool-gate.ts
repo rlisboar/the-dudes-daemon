@@ -23,6 +23,9 @@ export const CONTROLLER_ROLE = "controller";
 export const ROLE_GATED_TOOLS: Readonly<Record<string, string>> = Object.freeze({
   save_agent: CONTROLLER_ROLE,
   stop_agent: CONTROLLER_ROLE,
+  // T-397: liga/remove são as mesmas mãos do dono — papel, não feature.
+  start_agent: CONTROLLER_ROLE,
+  remove_agent: CONTROLLER_ROLE,
 });
 
 /** Feature do projeto que cada tool exige (ausente = sempre registrada). */
