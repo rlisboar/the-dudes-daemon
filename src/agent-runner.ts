@@ -54,6 +54,7 @@ import { buildOpenCodeAgentConfig, OPENCODE_MANAGED_AGENT } from "./runners/open
 import { randomUUID } from "node:crypto";
 import { PerMessageSessionState } from "./runners/message-session.js";
 import { buildAgentContext, buildInitialMessage, buildSystemPromptHeader, buildWorkspacePrompt } from "./runners/prompts.js";
+import { CONTROLLER_ROLE } from "./bridge-tool-gate.js";
 import { claudeThinkingEffort, codexEffort, providerModelParts, qwenConfigContextLimit, qwenReasoningEffort, resolveContextLimit, resolveContextLimitKnown } from "./runners/model-policy.js";
 import { resolveOcCatalogContextLimit } from "./model-discovery.js";
 import { classifyRunnerFailure, isAbortedFailure, isApiErrorMessage, isAuthenticationFailure, isLoopStopMessage, isMissingSessionFailure as isMissingSessionMessage } from "./runners/error-classifier.js";
@@ -490,7 +491,12 @@ export class AgentRunner {
 
   private promptContext(summary?: string, addon?: string) {
     return {
-      capabilityHeader: buildSystemPromptHeader(this.opts.features),
+      // T-391: a prosa do controller entra só para quem tem o papel — os três
+      // injetores (env do bridge, --allowed-tools, prompt) lêem o mesmo
+      // this.info.role, nenhum depende de features do projeto.
+      capabilityHeader: buildSystemPromptHeader(this.opts.features, {
+        controller: this.info.role === CONTROLLER_ROLE,
+      }),
       role: this.info.role,
       systemPrompt: this.info.systemPrompt,
       workspace: this.workspaceInfo(),
@@ -1264,6 +1270,9 @@ export class AgentRunner {
       tokenFile: this.runtimeFiles.tokenFile(),
       features: this.featuresEnv(),
       socketPath: this.opts.bridgeSocketPath ?? undefined,
+      // T-391: único ponto onde o papel sai do runner e chega ao bridge (pelos
+      // 4 config writers, um só spread). O bridge omite o que o papel não é.
+      role: this.info.role,
     });
   }
 
@@ -1531,6 +1540,11 @@ export class AgentRunner {
       "mcp__the-dudes__send_webhook",
       "mcp__the-dudes__list_webhooks",
     ];
+    // T-391 A3/A5: as tools do controller só entram na lista de quem É
+    // controller — num projeto com teammates ligado, um BACKEND não as vê.
+    if (this.info.role === CONTROLLER_ROLE) {
+      baseAllowed.push("mcp__the-dudes__save_agent", "mcp__the-dudes__stop_agent");
+    }
     const extraAllowed: string[] = [];
     if (this.opts.extraMcpServers) {
       for (const name of Object.keys(this.opts.extraMcpServers)) {

@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { randomBytes, publicEncrypt, createPublicKey, constants } from "node:crypto";
 import {
+  AGENT_FIELDS,
   BOARD_ANNOTATION_FIELDS,
   BOARD_STEP_FIELDS,
   BOARD_TEXT_FIELDS,
@@ -389,4 +390,39 @@ test("T-103 daemon: messages.images AAD cifra bytes; AAD content não abre", () 
   assert.ok(cifradoV2(blob));
   assert.deepEqual(decryptBytesForProject(blob, PID, aad), raw);
   assert.equal(decryptBytesForProject(blob, PID, aadV2({ projectId: PID, table: E2EE_TABLE.MESSAGES, field: "content" })), null);
+});
+
+test("T-391 agent_save: spec.systemPrompt e2e:v2 com AAD agents/system_prompt — paridade com o WS save_agent", () => {
+  assert.deepEqual(AGENT_FIELDS, ["system_prompt"], "a lista canônica mudou; o ramo do relay precisa de revisão");
+  const out = encryptBridgePayload("agent_save", { spec: { name: "qa2", role: "qa", systemPrompt: "claro" } }, PID);
+  const spec = out.spec as Record<string, unknown>;
+  assert.ok(cifradoV2(spec.systemPrompt), "spec.systemPrompt não saiu e2e:v2:");
+  const aad = aadV2({ projectId: PID, table: E2EE_TABLE.AGENTS, field: "system_prompt" });
+  assert.equal(decryptForProject(spec.systemPrompt as string, PID, aad), "claro");
+  // identificadores não são campos do catálogo: ficam como vieram
+  assert.equal(spec.name, "qa2");
+  assert.equal(spec.role, "qa");
+  // já cifrado passa; sem prompt não se inventa campo
+  const ok2 = encryptBridgePayload("agent_save", { spec: { name: "a", role: "r", systemPrompt: "e2e:v2:x" } }, PID);
+  assert.equal((ok2.spec as Record<string, unknown>).systemPrompt, "e2e:v2:x");
+  const sem = encryptBridgePayload("agent_save", { spec: { name: "a", role: "r" } }, PID);
+  assert.equal("systemPrompt" in (sem.spec as object), false, "relay inventou systemPrompt");
+  // payload sem spec não rebenta (o server é quem recusa a forma, com 400)
+  assert.deepEqual(encryptBridgePayload("agent_save", { spec: 7 }, PID), { spec: 7 });
+});
+
+test("T-391 agent_save: required+chave cifra; sem chave recusa (fail-closed como os outros kinds)", { concurrency: false }, async () => {
+  const { setE2eeRequired } = await import("../daemon-crypto.js");
+  setE2eeRequired(PID, true);
+  try {
+    const out = encryptBridgePayload("agent_save", { spec: { name: "a", role: "r", systemPrompt: "claro" } }, PID);
+    assert.ok(cifradoV2((out.spec as Record<string, unknown>).systemPrompt));
+  } finally {
+    setE2eeRequired(PID, false);
+  }
+  setE2eeRequired("sem-chave-t391", true);
+  assert.throws(
+    () => encryptBridgePayload("agent_save", { spec: { name: "a", role: "r", systemPrompt: "claro" } }, "sem-chave-t391"),
+    /e2ee-required/,
+  );
 });

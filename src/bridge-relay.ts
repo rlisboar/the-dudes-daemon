@@ -48,7 +48,11 @@ export type BridgeEncryptKind =
   | "goals_update"
   | "plans_create"
   | "plans_add_task"
-  | "plans_apply_tasks";
+  | "plans_apply_tasks"
+  // T-391: kind = op do path (não o nome MCP `save_agent`) — bate com o
+  // `catalogPlainHits("agent_save", …)` da T-390 e com o 409 e2ee-required do
+  // server, que deriva o kind do op.
+  | "agent_save";
 
 export function encryptBridgePayload(
   kind: BridgeEncryptKind,
@@ -144,6 +148,17 @@ export function encryptBridgePayload(
       for (const t of json.tasks) {
         if (t && typeof t === "object") cifraPlanDraft(t as Record<string, unknown>);
       }
+    }
+    return json;
+  }
+  // T-391: agent_save — só spec.systemPrompt é campo do catálogo (AGENTS /
+  // system_prompt, o AAD exato que o server lê e que o WS save_agent já usa em
+  // main.ts). name/role/... são identificadores, não texto de usuário.
+  if (kind === "agent_save") {
+    const spec = json.spec;
+    if (spec && typeof spec === "object" && !Array.isArray(spec)) {
+      const s = spec as Record<string, unknown>;
+      if ("systemPrompt" in s) s.systemPrompt = cifra(s.systemPrompt, E2EE_TABLE.AGENTS, "system_prompt");
     }
     return json;
   }
@@ -500,7 +515,7 @@ export class BridgeRelay {
         if (projectId && !encryptOr409("board", projectId, body)) return;
       }
       const wm = parsed.pathname.match(
-        /^\/api\/bridge\/([^/]+)\/(tasks_add|tasks_update|tasks_comment_add|goals_add|goals_update|plans_create|plans_add_task|plans_apply_tasks)$/,
+        /^\/api\/bridge\/([^/]+)\/(tasks_add|tasks_update|tasks_comment_add|goals_add|goals_update|plans_create|plans_add_task|plans_apply_tasks|agent_save)$/,
       );
       if (wm) {
         const projectId = this.agentProjectLookup(wm[1]);

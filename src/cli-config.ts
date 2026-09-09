@@ -318,7 +318,7 @@ function runProbe(binPath: string, timeoutMs: number, retryTimeoutMs: number): R
       // Ruling PM: timeout NÃO é prova. O binário pode estar à espera de
       // auth, com montagem lenta ou FS bloqueado — é o verde incondicional
       // com um cronómetro à frente. Não se passa ao arg seguinte: se não
-      // respondeu num orçamento de 5s, o segundo arg também não responde.
+      // respondeu num orçamento de 6s, o segundo arg também não responde.
       return {
         ok: false,
         inconclusive: true,
@@ -349,7 +349,7 @@ function runProbe(binPath: string, timeoutMs: number, retryTimeoutMs: number): R
 /** probeTimeoutMs: injectável para testes (sob carga do suite completo um
  * spawn pode inchar para além do timeout e cair no estado `timeout`
  * — inconclusivo — onde o teste esperava um veredicto; os casos negativos
- * pedem orçamento folgado). Produção usa os defaults: 1.5s + retry 5s. */
+ * pedem orçamento folgado). Produção usa os defaults: 1.5s + retry 6s. */
 export function resolveCliCommand(
   label: CliRunner | string,
   override?: string,

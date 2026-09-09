@@ -375,6 +375,10 @@ export function catalogPlainHits(kind, payload) {
     case "update_schedule":
       return collectFields(p.patch ?? p, SCHEDULE_FIELDS, "schedule");
     case "save_agent":
+    // T-390: a op HTTP do controller é `agent_save`, mas o payload é o MESMO
+    // spec — mesmo campo, mesma recusa. O kind chega aqui pelo `op` do path,
+    // por isso o nome do ramo tem de ser o nome da op.
+    case "agent_save":
     case "spawn": {
       const spec = p.spec ?? p.agent ?? p;
       const hits = [];

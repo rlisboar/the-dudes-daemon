@@ -11,6 +11,8 @@ import {
   memoryQueryMatch,
 } from "./memory-utils.js";
 import { POLICY_GATED_RUNNERS } from "./runner-policy.js";
+import { bridgeToolAllowed } from "./bridge-tool-gate.js";
+import { commandSchemas } from "@the-dudes/protocol/commands";
 
 const AGENT_ID = process.env.THE_DUDES_AGENT_ID;
 const AGENT_NAME = process.env.THE_DUDES_AGENT_NAME ?? AGENT_ID ?? "unknown";
@@ -152,38 +154,26 @@ const HTML_LEVEL: "basic" | "normal" | "quality" =
 const _enabledGroups = _featuresRaw === undefined
   ? null
   : new Set(_featuresRaw.split(",").map((s) => s.trim()).filter(Boolean));
-const TOOL_GROUP: Record<string, string> = {
-  send_message: "teammates", list_agents: "teammates", delegate: "teammates",
-  list_tasks: "tasks", get_task: "tasks", add_task: "tasks", update_task: "tasks",
-  lock_task: "tasks", unlock_task: "tasks",
-  add_task_comment: "tasks", list_task_comments: "tasks",
-  lock_file: "filelock", unlock_file: "filelock", list_file_locks: "filelock",
-  // Plans = grupo ordenado de board tasks; gate junto com tasks.
-  list_plans: "tasks", get_plan: "tasks", create_plan: "tasks",
-  add_plan_task: "tasks", apply_plan_tasks: "tasks",
-  start_plan: "tasks", pause_plan: "tasks", validate_plan_task: "tasks",
-  remember: "memory", recall: "memory", forget: "memory", pin: "memory",
-  list_goals: "goals",
-  get_credential: "credentials",
-  list_webhooks: "webhooks", send_webhook: "webhooks",
-  // Explanation Board — opt-in por projeto (THE_DUDES_FEATURES=board)
-  board_get: "board", board_clear: "board", board_set: "board",
-  board_upsert_block: "board", board_remove_block: "board",
-  board_focus: "board", board_set_step: "board", board_play: "board", board_pause: "board",
-  board_say: "board", board_draw: "board", board_remove_annotation: "board",
-  board_clear_drawings: "board",
-  board_list: "board", board_create: "board", board_switch: "board", board_delete: "board",
-  // approve_action permanece SEMPRE registrado (permission-prompt do claude).
-};
+// T-391: o papel do agente chega do runner (this.info.role → env). O bridge não
+// tem opinião sobre papéis — quem decide quem recebe o quê é o runner; aqui só
+// se obedece. TOOL_GROUP/ROLE_GATED/decisão vivem em bridge-tool-gate.ts para
+// serem testáveis sem importar este módulo (stdio liga no import).
+const _agentRole = process.env.THE_DUDES_AGENT_ROLE ?? "";
 const _origTool = server.tool.bind(server);
 (server as unknown as { tool: (...a: unknown[]) => unknown }).tool = (...args: unknown[]) => {
   const name = args[0] as string;
-  const g = TOOL_GROUP[name];
-  if (g && _enabledGroups !== null && !_enabledGroups.has(g)) {
-    return undefined; // grupo desligado pra este projeto — não registra
+  if (!bridgeToolAllowed(name, _enabledGroups, _agentRole)) {
+    return undefined; // grupo desligado no projeto, ou papel deste agente não a recebe
   }
   return (_origTool as (...a: unknown[]) => unknown)(...args);
 };
+
+// T-391 — o shape de `save_agent` É o `agentSpec` do protocolo, extraído do
+// schema congelado `commandSchemas.save_agent` (cmd() = z.object({type, ...shape})).
+// Sem contrato novo nem lista paralela: o que o MCP expõe é o que o WS valida.
+const AGENT_SPEC_SHAPE: z.ZodRawShape = (
+  (commandSchemas.save_agent as z.ZodObject<{ spec: z.ZodTypeAny }>).shape.spec as z.ZodObject<z.ZodRawShape>
+).shape;
 
 server.tool(
   "send_message",
@@ -226,6 +216,50 @@ server.tool(
       return { content: [{ type: "text", text: `subagente "${r.subagentName}" criado com ${r.route} (task ${r.taskId}). Ele te manda o resultado por mensagem quando terminar.` }] };
     } catch (e) {
       return { content: [{ type: "text", text: `bridge error: ${(e as Error).message}` }], isError: true };
+    }
+  }
+);
+
+// T-391 — Controller MVP: as duas ops batem nas HTTP `agent_save`/`agent_stop`
+// da T-390 (gate de papel lá, não aqui — aqui o runner já nem registrou estas
+// tools para não-controllers). `save_agent` nunca dá start: o server nasce com
+// running:false e quem inicia é o dono. Erros do server (400/403/404/409)
+// chegam via postJSON com status+corpo no texto — sem vazar stack, sem engolir.
+server.tool(
+  "save_agent",
+  "Register a teammate agent with the SAME AgentSpec as the UI's save_agent (name + role required; everything else optional). It does NOT start the agent: saved agents are born idle and the OWNER starts them by hand. You cannot create another controller nor rewrite yourself (both are 400).",
+  AGENT_SPEC_SHAPE,
+  async (spec: Record<string, unknown>) => {
+    try {
+      const r = await postJSON("agent_save", { spec });
+      const a = r.agent ?? {};
+      const name = a.name ?? spec.name ?? "?";
+      const role = a.role ?? spec.role ?? "?";
+      return {
+        content: [{
+          type: "text",
+          text: `agente ${name} salvo (id ${a.id ?? "?"}, role ${role}, running=${a.running === true}, state ${a.state ?? "?"}) — não iniciado; quem inicia é o dono.`,
+        }],
+      };
+    } catch (e) {
+      return { content: [{ type: "text", text: `save_agent falhou: ${(e as Error).message}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  "stop_agent",
+  "Stop a teammate by exact name, said twice (name + confirmName) — a misaimed stop halts work in progress. The server refuses with 400 when the names differ, 404 when no agent has that name, and 409 with the candidate ids when the name is ambiguous (name the one you meant). Does not touch the task board: tasks keep their status/lock.",
+  { name: z.string().describe("Exact agent name"), confirmName: z.string().describe("The same name, typed again") },
+  async ({ name, confirmName }) => {
+    try {
+      const r = await postJSON("agent_stop", { name, confirmName });
+      const s = r.stopped ?? {};
+      return {
+        content: [{ type: "text", text: `agente ${s.name ?? name} parado (id ${s.id ?? "?"}).` }],
+      };
+    } catch (e) {
+      return { content: [{ type: "text", text: `stop_agent falhou: ${(e as Error).message}` }], isError: true };
     }
   }
 );

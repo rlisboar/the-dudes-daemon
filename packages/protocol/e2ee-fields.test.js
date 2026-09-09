@@ -153,3 +153,26 @@ test("T-117 resolveAgentSendCipherAad: legado, par válido, parcial, inválido",
   assert.deepEqual(part, { kind: "cipher", text: "e2e:v2:x", table: "tasks", field: "title" });
   assert.throws(() => agentSendCipherPart("x", E2EE_TABLE.BOARDS, "title"));
 });
+
+test("T-390 A6: kind agent_save bate save_agent — mesmo campo, mesma recusa", async () => {
+  const { catalogPlainHits } = await import("./e2ee-fields.js");
+  // A6 literal: a op HTTP do controller é `agent_save` e o kind chega pelo `op` do path.
+  assert.ok(catalogPlainHits("agent_save", { spec: { systemPrompt: "claro" } }).includes("agent.system_prompt"));
+  // Cifrado não é recusa.
+  assert.deepEqual(catalogPlainHits("agent_save", { spec: { systemPrompt: "e2e:v2:x" } }), []);
+  // Paridade total com save_agent nos três formatos que o ramo aceita (spec, agent, nu).
+  for (const payload of [
+    { spec: { systemPrompt: "claro" } },
+    { agent: { systemPrompt: "claro" } },
+    { systemPrompt: "claro" },
+    { spec: { system_prompt: "claro" } },
+    { spec: { systemPrompt: "e2e:v2:x" } },
+    { spec: { name: "sem prompt" } },
+  ]) {
+    assert.deepEqual(
+      catalogPlainHits("agent_save", payload),
+      catalogPlainHits("save_agent", payload),
+      `paridade quebrada para ${JSON.stringify(payload)}`,
+    );
+  }
+});

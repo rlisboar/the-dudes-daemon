@@ -210,11 +210,20 @@ function footer(tasks: boolean, teammates: boolean): string {
   return parts.join(" ");
 }
 
-export function buildSystemPromptHeader(features?: ContextFeatures): string {
+// T-391 — prosa do controller, no mesmo ponto único dos headers. Entra só para
+// quem tem o papel (o runner decide); não depende de features — desligar
+// `teammates` não cega o save/stop, que são as mãos do dono.
+const CONTROLLER = `# Team roster (controller — the owner's hands)
+- \`mcp__the-dudes__save_agent\` (args: the AgentSpec itself — \`name\` + \`role\` required) — register a teammate with the same spec the UI uses. It NEVER starts: a saved agent is born idle and **the owner starts it by hand**. You cannot create another controller, nor rewrite yourself (400).
+- \`mcp__the-dudes__stop_agent\` (args: {name, confirmName}) — stop a teammate by exact name, said twice. Ambiguous name → 409 with the candidate ids: pick one and retry. Stopping does not touch the task board — tasks keep their status and lock.
+- You manage the roster, not the work: closing tasks and priorities are the PM's, as written in the task.`;
+
+export function buildSystemPromptHeader(features?: ContextFeatures, opts?: { controller?: boolean }): string {
   const teammates = features?.teammates !== false;
   const tasks = features?.tasks !== false;
   const sections = [teammates ? "You are part of a multi-agent team running locally." : "You are an agent running locally."];
   if (teammates) sections.push(ROUTING, teammateSection(tasks));
+  if (opts?.controller) sections.push(CONTROLLER);
   if (tasks) sections.push(TASKS);
   if (features?.webhooks !== false) sections.push(WEBHOOKS);
   if (features?.filelock !== false) sections.push(FILE_LOCKS);

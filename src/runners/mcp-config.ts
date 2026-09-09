@@ -24,7 +24,7 @@ export function summarizeMcpServers(extras: Record<string, McpServerConfig> | un
 
 export function buildBridgeEnv(input: {
   agentId: string; agentName: string; orchestratorUrl: string; tokenFile: string;
-  features?: Record<string, string>; socketPath?: string;
+  features?: Record<string, string>; socketPath?: string; role?: string;
 }): Record<string, string> {
   // Anotado: sem isso o TS infere o tipo exato do literal e recusa a
   // atribuição condicional de THE_DUDES_BRIDGE_SOCKET logo abaixo.
@@ -36,6 +36,10 @@ export function buildBridgeEnv(input: {
     ...(input.features ?? {}),
   };
   if (input.socketPath) env.THE_DUDES_BRIDGE_SOCKET = input.socketPath;
+  // T-391: o papel vem do runner (this.info.role), nunca do projeto — é o que
+  // faz o gate de save_agent/stop_agent provar A3/A5. Ausente = bridge não
+  // registra as tools de papel (daemon antigo nunca deu controller a ninguém).
+  if (input.role) env.THE_DUDES_AGENT_ROLE = input.role;
   return env;
 }
 
