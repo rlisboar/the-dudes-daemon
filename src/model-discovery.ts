@@ -133,10 +133,13 @@ export function parseLineModelCatalog(output: string, runner: "opencode" | "crus
       isDefault: isDefault || id === advertisedDefault || undefined,
       // Popula efforts do grok no catálogo (4.6+ inclui xhigh). Sem isto a UI
       // caía no fallback estático e xhigh não aparecia pra grok-4.6 (T-059).
+      // T-401: o runner é argumento — no grok-custom o binário fcustom aceita
+      // xhigh com QUALQUER model (T-161/T-162), então filtrar só pelo id
+      // clampava glm/composer/chatgpt para [low,medium,high] na UI.
       ...(runner === "opencode"
         ? { efforts: openCodeEffortsFor(id) }
         : isGrokFamily(runner)
-          ? { efforts: [...grokWireEfforts(id)] }
+          ? { efforts: [...grokWireEfforts(id, runner)] }
           : {}),
     }));
     if (models.length >= MAX_MODELS) break;

@@ -136,6 +136,60 @@ test("T-246: retrocompat — formato antigo (todos com *) segue parseando igual"
   assert.deepEqual(models.map((m) => [m.id, m.isDefault]), [["grok-build", true], ["grok-fast", undefined]]);
 });
 
+/* ---------- T-401: catálogo vivo do grok-custom publica xhigh em todo model ---------- */
+
+const XHIGH4 = ["low", "medium", "high", "xhigh"];
+
+test("T-401: grok-custom publica [low,medium,high,xhigh] em TODOS os models do fixture T-246", () => {
+  const models = parseLineModelCatalog(GROK_CUSTOM_MODELS_OUTPUT, "grok-custom");
+  assert.equal(models.length, 10);
+  for (const model of models) {
+    assert.deepEqual(model.efforts, XHIGH4, `efforts de ${model.id} deve ser ${XHIGH4.join(",")}`);
+  }
+  // IDs citados nos critérios: nem grok, nem OpenAI, nem MLX, nem Z.ai herdam o filtro de versão.
+  const byId = Object.fromEntries(models.map((m) => [m.id, m.efforts]));
+  for (const id of [
+    "rezulto:rezulto/glm5.3-flash",
+    "grok-4.6",
+    "chatgpt-gpt-5.6-sol",
+    "omlx:Qwen3.8-27B-MLX-oQ4e-mtp",
+  ]) {
+    assert.deepEqual(byId[id], XHIGH4, `${id} sem xhigh no catálogo → a UI clampa`);
+  }
+});
+
+test("T-401: só efforts muda — id/label/isDefault/tiers do fixture T-246 intactos", () => {
+  const models = parseLineModelCatalog(GROK_CUSTOM_MODELS_OUTPUT, "grok-custom").map((model) => {
+    const withoutEfforts: Record<string, unknown> = { ...model };
+    delete withoutEfforts.efforts;
+    return withoutEfforts;
+  });
+  assert.deepEqual(models, [
+    { id: "grok-4.6", label: "grok-4.6", isDefault: undefined, capabilityTier: 4, speedTier: 1, costTier: 3 },
+    { id: "rezulto:rezulto/glm5.3-flash", label: "rezulto:rezulto/glm5.3-flash", isDefault: true, capabilityTier: 2, speedTier: 2, costTier: 2 },
+    { id: "omlx:Qwen3.8-27B-MLX-oQ4e-mtp", label: "omlx:Qwen3.8-27B-MLX-oQ4e-mtp", isDefault: undefined, capabilityTier: 2, speedTier: 2, costTier: 2 },
+    { id: "rezulto-qwen:rezulto/qwen3.8-lite", label: "rezulto-qwen:rezulto/qwen3.8-lite", isDefault: undefined, capabilityTier: 2, speedTier: 2, costTier: 2 },
+    { id: "chatgpt-gpt-5.6-sol", label: "chatgpt-gpt-5.6-sol", isDefault: undefined, capabilityTier: 4, speedTier: 1, costTier: 3 },
+    { id: "chatgpt-gpt-5.6-terra", label: "chatgpt-gpt-5.6-terra", isDefault: undefined, capabilityTier: 3, speedTier: 2, costTier: 2 },
+    { id: "chatgpt-gpt-5.6-luna", label: "chatgpt-gpt-5.6-luna", isDefault: undefined, capabilityTier: 1, speedTier: 3, costTier: 1 },
+    { id: "chatgpt-gpt-5.5", label: "chatgpt-gpt-5.5", isDefault: undefined, capabilityTier: 2, speedTier: 2, costTier: 2 },
+    { id: "chatgpt-gpt-5.4", label: "chatgpt-gpt-5.4", isDefault: undefined, capabilityTier: 2, speedTier: 2, costTier: 2 },
+    { id: "chatgpt-gpt-5.4-mini", label: "chatgpt-gpt-5.4-mini", isDefault: undefined, capabilityTier: 1, speedTier: 3, costTier: 1 },
+  ]);
+});
+
+test("T-401: mesmo fixture, runner diverso — grok oficial segue filtrado por versão do model (T-059)", () => {
+  const output = "* grok-4.5\n* grok-4.6\n* rezulto:rezulto/glm5.3-flash\n";
+  const official = Object.fromEntries(parseLineModelCatalog(output, "grok").map((m) => [m.id, m.efforts]));
+  assert.deepEqual(official["grok-4.5"], ["low", "medium", "high"], "grok-4.5 oficial não ganha xhigh");
+  assert.deepEqual(official["grok-4.6"], XHIGH4, "grok-4.6 oficial mantém xhigh");
+  assert.deepEqual(official["rezulto:rezulto/glm5.3-flash"], ["low", "medium", "high"]);
+  const custom = Object.fromEntries(parseLineModelCatalog(output, "grok-custom").map((m) => [m.id, m.efforts]));
+  assert.deepEqual(custom["grok-4.5"], XHIGH4, "grok-custom aceita xhigh até no 4.5 (T-162)");
+  assert.deepEqual(custom["grok-4.6"], XHIGH4);
+  assert.deepEqual(custom["rezulto:rezulto/glm5.3-flash"], XHIGH4);
+});
+
 /* ── T-343: qwen — catálogo a partir do settings.json do dono ─────────── */
 
 function writeTmpQwenSettings(name: string, obj: unknown): string {
