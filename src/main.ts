@@ -962,11 +962,11 @@ export class DaemonClient {
         return;
       }
       case "workspace:create": {
-        const r = createTaskWorktree({
+        const r = await createTaskWorktree({
           workspaceRoot: String(msg.workspaceRoot ?? ""),
           taskId: String(msg.taskId ?? ""),
           agentId: String(msg.agentId ?? ""),
-        });
+        }, this.dropTo);
         this.send({
           type: "workspace:task_result",
           correlationId: msg.correlationId,
@@ -981,12 +981,12 @@ export class DaemonClient {
         return;
       }
       case "workspace:remove": {
-        const r = removeTaskWorktree({
+        const r = await removeTaskWorktree({
           workspaceRoot: String(msg.workspaceRoot ?? ""),
           path: String(msg.path ?? ""),
           branch: String(msg.branch ?? ""),
           force: !!msg.force,
-        });
+        }, this.dropTo);
         this.send({
           type: "workspace:task_result",
           correlationId: msg.correlationId,
@@ -1141,7 +1141,7 @@ export class DaemonClient {
    *  ~/.openclaw/skills, bundled, extras) e envia snapshot pro orch.
    *  Aceita override de workspaceRoot pra cenários multi-projeto. */
   private async reportSkillsScan(workspaceSkillsRoot?: string) {
-    const { scanSkills } = await import("./skills-scanner.js");
+    const { scanSkills, skillToScanPayload } = await import("./skills-scanner.js");
     // workspaceRoot do scanner é o BASE (não a pasta /skills). Strip o
     // sufixo /skills se vier do server. Sem path = nada pra escanear.
     if (!workspaceSkillsRoot) return;
@@ -1155,7 +1155,7 @@ export class DaemonClient {
     });
     this.send({
       type: "skills:scan",
-      skills: result.skills,
+      skills: result.skills.map(skillToScanPayload),
       scannedSources: result.scannedSources,
       ts: Date.now(),
     });
@@ -1168,11 +1168,11 @@ export class DaemonClient {
    *  sem env/headers) e no log do daemon — configuração corrompida não pode
    *  sumir com MCP da Integração em silêncio. */
   private async reportMCPsScan(workspaceRoot?: string) {
-    const { scanMCPs } = await import("./mcps-scanner.js");
+    const { scanMCPs, mcpToScanPayload } = await import("./mcps-scanner.js");
     const result = await scanMCPs({ workspaceRoot });
     this.send({
       type: "mcps:scan",
-      mcps: result.mcps,
+      mcps: result.mcps.map(mcpToScanPayload),
       scannedSources: result.scannedSources,
       ...(result.warnings.length ? { warnings: result.warnings } : {}),
       ts: Date.now(),

@@ -17,6 +17,10 @@
       "types": "./commands.d.ts",
       "default": "./commands.js"
     },
+    "./daemon-wire": {
+      "types": "./daemon-wire.d.ts",
+      "default": "./daemon-wire.js"
+    },
     "./e2ee-fields": {
       "types": "./e2ee-fields.d.ts",
       "default": "./e2ee-fields.js"

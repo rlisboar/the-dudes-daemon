@@ -1,6 +1,6 @@
 import { type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import http from "node:http";
-import { writeFileSync, readFileSync, readdirSync, realpathSync, mkdirSync, rmSync, existsSync, statSync, openSync, readSync, closeSync } from "node:fs";
+import { writeFileSync, readFileSync, readdirSync, realpathSync, mkdirSync, rmSync, existsSync, statSync, openSync, readSync, closeSync, chmodSync, chownSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import type { AgentInfo, AgentRuntimeState, AgentUsage, CliRunner, ImageAttachment } from "./types.js";
@@ -27,7 +27,7 @@ import {
   type GrokTurnBilling,
 } from "./runners/parsers.js";
 import { parseCodexTurnEvent, parseCodexRolloutSignals, parseCodexRolloutSessionId, parseCrushSessionMeta, parseGeminiTurnEvent, parseGrokStreamEvent, parseOpenCodeTurnEvent, parseQwenTurnEvent, TextLoopGuard } from "./runners/turn-parsers.js";
-import { buildBridgeEnv, buildClaudeMcpConfig, buildCodexMcpArgs, buildCrushMcpConfig, buildGeminiMcpServers, buildGrokMcpToml, buildOpenCodeMcpConfig, buildQwenMcpServers, summarizeMcpServers } from "./runners/mcp-config.js";
+import { buildBridgeEnv, buildClaudeMcpConfig, buildCodexMcpToml, buildCrushMcpConfig, buildGeminiMcpServers, buildGrokMcpToml, buildOpenCodeMcpConfig, buildQwenMcpServers, summarizeMcpServers } from "./runners/mcp-config.js";
 import { RunnerRuntimeFiles } from "./runners/runtime-files.js";
 import { ContextTracker, CumulativeUsageTracker, type UsageSemantics } from "./runners/context-tracker.js";
 import { armHardTimeout, appendCapped, collectProcessOutput, killGrokLeader, killProcess, processAlive as procAlive, RUNNER_OUTPUT_CAP_BYTES, terminateAndWait, terminateWithEscalation } from "./runners/process-lifecycle.js";
@@ -360,6 +360,9 @@ export class AgentRunner {
    *  de epoch — descartar por `compacting` engolia eventos LEGÍTIMOS do turno
    *  em voo durante a fase de waitOcIdle. */
   private sessionInvalid = false;
+  /** T-414: stderr de missing-session no claude só vale ANTES do init.
+   *  Depois do init, "404 Not Found" de tool/HTTP não é sessão perdida. */
+  private claudeSawInit = false;
   private restarting = false;
   private lastVerboseIoBody = "";
   private lastVerboseIoAt = 0;
@@ -416,6 +419,8 @@ export class AgentRunner {
   /** Intervalo mínimo entre tentativas de destravar a fila (ver tickHangWatch). */
   private static readonly QUEUE_HEAL_INTERVAL_MS = 30_000;
   private lastQueueHealAt = 0;
+  /** T-426: valores referenciados por `$VAR` no `.crush.json` (por turno). */
+  private crushMcpEnvRefs: Record<string, string> = {};
 
   constructor(info: AgentInfo, private opts: AgentRunnerOptions) {
     this.info = info;
@@ -690,6 +695,14 @@ export class AgentRunner {
   }
 
   resetWithSummary(summary?: string): void {
+    // T-417: o reset abaixo bumpa o epoch e invalida o turno em voo — a partir
+    // daqui o close dele é STALE e (pelo guarda dos runners per-message) não
+    // toca em mais nada. O slot do gate que era dele tem de voltar AGORA:
+    // antes o close tardio o libertava mesmo com epoch velho; com o guarda,
+    // sem isto clear/compact a meio do turno vazava o slot até o guarda
+    // anti-deadlock do turn-gate (MAX_HOLD_MS, 15min) o liberar à força.
+    // Idempotente (releaseActiveTurnSlot puxa e nula o handle).
+    this.releaseActiveTurnSlot();
     this.messageSession.reset(summary);
     this.ocSeenPartIds.clear();
     // Sessão nova nasce sem --resume (gemini) → stats do CLI voltam a zero;
@@ -1403,6 +1416,7 @@ export class AgentRunner {
     // se colaria à primeira linha do novo → JSON.parse falha e o init
     // (resolvedModel + idle) é perdido silenciosamente.
     this.buffer = "";
+    this.claudeSawInit = false;
     // Identidade capturada: chunks/exit tardios do processo antigo (entregues
     // entre exit e close, ou de um órfão) não podem re-emitir session_id/usage
     // da sessão descartada nem clobberar o processo novo.
@@ -1433,7 +1447,7 @@ export class AgentRunner {
       if (!msg) return;
       this.touchActivity();
       this.traceCli("claude", "stderr", msg);
-      if (isMissingSessionMessage(msg)) {
+      if (!this.claudeSawInit && isMissingSessionMessage(msg)) {
         this.sessionInvalid = true;
         this.opts.resumeSessionId = undefined;
         this.info.sessionId = undefined;
@@ -1478,7 +1492,7 @@ export class AgentRunner {
     // Scrub adicional: THE_DUDES_DAEMON_TOKEN do process.env do daemon
     // vazaria pro CLI agente (prompt injection no agente poderia fazer
     // ele revelar/exfiltrar). Mesmo motivo pra outras chaves sensíveis.
-    return buildBaseRunnerEnv({
+    const env = buildBaseRunnerEnv({
       inherited: process.env,
       runner: this.opts.cliRunner,
       agentId: this.info.id,
@@ -1489,6 +1503,8 @@ export class AgentRunner {
       opencodeConfigPath: this.opts.cliRunner === "opencode" ? this.runtimeFiles.openCodeConfigPath() : undefined,
       qwenHome: this.opts.cliRunner === "qwen" ? this.runtimeFiles.qwenHomeDir() : undefined,
     });
+    if (this.opts.cliRunner === "codex") env.CODEX_HOME = this.runtimeFiles.codexHomeDir();
+    return env;
   }
 
   private resolveClaudeConfigDir(): string | undefined {
@@ -1652,6 +1668,7 @@ export class AgentRunner {
       this.opts.onSessionId(event.session_id);
     }
     if (event.type === "system" && event.subtype === "init") {
+      this.claudeSawInit = true;
       // CLI reporta o model realmente resolvido (alias→ID, default da conta).
       if (typeof event.model === "string" && event.model) this.contextTracker.setResolvedModel(event.model);
       this.toolsInFlight = 0;
@@ -2205,7 +2222,47 @@ export class AgentRunner {
     this.applyOpenCodeEvents(event);
   }
 
+  /** T-416: crush não emite JSON no turno — cada chunk de stdout é progresso. */
+  private ingestCrushChunk(_chunk: string): void {
+    this.touchActivity();
+    if (this.toolsInFlight === 0) this.noteGrokToolInFlight();
+  }
+
   /* ---------- Gemini per-message model ---------- */
+
+  /** T-416: uma linha JSON parseada — touchActivity mesmo se setState for no-op. */
+  private ingestGeminiLine(
+    obj: unknown,
+    epoch: number,
+    acc: { addText: (t: string) => void; onResult: () => void; flush: () => void },
+  ): void {
+    if (!this.messageSession.owns(epoch)) return;
+    this.touchActivity();
+    for (const event of parseGeminiTurnEvent(obj)) {
+      if (event.type === "text") acc.addText(event.text);
+      else if (event.type === "tool") {
+        acc.flush();
+        this.noteGrokToolInFlight();
+        this.opts.onToolUse(event.name, event.input);
+        this.setState("thinking");
+      } else if (event.type === "result") {
+        acc.onResult();
+        this.clearGrokToolsInFlight();
+        acc.flush();
+      } else if (event.type === "usage") {
+        const rawInput = event.input;
+        const rawOutput = event.output;
+        const rawCached = event.cacheRead;
+        const cumulative = this.gemUsage.delta({ input: rawInput, output: rawOutput, cached: rawCached });
+        this.opts.onUsageDelta?.({
+          input: cumulative.input,
+          output: cumulative.output,
+          cacheCreate: 0,
+          cacheRead: cumulative.cached,
+        });
+      }
+    }
+  }
 
   private async runGeminiMessage(content: string, images?: ImageAttachment[]) {
     if (this.stopped) return;
@@ -2306,37 +2363,11 @@ export class AgentRunner {
         // (double-billing) e texto/tool velhos vazariam pós-clear.
         if (!this.messageSession.owns(epoch)) continue;
         try {
-          for (const event of parseGeminiTurnEvent(JSON.parse(line))) {
-            if (event.type === "text") pendingText += event.text;
-            else if (event.type === "tool") {
-              flush();
-              this.opts.onToolUse(event.name, event.input);
-              this.setState("thinking");
-            } else if (event.type === "result") {
-              sawResult = true;
-              flush();
-            } else if (event.type === "usage") {
-            // stats do gemini-cli são ACUMULADOS (uiTelemetryService soma o
-            // prompt de TODAS as requests do turno e o hydrate do --resume
-            // pré-carrega o histórico inteiro): input_tokens ≈ Σ requests,
-            // não a ocupação da janela. Billing = delta contra a base
-            // persistida (base zera junto com a sessão no resetWithSummary);
-            // ocupação NÃO é derivável daqui — contexto cheio do gemini é
-            // detectado pela rota reativa (banner no stderr →
-            // checkContextFullError), nunca por estes stats.
-            const rawInput = event.input;
-            const rawOutput = event.output;
-            const rawCached = event.cacheRead;
-            const cumulative = this.gemUsage.delta({ input: rawInput, output: rawOutput, cached: rawCached });
-            const delta: AgentUsage = {
-              input: cumulative.input,
-              output: cumulative.output,
-              cacheCreate: 0,
-              cacheRead: cumulative.cached,
-            };
-            this.opts.onUsageDelta?.(delta);
-            }
-          }
+          this.ingestGeminiLine(JSON.parse(line), epoch, {
+            addText: (t) => { pendingText += t; },
+            onResult: () => { sawResult = true; },
+            flush,
+          });
         } catch {}
       }
     });
@@ -2347,11 +2378,19 @@ export class AgentRunner {
     });
 
     proc.on("close", (code) => {
-      this.releaseActiveTurnSlot(); // T-251: slot do gate volta com o processo
       flush();
       imgCleanup();
-      this.ocActiveProc = null;
-      this.messageSession.busy = false;
+      // T-417: close TARDIO de turno já recuperado (SIGKILL do hard recover)
+      // não pode liberar o slot nem zerar busy/proc do turno NOVO que o drain
+      // do recover pôs em voo — o guarda do bloco qwen (T-371), estendido ao
+      // release: sem o epoch atual não há slot nosso para libertar (o hard
+      // recover devolve o dele antes do bump; clear/compact devolvem no
+      // resetWithSummary). Em stop(), o teardown completo é do stop().
+      if (this.messageSession.owns(epoch) || this.stopped) {
+        this.releaseActiveTurnSlot(); // T-251: slot do gate volta com o processo
+        this.ocActiveProc = null;
+        this.messageSession.busy = false;
+      }
       if (this.stopped) { this.emitExit(code); return; }
       // Primeiro turno que morreu sem completar (sem evento result — OAuth
       // expirado, 429 de quota, --model inválido: falhas antes do CLI gravar
@@ -2360,8 +2399,10 @@ export class AgentRunner {
       // descartou — e o delta contra gemStatsBase=0 re-fatura o histórico
       // inteiro. Só restaura no MESMO epoch (reset no meio já re-armou tudo).
       if (!sawResult && this.messageSession.owns(epoch)) this.messageSession.restoreFirstTurn(firstTurnSnapshot);
-      this.setState("idle");
-      this.drainOcQueue();
+      if (this.messageSession.owns(epoch)) {
+        this.setState("idle");
+        this.drainOcQueue();
+      }
     });
   }
 
@@ -2601,14 +2642,27 @@ export class AgentRunner {
 
   /* ---------- Codex per-message model ---------- */
 
-  private buildCodexConfigArgs(): string[] {
-    const built = buildCodexMcpArgs(this.opts.extraMcpServers, {
+  /** T-426 (A15): MCPs do codex vão para `<CODEX_HOME>/config.toml` (0600,
+   *  fora do repo) em vez de `-c mcp_servers.x.env={KEY="valor"}` — o valor do
+   *  token não aparece mais em `ps`/cmdline. O CODEX_HOME é POR AGENTE
+   *  (runtimeFiles.codexHomeDir), com auth/sessions linkados ao home do dono. */
+  private writeCodexConfig(): void {
+    const home = this.runtimeFiles.codexHomeDir();
+    const built = buildCodexMcpToml(this.opts.extraMcpServers, {
       command: this.opts.bridgeCommand,
       args: this.opts.bridgeArgs,
       env: this.bridgeEnv(),
     });
     for (const warning of built.warnings) this.opts.log("warn", `[codex:${this.info.name}] ${warning}`);
-    return built.args;
+    const file = path.join(home, "config.toml");
+    writeFileSync(file, built.toml, { mode: 0o600 });
+    try { chmodSync(file, 0o600); } catch {}
+    // Daemon root → CLI dropado: arquivo/dir precisam pertencer ao user do
+    // drop, senão o codex (uid drop) não lê o config nem escreve no home.
+    if (this.opts.dropTo) {
+      try { chownSync(home, this.opts.dropTo.uid, this.opts.dropTo.gid); } catch {}
+      try { chownSync(file, this.opts.dropTo.uid, this.opts.dropTo.gid); } catch {}
+    }
   }
 
   private async runCodexMessage(content: string, images?: ImageAttachment[]) {
@@ -2622,7 +2676,8 @@ export class AgentRunner {
     const firstTurnSnapshot = this.messageSession.consumeFirstTurnIfNeeded();
     if (firstTurnSnapshot.firstTurn) message = this.initialMessage(content, firstTurnSnapshot.pendingSummary);
 
-    const configArgs = this.buildCodexConfigArgs();
+    this.writeCodexConfig();
+    const configArgs: string[] = [];
     const commonFlags = [
       "--json",
       "--skip-git-repo-check",
@@ -2695,21 +2750,29 @@ export class AgentRunner {
     });
 
     proc.on("close", (code) => {
-      this.releaseActiveTurnSlot(); // T-251: slot do gate volta com o processo
       if (buf.trim().startsWith("{")) {
         try { this.handleCodexEvent(JSON.parse(buf.trim()), epoch); } catch {}
       }
       imgCleanup();
-      this.ocActiveProc = null;
-      this.messageSession.busy = false;
+      // T-417: mesmo guarda do bloco qwen (T-371) — close TARDIO de turno já
+      // recuperado não liberta o slot nem zera busy/proc do turno NOVO. Sem o
+      // epoch atual não há slot nosso para libertar (hard recover devolve o
+      // dele antes do bump; clear/compact devolvem no resetWithSummary).
+      if (this.messageSession.owns(epoch) || this.stopped) {
+        this.releaseActiveTurnSlot(); // T-251: slot do gate volta com o processo
+        this.ocActiveProc = null;
+        this.messageSession.busy = false;
+      }
       if (this.stopped) { this.emitExit(code); return; }
-      this.setState("idle");
-      // T-245: ocupação REAL pós-turno (último token_count do rollout). O
-      // billing do turn.completed já reportado acima é substituído pelo
-      // valor absoluto do último step — se o rollout não tiver sinal, o
-      // comportamento atual permanece (fallback).
-      void this.pollCodexContextOccupancy(epoch);
-      this.drainOcQueue();
+      if (this.messageSession.owns(epoch)) {
+        this.setState("idle");
+        // T-245: ocupação REAL pós-turno (último token_count do rollout). O
+        // billing do turn.completed já reportado acima é substituído pelo
+        // valor absoluto do último step — se o rollout não tiver sinal, o
+        // comportamento atual permanece (fallback).
+        void this.pollCodexContextOccupancy(epoch);
+        this.drainOcQueue();
+      }
     });
   }
 
@@ -2721,6 +2784,8 @@ export class AgentRunner {
     // do turno em voo durante o waitOcIdle — descartar thread.started nessa
     // fase deixava o primeiro turno órfão e o one-shot resumia thread vazia.
     if (!this.messageSession.owns(epoch)) return;
+    // T-416/A10: linha parseada = progresso mesmo se setState for no-op.
+    this.touchActivity();
     for (const normalized of parseCodexTurnEvent(event)) {
       if (normalized.type === "session") {
         if (normalized.sessionId !== this.messageSession.sessionId) {
@@ -2728,6 +2793,7 @@ export class AgentRunner {
           this.opts.onSessionId?.(normalized.sessionId);
         }
       } else if (normalized.type === "tool") {
+        this.noteGrokToolInFlight();
         this.opts.onToolUse(normalized.name, normalized.input);
         this.setState(normalized.name.includes("send_message") ? "sending" : "thinking");
       } else if (normalized.type === "text") {
@@ -2747,6 +2813,7 @@ export class AgentRunner {
           // aplicar o last_token_usage real do rollout. Guardado pro poll
           // usar como fallback (rollout ausente).
           this.codexTurnBilling = { epoch, delta };
+          this.clearGrokToolsInFlight();
       } else if (normalized.type === "error") {
         this.checkContextFullError(normalized.message);
         this.opts.onError(`codex: ${normalized.message}`);
@@ -2870,7 +2937,9 @@ export class AgentRunner {
       workspaceRoot: this.opts.workspaceRoot,
       model: this.info.model,
       effort: this.info.effort,
-      collectThinking: this.info.collectThinking,
+      // T-423/M34: AgentInfo do wire tem `boolean | null` (herança de projeto);
+      // grokHeadlessArgs só distingue true/false/ausente.
+      collectThinking: this.info.collectThinking ?? undefined,
       planMode: this.info.planMode,
       sessionId: opts.resume,
       forCompact: opts.forCompact,
@@ -3402,6 +3471,10 @@ export class AgentRunner {
       },
     });
     for (const warning of built.warnings) this.opts.log("warn", `[crush:${this.info.name}] ${warning}`);
+    // T-426: valores de env/headers dos extras NÃO vão pro arquivo (que vive
+    // no workspace e é stagediável) — só a referência `$VAR`; o literal entra
+    // no env do processo crush (crushTurnEnv).
+    this.crushMcpEnvRefs = built.envRefs;
     try {
       writeFileSync(configPath, JSON.stringify(built.config, null, 2), { mode: 0o600 });
     } catch (e) {
@@ -3412,7 +3485,10 @@ export class AgentRunner {
   /** Env por turno do crush: buildEnv + os valores que o `.crush.json`
    *  compartilhado referencia por `$VAR` (token file é por agente). */
   private crushTurnEnv(): NodeJS.ProcessEnv {
-    return buildBridgeAwareEnv(this.buildEnv(), this.runtimeFiles.tokenFile(), this.featuresEnv());
+    return {
+      ...buildBridgeAwareEnv(this.buildEnv(), this.runtimeFiles.tokenFile(), this.featuresEnv()),
+      ...this.crushMcpEnvRefs,
+    };
   }
 
   /** Roda um subcomando `crush session ...` e devolve o JSON parseado (null em
@@ -3514,6 +3590,7 @@ export class AgentRunner {
     proc.stdout!.setEncoding("utf8");
     proc.stderr!.setEncoding("utf8");
     proc.stdout!.on("data", (chunk: string) => {
+      this.ingestCrushChunk(chunk);
       this.traceCli("crush", "stdout", chunk);
       out = this.capAccum("crush", out, chunk);
     });
@@ -3526,9 +3603,16 @@ export class AgentRunner {
     });
 
     proc.on("close", (code) => {
-      this.releaseActiveTurnSlot(); // T-251: slot volta com o processo (o pós-turno não spawnada CLI)
       imgCleanup();
-      this.ocActiveProc = null;
+      // T-417: mesmo guarda do bloco qwen (T-371) — close TARDIO de turno já
+      // recuperado não liberta o slot nem apaga o proc do turno NOVO. O busy é
+      // do finishCrushTurn (finally já é epoch-guardado). Sem o epoch atual
+      // não há slot nosso para libertar (hard recover devolve o dele antes do
+      // bump; clear/compact devolvem no resetWithSummary).
+      if (this.messageSession.owns(epoch) || this.stopped) {
+        this.releaseActiveTurnSlot(); // T-251: slot volta com o processo (o pós-turno não spawnada CLI)
+        this.ocActiveProc = null;
+      }
       if (this.stopped) { this.messageSession.busy = false; this.emitExit(code); return; }
       void this.finishCrushTurn({ out, errOut, code, epoch, firstTurn, pendingSummary, content, images });
     });
@@ -3547,6 +3631,7 @@ export class AgentRunner {
       // Epoch trocado (clear/compact no meio do turno): nada deste turno pode
       // falar/faturar/ressuscitar sessão pós-reset.
       if (!this.messageSession.owns(t.epoch)) return;
+      this.clearGrokToolsInFlight();
 
       const text = t.out.trim();
       const failed = (t.code ?? 1) !== 0 && !text;

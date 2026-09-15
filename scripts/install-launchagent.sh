@@ -366,12 +366,13 @@ seed_check() {
 }
 
 seed_binaries() {
-  # Fonte ÚNICA: daemon/release/ do repo (T-149). Nunca ~/.the-dudes (pode
-  # estar desatualizado — incidente 2026-08-29) nem dist/ (não assinado).
+  # Fonte ÚNICA: daemon/release/ do checkout (T-149) — pasta LOCAL, não
+  # versionada desde a R16a (estage do build assinado). Nunca ~/.the-dudes
+  # (pode estar desatualizado — incidente 2026-08-29) nem dist/ direto.
   # Release ausente = erro claro; nunca cópia não verificada.
   local seed_dir="$SCRIPT_DIR/../release"
   if [ ! -f "$seed_dir/daemon.cjs" ]; then
-    die "seed: daemon/release/ sem daemon.cjs em $seed_dir — faça git pull / publique a release assinada antes de instalar"
+    die "seed: daemon/release/ sem daemon.cjs em $seed_dir — estage a release assinada antes de instalar (ex.: cp daemon/dist/*.cjs* daemon/release/)"
   fi
 
   if [ ! -f "$DAEMON_BIN" ]; then

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildBridgeEnv, buildClaudeMcpConfig, buildCodexMcpArgs, buildCrushMcpConfig, buildGeminiMcpServers, buildGrokMcpToml, buildOpenCodeMcpConfig } from "../runners/mcp-config.js";
+import { buildBridgeEnv, buildClaudeMcpConfig, buildCodexMcpToml, buildCrushMcpConfig, crushRefName, buildGeminiMcpServers, buildGrokMcpToml, buildOpenCodeMcpConfig } from "../runners/mcp-config.js";
 
 const bridge = { command: "node", args: ["bridge.js"], env: { TOKEN: "file" } };
 
@@ -27,16 +27,24 @@ test("Claude preserves native server shapes and reserves the internal bridge", (
   assert.deepEqual(config.mcpServers["the-dudes"], { type: "stdio", ...bridge });
 });
 
-test("Crush supports local and remote servers and reports incomplete entries", () => {
+test("Crush: env/headers viram $VAR (T-426) e o literal sai no envRefs", () => {
   const result = buildCrushMcpConfig({
-    local: { command: "tool", args: ["--x"], env: { A: "1" } },
-    remote: { type: "http", url: "https://mcp", headers: { Authorization: "token" } },
+    local: { command: "tool", args: ["--x"], env: { A: "segredo" } },
+    remote: { type: "http", url: "https://mcp", headers: { Authorization: "Bearer tok" } },
     broken: { type: "sse" },
   }, bridge);
   const mcp = result.config.mcp as Record<string, unknown>;
-  assert.deepEqual(mcp.local, { type: "stdio", command: "tool", args: ["--x"], env: { A: "1" } });
-  assert.deepEqual(mcp.remote, { type: "http", url: "https://mcp", headers: { Authorization: "token" } });
+  const envRef = `$${crushRefName("local", "env", "A")}`;
+  const hdrRef = `$${crushRefName("remote", "hdr", "Authorization")}`;
+  assert.deepEqual(mcp.local, { type: "stdio", command: "tool", args: ["--x"], env: { A: envRef } });
+  assert.deepEqual(mcp.remote, { type: "http", url: "https://mcp", headers: { Authorization: hdrRef } });
+  assert.equal(result.envRefs[crushRefName("local", "env", "A")], "segredo");
+  assert.equal(result.envRefs[crushRefName("remote", "hdr", "Authorization")], "Bearer tok");
   assert.equal(result.warnings.length, 1);
+  // o arquivo serializado não contém o valor — só a referência
+  const raw = JSON.stringify(result.config);
+  assert.ok(!raw.includes("segredo"));
+  assert.ok(!raw.includes("Bearer tok"));
 });
 
 test("Grok emits escaped TOML for local, remote and interpolated bridge entries", () => {
@@ -69,10 +77,13 @@ test("OpenCode serializes stdio as local and http/sse as remote (T-308); only mi
   assert.deepEqual((result.config.agent as Record<string, unknown>)["the-dudes-managed"], { model: "openai/gpt-5", reasoningEffort: "high" });
 });
 
-test("Codex TOML args escape quoted names and values without shell interpolation", () => {
-  const result = buildCodexMcpArgs({ "odd.name": { command: "a\"b", args: ["$HOME"] }, remote: { type: "sse", url: "https://mcp" } }, bridge);
+test("Codex config.toml (T-426): escapa nomes/valores e mantém token no arquivo, não em -c", () => {
+  const result = buildCodexMcpToml({ "odd.name": { command: "a\"b", args: ["$HOME"], env: { API_KEY: "tok-123" } }, remote: { type: "sse", url: "https://mcp" } }, bridge);
   assert.equal(result.warnings.length, 1);
   assert.match(result.warnings[0], /"remote".*not sse/);
-  assert.ok(result.args.some((arg) => arg.includes('mcp_servers."odd.name".command="a\\"b"')));
-  assert.ok(result.args.some((arg) => arg.includes('["$HOME"]')));
+  assert.ok(result.toml.includes('[mcp_servers."odd.name"]'));
+  assert.ok(result.toml.includes('command = "a\\"b"'));
+  assert.ok(result.toml.includes('args = ["$HOME"]'));
+  assert.ok(result.toml.includes('API_KEY="tok-123"'), "valor do token no config.toml");
+  assert.ok(result.toml.includes("[mcp_servers.the-dudes]"));
 });

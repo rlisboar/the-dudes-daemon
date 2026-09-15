@@ -80,32 +80,67 @@ export function buildClaudeMcpConfig(extras: Record<string, McpServerConfig> | u
   return { mcpServers };
 }
 
+/** T-426 (A15): nome de var de ambiente que REFERENCIA um valor no
+ *  `.crush.json` (o crush expande `$VAR` em command/args/env/headers — testado
+ *  na v0.82.0). O valor literal fica no env do processo crush, nunca no
+ *  arquivo do workspace. Namespace evita colisão com PATH/HOME do runner. */
+export function crushRefName(server: string, kind: "env" | "hdr", key: string): string {
+  const clean = (s: string) => s.replace(/[^A-Za-z0-9]/g, "_").toUpperCase();
+  return `THEDUDES_MCP_${clean(server)}_${kind.toUpperCase()}_${clean(key)}`;
+}
+
+/** Crush: `.crush.json` no workspaceRoot só carrega REFERÊNCIAS (`$VAR`) em
+ *  env/headers; os valores vão no env do processo (`envRefs`), fora do git.
+ *  O envelope `mcp["the-dudes"]` já era construído com `$VAR` pelo caller. */
 export function buildCrushMcpConfig(
   extras: Record<string, McpServerConfig> | undefined,
   bridge: BridgeConfig,
 ) {
   const mcp: Record<string, unknown> = {};
   const warnings: string[] = [];
+  const envRefs: Record<string, string> = {};
+  const refEnv = (server: string, env: Record<string, string> | undefined) => {
+    if (!env || !Object.keys(env).length) return undefined;
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(env)) {
+      const ref = crushRefName(server, "env", k);
+      out[k] = `$${ref}`;
+      envRefs[ref] = v;
+    }
+    return out;
+  };
+  const refHeaders = (server: string, headers: Record<string, string> | undefined) => {
+    if (!headers || !Object.keys(headers).length) return undefined;
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(headers)) {
+      const ref = crushRefName(server, "hdr", k);
+      out[k] = `$${ref}`;
+      envRefs[ref] = v;
+    }
+    return out;
+  };
   for (const [name, config] of Object.entries(extras ?? {})) {
     if (name === "the-dudes") continue;
     const type = config.type ?? "stdio";
     if (type === "stdio" && config.command) {
+      const env = refEnv(name, config.env);
       mcp[name] = {
         type, command: config.command,
         ...(config.args?.length ? { args: config.args } : {}),
-        ...(config.env && Object.keys(config.env).length ? { env: config.env } : {}),
+        ...(env ? { env } : {}),
       };
     } else if ((type === "http" || type === "sse") && config.url) {
+      const headers = refHeaders(name, config.headers);
       mcp[name] = {
         type, url: config.url,
-        ...(config.headers && Object.keys(config.headers).length ? { headers: config.headers } : {}),
+        ...(headers ? { headers } : {}),
       };
     } else {
       warnings.push(`skipping MCP "${name}" — transport "${type}" requires ${type === "stdio" ? "command" : "url"}`);
     }
   }
   mcp["the-dudes"] = { type: "stdio", ...bridge };
-  return { config: { $schema: "https://charm.land/crush.json", mcp }, warnings };
+  return { config: { $schema: "https://charm.land/crush.json", mcp }, warnings, envRefs };
 }
 
 export function buildOpenCodeMcpConfig(extras: Record<string, McpServerConfig> | undefined, bridge: BridgeConfig, autoApprove: boolean, managedAgent?: Record<string, unknown>) {
@@ -186,6 +221,48 @@ export function buildGrokMcpToml(extras: Record<string, McpServerConfig> | undef
     }
   }
   emitStdio("the-dudes", bridge);
+  return { toml: lines.join("\n"), warnings };
+}
+
+/**
+ * T-426 (A15): config.toml do CODEX_HOME por agente. Antes tudo ia em `-c
+ * mcp_servers.<x>.env={KEY="valor"}` — o VALOR do token ficava visível em
+ * `ps`/cmdline. O arquivo fica fora do git worktree e em mode 0600.
+ */
+export function buildCodexMcpToml(extras: Record<string, McpServerConfig> | undefined, bridge: BridgeConfig): { toml: string; warnings: string[] } {
+  const lines = [
+    "# Managed by the-dudes — MCP servers for Codex agents (T-426).",
+    "# Per-agent file, mode 0600, outside the git worktree.",
+    "",
+  ];
+  const warnings: string[] = [];
+  const emitServer = (name: string, config: { command: string; args: string[]; env: Record<string, string> }) => {
+    lines.push(`[mcp_servers.${tomlKey(name)}]`, `command = ${tomlString(config.command)}`);
+    if (config.args.length) lines.push(`args = ${tomlArray(config.args)}`);
+    if (Object.keys(config.env).length) lines.push(`env = ${tomlEnv(config.env)}`);
+    lines.push("");
+  };
+  for (const [name, config] of Object.entries(extras ?? {})) {
+    if (name === "the-dudes") continue;
+    const type = config.type ?? "stdio";
+    if ((type === "http" || type === "sse") && config.url) {
+      if (type === "sse") {
+        warnings.push(`skipping MCP "${name}" — codex supports stdio and streamable http (url), not sse`);
+        continue;
+      }
+      lines.push(`[mcp_servers.${tomlKey(name)}]`, `url = ${tomlString(config.url)}`, "");
+      if (config.headers && Object.keys(config.headers).length) {
+        warnings.push(`MCP "${name}" (http): codex não aplica headers custom — use bearer_token_env_var no config do codex`);
+      }
+      continue;
+    }
+    if (type !== "stdio" || !config.command) {
+      warnings.push(`skipping MCP "${name}" — transport "${type}" requires ${type === "stdio" ? "command" : "url"}`);
+      continue;
+    }
+    emitServer(name, { command: config.command, args: config.args ?? [], env: config.env ?? {} });
+  }
+  emitServer("the-dudes", bridge);
   return { toml: lines.join("\n"), warnings };
 }
 

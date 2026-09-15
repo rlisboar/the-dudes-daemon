@@ -54,9 +54,42 @@ test("rejeita exatamente o que passava batido antes", () => {
   assert.equal(validateCommand({ type: "update_task", id: "t", patch: { labels: "nao-é-array" } }).ok, false);
 });
 
-test("comando sem schema passa — cobertura é allowlist progressivo", () => {
+test("T-422 fail-closed: comando sem schema é recusado", () => {
+  assert.equal(validateCommand({ type: "comando_que_nao_existe", x: 1 }).ok, false);
+  const r = validateCommand({ type: "comando_que_nao_existe" });
+  assert.match(r.error, /sem schema/);
+  // `ping` saiu da lista de sem-schema na T-422.
   assert.equal(validateCommand({ type: "ping" }).ok, true);
-  assert.equal(validateCommand({ type: "comando_que_nao_existe", x: 1 }).ok, true);
+});
+
+test("T-422 opt-out explícito do canal daemon (até a T-423)", () => {
+  assert.equal(validateCommand({ type: "daemon:hello", name: "d" }, { failClosed: false }).ok, true);
+  assert.equal(validateCommand({ type: "comando_que_nao_existe" }, { failClosed: false }).ok, true);
+  // Campo errado de um schema conhecido continua recusando mesmo no opt-out.
+  assert.equal(validateCommand({ type: "remove_member", userId: 42 }, { failClosed: false }).ok, false);
+});
+
+test("T-422: os 44 cases que passavam por fora agora têm schema real", () => {
+  const novas = [
+    "write_file", "file_operation", "mcp:save", "mcp:delete", "skill:save_file", "skill:delete",
+    "inject_chat_history", "permission:respond", "reveal_credential", "graph:reindex",
+    "daemon:logs:get", "summarize", "compact_context", "clear_context", "read_file",
+    "search_files", "git_log", "git_status", "git_diff", "git_stage", "git_commit",
+    "list_files", "list_users", "list_templates", "list_goals", "list_missions", "list_plans",
+    "request_skills_scan", "request_mcps_scan", "request_model_catalogs",
+    "crypto:get_setup", "crypto:get_recovery_hash", "project_keys:get", "totp:status",
+    "user_public_key:get", "daemon_public_key:get", "list_file_locks", "gitlab_test",
+    "list_schedule_runs", "get_usage", "list_tts_summaries", "graph:get",
+    "clear_context", "compact_context",
+  ];
+  const sem = novas.filter((n) => !(n in commandSchemas));
+  assert.deepEqual(sem, [], `rota sem schema na T-422: ${sem.join(", ")}`);
+  // Não é z.any(): campo obrigatório errado tem de recusar.
+  assert.equal(validateCommand({ type: "write_file", path: "a", content: 1 }).ok, false);
+  assert.equal(validateCommand({ type: "write_file", path: "a", content: "x" }).ok, true);
+  assert.equal(validateCommand({ type: "file_operation", op: "tar", path: "a" }).ok, false);
+  assert.equal(validateCommand({ type: "summarize", correlationId: "c", runner: "claude", text: "t" }).ok, true);
+  assert.equal(validateCommand({ type: "permission:respond", requestId: "r", allow: "sim" }).ok, false);
 });
 
 test("campo extra não é rejeitado", () => {
@@ -67,10 +100,11 @@ test("campo extra não é rejeitado", () => {
 
 test("não confunde propriedade herdada de Object com schema", () => {
   // `commandSchemas[cmd.type]` sem hasOwnProperty devolveria a função pra
-  // type="constructor" e estouraria no safeParse.
-  assert.equal(validateCommand({ type: "constructor" }).ok, true);
-  assert.equal(validateCommand({ type: "toString" }).ok, true);
-  assert.equal(validateCommand({ type: "__proto__" }).ok, true);
+  // type="constructor" e estouraria no safeParse. Com fail-closed (T-422)
+  // esses types não têm schema e são recusados — nunca chegam ao safeParse.
+  assert.equal(validateCommand({ type: "constructor" }).ok, false);
+  assert.equal(validateCommand({ type: "toString" }).ok, false);
+  assert.equal(validateCommand({ type: "__proto__" }).ok, false);
 });
 
 test("a mensagem de erro aponta o campo", () => {

@@ -9,9 +9,12 @@ import { z } from "zod";
  *
  * T-067: 100% dos comandos que escrevem em DB têm schema. O teste estrutural
  * em server/src/__tests__/ws-command-schemas.test.ts falha o build se um
- * `case` novo do dispatch não tiver schema nem estiver no allowlist de
- * leitura. Comando sem schema ainda PASSA em runtime (allowlist progressivo
- * pras rotas só-leitura).
+ * `case` novo do dispatch não tiver schema.
+ *
+ * T-422 (A5): fail-closed — comando SEM schema é recusado (era `{ok:true}`),
+ * e os 44 cases + 15 `git_*` que ainda passavam por fora ganharam schema. O
+ * canal do daemon (FromDaemon) ainda usa `{failClosed:false}` até a T-423
+ * publicar os schemas zod daquele contrato; a janela é declarada no call site.
  */
 
 const id = z.string();
@@ -576,6 +579,108 @@ export const commandSchemas = {
   workspace_create: cmd({ taskId: id, agentId: id }),
   workspace_remove: cmd({ taskId: id, force: flag.optional() }),
   workspace_list: cmd({}),
+
+  /* ---------- T-422 (A5): rotas que ainda passavam sem schema ----------
+   * Forma bate com o ClientCommand de packages/protocol/wire.d.ts e com o que
+   * o web realmente envia. Sem `.strict()`/`.passthrough()` novos: campo extra
+   * segue ignorado (deploy escalonado). */
+  ping: cmd({}),
+  list_projects: cmd({}),
+  list_users: cmd({}),
+  list_templates: cmd({}),
+  get_usage: cmd({ from: text.optional(), to: text.optional() }),
+  "daemon:logs:get": cmd({ daemonName: text.optional(), limit: num.optional() }),
+  list_tts_summaries: cmd({}),
+
+  request_skills_scan: cmd({}),
+  request_mcps_scan: cmd({}),
+  request_model_catalogs: cmd({ runner: text.optional(), force: flag.optional() }),
+  "mcp:save": cmd({
+    correlationId: text.optional(),
+    name: text,
+    transport: z.enum(["stdio", "sse", "http"]).optional(),
+    command: text.optional(),
+    args: z.array(text).optional(),
+    env: z.record(text).optional(),
+    url: text.optional(),
+    headers: z.record(text).optional(),
+    description: text.optional(),
+  }),
+  "mcp:delete": cmd({ correlationId: text.optional(), name: text }),
+  "skill:read_file": cmd({ correlationId: text, skillName: text, relPath: text.optional() }),
+  "skill:save_file": cmd({ correlationId: text, skillName: text, relPath: text.optional(), content: text }),
+  "skill:delete": cmd({ correlationId: text, skillName: text }),
+  "graph:reindex": cmd({ semantic: flag.optional(), backend: text.optional(), model: text.optional() }),
+  "graph:get": cmd({}),
+
+  summarize: cmd({
+    correlationId: text,
+    runner: text,
+    model: text.optional(),
+    effort: text.optional(),
+    systemPrompt: text.optional(),
+    text: text,
+    dedupKey: text.optional(),
+    claudeConfigDir: text.optional(),
+    agentId: id.optional(),
+    probe: flag.optional(),
+  }),
+
+  list_files: cmd({ path: text }),
+  read_file: cmd({ path: text }),
+  write_file: cmd({ path: text, content: text }),
+  file_operation: cmd({
+    op: z.enum(["create_file", "create_directory", "rename", "delete"]),
+    path: text,
+    newPath: text.optional(),
+  }),
+  search_files: cmd({ query: text }),
+  git_log: cmd({ count: num.optional() }),
+  git_status: cmd({}),
+  git_diff: cmd({ path: text }),
+  git_stage: cmd({ path: text }),
+  git_unstage: cmd({ path: text }),
+  git_commit: cmd({ message: text, paths: z.array(text).optional() }),
+  git_push: cmd({}),
+  git_pull: cmd({}),
+  git_branches: cmd({}),
+  git_switch_branch: cmd({ branch: text }),
+  git_create_branch: cmd({ branch: text }),
+  git_show: cmd({ hash: text }),
+  git_file_log: cmd({ path: text, count: num.optional() }),
+  git_graph: cmd({}),
+  git_blame: cmd({ path: text }),
+  git_stash_list: cmd({}),
+  git_stash: cmd({ message: text.optional() }),
+  git_stash_pop: cmd({}),
+
+  "permission:respond": cmd({ requestId: id, allow: flag }),
+  reveal_credential: cmd({ id }),
+  list_file_locks: cmd({}),
+  gitlab_test: cmd({}),
+
+  clear_context: cmd({ id }),
+  compact_context: cmd({ id, saveMemory: flag.optional() }),
+  inject_chat_history: cmd({
+    id,
+    count: num,
+    instructions: text.optional(),
+    includeTasks: flag.optional(),
+    taskIds: z.array(id).optional(),
+  }),
+
+  list_schedule_runs: cmd({ scheduleId: id.optional(), limit: num.optional() }),
+  list_goals: cmd({}),
+  list_missions: cmd({}),
+  list_plans: cmd({}),
+
+  "project_keys:get": cmd({ projectId: id }),
+  "project_keys:list_pending": cmd({ projectId: id }),
+  "user_public_key:get": cmd({ userId: id }),
+  "daemon_public_key:get": cmd({}),
+  "crypto:get_setup": cmd({}),
+  "crypto:get_recovery_hash": cmd({}),
+  "totp:status": cmd({}),
 };
 
 /**
@@ -622,11 +727,21 @@ export const DB_WRITE_COMMANDS = Object.freeze([
   "workspace_create", "workspace_remove",
 ]);
 
-export function validateCommand(command) {
-  const schema = Object.prototype.hasOwnProperty.call(commandSchemas, command.type)
-    ? commandSchemas[command.type]
-    : undefined;
-  if (!schema) return { ok: true };
+/**
+ * Valida a FORMA do comando contra o schema do `type`.
+ *
+ * T-422 (A5): fail-closed por padrão — `type` sem schema é recusa, não passe
+ * livre. O canal do daemon (FromDaemon) usa `{failClosed:false}` até a T-423
+ * publicar os schemas daquele contrato (0/97 hoje).
+ */
+export function validateCommand(command, { failClosed = true } = {}) {
+  const has = Object.prototype.hasOwnProperty.call(commandSchemas, command.type);
+  const schema = has ? commandSchemas[command.type] : undefined;
+  if (!schema) {
+    return failClosed
+      ? { ok: false, error: `comando sem schema: ${command.type}` }
+      : { ok: true };
+  }
   const parsed = schema.safeParse(command);
   if (parsed.success) return { ok: true };
   const first = parsed.error.issues[0];

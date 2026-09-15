@@ -166,6 +166,20 @@ function parseServers(
   return out;
 }
 
+/** T-415/A11: payload WS de mcps:scan — só nomes, nunca valores de env/headers. */
+export type MCPScanWire = Omit<MCPDefinition, "env" | "headers"> & {
+  envKeys?: string[];
+  headerKeys?: string[];
+};
+
+export function mcpToScanPayload(m: MCPDefinition): MCPScanWire {
+  const { env, headers, ...rest } = m;
+  const out: MCPScanWire = { ...rest };
+  if (env && Object.keys(env).length > 0) out.envKeys = Object.keys(env);
+  if (headers && Object.keys(headers).length > 0) out.headerKeys = Object.keys(headers);
+  return out;
+}
+
 export async function scanMCPs(input: ScanInput): Promise<ScanResult> {
   const sources = buildSources(input.workspaceRoot);
   const byName = new Map<string, MCPDefinition>();

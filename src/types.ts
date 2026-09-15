@@ -1,135 +1,30 @@
-// Subset of types shared with the server. Keep shapes byte-compatible —
-// these flow over the orchestrator WS as JSON.
+// Tipos do daemon.
+//
+// T-423/R3 (M34): os tipos que já existiam no wire web↔server deixaram de ser
+// redefinidos aqui — a fonte única é `@the-dudes/protocol/wire`. `AgentRepoSpec`
+// é o nome histórico do daemon para `AgentRepo` (alias, mesmo shape); só
+// `RepoSummary` segue local (não existe no wire).
 
-import type { AgentRuntimeState, CliRunner, EffortLevel } from "@the-dudes/protocol";
 export type { AgentRuntimeState, CliRunner, EffortLevel } from "@the-dudes/protocol";
 
-export interface AgentUsage {
-  input: number;
-  output: number;
-  cacheCreate: number;
-  cacheRead: number;
-}
+export type {
+  AgentInfo,
+  AgentUsage,
+  ImageAttachment,
+  MCPDefinition,
+  MCPSource,
+  SkillDefinition,
+  SkillFrontmatter,
+  SkillSource,
+} from "@the-dudes/protocol/wire";
 
-export interface AgentRepoSpec {
-  name: string;
-  gitUrl: string;
-  branch?: string;
-}
+/** Alias do wire — nome usado pelo daemon desde antes do pacote protocol. */
+export type { AgentRepo as AgentRepoSpec } from "@the-dudes/protocol/wire";
 
-export interface AgentInfo {
-  id: string;
-  ownerUserId: string;
-  name: string;
-  role: string;
-  systemPrompt: string;
-  hierarchyLevel?: number;
-  managerAgentId?: string;
-  team?: string;
-  color: string;
-  state: AgentRuntimeState;
-  running: boolean;
-  model?: string;
-  effort?: EffortLevel;
-  cliRunner?: CliRunner;
-  planMode?: boolean;
-  /** Custom CLAUDE_CONFIG_DIR. Empty/undefined → native Claude default (env unset). */
-  claudeConfigDir?: string;
-  sessionId?: string;
-  repo?: AgentRepoSpec;
-  cwdOverride?: string;
-  usage: AgentUsage;
-  /** When true, daemon forwards Claude's extended-thinking blocks via onThinkingText.
-   *  Resolved by the server (agent override ?? project default ?? false). */
-  collectThinking?: boolean;
-  /** Subagente Brain (mcp delegate) — usa pool turn-gate `bg` (T-055). */
-  ephemeral?: boolean;
-  /** T-360 migração cross-runner: contexto portátil (markdown ≤ 8 KB) do agente
-   *  que morreu, CRU — sob E2EE cifrado. Presente e sessão descartada → o daemon
-   *  decripta (T-365), mede o limite em plaintext, embrulha na tag e entrega como
-   *  PRIMEIRO input do usuário após init. */
-  seedDigest?: string;
-  /** T-365: origem do seed, para o daemon escrever a tag. migrationId é o elo do
-   *  evento de metadados fixos (seed caído por falta de chave) ao agent:migrate. */
-  seedFrom?: { runner: string; model?: string; ts: number; migrationId?: string };
-  /** T-360: instrução opcional pedida por quem migrou, entregue junto do seed. */
-  seedInstruction?: string;
-}
-
-export interface ImageAttachment {
-  mimeType: string;
-  base64: string;
-  /** Nome original. Imagem só colada não tem; arquivo anexado tem. */
-  name?: string;
-}
-
+/** Repo base do workspace (espelho de workspace:set) — daemon-only. */
 export interface RepoSummary {
   id: string;
   name: string;
   gitUrl: string;
   defaultBranch?: string;
-}
-
-/* ---------- AgentSkills v2 (mirrors server/src/types) ---------- */
-
-export interface SkillFrontmatter {
-  name: string;
-  description: string;
-  when?: string;
-  version?: string;
-  userInvocable?: boolean;
-  commandDispatch?: "tool" | "shell" | null;
-  disableModelInvocation?: boolean;
-  allowedTools?: string[];
-  metadata?: {
-    requiresBinary?: string[];
-    requiresEnv?: string[];
-    requiresOs?: Array<"linux" | "macos" | "windows">;
-    requiresConfig?: Record<string, unknown>;
-  };
-}
-
-export type SkillSource =
-  | "workspace"
-  | "project-agents"
-  | "personal-agents"
-  | "openclaw-managed"
-  | "bundled"
-  | "extra";
-
-export interface SkillDefinition {
-  name: string;
-  source: SkillSource;
-  /** Origem do install — gravado pelo installer em `.installed-from.json`.
-   *  Ausente pra skills criadas manualmente. */
-  installedFrom?: { source: string; slug: string; installedAt?: string };
-  path: string;
-  frontmatter: SkillFrontmatter;
-  body: string;
-  contentHash: string;
-}
-
-/* ---------- MCP servers (Phase 1: discovery) ---------- */
-
-export type MCPSource =
-  | "workspace"
-  | "claude-project"
-  | "claude-global"
-  | "codex"
-  | "opencode"
-  | "gemini"
-  | "qwen"
-  | "override";
-
-export interface MCPDefinition {
-  name: string;
-  source: MCPSource;
-  configPath: string;
-  transport?: "stdio" | "sse" | "http";
-  command?: string;
-  args?: string[];
-  env?: Record<string, string>;
-  url?: string;
-  headers?: Record<string, string>;
-  description?: string;
 }

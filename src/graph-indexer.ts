@@ -3,7 +3,8 @@ import { homedir } from "node:os";
 import { statSync, readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { spawn } from "node:child_process";
 import type { ResolvedCliCommands } from "./cli-config.js";
-import type { DropTarget } from "./privileges.js";
+import { spawnDropped, type DropTarget } from "./privileges.js";
+import { buildSummarizerEnv } from "./runners/env.js";
 import type { CliRunner } from "./types.js";
 import { startCliShim, type CliShim } from "./graph-llm-shim.js";
 
@@ -77,13 +78,20 @@ export function normalizeGraphifyBackend(backend?: string): string {
 // (probe rápido, cache por processo) e passamos pro graphify. Resolve o exit 1
 // silencioso (401 que o claude joga no stdout JSON e o graphify descarta).
 let _authedClaudeCfg: string | null | undefined; // undefined=não testado, null=nenhum, string=dir
-function probeClaudeAuth(claudeCmd: string, cfgDir: string): Promise<boolean> {
+function probeClaudeAuth(claudeCmd: string, cfgDir: string, drop: DropTarget | null = null): Promise<boolean> {
   return new Promise((resolve) => {
     let out = ""; let settled = false;
     const fin = (v: boolean) => { if (!settled) { settled = true; resolve(v); } };
     let pr: ReturnType<typeof spawn>;
     try {
-      pr = spawn(claudeCmd, ["-p", "--output-format", "json", "ok"], { env: { ...process.env, CLAUDE_CONFIG_DIR: cfgDir } });
+      // A13 (T-425): mesmo contrato do spawn principal — env por allowlist
+      // (sem process.env inteiro) e drop quando o daemon roda como root.
+      pr = spawnDropped(
+        claudeCmd,
+        ["-p", "--output-format", "json", "ok"],
+        { env: { ...buildSummarizerEnv(process.env), CLAUDE_CONFIG_DIR: cfgDir } },
+        drop,
+      );
     } catch { fin(false); return; }
     const t = setTimeout(() => { try { pr.kill("SIGKILL"); } catch { /* noop */ } fin(false); }, 30_000);
     pr.stdout?.on("data", (c: Buffer) => { out += c.toString(); });
@@ -95,7 +103,7 @@ function probeClaudeAuth(claudeCmd: string, cfgDir: string): Promise<boolean> {
     });
   });
 }
-async function resolveAuthedClaudeConfigDir(claudeCmd: string): Promise<string | undefined> {
+async function resolveAuthedClaudeConfigDir(claudeCmd: string, drop: DropTarget | null = null): Promise<string | undefined> {
   if (_authedClaudeCfg !== undefined) return _authedClaudeCfg ?? undefined;
   const home = homedir();
   const cands = [process.env.CLAUDE_CONFIG_DIR, path.join(home, ".claude-eonf"), path.join(home, ".config", "claude"), path.join(home, ".claude")]
@@ -104,7 +112,7 @@ async function resolveAuthedClaudeConfigDir(claudeCmd: string): Promise<string |
   for (const dir of cands) {
     if (seen.has(dir)) continue;
     seen.add(dir);
-    if (await probeClaudeAuth(claudeCmd, dir)) { _authedClaudeCfg = dir; return dir; }
+    if (await probeClaudeAuth(claudeCmd, dir, drop)) { _authedClaudeCfg = dir; return dir; }
   }
   _authedClaudeCfg = null;
   return undefined;
@@ -416,7 +424,7 @@ async function runBuild(
   let claudeCfgDir: string | undefined;
   const reqBackend = normalizeGraphifyBackend(opts.backend);
   if (opts.semantic && reqBackend === "claude-cli" && opts.claudeCmd) {
-    claudeCfgDir = await resolveAuthedClaudeConfigDir(opts.claudeCmd);
+    claudeCfgDir = await resolveAuthedClaudeConfigDir(opts.claudeCmd, opts.dropTo ?? null);
   }
   // Backend *-cli: sobe o shim OpenAI-compat ANTES do graphify.
   // graphify 0.8+ ignora OPENAI_BASE_URL no backend openai — usamos ollama
@@ -455,7 +463,10 @@ async function runBuild(
         // *-cli: shim loopback via backend ollama + OLLAMA_BASE_URL.
         // API (gemini/openai/…): key do vault no env.
         let backend = reqBackend;
-        const env: NodeJS.ProcessEnv = { ...process.env };
+        // A13 (T-425): env do graphify por allowlist (buildSummarizerEnv) — o
+        // graphify é o NETO do daemon (spawna o claude/CLI por baixo), então
+        // process.env inteiro vazava token/encryption key até o LLM.
+        const env: NodeJS.ProcessEnv = buildSummarizerEnv(process.env);
         if (shim) {
           // graphify openai ignora OPENAI_BASE_URL; ollama honra OLLAMA_BASE_URL.
           backend = "ollama";
@@ -488,10 +499,16 @@ async function runBuild(
         if (backend !== "auto") args.push("--backend", backend);
         // --model do graphify sobrescreve o default do backend
         if (opts.model) args.push("--model", opts.model);
-        proc = spawn(graphifyBin, args, { cwd: workspaceRoot, env });
+        proc = spawnDropped(graphifyBin, args, { cwd: workspaceRoot, env }, opts.dropTo ?? null);
       } else {
-        // code-only: build local; herda PATH pro python resolver libs.
-        proc = spawn(graphifyBin, ["update", workspaceRoot], { cwd: workspaceRoot });
+        // code-only: build local; env por allowlist (PATH pro python resolver
+        // libs) e drop igual aos CLIs.
+        proc = spawnDropped(
+          graphifyBin,
+          ["update", workspaceRoot],
+          { cwd: workspaceRoot, env: buildSummarizerEnv(process.env) },
+          opts.dropTo ?? null,
+        );
       }
     } catch (e) {
       done({ ok: false, error: `graphify spawn falhou: ${(e as Error).message}` });

@@ -243,3 +243,16 @@ export async function scanSkills(input: ScanInput): Promise<ScanResult> {
     scannedSources: sources.map((s) => s.root),
   };
 }
+
+/** T-415/A11: payload WS de skills:scan — sem env/headers (valores). */
+export function skillToScanPayload(s: SkillDefinition): SkillDefinition {
+  return {
+    name: s.name,
+    source: s.source,
+    ...(s.installedFrom ? { installedFrom: s.installedFrom } : {}),
+    path: s.path,
+    frontmatter: s.frontmatter,
+    body: s.body,
+    contentHash: s.contentHash,
+  };
+}

@@ -18,6 +18,10 @@ test("classifier recognizes context, missing sessions, auth and transient networ
     classifyRunnerFailure("No saved session found with ID 0e5f0580-b460-4728-bf1f-4a811395e524. Run qwen --resume without an ID to choose from existing sessions."),
     "missing_session",
   );
+  // T-414: 404 HTTP genérico NÃO é sessão perdida
+  assert.equal(classifyRunnerFailure("GET /x 404 Not Found"), "other");
+  assert.equal(isMissingSessionFailure("GET /x 404 Not Found"), false);
+  assert.equal(isMissingSessionFailure("404 not found"), false);
   assert.equal(classifyRunnerFailure("401 invalid or expired credentials"), "authentication");
   assert.equal(classifyRunnerFailure("socket hang up ECONNRESET"), "transient_network");
   assert.equal(classifyRunnerFailure("API Error: provider rejected request"), "provider_error");

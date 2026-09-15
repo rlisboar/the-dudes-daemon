@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { registerAgentPid } from "../privileges.js";
@@ -16,6 +16,16 @@ export function grokHomeDirName(runner?: string): string {
 
 export function grokHomePath(home: string, runner?: string): string {
   return path.join(home, grokHomeDirName(runner));
+}
+
+/** T-426 (A15): CODEX_HOME por agente = <base>/agents/<slug>. Fica FORA do
+ *  git worktree do projeto (config.toml 0600 com os MCPs) e é estável por
+ *  agente (slug de hash) para o resume de sessão do codex sobreviver a
+ *  restart do daemon. `sessions`/`auth.json` são symlinks pro base — o
+ *  histórico compartilhado e o login do dono continuam valendo. */
+export function codexAgentHomePath(codexBase: string, agentId: string): string {
+  const slug = createHash("sha1").update(agentId).digest("hex").slice(0, 10);
+  return path.join(codexBase, "agents", slug);
 }
 
 /** Arquivos e diretórios pertencentes a uma única instância de runner.
@@ -124,6 +134,37 @@ export class RunnerRuntimeFiles {
     try { chmodSync(parent, 0o700); } catch {}
     const slug = createHash("sha1").update(this.input.agentId).digest("hex").slice(0, 10);
     return path.join(parent, `${slug}.sock`);
+  }
+
+  /** Base do CODEX_HOME do dono (respeita override por env do container). */
+  private codexBaseDir(): string {
+    const forced = process.env.CODEX_HOME?.trim();
+    if (forced) return forced;
+    return path.join(this.input.home ?? os.homedir(), ".codex");
+  }
+
+  /**
+   * Home POR AGENTE do codex: config.toml com os MCPs (escrito pelo runner,
+   * 0600) fora do repo. `auth.json` e `sessions` apontam pro base por symlink
+   * — sem isso o CLI ficaria deslogado ou perderia o histórico.
+   */
+  codexHomeDir(): string {
+    const base = this.codexBaseDir();
+    const dir = codexAgentHomePath(base, this.input.agentId);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    try { chmodSync(dir, 0o700); } catch {}
+    const link = (name: string, ensureDir = false) => {
+      const target = path.join(base, name);
+      const at = path.join(dir, name);
+      try {
+        if (existsSync(at)) return;
+        if (ensureDir && !existsSync(target)) mkdirSync(target, { recursive: true });
+        if (existsSync(target)) symlinkSync(target, at);
+      } catch { /* base ausente/race — segue sem o link */ }
+    };
+    link("auth.json");
+    link("sessions", true);
+    return dir;
   }
 
   crushDataDir(): string {

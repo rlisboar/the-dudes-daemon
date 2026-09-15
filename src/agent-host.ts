@@ -1,6 +1,5 @@
 import path from "node:path";
 import fs from "node:fs";
-import { spawnSync } from "node:child_process";
 import { AgentRunner, type AgentRunnerOptions } from "./agent-runner.js";
 import { breadcrumb, captureWarn } from "./sentry.js";
 import { assertWorkspaceScoped, autoWorkspaceCwd, cloneRepoIfMissing, expandBasePath, findGitRoot, getWorkspaceRoot, isInsideRoot, repoCwd } from "./workspace.js";
@@ -14,6 +13,40 @@ export type AgentErrorKind = "rate_limit" | "other";
 
 export function agentErrorKind(plain: string): AgentErrorKind {
   return classifyRunnerFailure(plain) === "rate_limit" ? "rate_limit" : "other";
+}
+
+/**
+ * A13 (T-425): `git worktree add` isolado do agent-host.
+ *  - spawnDropped com drop (quando o daemon roda como root);
+ *  - env por allowlist (buildSummarizerEnv) — antes era spawnSync herdando
+ *    process.env inteiro e sem drop;
+ *  - `--` antes do path (mesmo contrato do task-workspace/T-424).
+ */
+export function runGitWorktreeAdd(
+  gitRoot: string,
+  branchName: string,
+  worktreePath: string,
+  drop: DropTarget | null = null,
+): Promise<{ error?: Error; status: number | null; stderr: string }> {
+  return new Promise((resolve) => {
+    let stderr = "";
+    let proc;
+    try {
+      proc = spawnDropped(
+        "git",
+        ["worktree", "add", "-b", branchName, "--", worktreePath],
+        { cwd: gitRoot, env: buildSummarizerEnv(process.env), stdio: ["ignore", "pipe", "pipe"] },
+        drop,
+      );
+    } catch (e) {
+      resolve({ error: e as Error, status: 1, stderr });
+      return;
+    }
+    proc.stderr?.setEncoding("utf8");
+    proc.stderr?.on("data", (c: string) => { stderr += c; });
+    proc.on("error", (e) => resolve({ error: e, status: 1, stderr }));
+    proc.on("close", (code) => resolve({ status: code, stderr }));
+  });
 }
 
 /**
@@ -37,7 +70,8 @@ export function sealAgentErrorMessage(projectId: string | undefined, message: st
 import type { ResolvedCliCommands } from "./cli-config.js";
 import type { AgentInfo, ImageAttachment } from "./types.js";
 import type { AgentSpawn, FromDaemon } from "./protocol.js";
-import type { DropTarget } from "./privileges.js";
+import { spawnDropped, type DropTarget } from "./privileges.js";
+import { buildSummarizerEnv } from "./runners/env.js";
 import { compatibleSessionId } from "./runners/index.js";
 import { createAgentInboundBuffer } from "./inbound-dedup.js";
 
@@ -381,13 +415,10 @@ export class AgentHost {
           if (fs.existsSync(worktreePath)) {
             fs.rmSync(worktreePath, { recursive: true, force: true });
           }
-          // stdio pipe pra não bufferar git verboso até estourar maxBuffer (1MB)
-          // e pra poder inspecionar stderr no erro. encoding utf-8 pra ler a msg.
-          const wtRes = spawnSync(
-            "git",
-            ["worktree", "add", "-b", branchName, worktreePath],
-            { cwd: gitRoot, stdio: ["ignore", "pipe", "pipe"], encoding: "utf-8" },
-          );
+          // A13 (T-425): mesmo helper do graph-indexer — spawnDropped (drop
+          // quando root) + env por allowlist; antes era spawnSync herdando
+          // process.env inteiro e sem drop.
+          const wtRes = await runGitWorktreeAdd(gitRoot, branchName, worktreePath, this.dropTo);
           if (wtRes.error || wtRes.status !== 0) {
             // Falha (branch já existe, HEAD destacado, árvore suja…). Não cair
             // silenciosamente no cwd compartilhado: avisa e mantém o cwd base.
