@@ -7,10 +7,11 @@
  * e branch/paths são re-validados (`validateGitRef`/`isInsideRoot`) com `--`
  * antes de refs/paths.
  */
-import { existsSync, mkdirSync } from "node:fs";
+import {existsSync, mkdirSync} from "node:fs";
 import path from "node:path";
-import { spawnDropped, type DropTarget } from "./privileges.js";
-import { gitMinimalEnv, isInsideRoot, validateBasePath, validateGitRef } from "./workspace.js";
+import {type DropTarget} from "./privileges.js";
+import {isInsideRoot, validateBasePath, validateGitRef} from "./workspace.js";
+import {runGit} from "./runners/run-git.js";
 
 export type WorkspaceOpOk = {
   ok: true;
@@ -34,31 +35,9 @@ async function git(
   args: string[],
   drop: DropTarget | null = null,
 ): Promise<{ ok: boolean; stdout: string; stderr: string; status: number }> {
-  return new Promise((resolve) => {
-    let proc;
-    try {
-      proc = spawnDropped(
-        "git",
-        args,
-        { cwd: repo, env: gitMinimalEnv(drop), stdio: ["ignore", "pipe", "pipe"] },
-        drop,
-      );
-    } catch (e) {
-      resolve({ ok: false, stdout: "", stderr: (e as Error).message, status: 1 });
-      return;
-    }
-    let stdout = "";
-    let stderr = "";
-    proc.stdout?.setEncoding("utf8");
-    proc.stdout?.on("data", (c: string) => { stdout += c; });
-    proc.stderr?.setEncoding("utf8");
-    proc.stderr?.on("data", (c: string) => { stderr += c; });
-    proc.on("close", (code) => {
-      const status = code ?? 1;
-      resolve({ ok: status === 0, stdout: stdout.trim(), stderr: stderr.trim(), status });
-    });
-    proc.on("error", (e) => resolve({ ok: false, stdout: "", stderr: e.message, status: 1 }));
-  });
+  // R8 (T-463): ponto único (spawnDropped + env mínimo + timeout de grupo).
+  const r = await runGit(repo, args, { drop });
+  return { ok: r.ok, stdout: r.stdout, stderr: r.stderr, status: r.status ?? 1 };
 }
 
 export function slug(s: string): string {

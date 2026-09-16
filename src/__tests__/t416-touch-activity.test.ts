@@ -4,14 +4,15 @@
  */
 import "./scratch-home.js";
 
-import { test } from "node:test";
+import {test} from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { AgentRunner } from "../agent-runner.js";
-import { resolveCliCommands } from "../cli-config.js";
+import {fileURLToPath} from "node:url";
+import {AgentRunner} from "../agent-runner.js";
+import {resolveCliCommands} from "../cli-config.js";
+import {allRunnerSources} from "./_sources.js";
 
 function makeRunner(cliRunner: "gemini" | "codex" | "crush"): {
   runner: AgentRunner;
@@ -39,18 +40,15 @@ function makeRunner(cliRunner: "gemini" | "codex" | "crush"): {
 const asAny = (r: AgentRunner) => r as unknown as Record<string, any>;
 const tick = (r: AgentRunner) => (r as unknown as { tickHangWatch: () => void }).tickHangWatch();
 
-const SRC = readFileSync(
-  path.join(path.dirname(fileURLToPath(import.meta.url)), "../agent-runner.ts"),
-  "utf8",
-);
+const SRC = allRunnerSources(path.join(path.dirname(fileURLToPath(import.meta.url)), "../agent-runner.ts"));
 
 test("T-416: os 3 handlers chamam touchActivity (gemini linha, codex linha, crush chunk)", () => {
-  const gemini = SRC.slice(SRC.indexOf("ingestGeminiLine"), SRC.indexOf("runGeminiMessage"));
-  const codex = SRC.slice(SRC.indexOf("handleCodexEvent"), SRC.indexOf("readCodexRolloutSignals"));
-  const crush = SRC.slice(SRC.indexOf("ingestCrushChunk"), SRC.indexOf("runGeminiMessage"));
-  assert.match(gemini, /this\.touchActivity\(\)/);
-  assert.match(codex, /this\.touchActivity\(\)/);
-  assert.match(crush, /this\.touchActivity\(\)/);
+  const gemini = SRC.slice(SRC.indexOf("export function ingestGeminiLine"), SRC.indexOf("export function runGeminiMessage"));
+  const codex = SRC.slice(SRC.indexOf("export function handleCodexEvent"), SRC.indexOf("export function readCodexRolloutSignals"));
+  const crush = SRC.slice(SRC.indexOf("export function ingestCrushChunk"), SRC.indexOf("export function runCrushMessage"));
+  assert.match(gemini, /(?:this|self)\.touchActivity\(\)/);
+  assert.match(codex, /(?:this|self)\.touchActivity\(\)/);
+  assert.match(crush, /(?:this|self)\.touchActivity\(\)/);
   assert.match(gemini, /noteGrokToolInFlight/);
   assert.match(codex, /noteGrokToolInFlight/);
   assert.match(crush, /noteGrokToolInFlight/);

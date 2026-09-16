@@ -1,4 +1,4 @@
-/* global AbortSignal */
+/* global AbortSignal, TransformStream, Response */
 import * as dns from "node:dns/promises";
 import * as net from "node:net";
 import { Agent, fetch as undiciFetch } from "undici";
@@ -48,6 +48,11 @@ const PRIVATE_CIDRS = [
   /^::$/,
   // NAT64 well-known prefix
   /^64:ff9b:/i,
+  // M37 (T-455): lacunas fechadas — fec0::/10 (site-local legado),
+  // 198.18.0.0/15 (benchmarking) e 192.0.0.0/24.
+  /^fe[c-f][0-9a-f]:/i,
+  /^198\.1[89]\./,
+  /^192\.0\.0\./,
 ];
 
 /** Extrai o IPv4 embutido num IPv6 IPv4-mapped, pra re-testar contra os CIDRs
@@ -200,9 +205,22 @@ export async function safeFetch(rawUrl, init = {}, opts = {}) {
     });
     const resp = await undiciFetch(current, { ...init, ...(signal ? { signal } : {}), dispatcher, redirect: "manual" });
     if (resp.status >= 300 && resp.status < 400 && resp.headers.has("location")) {
+      // M37 (T-455): o body do 30x tem de ser DRENADO (senão a conexão do
+      // hop fica pinada) e o Agent do hop tem de fechar (senão vaza socket/
+      // handle por redirect). Depois segue pro próximo hop.
+      try { await resp.body?.cancel(); } catch { /* body já fechado */ }
       current = new URL(resp.headers.get("location"), current).toString();
+      try { await dispatcher.close(); } catch { /* já fechado */ }
       continue;
     }
+    // Hop final: o body ainda vai ser lido pelo caller — fecha o Agent
+    // quando o stream terminar/cancelar (sem proibir o read).
+    if (resp.body) {
+      const ts = new TransformStream();
+      void resp.body.pipeTo(ts.writable).then(() => dispatcher.close()).catch(() => dispatcher.close());
+      return new Response(ts.readable, { status: resp.status, statusText: resp.statusText, headers: resp.headers });
+    }
+    try { await dispatcher.close(); } catch { /* */ }
     return resp;
   }
   throw new Error(`SSRF bloqueado: redirects demais (> ${maxRedirects})`);

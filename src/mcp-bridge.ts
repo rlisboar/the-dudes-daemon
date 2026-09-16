@@ -40,7 +40,22 @@ function loadAgentToken(): string {
 }
 const AGENT_TOKEN = loadAgentToken();
 
-if (!AGENT_ID) {
+// T-577: este módulo é um PROGRAMA (o daemon o spawna como processo próprio,
+// via `resolveBridge()` do agent-host: `node dist/mcp-bridge.cjs` ou
+// `tsx src/mcp-bridge.ts` em dev) e TAMBÉM é importado pelos testes do registry
+// (t469, t557). Os dois efeitos de processo no topo do módulo quebravam o
+// `node --test` no CI, que roda a suíte do daemon sem nenhuma env THE_DUDES_*:
+//   - este `process.exit(1)` matava o processo do runner durante o import e os
+//     2 arquivos morriam sem rodar um único teste;
+//   - o `server.connect(transport)` do fim pendura listeners em process.stdin e
+//     segurava o event loop do filho para sempre.
+// Gate: só age como processo quem ESTE arquivo é o entrypoint. O nome do
+// arquivo é a mesma âncora que o `resolveBridge()` do daemon já usa pra achá-lo
+// (`mcp-bridge.{cjs,js,ts}`). `import.meta.url` não serve: o bundle CJS do
+// esbuild (0.28) o deixa `undefined`.
+const IS_BRIDGE_ENTRYPOINT = /[/\\]mcp-bridge\.(?:cjs|js|ts)$/.test(process.argv[1] ?? "");
+
+if (!AGENT_ID && IS_BRIDGE_ENTRYPOINT) {
   console.error("[mcp-bridge] THE_DUDES_AGENT_ID not set");
   process.exit(1);
 }
@@ -127,7 +142,7 @@ async function postJSON(route: string, body: unknown): Promise<any> {
   return withBridgeRetry(() => postJSONOnce(route, body), { attempts: 4, baseDelayMs: 200 });
 }
 
-const server = new McpServer({ name: "the-dudes", version: "0.1.0" });
+export const server = new McpServer({ name: "the-dudes", version: "0.1.0" });
 
 // --- Gating de contexto por projeto -------------------------------------
 // O daemon escreve THE_DUDES_FEATURES (lista CSV dos grupos ligados) no env
@@ -1605,8 +1620,14 @@ server.tool(
   },
 );
 
-const transport = new StdioServerTransport();
-server.connect(transport).catch((e: unknown) => {
-  console.error("[mcp-bridge] failed to connect:", e);
-  process.exit(1);
-});
+export const transport = new StdioServerTransport();
+
+// T-577: só liga o stdio quando é o entrypoint. Importado (teste), o módulo
+// deixa o stdin do host em paz — o registry já está montado e ninguém pendura
+// o event loop de quem importou.
+if (IS_BRIDGE_ENTRYPOINT) {
+  server.connect(transport).catch((e: unknown) => {
+    console.error("[mcp-bridge] failed to connect:", e);
+    process.exit(1);
+  });
+}

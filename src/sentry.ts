@@ -13,6 +13,7 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import * as Sentry from "@sentry/node";
+import { scrubText } from "@the-dudes/protocol/scrub";
 
 // Build-time injectado em scripts/build.mjs via esbuild --define.
 // Runtime env tem precedência pra overrides ad-hoc.
@@ -47,15 +48,7 @@ export function initSentry() {
       },
     },
     beforeSend(event) {
-      // O daemon vê tokens + valores de credencial (get_credential) + blobs
-      // E2EE em trânsito. Scrub em URL, message, exceptions e breadcrumbs.
-      const SECRET = /\b(token|secret|api[_-]?key|password|passwd|authorization|bearer|recovery|kek)["':=\s]+\S+/gi;
-      const scrub = (s: unknown): any =>
-        typeof s === "string"
-          ? s.replace(SECRET, "$1=[REDACTED]")
-             .replace(/\be2e:[A-Za-z0-9+/=]{8,}/g, "e2e:[REDACTED]")
-             .replace(/\bsk-[a-zA-Z0-9_-]{16,}/g, "[REDACTED]")
-          : s;
+      const scrub = scrubText;
       if (event.request?.url) event.request.url = scrub(event.request.url);
       if (event.message) event.message = scrub(event.message);
       for (const ex of event.exception?.values ?? []) if (ex.value) ex.value = scrub(ex.value);

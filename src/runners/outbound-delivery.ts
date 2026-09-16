@@ -9,7 +9,8 @@
  * Este módulo:
  *  - classifica mensagens críticas (texto/erro/hung/exit do agente);
  *  - decide se o canal aceita envio (OPEN + bufferedAmount);
- *  - enfileira críticas quando o envio falha, pra flush no reconnect.
+ *  - enfileira críticas quando o envio falha, pra flush no reconnect;
+ *  - no overflow, efémeras (thinking/tool_use) saem antes das semânticas.
  */
 
 export type OutboundWire = { type: string; [k: string]: unknown };
@@ -23,8 +24,24 @@ const CRITICAL_TYPES = new Set([
   "agent:tool_use",
 ]);
 
+// M23 (T-446): thinking/tool_use são estado EFÉMERO de alta frequência; num
+// socket fora, enchiam a fila e o `shift()` antigo expulsava agent:text/exit/
+// error/hung (semânticos). Overflow passa a evictar o low-priority mais antigo.
+const HIGH_PRIORITY_TYPES = new Set([
+  "agent:text",
+  "agent:error",
+  "agent:hung",
+  "agent:exit",
+]);
+
 export function isCriticalOutbound(msg: OutboundWire): boolean {
   return CRITICAL_TYPES.has(msg.type);
+}
+
+/** Item semântico (text/error/hung/exit) nunca é evictado enquanto houver
+ *  thinking/tool_use na fila. */
+export function isHighPriorityOutbound(msg: OutboundWire): boolean {
+  return HIGH_PRIORITY_TYPES.has(msg.type);
 }
 
 export interface ChannelState {
@@ -55,6 +72,12 @@ export function createOutboundQueue(max = 80): OutboundQueue {
   return { items: [], max };
 }
 
+function evictOne(q: OutboundQueue): void {
+  const idx = q.items.findIndex((it) => !HIGH_PRIORITY_TYPES.has(it.type));
+  if (idx >= 0) q.items.splice(idx, 1);
+  else q.items.shift();
+}
+
 export function enqueueCritical(
   q: OutboundQueue,
   msg: OutboundWire,
@@ -62,7 +85,7 @@ export function enqueueCritical(
 ): void {
   if (!isCriticalOutbound(msg)) return;
   q.items.push({ type: msg.type, json });
-  while (q.items.length > q.max) q.items.shift();
+  while (q.items.length > q.max) evictOne(q);
 }
 
 /**

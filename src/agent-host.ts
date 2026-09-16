@@ -1,12 +1,12 @@
 import path from "node:path";
 import fs from "node:fs";
-import { AgentRunner, type AgentRunnerOptions } from "./agent-runner.js";
-import { breadcrumb, captureWarn } from "./sentry.js";
-import { assertWorkspaceScoped, autoWorkspaceCwd, cloneRepoIfMissing, expandBasePath, findGitRoot, getWorkspaceRoot, isInsideRoot, repoCwd } from "./workspace.js";
-import { aadV2, E2EE_TABLE, MIGRATE_SEED_DROPPED_REASON, MIGRATE_SEED_RESUME_SKIPS_REASON } from "@the-dudes/protocol/e2ee-fields";
-import { decryptForProject, encryptForProject, isE2eEncrypted, isE2eeRequired, setE2eeRequired, redactCredentials, redactCredentialsDeep } from "./daemon-crypto.js";
-import { classifyRunnerFailure } from "./runners/error-classifier.js";
-import { migratedSeedFor, MIGRATED_SEED_LIMIT_BYTES } from "./migrated-seed.js";
+import {AgentRunner, type AgentRunnerOptions} from "./agent-runner.js";
+import {breadcrumb, captureWarn} from "./sentry.js";
+import {assertWorkspaceScoped, autoWorkspaceCwd, cloneRepoIfMissing, expandBasePath, findGitRoot, getWorkspaceRoot, isInsideRoot, repoCwd} from "./workspace.js";
+import {aadV2, E2EE_TABLE, MIGRATE_SEED_DROPPED_REASON, MIGRATE_SEED_RESUME_SKIPS_REASON} from "@the-dudes/protocol/e2ee-fields";
+import {decryptForProject, encryptForProject, isE2eEncrypted, isE2eeRequired, setE2eeRequired, redactCredentials, redactCredentialsDeep} from "./daemon-crypto.js";
+import {classifyRunnerFailure} from "./runners/error-classifier.js";
+import {migratedSeedFor, MIGRATED_SEED_LIMIT_BYTES} from "./migrated-seed.js";
 
 /** 1 enum operacional (paridade hung.soft). Classifica no plaintext ANTES do seal. */
 export type AgentErrorKind = "rate_limit" | "other";
@@ -28,25 +28,12 @@ export function runGitWorktreeAdd(
   worktreePath: string,
   drop: DropTarget | null = null,
 ): Promise<{ error?: Error; status: number | null; stderr: string }> {
-  return new Promise((resolve) => {
-    let stderr = "";
-    let proc;
-    try {
-      proc = spawnDropped(
-        "git",
-        ["worktree", "add", "-b", branchName, "--", worktreePath],
-        { cwd: gitRoot, env: buildSummarizerEnv(process.env), stdio: ["ignore", "pipe", "pipe"] },
-        drop,
-      );
-    } catch (e) {
-      resolve({ error: e as Error, status: 1, stderr });
-      return;
-    }
-    proc.stderr?.setEncoding("utf8");
-    proc.stderr?.on("data", (c: string) => { stderr += c; });
-    proc.on("error", (e) => resolve({ error: e, status: 1, stderr }));
-    proc.on("close", (code) => resolve({ status: code, stderr }));
-  });
+  // R8 (T-463): helper central (env mínimo + spawnDropped + timeout de grupo).
+  return runGit(gitRoot, ["worktree", "add", "-b", branchName, "--", worktreePath], { drop }).then((r) => ({
+    error: r.timedOut ? new Error("git worktree add timeout") : undefined,
+    status: r.ok ? 0 : (r.status ?? 1),
+    stderr: r.stderr,
+  }));
 }
 
 /**
@@ -67,13 +54,14 @@ export function sealAgentErrorMessage(projectId: string | undefined, message: st
   return red;
 }
 
-import type { ResolvedCliCommands } from "./cli-config.js";
-import type { AgentInfo, ImageAttachment } from "./types.js";
-import type { AgentSpawn, FromDaemon } from "./protocol.js";
-import { spawnDropped, type DropTarget } from "./privileges.js";
-import { buildSummarizerEnv } from "./runners/env.js";
-import { compatibleSessionId } from "./runners/index.js";
-import { createAgentInboundBuffer } from "./inbound-dedup.js";
+import type {ResolvedCliCommands} from "./cli-config.js";
+import type {AgentInfo, ImageAttachment} from "./types.js";
+import type {AgentSpawn, FromDaemon} from "./protocol.js";
+import {type DropTarget} from "./privileges.js";
+import {runGit} from "./runners/run-git.js";
+
+import {compatibleSessionId} from "./runners/index.js";
+import {createAgentInboundBuffer} from "./inbound-dedup.js";
 
 // Works in both CJS bundle (where __dirname is native) and ESM dev (tsx)
 // where we fall back to the process entry script.
@@ -85,12 +73,15 @@ const baseDir: string = (() => {
 })();
 
 function resolveBridge(): { command: string; args: string[] } {
-  // Bundled distribution (cjs)
+  // P2 (T-474): em dev (entry .ts via tsx) a FONTE vence cjs/js stale em
+  // daemon/src — antes um daemon.cjs velho deixado por build local sombreava
+  // o mcp-bridge.ts e o daemon rodava código antigo.
+  const runningFromTs = String(process.argv[1] ?? "").endsWith(".ts");
   const bundled = path.resolve(baseDir, "mcp-bridge.cjs");
-  if (fs.existsSync(bundled)) return { command: "node", args: [bundled] };
+  if (!runningFromTs && fs.existsSync(bundled)) return { command: "node", args: [bundled] };
   // Compiled tsc output
   const compiled = path.resolve(baseDir, "mcp-bridge.js");
-  if (fs.existsSync(compiled)) return { command: "node", args: [compiled] };
+  if (!runningFromTs && fs.existsSync(compiled)) return { command: "node", args: [compiled] };
   // Dev: tsx + .ts source
   const source = path.resolve(baseDir, "mcp-bridge.ts");
   const tsxBin = (() => {
@@ -119,6 +110,32 @@ interface Entry {
   /** Espelho Telegram: chat vinculado pra onde TODA saída do agente é
    *  encaminhada (texto em claro). Setado via agent:send.telegram. */
   telegramMirror?: { botToken: string; chatId: string };
+  /** M25 (T-448): worktree isolado deste agente (removido em stop/shutdown).
+   *  Sem isto o par (path, gitRoot) perdia-se no escopo do spawn e os
+   *  worktrees antigos acumulavam em `<repo>/../worktrees`. */
+  worktreePath?: string;
+  gitRoot?: string;
+}
+
+/**
+ * M25 (T-448): remove o worktree de um agente (best-effort, com fallback).
+ * `git worktree remove --force` limpa também o metadata (.git/worktrees);
+ * se o git falhar (dir já apagado/lock), rmSync + `git worktree prune`.
+ */
+export function runGitWorktreeRemove(
+  gitRoot: string,
+  worktreePath: string,
+  drop: DropTarget | null = null,
+): Promise<{ ok: boolean; detail?: string }> {
+  const run = (args: string[]) => runGit(gitRoot, args, { drop });
+  return run(["worktree", "remove", "--force", "--", worktreePath]).then(async (r) => {
+    if (r.ok) return { ok: true };
+    const detail = r.timedOut ? "timeout" : (r.stderr || `exit ${r.status}`);
+    try { fs.rmSync(worktreePath, { recursive: true, force: true }); } catch { /* já limpo */ }
+    const pr = await run(["worktree", "prune"]);
+    if (pr.ok) return { ok: true, detail: `fallback rm+prune (${detail})` };
+    return { ok: false, detail };
+  });
 }
 
 export class AgentHost {
@@ -129,6 +146,15 @@ export class AgentHost {
   /** Quantos agentes este daemon mantém vivos — indicador de saúde da UI. */
   agentCount(): number {
     return this.entries.size;
+  }
+
+  /** M18 (T-441): algum runner com turno VIVO fora do turn-gate (claude
+   *  contínuo). O idle do self-update precisa consultar isto além do gate. */
+  hasActiveTurn(): boolean {
+    for (const e of this.entries.values()) {
+      if (e.runner?.isTurnActive()) return true;
+    }
+    return false;
   }
   private autoApproveDefault = false;
   /** Liga watch debounced do grafo (setado pelo DaemonClient). */
@@ -257,7 +283,10 @@ export class AgentHost {
         existing.info?.collectThinking !== msg.agent.collectThinking ||
         existing.info?.planMode !== msg.agent.planMode ||
         existing.info?.claudeConfigDir !== msg.agent.claudeConfigDir;
-      if (!reconfig) {
+      // M17 (T-440): reconnect só vale para runner VIVO. Claude cujo proc
+      // nunca subiu (spawn error) ou morreu sem exit ficava marcado running e
+      // nada rodava; aqui o cadáver cai no spawn completo abaixo.
+      if (!reconfig && existing.runner.isAlive()) {
         // Reconnect puro — re-anuncia estado pro orchestrator reconciliar.
         // Re-anuncia o token: server perdeu o Map agentTokens (in-memory)
         // após restart e o mcp-bridge segue com o token antigo — sem isto
@@ -271,8 +300,9 @@ export class AgentHost {
         this.send({ type: "agent:state", agentId: msg.agent.id, state: existing.runner.currentRuntimeState() });
         return;
       }
-      // Reconfig: derruba o runner antigo antes de criar o novo. Seu
-      // onExit tardio não vai zerar o novo (guard `e.runner === thisRunner`).
+      // Reconfig OU runner stale (M17): derruba o antigo antes de criar o
+      // novo. Seu onExit tardio não vai zerar o novo (guard
+      // `e.runner === thisRunner`).
       try { existing.runner.stop(); } catch { /* já morto */ }
       existing.runner = null;
     }
@@ -384,6 +414,10 @@ export class AgentHost {
     // Git worktree isolation: create an isolated worktree for this agent
     // so it never shares the same working directory with other agents.
     let worktreePath: string | undefined;
+    // M25 (T-448): captura o par (path, gitRoot) pro entry — o `gitRoot` local
+    // do bloco não inclui a árvore do worktree (rev-parse dentro dele devolve o
+    // próprio worktree).
+    let agentWorktree: { path: string; gitRoot: string } | undefined;
     if (msg.agentWorktrees) {
       const gitRoot = findGitRoot(cwd);
       if (gitRoot) {
@@ -453,6 +487,7 @@ export class AgentHost {
               throw new Error(`worktree escapou da base: ${resolvedWt}`);
             }
             if (fs.existsSync(worktreePath)) {
+              agentWorktree = { path: worktreePath, gitRoot };
               cwd = worktreePath;
               this.emitAgentError(
                 msg.agent.id,
@@ -624,6 +659,7 @@ export class AgentHost {
       autoApprove: msg.autoApprove,
       projectId: msg.projectId,
       agentToken: msg.agentToken,
+      ...(agentWorktree ? { worktreePath: agentWorktree.path, gitRoot: agentWorktree.gitRoot } : {}),
     });
     this.send({ type: "agent:running", agentId: msg.agent.id, running: true });
     // T-360/T-365: seed de migração cross-runner. É o PRIMEIRO input do usuário —
@@ -684,6 +720,20 @@ export class AgentHost {
     const e = this.entries.get(agentId);
     if (!e?.runner) return;
     e.runner.stop();
+    // M25 (T-448): worktree do agente pára com ele — hoje ficava no disco.
+    void this.removeWorktreeOf(e);
+  }
+
+  /** M25 (T-448): remove (1×) o worktree do entry. Limpa o campo antes pra
+   *  stop/shutdown duplo não repetir. */
+  private removeWorktreeOf(e: Entry): Promise<void> {
+    const wt = e.worktreePath;
+    const gitRoot = e.gitRoot;
+    if (!wt || !gitRoot) return Promise.resolve();
+    e.worktreePath = undefined;
+    return runGitWorktreeRemove(gitRoot, wt, this.dropTo)
+      .then((r) => this.log(r.ok ? "info" : "warn", `[worktree] ${r.ok ? "removido" : "remoção falhou"} ${wt}${r.detail ? ` (${r.detail})` : ""}`))
+      .catch((err) => this.log("warn", `[worktree] remoção falhou ${wt}: ${(err as Error).message}`));
   }
 
   send_message(agentId: string, content: string, images?: ImageAttachment[], deliveryId?: string) {
@@ -735,9 +785,17 @@ export class AgentHost {
     }
   }
 
-  shutdown() {
+  /** M25 (T-448): async — além de parar os runners, remove os worktrees
+   *  (com teto de 2s; main espera 2.5s antes do re-exec). */
+  async shutdown(): Promise<void> {
+    const removals: Promise<void>[] = [];
     for (const e of this.entries.values()) {
       if (e.runner) try { e.runner.stop(); } catch {}
+      removals.push(this.removeWorktreeOf(e));
     }
+    await Promise.race([
+      Promise.allSettled(removals),
+      new Promise<void>((r) => setTimeout(r, 2_000)),
+    ]);
   }
 }

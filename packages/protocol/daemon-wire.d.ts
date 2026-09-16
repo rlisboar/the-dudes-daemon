@@ -110,6 +110,8 @@ export interface ProjectKeyForDaemon {
 export interface DaemonWelcome {
   type: "daemon:welcome";
   user: { id: string; email: string; name: string };
+  /** M35 (T-475): versão de fio do server; daemon avisa se diferir. */
+  protocolVersion?: number;
 }
 
 export interface DaemonPing { type: "daemon:ping"; ts: number }

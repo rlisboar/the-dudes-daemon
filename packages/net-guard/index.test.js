@@ -1,3 +1,4 @@
+/* global setTimeout */
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { checkOutboundUrl, isPrivateAddress, unmapV4 } from "./index.js";
@@ -90,4 +91,71 @@ test("allowLocalhost é opt-in — o daemon usa, o orchestrator não", async () 
   assert.notEqual(await checkOutboundUrl("http://127.0.0.1:9999/"), null);
   // E allowLocalhost NÃO abre a LAN inteira.
   assert.notEqual(await checkOutboundUrl("http://10.0.0.1/", { allowLocalhost: true }), null);
+});
+
+/* ---------- T-455 (M37) ---------- */
+
+test("M37: ranges fec0::/10, 198.18/15, 192.0.0/24 recusados", async () => {
+  for (const ip of ["fec0::1", "feff::1"]) {
+    assert.equal(isPrivateAddress(ip), true, `${ip} deveria ser privado`);
+    // URL IPv6 exige brackets; asserta o MOTIVO (CIDR), não "URL inválida".
+    const r = await checkOutboundUrl(`http://[${ip}]/`);
+    assert.match(String(r), /endereço privado bloqueado/, `[${ip}] deveria ser barrado por CIDR`);
+  }
+  for (const ip of ["198.18.0.1", "198.19.255.255", "192.0.0.1", "192.0.0.170"]) {
+    assert.equal(isPrivateAddress(ip), true, `${ip} deveria ser privado`);
+    assert.ok(await checkOutboundUrl(`http://${ip}/`), `${ip} deveria ser barrado pelo checkOutboundUrl`);
+  }
+  // vizinhos continuam públicos
+  for (const ip of ["fe00::1", "198.20.0.1", "192.0.1.1"]) {
+    assert.equal(isPrivateAddress(ip), false, `${ip} NÃO deveria ser privado`);
+  }
+});
+
+test("M37: redirect drena o body do 30x e fecha o Agent do hop", async () => {
+  const http = await import("node:http");
+  const s2 = http.createServer((_q, r) => { r.writeHead(200); r.end("destino"); });
+  await new Promise((r) => s2.listen(0, "127.0.0.1", r));
+  const port2 = s2.address().port;
+  let bodySize = 65 * 1024; // body grande: se não drenar, a conexão fica em backpressure
+  const s1 = http.createServer((_q, r) => {
+    r.writeHead(302, { location: `http://127.0.0.1:${port2}/` });
+    r.write("x".repeat(bodySize));
+    setTimeout(() => r.end(), 30);
+  });
+  await new Promise((r) => s1.listen(0, "127.0.0.1", r));
+  const port1 = s1.address().port;
+
+  const { safeFetch } = await import("./index.js");
+  const resp = await safeFetch(`http://127.0.0.1:${port1}/`, {}, { allowLocalhost: true });
+  assert.equal(resp.status, 200);
+  assert.equal(await resp.text(), "destino");
+
+  // Agent do hop redirect fechou o socket com o servidor 1.
+  // Deadline curto: sem o close do hop o socket fica ~2,9s (backpressure do
+  // body) e ESTE assert tem de morrer (pin do fix).
+  const antes = Date.now();
+  const deadline = antes + 1_000;
+  const conns = () => new Promise((r) => s1.getConnections((_e, n) => r(n)));
+  while ((await conns()) > 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+  const demorou = Date.now() - antes;
+  assert.equal(await conns(), 0, `conexão do hop redirect pendurada (${demorou}ms)`);
+  assert.ok(demorou < 1_000, `close do hop demorou ${demorou}ms (esperado <1000ms; mutação M1 morre aqui)`);
+
+  s1.close(); s2.close();
+});
+
+test("M37: sem redirect, o Agent fecha quando o body termina", async () => {
+  const http = await import("node:http");
+  const s = http.createServer((_q, r) => { r.writeHead(200); r.end("ok"); });
+  await new Promise((r) => s.listen(0, "127.0.0.1", r));
+  const port = s.address().port;
+  const { safeFetch } = await import("./index.js");
+  const resp = await safeFetch(`http://127.0.0.1:${port}/`, {}, { allowLocalhost: true });
+  assert.equal(await resp.text(), "ok");
+  const deadline = Date.now() + 3_000;
+  const conns = () => new Promise((r) => s.getConnections((_e, n) => r(n)));
+  while ((await conns()) > 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+  assert.equal(await conns(), 0);
+  s.close();
 });

@@ -37,6 +37,15 @@ function startCapture(socketPath: string): Promise<Capture> {
       res.end(JSON.stringify({ memory: { id: `mem_${randomUUID().slice(0, 8)}` } }));
     });
   });
+  // O postBridgeJson do runner usa o agent keep-alive global: a 2ª chamada
+  // reusa o socket da 1ª. Entre uma e outra o teste bloqueia ~15s no
+  // resolveCliCommands (2 runners que não respondem a --version: 1.5s +
+  // retry 6s cada, e timeout é inconclusivo → não cacheia), e nesse intervalo
+  // o keepAliveTimeout DEFAULT do server (5s) já fechou o socket ocioso — o
+  // POST seguinte morre com "socket hang up" e o memory_add nunca chega.
+  // Sem keep-alive curto aqui, a asserção vira loteria de máquina.
+  server.keepAliveTimeout = 120_000;
+  server.headersTimeout = 125_000;
   return new Promise((resolve) => {
     server.listen(socketPath, () => resolve({
       payloads,

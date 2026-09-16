@@ -147,6 +147,14 @@ export class OpenCodeTransport {
     return requestJson(this.serverUrl, path, method, body, timeoutMs);
   }
 
+  /** M19 (T-442): cancela o turno em voo NO SERVE. Matar o cliente/POST não
+   *  aborta a run no serve — sem isto o retry do hard recover duplica side
+   *  effects. Idempotente e best-effort no caller. */
+  async abortSession(sessionId: string): Promise<void> {
+    if (!this.serverUrl) return;
+    await requestJson(this.serverUrl, `/session/${encodeURIComponent(sessionId)}/abort`, "POST");
+  }
+
   stop(): void {
     this.stopped = true;
     this.closeEventStream();

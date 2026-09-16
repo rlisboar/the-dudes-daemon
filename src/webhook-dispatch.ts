@@ -298,20 +298,51 @@ export async function dispatchWebhook(args: {
     // custom pro host de destino. Webhook não segue redirect.
     const { safeFetch } = await import("./ssrf-guard.js");
     const ctrl = new AbortController();
+    // M21 (T-444): o timeout cobre headers E body — antes era clearTimeout
+    // logo após os headers e `resp.text()` podia pendurar para sempre ou
+    // bufferizar um body sem fim. Body lido por stream com cap duro.
     const tm = setTimeout(() => ctrl.abort(), 10_000);
-    // Tipo derivado do próprio safeFetch: ele devolve a Response da undici,
-    // que não é a Response global do DOM (falta `bytes`, entre outras).
-    let resp: Awaited<ReturnType<typeof safeFetch>>;
     try {
-      resp = await safeFetch(args.url, { method: "POST", headers, body: payload, signal: ctrl.signal }, { maxRedirects: 0 });
-    } catch (e) {
+      // Tipo derivado do próprio safeFetch: ele devolve a Response da undici,
+      // que não é a Response global do DOM (falta `bytes`, entre outras).
+      let resp: Awaited<ReturnType<typeof safeFetch>>;
+      try {
+        resp = await safeFetch(args.url, { method: "POST", headers, body: payload, signal: ctrl.signal }, { maxRedirects: 0, allowLocalhost: true });
+      } catch (e) {
+        return { status: null, body: "", error: `webhook bloqueado: ${(e as Error).message}` };
+      }
+      const body = await readCapped(resp, WEBHOOK_BODY_CAP_BYTES).catch(() => "");
+      return { status: resp.status, body: body.slice(0, 2000) };
+    } finally {
       clearTimeout(tm);
-      return { status: null, body: "", error: `webhook bloqueado: ${(e as Error).message}` };
     }
-    clearTimeout(tm);
-    const body = await resp.text().catch(() => "");
-    return { status: resp.status, body: body.slice(0, 2000) };
   } catch (e) {
     return { status: null, body: "", error: (e as Error).message };
   }
+}
+
+// M21 (T-444): cap de leitura do body do webhook. 256KiB é folgado para
+// resposta de ack; acima disso o body é truncado (e o stream cancelado).
+export const WEBHOOK_BODY_CAP_BYTES = 256 * 1024;
+
+type BodyStream = { getReader(): { read(): Promise<{ done: boolean; value?: Uint8Array }>; cancel(): Promise<void> } };
+
+/** Lê o body com cap duro; cancela o stream ao exceder (não espera o EOF). */
+export async function readCapped(resp: { body?: BodyStream | null }, cap: number): Promise<string> {
+  if (!resp.body) return "";
+  const reader = resp.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (total < cap) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  } finally {
+    if (total >= cap) await reader.cancel().catch(() => {});
+  }
+  return Buffer.concat(chunks).subarray(0, cap).toString("utf8");
 }

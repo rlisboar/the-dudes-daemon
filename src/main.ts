@@ -181,6 +181,8 @@ Options:
 /** Exportado p/ teste unitário (T-252) — o bootstrap real continua privado
  *  ao módulo via SELF_BOOTSTRAP (abaixo). */
 export class DaemonClient {
+  /** M35 (T-475): welcome do server declarou protocolo diferente do local. */
+  protocolMismatch = false;
   private args: Args;
   private readonly installedRunnerAvailability: InstalledRunnerAvailability;
   private ws: WebSocket | null = null;
@@ -411,8 +413,8 @@ export class DaemonClient {
         // persistente per-tokenId. 0/ausente = primeira conn / buffer
         // expirou (server faz nothing, comportamento legado).
         resumeFromSeq: this.lastSeenSeq,
-        availableRunners: helloRunnerLists(this.cliCommands).availableRunners,
-        installedRunners: helloRunnerLists(this.cliCommands).installedRunners,
+        availableRunners: helloRunnerLists(this.cliCommands, this.installedRunnerAvailability).availableRunners,
+        installedRunners: helloRunnerLists(this.cliCommands, this.installedRunnerAvailability).installedRunners,
         graphify: {
           cli: !!this.cliCommands.graphify?.available,
           mcp: !!this.cliCommands.graphifyMcp?.available,
@@ -558,6 +560,14 @@ export class DaemonClient {
     switch (msg.type) {
       case "daemon:welcome":
         log("info", `authed as ${msg.user.name} <${msg.user.email}>`);
+        // M35 (T-475): o server anuncia a versão de fio no welcome; mismatch
+        // aqui = daemon velho contra server novo (o outro lado nos recusaria
+        // no hello, mas quando É o server que subiu primeiro queremos o aviso
+        // local). Ausente = server antigo; aceita.
+        if (Number.isInteger(msg.protocolVersion) && msg.protocolVersion !== WIRE_PROTOCOL_VERSION) {
+          log("error", `[protocol] server=${msg.protocolVersion} daemon=${WIRE_PROTOCOL_VERSION} — atualize o daemon (agents rodam com risco de incompatibilidade)`);
+          this.protocolMismatch = true;
+        }
         return;
       case "daemon:pong":
         return;
@@ -2134,7 +2144,10 @@ export class DaemonClient {
       // não bloqueiam; turnos/fila sim (restart derruba sessões).
       isIdle: () => {
         const t = turnGateStats();
-        return t.ativos === 0 && t.fila === 0 && t.bg.ativos === 0 && t.bg.fila === 0;
+        // M18 (T-441): claude contínuo não passa pelo turn-gate — o turno
+        // dele era invisível pro self-update (restart no meio da sessão).
+        return t.ativos === 0 && t.fila === 0 && t.bg.ativos === 0 && t.bg.fila === 0
+          && !this.host.hasActiveTurn();
       },
       // T-100: idle-restart mata CLIs (detached:true) ANTES do exit 42.
       prepareReexec: () => this.prepareReexec(),
@@ -2182,7 +2195,7 @@ export class DaemonClient {
   private async prepareReexec(): Promise<void> {
     log("info", "[self-update] parando CLIs filhos antes do re-exec");
     try { stopAllGraphWatches(); } catch { /* noop */ }
-    this.host.shutdown();
+    await this.host.shutdown();
     // terminateWithEscalation agenda SIGKILL em ~1.5s; espera o timer.
     await new Promise((r) => setTimeout(r, 2_500));
   }

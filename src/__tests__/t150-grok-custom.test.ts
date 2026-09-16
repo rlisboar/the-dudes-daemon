@@ -12,6 +12,7 @@ import { hangThresholds } from "../runners/turn-watchdog.js";
 import { grokWireEfforts, normalizeGrokEffort, resolveContextLimit } from "../runners/model-policy.js";
 // isGrokFamily vive no registro de runners (index), não no model-policy
 import { parseLineModelCatalog } from "../model-discovery.js";
+import { allRunnerSources } from "./_sources.js";
 
 /**
  * T-150 — runner "grok-custom": semântica grok completa (spawn args/env,
@@ -96,8 +97,8 @@ test("T-150 A3: env de turno do grok-custom (GROK_HOME/AUTOPDATER) via isGrokFam
 /* ---------- A6: diff restrito — wiring nos pontos do mapa ---------- */
 
 test("T-150: wiring do agent-runner (isGrokFamily nos branches grok, binário do runner)", () => {
-  const runner = readFileSync(join(AQUI, "../agent-runner.ts"), "utf8");
-  assert.match(runner, /isGrokFamily\(this\.opts\.cliRunner\)/, "branches grok usam isGrokFamily");
-  assert.match(runner, /this\.runnerCommand\(this\.opts\.cliRunner\)/, "binário resolvido pelo runner configurado");
+  const runner = allRunnerSources(join(AQUI, "../agent-runner.ts"));
+  assert.match(runner, /isGrokFamily\((?:this|self)\.opts\.cliRunner\)/, "branches grok usam isGrokFamily");
+  assert.match(runner, /(?:this|self)\.runnerCommand\((?:this|self)\.opts\.cliRunner\)/, "binário resolvido pelo runner configurado");
   assert.ok(!/"grok-custom"/.test(runner), "nenhum id/path hardcoded de grok-custom no agent-runner");
 });

@@ -136,10 +136,22 @@ export class RunnerRuntimeFiles {
     return path.join(parent, `${slug}.sock`);
   }
 
-  /** Base do CODEX_HOME do dono (respeita override por env do container). */
+  /** Base do CODEX_HOME do dono (respeita override por env do container).
+   *  T-506: em ROOT+drop, um CODEX_HOME apontando pro home do ROOT não é
+   *  atravessável pelo CLI dropado (ex.: /root é 0700) — nesse caso a base
+   *  vai pro home do user do drop. Override para path acessível (container
+   *  montado, /opt/...) continua vencendo. */
   private codexBaseDir(): string {
     const forced = process.env.CODEX_HOME?.trim();
-    if (forced) return forced;
+    if (forced) {
+      const daemonHome = os.homedir();
+      const dropHome = this.input.home;
+      const dropping = !!dropHome && path.resolve(dropHome) !== path.resolve(daemonHome);
+      const forcedInsideDaemonHome =
+        path.resolve(forced) === path.resolve(daemonHome) ||
+        path.resolve(forced).startsWith(path.resolve(daemonHome) + path.sep);
+      if (!(dropping && forcedInsideDaemonHome)) return forced;
+    }
     return path.join(this.input.home ?? os.homedir(), ".codex");
   }
 

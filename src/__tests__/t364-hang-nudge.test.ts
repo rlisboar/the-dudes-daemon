@@ -10,22 +10,16 @@
  */
 import "./scratch-home.js";
 
-import { test } from "node:test";
+import {test} from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+
 import os from "node:os";
-import { fileURLToPath } from "node:url";
-import { AgentRunner } from "../agent-runner.js";
-import { resolveCliCommands } from "../cli-config.js";
-import { PerMessageSessionState } from "../runners/message-session.js";
-import {
-  HANG_RECOVER_NUDGE_FLAG,
-  HANG_RECOVER_NUDGE_MAX,
-  HANG_RECOVER_NUDGE_TEXT,
-  HANG_RECOVER_NUDGE_WINDOW_MS,
-  deliverHangRecoverNudge,
-  planHangRecoverNudge,
-} from "../runners/hang-nudge.js";
+import {fileURLToPath} from "node:url";
+import {AgentRunner} from "../agent-runner.js";
+import {resolveCliCommands} from "../cli-config.js";
+import {PerMessageSessionState} from "../runners/message-session.js";
+import {HANG_RECOVER_NUDGE_FLAG, HANG_RECOVER_NUDGE_MAX, HANG_RECOVER_NUDGE_TEXT, HANG_RECOVER_NUDGE_WINDOW_MS, deliverHangRecoverNudge, planHangRecoverNudge} from "../runners/hang-nudge.js";
+import {allRunnerSources} from "./_sources.js";
 
 const MIN = 60_000;
 
@@ -178,10 +172,7 @@ test("T-364 (b): fase SOFT (idle entre softMs e hardMs) ⇒ stalled sem recover 
 });
 
 test("T-364 (b2): gancho só existe dentro de recoverHungTurn (hard); ramo soft do tick não o chama", () => {
-  const src = readFileSync(
-    fileURLToPath(new URL("../agent-runner.ts", import.meta.url)),
-    "utf8",
-  );
+  const src = allRunnerSources(fileURLToPath(new URL("../agent-runner.ts", import.meta.url)));
   const hard = src.indexOf("private recoverHungTurn(");
   const call = src.indexOf("this.scheduleHangNudge(idleMs)");
   const arm = src.indexOf("private scheduleHangNudge(");

@@ -133,6 +133,9 @@ test("T-251: turno além do MAX fica NA FILA (queued) e passa quando um slot lib
 
 test("T-251: idle do self-update continua amarrado ao turnGateStats (fonte lida)", () => {
   const src = readFileSync(new URL("../main.ts", import.meta.url), "utf8");
-  const m = src.match(/isIdle:\s*\(\)\s*=>\s*\{[\s\S]{0,200}turnGateStats\(\)[\s\S]{0,200}\}/);
+  const m = src.match(/isIdle:\s*\(\)\s*=>\s*\{[\s\S]{0,600}turnGateStats\(\)[\s\S]{0,600}\}/);
   assert.ok(m, "isIdle do self-update deve consultar turnGateStats — turnos de QUALQUER runner ocupam o gate e adiam o update");
+  // T-441/M18: além do gate, o claude contínuo (que não usa o gate) também
+  // precisa adiar o update.
+  assert.match(m![0], /hasActiveTurn\(\)/, "isIdle precisa consultar turno fora do gate (claude contínuo)");
 });

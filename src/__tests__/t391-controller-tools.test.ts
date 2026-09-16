@@ -18,10 +18,11 @@ import { randomBytes, publicEncrypt, createPublicKey, constants } from "node:cry
 import { bridgeToolAllowed, CONTROLLER_ROLE, ROLE_GATED_TOOLS, TOOL_GROUP } from "../bridge-tool-gate.js";
 import { buildBridgeEnv } from "../runners/mcp-config.js";
 import { buildSystemPromptHeader } from "../runners/prompts.js";
+import { allRunnerSources } from "./_sources.js";
 
 const AQUI = dirname(fileURLToPath(import.meta.url));
 const BRIDGE = readFileSync(join(AQUI, "../mcp-bridge.ts"), "utf8");
-const RUNNER = readFileSync(join(AQUI, "../agent-runner.ts"), "utf8");
+const RUNNER = allRunnerSources(join(AQUI, "../agent-runner.ts"));
 const RELAY = readFileSync(join(AQUI, "../bridge-relay.ts"), "utf8");
 
 // --- A3/A5: gate de registo (comportamento puro, sem importar o bridge) ----
@@ -72,13 +73,13 @@ test("T-391: env do bridge leva o papel só quando o runner o declara (ponto ún
   assert.equal(buildBridgeEnv({ ...base, role: "backend" }).THE_DUDES_AGENT_ROLE, "backend");
   assert.equal("THE_DUDES_AGENT_ROLE" in buildBridgeEnv(base), false, "sem papel declarado não se injeta vazio");
   // O runner passa this.info.role pelo único funil que os 4 config writers partilham
-  assert.match(RUNNER, /buildBridgeEnv\(\{[\s\S]{0,700}role: this\.info\.role,\s*\}\)/);
+  assert.match(RUNNER, /buildBridgeEnv\(\{[\s\S]{0,700}role: (?:this|self)\.info\.role,\s*\}\)/);
 });
 
 test("T-391: --allowed-tools do claude só lista as tools de controller para quem é controller", () => {
   assert.match(
     RUNNER,
-    /if \(this\.info\.role === CONTROLLER_ROLE\) \{\s*baseAllowed\.push\(\s*"mcp__the-dudes__save_agent",\s*"mcp__the-dudes__stop_agent",\s*"mcp__the-dudes__start_agent",\s*"mcp__the-dudes__remove_agent",\s*\);\s*\}/,
+    /if \((?:this|self)\.info\.role === CONTROLLER_ROLE\) \{\s*baseAllowed\.push\(\s*"mcp__the-dudes__save_agent",\s*"mcp__the-dudes__stop_agent",\s*"mcp__the-dudes__start_agent",\s*"mcp__the-dudes__remove_agent",\s*\);\s*\}/,
   );
 });
 

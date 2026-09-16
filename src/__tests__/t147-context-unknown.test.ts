@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { ContextTracker } from "../runners/context-tracker.js";
 import { DEFAULT_CONTEXT_LIMIT, resolveContextLimit, resolveContextLimitKnown } from "../runners/model-policy.js";
 import { resolveOcCatalogContextLimit } from "../model-discovery.js";
+import { allRunnerSources } from "./_sources.js";
 
 /**
  * T-147 — contexto pré-uso: janela UNKNOWN em vez de fabricar 200k.
@@ -144,7 +145,7 @@ test("T-147: tracker sem resolveLimitKnown (uso legado/testes) emite o mapeado",
 /* ---------- wiring ---------- */
 
 test("T-147: agent-runner cable resolveLimitKnown; agent-host repassa limit sem fabricar", () => {
-  const runner = readFileSync(join(AQUI, "../agent-runner.ts"), "utf8");
+  const runner = allRunnerSources(join(AQUI, "../agent-runner.ts"));
   assert.match(runner, /resolveLimitKnown: \(resolvedModel, catalogLimit\) => resolveContextLimitKnown/);
   assert.match(runner, /resolveContextLimitKnown\(\{[^}]*configuredModel: this\.info\.model/s);
   const host = readFileSync(join(AQUI, "../agent-host.ts"), "utf8");

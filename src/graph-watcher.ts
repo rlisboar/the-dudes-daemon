@@ -95,13 +95,19 @@ async function runUpdate(entry: WatchEntry): Promise<void> {
 function schedule(entry: WatchEntry): void {
   if (entry.closed) return;
   const ms = entry.handlers.debounceMs ?? 3000;
+  // M24 (T-447): um `watch-pending` por JANELA de debounce, não por evento —
+  // `npm install` (milhares de eventos) mandava um frame graph:status por
+  // arquivo e o bufferedAmount do WS estourava (drops de outbound).
+  const alreadyPending = entry.timer !== null;
   if (entry.timer) clearTimeout(entry.timer);
-  // avisa UI que está stale enquanto espera o debounce
-  entry.handlers.onStatus("ready", {
-    indexMtime: graphMtime(entry.root),
-    stale: true,
-    phase: "watch-pending",
-  });
+  if (!alreadyPending) {
+    // avisa UI que está stale enquanto espera o debounce
+    entry.handlers.onStatus("ready", {
+      indexMtime: graphMtime(entry.root),
+      stale: true,
+      phase: "watch-pending",
+    });
+  }
   entry.timer = setTimeout(() => {
     entry.timer = null;
     void runUpdate(entry);

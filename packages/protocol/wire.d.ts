@@ -897,6 +897,10 @@ export interface ScheduledPrompt {
   lastSuccessAt?: number;
   lastStatus?: ScheduleRunStatus;
   lastSkipReason?: string;
+  /** R9 (T-464): último minuto (epoch minutes) avaliado pelo scheduler. */
+  lastEvaluatedMinute?: number;
+  /** R9 (T-464): próximo disparo teórico (observabilidade). */
+  nextDueAt?: number;
   createdAt?: string;
   /** Últimas execuções (preenchido no snapshot / events). */
   recentRuns?: ScheduleRun[];
@@ -1058,6 +1062,8 @@ export interface DaemonInfo {
   updateAvailable?: boolean;
   /** Versão do protocolo de fio declarada no hello (ausente = daemon antigo). */
   protocolVersion?: number;
+  /** M35 (T-475): hello declarou protocolo != do server (conn recusada). */
+  protocolMismatch?: boolean;
   lastSeen?: number;
   connectedAt?: number;
   /** graphify CLI (build) disponível no daemon. */

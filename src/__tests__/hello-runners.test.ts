@@ -28,6 +28,6 @@ test("hello omite grok-custom quando indisponível (T-159)", () => {
 
 test("hello do main.ts usa a lista compartilhada — sem lista hardcoded paralela (T-159)", () => {
   const mainSource = readFileSync(fileURLToPath(new URL("../main.ts", import.meta.url)), "utf8");
-  assert.ok(mainSource.includes("helloRunnerLists(this.cliCommands)"), "hello deve derivar de helloRunnerLists");
+  assert.ok(/helloRunnerLists\(this\.cliCommands/.test(mainSource), "hello deve derivar de helloRunnerLists");
   assert.doesNotMatch(mainSource, /availableRunners: \(\[/, "lista hardcoded de runners voltou ao hello");
 });

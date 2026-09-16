@@ -1,11 +1,12 @@
-import { test } from "node:test";
+import {test} from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
-import { resolveOcCatalogContextLimit } from "../model-discovery.js";
-import { resolveContextLimit, DEFAULT_CONTEXT_LIMIT, contextLimitFor } from "../runners/model-policy.js";
-import { ContextTracker } from "../runners/context-tracker.js";
+
+import {join, dirname} from "node:path";
+import {fileURLToPath} from "node:url";
+import {resolveOcCatalogContextLimit} from "../model-discovery.js";
+import {resolveContextLimit, DEFAULT_CONTEXT_LIMIT, contextLimitFor} from "../runners/model-policy.js";
+import {ContextTracker} from "../runners/context-tracker.js";
+import {allRunnerSources} from "./_sources.js";
 
 /**
  * T-137 — janela de contexto imprecisa no runner opencode (500k → 200k).
@@ -205,7 +206,7 @@ test("T-137: providers malformados / limit inválido → undefined (fallback seg
 /* ---------- wiring: fetchOcCatalogLimit usa o resolvedor novo ---------- */
 
 test("T-137: fetchOcCatalogLimit cable no resolvedor de catálogo (guarda de wiring)", () => {
-  const src = readFileSync(join(AQUI, "../agent-runner.ts"), "utf8");
+  const src = allRunnerSources(join(AQUI, "../agent-runner.ts"));
   assert.ok(src.includes("resolveOcCatalogContextLimit"), "fetchOcCatalogLimit deve usar o resolvedor");
   assert.ok(src.includes('"/config"'), "deve consultar o /config (default do serve)");
   assert.ok(!src.includes("if (!providerID || !modelID) return;"), "early-return antigo removido");

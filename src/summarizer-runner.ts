@@ -18,6 +18,7 @@ import { join } from "node:path";
 import type { ResolvedCliCommands } from "./cli-config.js";
 import { extractOneShotText } from "./agent-runner.js";
 import { spawnDropped, type DropTarget } from "./privileges.js";
+import { killProcess } from "./runners/process-lifecycle.js";
 import { normalizeGrokEffort, qwenReasoningEffort } from "./runners/model-policy.js";
 import { isGrokFamily } from "./runners/index.js";
 import { buildSummarizerEnv } from "./runners/env.js";
@@ -232,7 +233,9 @@ async function runOpenCodeText(prompt: string, args: CliTextArgs, cwd: string, e
     return { ok: false, error: `opencode serve spawn falhou: ${(e as Error).message}` };
   }
   const cleanup = () => {
-    try { proc.kill("SIGKILL"); } catch { /* ignore */ }
+    // M22 (T-445): spawnDropped usa detached → proc.kill mata só o líder;
+    // netos (CLI atrás do wrapper/pty) sobreviviam segurando o port do serve.
+    killProcess(proc);
     try { rmSync(cwd, { recursive: true, force: true }); } catch { /* ignore */ }
   };
 
@@ -483,7 +486,8 @@ async function runCliTextWithSlot(
     proc.stderr?.on("data", (c: string) => { stderr += c; });
 
     const timer = setTimeout(() => {
-      try { proc.kill("SIGKILL"); } catch { /* ignore */ }
+      // M22 (T-445): mata o GRUPO inteiro (fallback individual embutido).
+      killProcess(proc);
       finish({ ok: false, error: `timeout após ${timeoutMs / 1000}s` });
     }, timeoutMs);
 

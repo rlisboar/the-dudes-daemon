@@ -110,8 +110,9 @@ test("T-424 gitMinimalEnv: contrato do env enxuto", () => {
 
 test("T-424 wiring: spawn via spawnDropped, `--` antes de paths/refs", async () => {
   const src = readFileSync(new URL("../task-workspace.ts", import.meta.url), "utf8");
-  assert.match(src, /spawnDropped\(\s*"git"/);
-  assert.match(src, /gitMinimalEnv\(/);
+  assert.match(src, /runGit\(/); // R8 (T-463): helper central em runners/run-git.ts
+  assert.match(readFileSync(new URL("../runners/run-git.ts", import.meta.url), "utf8"), /spawnDropped\(\s*"git"/);
+  assert.match(readFileSync(new URL("../runners/run-git.ts", import.meta.url), "utf8"), /gitMinimalEnv\(/);
   assert.match(src, /validateGitRef\(/);
   assert.match(src, /isInsideRoot\(/);
   assert.match(src, /validateBasePath\(/);

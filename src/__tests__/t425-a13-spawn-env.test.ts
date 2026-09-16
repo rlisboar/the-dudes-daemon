@@ -139,7 +139,8 @@ test("T-425 wiring: graph-indexer e agent-host usam spawnDropped + buildSummariz
   assert.doesNotMatch(gia, /spawn\(graphifyBin/);
   const ah = readFileSync(new URL("../agent-host.ts", import.meta.url), "utf8");
   assert.match(ah, /export function runGitWorktreeAdd/);
-  assert.match(ah, /spawnDropped\(\s*"git"/);
-  assert.match(ah, /buildSummarizerEnv\(process\.env\)/);
+  assert.match(ah, /runGit\(/); // R8 (T-463): worktree add/remove via helper central
+  assert.match(readFileSync(new URL("../runners/run-git.ts", import.meta.url), "utf8"), /spawnDropped\(\s*"git"/);
+  assert.match(readFileSync(new URL("../runners/run-git.ts", import.meta.url), "utf8"), /gitMinimalEnv\(/); // R8: env mínimo no helper
   assert.doesNotMatch(ah, /spawnSync\(/);
 });

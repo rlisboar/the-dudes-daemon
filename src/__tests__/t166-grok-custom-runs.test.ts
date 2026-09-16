@@ -5,21 +5,17 @@
  */
 import "./scratch-home.js";
 
-import { test } from "node:test";
+import {test} from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {mkdirSync, mkdtempSync, rmSync, writeFileSync} from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { grokHomePath, RunnerRuntimeFiles } from "../runners/runtime-files.js";
-import { grokSignalsPath } from "../runners/parsers.js";
-import { buildGrokEnv } from "../runners/env.js";
-import {
-  grokSignalsCandidatesFor,
-  grokUpdatesCandidatesFor,
-  resolveGrokChatHistoryPath,
-  sweepGrokChatToolCallsFromPath,
-} from "../agent-runner.js";
+import {fileURLToPath} from "node:url";
+import {grokHomePath, RunnerRuntimeFiles} from "../runners/runtime-files.js";
+import {grokSignalsPath} from "../runners/parsers.js";
+import {buildGrokEnv} from "../runners/env.js";
+import {grokSignalsCandidatesFor, grokUpdatesCandidatesFor, resolveGrokChatHistoryPath, sweepGrokChatToolCallsFromPath} from "../agent-runner.js";
+import {allRunnerSources} from "./_sources.js";
 
 const AQUI = path.dirname(fileURLToPath(import.meta.url));
 
@@ -182,9 +178,9 @@ test("T-166 A4: buildGrokEnv(runner=grok-custom) NÃO seta GROK_HOME (T-164 inta
 });
 
 test("T-166: 401 e leitores do agent-runner usam grokHome() (sem literal grok-custom)", () => {
-  const src = readFileSync(path.join(AQUI, "../agent-runner.ts"), "utf8");
+  const src = allRunnerSources(path.join(AQUI, "../agent-runner.ts"));
   assert.ok(!/"grok-custom"/.test(src), "T-150: nenhum literal grok-custom em agent-runner.ts");
   assert.match(src, /isAuthenticationFailure[\s\S]{0,400}runtimeFiles\.grokHome\(\)/);
-  assert.match(src, /runner:\s*opts\.cliRunner/);
-  assert.match(src, /resolveGrokChatHistoryPath\(this\.runtimeFiles\.grokHome\(\)/);
+  assert.match(src, /runner:\s*(?:self\.)?opts\.cliRunner/);
+  assert.match(src, /resolveGrokChatHistoryPath\((?:this|self)\.runtimeFiles\.grokHome\(\)/);
 });
