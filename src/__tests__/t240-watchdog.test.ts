@@ -123,6 +123,10 @@ test("T-240 (3): loop sem tool (sem eventos, sem processo) → hard ~120s como h
   a.ocActiveProc = null;
   a.inflightPerMessage = { content: "msg", images: undefined, attempt: 0 };
   a.activityClock.lastActivityAt = Date.now() - 121_000; // > hardMs grok (120s)
+  // T-593: o limiar seco de 120s só vale DEPOIS do primeiro evento semântico.
+  // Turno ainda em cold start (firstEventAt null) tem a janela firstEventMs —
+  // é o que o T-593 critério 4 trava. Aqui: turno que já emitiu e ficou quieto.
+  a.activityClock.firstEventAt = Date.now() - 130_000;
 
   tick(runner);
 
@@ -148,6 +152,7 @@ test("T-240 (4b): agregação end-to-end — 3º evento de 1º attempt na janela
   a.ocActiveProc = null;
   a.inflightPerMessage = { content: "msg", images: undefined, attempt: 0 };
   a.activityClock.lastActivityAt = Date.now() - 121_000;
+  a.activityClock.firstEventAt = Date.now() - 130_000; // T-593: já saiu do cold start
   // janela já com 2 eventos de 1º attempt (sem resumo emitido)
   a.hardRecoverTimes = [Date.now() - 60_000, Date.now() - 30_000];
 
@@ -167,6 +172,7 @@ test("T-240 (4c): attempt≥1 (retry esgotado/re-enfileirado antes) notifica ind
   a.ocActiveProc = null;
   a.inflightPerMessage = { content: "msg", images: undefined, attempt: 1 };
   a.activityClock.lastActivityAt = Date.now() - 121_000;
+  a.activityClock.firstEventAt = Date.now() - 130_000; // T-593: já saiu do cold start
 
   tick(runner);
 

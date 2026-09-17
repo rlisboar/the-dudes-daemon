@@ -4,6 +4,7 @@ import {ChildProcess} from "node:child_process";
 import {GROK_TURN_TIMEOUT_MS, grokSignalsCandidatesFor, grokUpdatesCandidatesFor, resolveGrokChatHistoryPath, sweepGrokChatToolCallsFromPath} from "../../agent-runner.js";
 import {GrokContextSignals, GrokTurnBilling, mergeGrokContextOccupancy, parseGrokContextSignals, parseGrokTurnBillingFromUpdates, parseGrokUpdatesContextTokens} from "../parsers.js";
 import {acquireTurnSlot} from "../turn-gate.js";
+import {markTurnStart} from "../turn-watchdog.js";
 import {appendPathAttachmentPrompt} from "../attachments.js";
 import {armHardTimeout, processAlive as procAlive} from "../process-lifecycle.js";
 import {buildGrokEnv} from "../env.js";
@@ -184,10 +185,18 @@ export async function runGrokMessage(self: any, content: string, images?: ImageA
       return;
     }
     proc.once("close", (code: number | null) => {
-      self.releaseActiveTurnSlot();
+      // T-593: um close TARDIO (SIGKILL de um hard recover anterior) não pode
+      // devolver o slot do turn-gate do turno NOVO — o recover já devolveu o do
+      // turno morto. Mesmo guarda do endTurn (T-417) e do qwen (T-371); o grok
+      // era o único runner per-message sem ela.
+      if (self.messageSession.owns(epoch) || self.stopped) self.releaseActiveTurnSlot();
       recordTurnEnd(self.opts.cliRunner, Date.now() - grokTurnT0, code === 0);
     });
     self.ocActiveProc = proc;
+    // T-593: o pid é rastreado para o hard recover matar por PID mesmo quando
+    // `ocActiveProc` já tiver sido anulado por um close tardio do turno
+    // anterior (killProcess(null) é no-op — ver liveTurnPids no agent-runner).
+    self.trackTurnPid(proc.pid);
     const grokTurnStartedAt = Date.now();
     // Marco de INÍCIO do turno. Sem ele o log só tinha o fim (soft hang aos
     // 92s, SIGKILL aos 720s) e não dava pra distinguir "CLI subiu e ficou
@@ -199,6 +208,10 @@ export async function runGrokMessage(self: any, content: string, images?: ImageA
     // Zera o relógio de hang no spawn — o acquireTurnSlot pode ter esperado
     // na fila e o setState("thinking") anterior não reflete o início real.
     self.touchActivity();
+    // T-593: nenhum evento SEMÂNTICO ainda — reabre a janela de cold start
+    // (firstEventMs) para o hard de 120s não matar o turno enquanto o CLI só
+    // está carregando. Depois de `touchActivity`, que fecha a janela.
+    markTurnStart(self.activityClock);
     // Watchdog: se o CLI não sair em GROK_TURN_TIMEOUT_MS, mata e libera
     // a fila (sintoma real: resume + prompt enorme fica em 0% CPU por horas).
     // Pós-SIGKILL o 'close' NÃO é garantido (netos herdam pipes) — se busy
@@ -347,7 +360,17 @@ export async function runGrokMessage(self: any, content: string, images?: ImageA
         self.opts.onError(`grok: ${errFromJson.slice(0, 500)}`);
       }
       imgCleanup();
-      self.ocActiveProc = null;
+      // T-593: o processo saiu — sai do rastreamento de pids do recover.
+      self.untrackTurnPid(proc.pid);
+      // T-593: `ocActiveProc` só é anulado se ESTE turno ainda for dono do
+      // epoch. Antes era incondicional, e um close TARDIO (SIGKILL de um hard
+      // recover anterior) apagava a referência do turno NOVO que o drain tinha
+      // acabado de pôr em voo. O recover seguinte chamava killProcess(null) —
+      // no-op em process-lifecycle (`!processAlive(null)` → return false) — e o
+      // CLI sobrevivia por horas: 10 processos `grok -p` vivos no host do dono
+      // (2026-09-16), carga que sustentava a T-592. Mesmo guarda do endTurn
+      // (T-417) / qwen (T-371).
+      if (self.messageSession.owns(epoch) || self.stopped) self.ocActiveProc = null;
       if (self.stopped) { self.messageSession.busy = false; self.emitExit(code); return; }
       void self.finishGrokTurn({
         code, epoch, firstTurn, pendingSummary, content, images,

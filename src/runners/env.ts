@@ -1,5 +1,6 @@
 import type { CliRunner } from "../types.js";
 import type { DropTarget } from "../privileges.js";
+import { QWEN_STREAM_MAX_LIFETIME_MS } from "./turn-watchdog.js";
 
 /** Vars do processo pai que o CLI do agente pode herdar. Nada além disto. */
 export const AGENT_ENV_ALLOWLIST = ["PATH", "HOME", "LANG", "TERM", "USER", "LOGNAME"] as const;
@@ -83,9 +84,18 @@ export function buildGeminiEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 
 /** Qwen Code: silencia o aviso "yolo sem sandbox" (stderr) — o daemon roda o
  *  CLI headless deliberadamente. Auth/model vêm do ~/.qwen do user (QWEN_HOME
- *  por agente entra via buildBaseRunnerEnv quando há config dir isolado). */
+ *  por agente entra via buildBaseRunnerEnv quando há config dir isolado).
+ *  T-598: o teto do guard do CLI (`QWEN_STREAM_MAX_LIFETIME_MS`, upstream wait
+ *  de UMA resposta) sai da MESMA fonte que o teto de lifetime do turno
+ *  (turn-watchdog) e fica acima dele — o daemon corta primeiro com re-fila;
+ *  sem isto um env velho (8min) abortaria a resposta antes do teto do turno,
+ *  e aborto do CLI fecha o turno sem recover (mensagem em voo perdida). */
 export function buildQwenEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  return { ...base, QWEN_CODE_SUPPRESS_YOLO_WARNING: "1" };
+  return {
+    ...base,
+    QWEN_CODE_SUPPRESS_YOLO_WARNING: "1",
+    QWEN_STREAM_MAX_LIFETIME_MS: String(QWEN_STREAM_MAX_LIFETIME_MS),
+  };
 }
 
 export function buildBridgeAwareEnv(base: NodeJS.ProcessEnv, tokenFile: string, features: Record<string, string>): NodeJS.ProcessEnv {

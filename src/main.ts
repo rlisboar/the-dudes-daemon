@@ -30,7 +30,7 @@ import { assertWorkspaceScoped, autoWorkspaceCwd, describeGitRoots, ensureWritab
 import { buildGraph, graphMtime, graphPath, hasSemanticMarker, loadGraphJsonForUi, needsSemanticUpdate } from "./graph-indexer.js";
 import { ensureGraphWatch, stopAllGraphWatches } from "./graph-watcher.js";
 import { detectDropTarget, spawnDropped, type DropTarget } from "./privileges.js";
-import { BridgeRelay } from "./bridge-relay.js";
+import { BridgeRelay, type PeerPidMode } from "./bridge-relay.js";
 import { defaultDaemonConfigPath, formatCliStatus, loadDaemonCliConfig, mergeCliConfig, resolveCliCommands, type DaemonCliConfig, type ResolvedCliCommands } from "./cli-config.js";
 import { applyRunnerPolicy, buildInstalledRunnerAvailability, helloRunnerLists, POLICY_GATED_RUNNERS, type InstalledRunnerAvailability } from "./runner-policy.js";
 import { assembleAgentSendParts, type FromDaemon, type FromOrch, type TaskUpdatedEv } from "./protocol.js";
@@ -324,7 +324,11 @@ export class DaemonClient {
     // Start the local Unix-socket relay so MCP bridges spawned by agents
     // (which run as the dropped user) can reach the orchestrator without
     // hitting an outbound firewall app.
-    this.relay = new BridgeRelay(this.orchUrl, this.dropTo, (agentId) => this.host.getAgentProjectId(agentId));
+    this.relay = new BridgeRelay(this.orchUrl, this.dropTo, (agentId) => this.host.getAgentProjectId(agentId), {
+      // T-581: o prompt de delegação cifrado cita o nome do pai (o subagente
+      // responde por send_message pra ele). Closures lazy — `host` nasce abaixo.
+      agentNameLookup: (agentId) => this.host.getAgentName(agentId),
+    });
     try {
       await this.relay.start();
       log("info", `bridge relay listening on ${this.relay.socketPath}`);
@@ -2179,7 +2183,7 @@ export class DaemonClient {
         agentsRunning: this.host.agentCount(),
         e2eeProjects: countUsableProjectKeys(),
       });
-      this.send({ type: "daemon:health", health: { ...health, ...runningReleaseInfo() } });
+      this.send({ type: "daemon:health", health: { ...health, ...runningReleaseInfo(), ...this.peerPidHealthFields() } });
     } catch (e) {
       log("warn", `sendHealth falhou: ${(e as Error).message}`);
     }
@@ -2187,6 +2191,18 @@ export class DaemonClient {
 
   private stopHeartbeat() {
     if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
+  }
+
+  /**
+   * #592: o estado do peer-pid sai no health porque hoje ele só existe no log
+   * da máquina — um daemon de campo com THE_DUDES_PEER_PID_INSECURE=1 cai para
+   * não-enforced sem ninguém ver. O valor vem da DECISÃO do relay (lida no
+   * start), não do ambiente: `relay` null = o relay ainda não subiu, e aí o
+   * estado é `pending`, não "fail-closed".
+   */
+  private peerPidHealthFields(): { peerPidEnforced: boolean | null; peerPidMode: PeerPidMode } {
+    const st = this.relay?.peerPidState() ?? { enforced: null, mode: "pending" as const };
+    return { peerPidEnforced: st.enforced, peerPidMode: st.mode };
   }
 
   private shuttingDown = false;

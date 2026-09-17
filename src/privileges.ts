@@ -8,7 +8,7 @@
 
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
-import { accessSync, constants as fsConstants, readFileSync } from "node:fs";
+import { accessSync, constants as fsConstants, existsSync, readFileSync } from "node:fs";
 
 export interface DropTarget {
   uid: number;
@@ -259,6 +259,17 @@ export function setParentPidReader(fn: ParentPidReader | null): void {
   parentPidReader = fn ?? defaultGetParentPid;
 }
 
+/**
+ * T-592: o reader vigente. O relay troca o reader globalmente durante a
+ * resolução (para o walk sair do cache da conexão) e precisa DEVOLVER o que
+ * estava lá — restaurar `null` incondicionalmente descartava o reader
+ * injetado pelo chamador, e o retry da request seguinte caía no `ps` real
+ * contra pids que só existiam na injeção.
+ */
+export function getParentPidReader(): ParentPidReader {
+  return parentPidReader;
+}
+
 export function registerAgentPid(agentId: string, pid: number): void {
   if (!agentId || !Number.isFinite(pid) || pid <= 0) return;
   agentPidToId.set(pid, agentId);
@@ -324,6 +335,48 @@ export function unixSocketFd(sock: object): number | null {
   return typeof fd === "number" && fd >= 0 ? fd : null;
 }
 
+/* ---------- T-592: ppid com cache curto (o walk pagava 1 spawn por hop) ---------- */
+
+/**
+ * T-592: subir a cadeia de pais custa 1 `ps -p <pid>` por hop, e `ps` neste
+ * host custa 120–280ms sob carga (medido) — até PEER_OS_WALK_MAX hops por
+ * conexão nova. Os pids do topo da cadeia (CLI, daemon, launcher) repetem
+ * entre conexões; um cache curto de pid→ppid corta o custo sem risco real:
+ * ppid de processo vivo só muda em reparent, e o TTL cobre.
+ */
+const PARENT_PID_TTL_MS = 1000;
+/** T-592: era 800ms — estourava sob carga e truncava o walk. */
+const PARENT_PID_PS_TIMEOUT_MS = 1500;
+const parentPidCache = new Map<number, { ppid: number; at: number }>();
+
+/** T-592: descarta o cache de ppid (testes / probe no host). */
+export function resetParentPidCache(): void {
+  parentPidCache.clear();
+}
+
+/**
+ * T-592: leitura de ppid com cache curto, sobre um `read` injetável (é o seam
+ * que torna a política de cache testável sem depender de `ps` estourar).
+ *
+ * Só o resultado BEM-SUCEDIDO entra no cache. Um `ps` que estourou o timeout
+ * (ou um pid morto) devolve null; guardar esse null pelo TTL inteiro fazia as
+ * tentativas seguintes da MESMA request lerem o mesmo null do cache e
+ * devolverem 403 — o retry existe para re-perguntar ao SO e não conseguia.
+ * Mesma política que `resolvePeerAgentId` aplica ao peer-pid.
+ */
+export function readParentPidCached(
+  pid: number,
+  read: (pid: number) => number | null,
+): number | null {
+  const cached = parentPidCache.get(pid);
+  const now = Date.now();
+  if (cached && now - cached.at < PARENT_PID_TTL_MS) return cached.ppid;
+  const ppid = read(pid);
+  if (ppid == null) parentPidCache.delete(pid);
+  else parentPidCache.set(pid, { ppid, at: now });
+  return ppid;
+}
+
 function defaultGetParentPid(pid: number): number | null {
   if (process.platform === "linux") {
     try {
@@ -336,10 +389,14 @@ function defaultGetParentPid(pid: number): number | null {
       return null;
     }
   }
+  return readParentPidCached(pid, readParentPidFromPs);
+}
+
+function readParentPidFromPs(pid: number): number | null {
   try {
     const out = execFileSync("ps", ["-p", String(pid), "-o", "ppid="], {
       encoding: "utf8",
-      timeout: 800,
+      timeout: PARENT_PID_PS_TIMEOUT_MS,
     });
     const ppid = Number(out.trim());
     return Number.isFinite(ppid) && ppid > 0 ? ppid : null;
@@ -348,45 +405,101 @@ function defaultGetParentPid(pid: number): number | null {
   }
 }
 
+/* ---------- T-592: leitor de peer-pid por perl, python3 como fallback ---------- */
+
 /**
- * Sem FFI/koffi: herda o fd e pergunta ao python3 (ctypes/getsockopt).
- * Ausente ou falha → null. O relay trata como fail-CLOSED (recusa
- * conexões não-verificáveis) salvo THE_DUDES_PEER_PID_INSECURE=1.
+ * T-592: o leitor era só python3 e, no macOS, `/usr/bin/python3` é o stub do
+ * CommandLineTools — ele re-executa antes de rodar o script. Medido neste host
+ * com load ~80: 2,0–3,8s por spawn, contra o timeout de 800ms. Resultado: a
+ * resolução devolvia null QUASE SEMPRE, o relay cacheava esse null por conexão
+ * e o agente levava 403 em rajada (T-578/T-592).
+ * `/usr/bin/perl` (base do macOS) faz o MESMO getsockopt em ~66ms; o self-test
+ * do relay valida o caminho contra `process.pid` no boot.
+ * python3 continua como fallback — nenhum caminho novo passa a ser obrigatório.
+ */
+const PERL_BIN = "/usr/bin/perl";
+const PEER_PID_PERL_TIMEOUT_MS = 1000;
+/** T-592: python3 neste host não cabe em 800ms nem com folga. */
+const PEER_PID_PYTHON_TIMEOUT_MS = 4000;
+
+/** SOL_LOCAL=0/LOCAL_PEERPID=2 (darwin) · SOL_SOCKET=1/SO_PEERCRED=17 (linux). */
+function peerPidPerlScript(): string | null {
+  const opt = process.platform === "darwin" ? [0, 2]
+    : process.platform === "linux" ? [1, 17]
+      : null;
+  if (!opt) return null;
+  return [
+    'open(my $s, "<&=3") or die "open: $!";',
+    `my $v = getsockopt($s, ${opt[0]}, ${opt[1]});`,
+    'die "getsockopt: $!" unless defined $v;',
+    'die "short value" if length($v) < 4;',
+    'print unpack("i", $v), "\n";',
+  ].join(" ");
+}
+
+function peerPidPythonScript(): string | null {
+  if (process.platform === "darwin") {
+    return [
+      "import ctypes,sys",
+      "fd=3",
+      "libc=ctypes.CDLL('/usr/lib/libSystem.B.dylib')",
+      "pid=ctypes.c_int(0)",
+      "sz=ctypes.c_uint32(4)",
+      "r=libc.getsockopt(fd,0,2,ctypes.byref(pid),ctypes.byref(sz))",
+      "sys.exit(1) if r!=0 else print(pid.value)",
+    ].join(";");
+  }
+  if (process.platform === "linux") {
+    return [
+      "import socket,struct,sys",
+      "s=socket.fromfd(3,socket.AF_UNIX,socket.SOCK_STREAM)",
+      "c=s.getsockopt(socket.SOL_SOCKET,17,struct.calcsize('3i'))",
+      "print(struct.unpack('3i',c)[0])",
+    ].join(";");
+  }
+  return null;
+}
+
+type PeerPidProbe = { bin: string; args: string[]; timeout: number };
+
+let peerPidProbeCache: PeerPidProbe[] | null = null;
+
+function peerPidProbes(): PeerPidProbe[] {
+  if (peerPidProbeCache) return peerPidProbeCache;
+  const probes: PeerPidProbe[] = [];
+  const perl = peerPidPerlScript();
+  if (perl && existsSync(PERL_BIN)) {
+    probes.push({ bin: PERL_BIN, args: ["-e", perl], timeout: PEER_PID_PERL_TIMEOUT_MS });
+  }
+  const py = peerPidPythonScript();
+  if (py) {
+    for (const bin of ["/usr/bin/python3", "/usr/local/bin/python3", "python3"]) {
+      probes.push({ bin, args: ["-c", py], timeout: PEER_PID_PYTHON_TIMEOUT_MS });
+    }
+  }
+  peerPidProbeCache = probes;
+  return probes;
+}
+
+/**
+ * Sem FFI/koffi: herda o fd e pergunta ao SO (perl; python3 se o perl faltar).
+ * Ausente ou falha → null. O relay trata como fail-CLOSED (recusa conexões
+ * não-verificáveis) salvo THE_DUDES_PEER_PID_INSECURE=1.
  */
 function defaultGetUnixPeerPid(sock: object): number | null {
   const fd = unixSocketFd(sock);
   if (fd == null) return null;
-  const py = process.platform === "darwin"
-    ? [
-        "import ctypes,sys",
-        "fd=3",
-        "libc=ctypes.CDLL('/usr/lib/libSystem.B.dylib')",
-        "pid=ctypes.c_int(0)",
-        "sz=ctypes.c_uint32(4)",
-        "r=libc.getsockopt(fd,0,2,ctypes.byref(pid),ctypes.byref(sz))",
-        "sys.exit(1) if r!=0 else print(pid.value)",
-      ].join(";")
-    : process.platform === "linux"
-      ? [
-          "import socket,struct,sys",
-          "s=socket.fromfd(3,socket.AF_UNIX,socket.SOCK_STREAM)",
-          "c=s.getsockopt(socket.SOL_SOCKET,17,struct.calcsize('3i'))",
-          "print(struct.unpack('3i',c)[0])",
-        ].join(";")
-      : null;
-  if (!py) return null;
-  const bins = ["/usr/bin/python3", "/usr/local/bin/python3", "python3"];
-  for (const bin of bins) {
+  for (const probe of peerPidProbes()) {
     try {
-      const out = spawnSync(bin, ["-c", py], {
+      const out = spawnSync(probe.bin, probe.args, {
         encoding: "utf8",
-        timeout: 800,
+        timeout: probe.timeout,
         stdio: ["ignore", "pipe", "pipe", fd],
       });
       if (out.status !== 0) continue;
       const pid = Number((out.stdout ?? "").trim());
       if (Number.isFinite(pid) && pid > 0) return pid;
-    } catch { /* tenta o próximo bin */ }
+    } catch { /* tenta o próximo */ }
   }
   return null;
 }

@@ -8,7 +8,7 @@
 export * from "@the-dudes/protocol/daemon-wire";
 
 import type { AgentSendPart, AssemblePartsResult } from "@the-dudes/protocol/daemon-wire";
-import { aadV2, resolveAgentSendCipherAad } from "@the-dudes/protocol/e2ee-fields";
+import { aadReadChain, resolveAgentSendCipherAad } from "@the-dudes/protocol/e2ee-fields";
 
 export function cipherWirePrefix(text: string): "e2e:v2" | "e2e:v1" | "e2e" | "none" {
   if (text.startsWith("e2e:v2:")) return "e2e:v2";
@@ -17,7 +17,17 @@ export function cipherWirePrefix(text: string): "e2e:v2" | "e2e:v1" | "e2e" | "n
   return "none";
 }
 
-/** Concatena parts; cada cipher usa AAD declarado ou fallback legado messages.content. Sem varredura. */
+/**
+ * Concatena parts; cada cipher usa AAD declarado ou fallback legado
+ * messages.content. Sem varredura.
+ *
+ * T-581: o AAD declarado é o do campo de DESTINO; a decifragem usa a mesma
+ * cadeia de leitura do web (destino → no máx. UMA fonte canônica,
+ * `aadReadChain`). É o que permite o blob copiado pelo server cross-tabela
+ * (startPlan: plan item → mission step) decifrar no destino sem o server ter
+ * a chave — antes o part declarava o destino, o decrypt falhava e a mensagem
+ * era dropada com agent:error.
+ */
 export function assembleAgentSendParts(
   parts: AgentSendPart[],
   projectId: string | undefined,
@@ -32,8 +42,11 @@ export function assembleAgentSendParts(
     if (!projectId) return { ok: false, reason: "missing_project", prefix };
     const resolved = resolveAgentSendCipherAad(p);
     if (!resolved.ok) return { ok: false, reason: resolved.reason, prefix };
-    const aad = aadV2({ projectId, table: resolved.table, field: resolved.field });
-    const dec = decrypt(p.text, projectId, aad);
+    let dec: string | null = null;
+    for (const aad of aadReadChain({ projectId, table: resolved.table, field: resolved.field })) {
+      dec = decrypt(p.text, projectId, aad);
+      if (dec !== null) break;
+    }
     if (dec === null) return { ok: false, reason: "decrypt", prefix };
     out.push(dec);
   }

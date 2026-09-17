@@ -1,13 +1,12 @@
 /* R7 (T-462): turno extraído do agent-runner — `self` é o AgentRunner. */
 import {AgentUsage, ImageAttachment} from "../../types.js";
 import {ChildProcess} from "node:child_process";
-import {PER_MSG_TURN_TIMEOUT_MS} from "../../agent-runner.js";
 import {TextLoopGuard, parseQwenTurnEvent} from "../turn-parsers.js";
 import {appendPathAttachmentPrompt} from "../attachments.js";
 import {armHardTimeout, killProcess} from "../process-lifecycle.js";
 import {buildQwenEnv} from "../env.js";
 import {isMissingSessionFailure as isMissingSessionMessage} from "../error-classifier.js";
-import {markTurnStart} from "../turn-watchdog.js";
+import {markTurnStart, QWEN_HARD_TIMEOUT_MS} from "../turn-watchdog.js";
 import {randomUUID} from "node:crypto";
 import {spawnDropped} from "../../privileges.js";
 
@@ -89,8 +88,17 @@ export async function runQwenMessage(self: any, content: string, images?: ImageA
     proc.stdin?.on("error", () => { /* EPIPE: o CLI morreu cedo — o close cuida */ });
     proc.stdin?.end(message);
     self.ocActiveProc = proc;
-    armHardTimeout(proc, PER_MSG_TURN_TIMEOUT_MS, () => {
-      self.opts.log("warn", `[qwen:${self.info.name}] turno excedeu ${PER_MSG_TURN_TIMEOUT_MS / 1000}s — SIGKILL`);
+    // T-598: backstop do processo ACIMA do teto de lifetime do watchdog — o
+    // watchdog corta primeiro, com re-fila + sessão preservada. Se este
+    // disparar mesmo assim, passa pelo MESMO recover em vez de um SIGKILL
+    // seco (close sem result não re-enfileira e a mensagem em voo se perdia).
+    armHardTimeout(proc, QWEN_HARD_TIMEOUT_MS, () => {
+      self.opts.log("warn", `[qwen:${self.info.name}] turno excedeu o backstop de ${QWEN_HARD_TIMEOUT_MS / 60_000}min — recover`);
+      self.recoverHungTurn(
+        `hard timeout ${Math.round(QWEN_HARD_TIMEOUT_MS / 1000)}s`,
+        Date.now() - self.activityClock.lastActivityAt,
+        "lifetime",
+      );
     });
     let buf = "";
     let pendingText = "";

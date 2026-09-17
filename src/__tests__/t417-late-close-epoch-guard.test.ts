@@ -22,6 +22,7 @@ import "./scratch-home.js";
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import type { ChildProcess } from "node:child_process";
 import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -57,7 +58,7 @@ interface Harness {
   runner: AgentRunner;
   warns: string[];
   /** TODO ChildProcess real spawnado pelo runner — morto à mão no cleanup. */
-  children: Array<{ kill: (s?: string) => boolean }>;
+  children: ChildProcess[];
   argvLines(): string[];
 }
 
@@ -128,16 +129,39 @@ async function until(cond: () => boolean, what: string, ms = 5000): Promise<void
   }
 }
 
+/** Budget dos waits de SPAWN (os que precedem asserção de slot). O spawn do stub
+ *  é um `node` novo sob a carga do runner de CI: 5s já estourou ali (observado
+ *  nos dois lados, base e tip, na mesma rodada). Como o `until` espera um FATO,
+ *  subir o budget não afrouxa asserção — só o tempo que o teste tolera. */
+const SPAWN_BUDGET_MS = 15_000;
+
 /** O evento real de close do filho morto chega assincronamente: dá-lhe tempo
  *  de aterrar antes das asserções (é exatamente esse close que se testa). */
 const settle = () => new Promise((r) => setTimeout(r, 250));
 
 /** Cleanup: mata os filhos reais (senão o teste PENDA — ver cabeçalho), pára o
- *  runner e zera o gate para o próximo teste começar do zero. */
+ *  runner e zera o gate para o próximo teste começar do zero.
+ *
+ *  T-417 flake: é o `close` do filho morto que devolve o slot ao contador
+ *  GLOBAL do gate (`endTurn` → `releaseActiveTurnSlot`), e ele aterra
+ *  assíncrono. Com espera FIXA esse close podia aterrar depois do
+ *  `_resetTurnGateForTest()` do teste SEGUINTE e derrubar a pré-condição dele
+ *  ("turno 1 segura o slot" com 0 no contador). Aqui a espera é pelo FATO —
+ *  cada filho fechado — e só depois o gate zera. */
 async function cleanup(h: Harness): Promise<void> {
-  for (const p of h.children) killProcess(p as never, "SIGKILL");
+  // Liga o listener ANTES do kill (T-577): se o close já aterrou, o filho
+  // nem entra no pending. T-599: `until` (teto + mensagem) em vez de
+  // Promise.all sem prazo — um close que nunca vem falha o teste, não pende.
+  const pending = new Set<ChildProcess>();
+  for (const p of h.children) {
+    if (p.exitCode !== null || p.signalCode !== null) continue;
+    pending.add(p);
+    p.once("close", () => pending.delete(p));
+    if (p.exitCode !== null || p.signalCode !== null) pending.delete(p);
+  }
+  for (const p of h.children) killProcess(p, "SIGKILL");
   h.runner.stop();
-  await settle();
+  await until(() => pending.size === 0, "close dos filhos mortos");
   _resetTurnGateForTest();
 }
 
@@ -147,7 +171,14 @@ async function spawnHangingTurn(h: Harness, method: string, content: string): Pr
   const a = asAny(h.runner);
   a.messageSession.busy = true; // o que o drainOcQueue faria antes de despachar
   void a[method](content);
-  await until(() => h.argvLines().length >= 1, "spawn do stub");
+  // T-417 flake / T-599: esperar o FATO (slot ocupado), não só o spawn — o
+  // slot é adquirido ANTES do spawn, mas quem o segura é o turno, não a
+  // linha de argv. Budget do T-577 (5s já estourou sob carga).
+  await until(
+    () => h.argvLines().length >= 1 && gateAtivos() === 1,
+    "spawn do stub e slot do gate ocupado",
+    SPAWN_BUDGET_MS,
+  );
   const proc = a.ocActiveProc;
   assert.ok(proc && typeof proc.emit === "function", "pré-condição: turno em voo tem proc");
   h.children.push(proc);
@@ -236,7 +267,11 @@ for (const { runner } of RUNNERS) {
     try {
       // Turno 1 pelo drain REAL, para o recover poder drenar a fila.
       h.runner.pushUserMessage("turno-1");
-      await until(() => h.argvLines().length === 1, "spawn do turno 1");
+      await until(
+        () => h.argvLines().length === 1 && gateAtivos() === 1,
+        "spawn do turno 1 e slot do gate ocupado",
+        SPAWN_BUDGET_MS,
+      );
       const proc1 = a.ocActiveProc;
       h.children.push(proc1);
       const epoch1 = a.messageSession.epoch;
@@ -255,7 +290,11 @@ for (const { runner } of RUNNERS) {
         `o recover tem de correr de facto: ${h.warns.join(" | ")}`,
       );
       assert.notEqual(a.messageSession.epoch, epoch1, "recover invalidou a geração do turno 1");
-      await until(() => h.argvLines().length === 2, "spawn do turno novo pelo drain do recover");
+      await until(
+        () => h.argvLines().length === 2 && gateAtivos() === 1,
+        "spawn do turno novo pelo drain do recover e slot do gate ocupado",
+        SPAWN_BUDGET_MS,
+      );
 
       const proc2 = a.ocActiveProc;
       h.children.push(proc2);

@@ -11,7 +11,9 @@ import { performance } from "node:perf_hooks";
 import { BridgeRelay } from "../bridge-relay.js";
 import {
   clearAgentPidRegistry,
+  readParentPidCached,
   registerAgentPid,
+  resetParentPidCache,
   setParentPidReader,
   setUnixPeerPidReader,
   unregisterAgentPid,
@@ -21,6 +23,7 @@ afterEach(() => {
   clearAgentPidRegistry();
   setParentPidReader(null);
   setUnixPeerPidReader(null);
+  resetParentPidCache();
 });
 
 async function listenOrch(): Promise<{ url: string; close: () => Promise<void> }> {
@@ -186,7 +189,7 @@ test("T-071 A4: unregisterAgentPid após 1º request → 2º na mesma conexão =
   }
 });
 
-test("T-071 A6: p50 requests 2..N na mesma conexão (python3 real) < 50ms (T-242: budget com margem p/ execução paralela)", async () => {
+test("T-071 A6: p50 requests 2..N na mesma conexão (python3 real) < budget derivado do cold start (T-242/T-569)", async () => {
   delete process.env.THE_DUDES_PEER_PID_INSECURE;
   registerAgentPid("ag_bench", process.pid);
   const orch = await listenOrch();
@@ -196,7 +199,9 @@ test("T-071 A6: p50 requests 2..N na mesma conexão (python3 real) < 50ms (T-242
   const sock = await connectUnix(relay.socketPath);
   const samples: number[] = [];
   try {
-    const n = 12;
+    // T-569: janela maior que a original (12) — o p50 sai de 20 amostras em vez
+    // de 11, então um único request patológico não decide a mediana.
+    const n = 21;
     for (let i = 0; i < n; i++) {
       const r = await httpGetKeepAlive(sock, "/api/bridge/ag_bench/tasks_list");
       assert.equal(r.status, 200, `request ${i + 1} status`);
@@ -211,9 +216,210 @@ test("T-071 A6: p50 requests 2..N na mesma conexão (python3 real) < 50ms (T-242
     );
     // T-242: budget <5ms media ruído de scheduler do host sob a suíte paralela
     // (probes PG + outros arquivos de teste): p50 isolado 1,0–1,9ms, mas 5,19–43,8ms
-    // com carga (3 flakes seguidos na QA: T-233/T-188/T-240). A asserção funcional
-    // permanece: rota medida, reportada e dentro de budget com margem realista.
-    assert.ok(med < 50, `p50 requests 2..N = ${med.toFixed(2)}ms, esperado < 50ms (first=${first.toFixed(2)}ms)`);
+    // com carga (3 flakes seguidos na QA: T-233/T-188/T-240).
+    //
+    // T-569: o teto FIXO de 50ms perdeu a margem real. Medido no CI (run
+    // 35124375568, head 146f017): p50 = 54,69ms com first = 204,32ms — o ruído
+    // do host não cabe num número fixo. O teto passa a ser PROPORCIONAL ao cold
+    // start desta própria execução (o `first` paga spawn de python3 + walk de
+    // ppid, e é medido sob a MESMA carga): mesma classe do T-599, arquivo outro.
+    //
+    // O fator 0,6 separa "cache pagando" de "cache quebrado", com números
+    // medidos dos dois lados:
+    //   - cache ON, pior caso conhecido (CI acima): med/first = 0,27 → 2,2x de folga
+    //   - cache OFF (medido neste host, T-569): med = 518ms vs first = 606ms → 0,86
+    // A asserção funcional NÃO afrouxa: com o cache desligado a mediana encosta
+    // no cold start e reprova (518ms > 364ms). O piso de 50ms é o budget do
+    // T-242, e só passa a valer em host ocioso (first < 84ms).
+    const FLOOR_MS = 50;
+    const RATIO_DO_COLD_START = 0.6;
+    const budget = Math.max(FLOOR_MS, first * RATIO_DO_COLD_START);
+    assert.ok(
+      med < budget,
+      `p50 requests 2..N = ${med.toFixed(2)}ms, esperado < ${budget.toFixed(2)}ms ` +
+      `(budget = max(${FLOOR_MS}ms, first*${RATIO_DO_COLD_START}), first=${first.toFixed(2)}ms)`,
+    );
+    // Asserção funcional explícita: as requests em cache têm de ser mais baratas
+    // que a 1ª (que paga o spawn). Com o cache desligado as duas se igualam.
+    assert.ok(
+      med < first,
+      `p50 requests 2..N = ${med.toFixed(2)}ms tem de ser < 1ª request = ${first.toFixed(2)}ms ` +
+      `(a 1ª paga o spawn do python3; o cache tem de tirar esse custo do caminho)`,
+    );
+  } finally {
+    sock.destroy();
+    relay.stop();
+    await orch.close();
+  }
+});
+
+/*
+ * T-592: o 403 em rajada. O leitor de peer-pid (spawn de processo) estoura o
+ * timeout sob carga e o walk de ppid pode truncar num hop; nenhum dos dois
+ * pode ser cacheado como fato definitivo da conexão. Medido em produção
+ * (T-578/T-592): 7/12 curls em 403, 5/5 em conexões novas, sem mudança de
+ * código entre as medições.
+ */
+
+test("T-592 A5: leitor devolve null na 1ª request → 2ª request na MESMA conexão = 200 (null não fica cacheado)", async () => {
+  let peerCalls = 0;
+  registerAgentPid("ag_a", 100);
+  // 3 primeiras chamadas = as 3 tentativas da 1ª request (spawn estourou).
+  setUnixPeerPidReader(() => {
+    peerCalls++;
+    return peerCalls <= 3 ? null : 300;
+  });
+  setParentPidReader((pid) => ({ 300: 200, 200: 100, 100: 1 } as Record<number, number>)[pid] ?? 0);
+  const orch = await listenOrch();
+  const relay = new BridgeRelay(orch.url, null, undefined, { peerPidSelfTest: async () => true });
+  await relay.start();
+  const sock = await connectUnix(relay.socketPath);
+  try {
+    const r1 = await httpGetKeepAlive(sock, "/api/bridge/ag_a/tasks_list");
+    assert.equal(r1.status, 403, "1ª request com o leitor falho");
+    const r2 = await httpGetKeepAlive(sock, "/api/bridge/ag_a/tasks_list");
+    assert.equal(r2.status, 200, "2ª request na MESMA conexão tem de re-perguntar ao SO");
+    assert.equal(peerCalls, 4, "3 tentativas na 1ª request + 1 na 2ª");
+  } finally {
+    sock.destroy();
+    relay.stop();
+    await orch.close();
+  }
+});
+
+test("T-592 A7: falha isolada do leitor (null 1×) resolve na MESMA request — sem 403 e sem perder o cache", async () => {
+  let peerCalls = 0;
+  registerAgentPid("ag_a", 100);
+  setUnixPeerPidReader(() => {
+    peerCalls++;
+    return peerCalls === 1 ? null : 300;
+  });
+  setParentPidReader((pid) => ({ 300: 200, 200: 100, 100: 1 } as Record<number, number>)[pid] ?? 0);
+  const orch = await listenOrch();
+  const relay = new BridgeRelay(orch.url, null, undefined, { peerPidSelfTest: async () => true });
+  await relay.start();
+  const sock = await connectUnix(relay.socketPath);
+  try {
+    assert.equal((await httpGetKeepAlive(sock, "/api/bridge/ag_a/tasks_list")).status, 200);
+    assert.equal(peerCalls, 2, "1 falha + 1 sucesso na mesma request");
+    // Cache preservado: a 2ª request não volta a spawnar (T-071 A1).
+    assert.equal((await httpGetKeepAlive(sock, "/api/bridge/ag_a/tasks_list")).status, 200);
+    assert.equal(peerCalls, 2, "peerPid resolvido tem de ficar cacheado na conexão");
+  } finally {
+    sock.destroy();
+    relay.stop();
+    await orch.close();
+  }
+});
+
+test("T-592 A8: hop ilegível não congela walk truncado — cadeia é refeita até resolver", async () => {
+  const parentCalls = new Map<number, number>();
+  let peerCalls = 0;
+  registerAgentPid("ag_a", 100);
+  setUnixPeerPidReader(() => { peerCalls++; return 300; });
+  setParentPidReader((pid) => {
+    const n = (parentCalls.get(pid) ?? 0) + 1;
+    parentCalls.set(pid, n);
+    if (pid === 300 && n === 1) return null; // 1º hop do walk estoura (ps timeout)
+    return ({ 300: 200, 200: 100, 100: 1 } as Record<number, number>)[pid] ?? 0;
+  });
+  const orch = await listenOrch();
+  const relay = new BridgeRelay(orch.url, null, undefined, { peerPidSelfTest: async () => true });
+  await relay.start();
+  const sock = await connectUnix(relay.socketPath);
+  try {
+    assert.equal(
+      (await httpGetKeepAlive(sock, "/api/bridge/ag_a/tasks_list")).status,
+      200,
+      "walk truncado tem de ser refeito, não virar 403",
+    );
+    assert.equal(parentCalls.get(300), 2, "hop ilegível tem de ser re-lido");
+    assert.equal(peerCalls, 1, "peerPid não tem de ser re-lido por causa do walk");
+    // Cadeia completa agora: request seguinte não re-walka.
+    assert.equal((await httpGetKeepAlive(sock, "/api/bridge/ag_a/tasks_list")).status, 200);
+    assert.equal(parentCalls.get(300), 2, "walk resolvido tem de ficar cacheado na conexão");
+  } finally {
+    sock.destroy();
+    relay.stop();
+    await orch.close();
+  }
+});
+
+test("T-592 A10: hop que falhou NÃO fica no cache de ppid — o retry relê o SO de verdade", async () => {
+  /*
+   * A5/A8 injetam o reader de ppid, e por isso passam POR CIMA do cache de
+   * ppid. Este é o teste que fecha o furo: o reader aqui é o caminho real
+   * (`readParentPidCached`) com um `ps` que estoura 1×, que é o que acontece
+   * no host sob carga. Com o null cacheado, as 3 tentativas da mesma request
+   * leriam o mesmo null e o 403 voltaria a ser permanente.
+   */
+  resetParentPidCache();
+  const inner = new Map<number, number>();
+  let peerCalls = 0;
+  registerAgentPid("ag_a", 100);
+  setUnixPeerPidReader(() => { peerCalls++; return 300; });
+  setParentPidReader((pid) => readParentPidCached(pid, (p) => {
+    const n = (inner.get(p) ?? 0) + 1;
+    inner.set(p, n);
+    if (p === 300 && n === 1) return null; // `ps` estourou no 1º hop
+    return ({ 300: 200, 200: 100, 100: 1 } as Record<number, number>)[p] ?? 0;
+  }));
+  const orch = await listenOrch();
+  const relay = new BridgeRelay(orch.url, null, undefined, { peerPidSelfTest: async () => true });
+  await relay.start();
+  const sock = await connectUnix(relay.socketPath);
+  try {
+    assert.equal(
+      (await httpGetKeepAlive(sock, "/api/bridge/ag_a/tasks_list")).status,
+      200,
+      "1 hop ilegível não pode virar 403 na request",
+    );
+    assert.equal(inner.get(300), 2, "a falha não pode ter ficado no cache de ppid");
+    assert.equal(peerCalls, 1, "peerPid não tem de ser re-lido por causa do walk");
+    assert.equal((await httpGetKeepAlive(sock, "/api/bridge/ag_a/tasks_list")).status, 200);
+    assert.equal(inner.get(300), 2, "cadeia resolvida tem de ficar cacheada (T-071 A1)");
+  } finally {
+    sock.destroy();
+    relay.stop();
+    await orch.close();
+  }
+});
+
+test("T-569: self-test do peer-pid RETENTA — fail-closed só depois de esgotar as tentativas", async () => {
+  delete process.env.THE_DUDES_PEER_PID_INSECURE;
+  // Simula o pico transitório medido: sob load ~40 num host de 18 cpus o
+  // `connection` do self-test de boot não chegou dentro do teto e o caso A6
+  // durou 1620ms. Aqui o host "não consegue" resolver o peer nas 2 primeiras
+  // tentativas e consegue na 3ª. Antes do fix (T-569) a 1ª falha já era
+  // DEFINITIVA: peerPidEnforced ficava false e o relay respondia 503 em toda
+  // request até restart.
+  let tentativas = 0;
+  setUnixPeerPidReader(() => (++tentativas < 3 ? null : process.pid));
+  const orch = await listenOrch();
+  const relay = new BridgeRelay(orch.url, null);
+  await relay.start();
+  try {
+    assert.equal(tentativas, 3, "o self-test tem de ter retentado até conseguir");
+    assert.equal(relay.peerPidEnforced, true, "3ª tentativa tem de valer (não é fail-closed)");
+  } finally {
+    relay.stop();
+    await orch.close();
+  }
+});
+
+test("T-569: self-test que falha em TODAS as tentativas continua fail-closed", async () => {
+  delete process.env.THE_DUDES_PEER_PID_INSECURE;
+  let tentativas = 0;
+  setUnixPeerPidReader(() => { tentativas++; return null; });
+  const orch = await listenOrch();
+  const relay = new BridgeRelay(orch.url, null);
+  await relay.start();
+  const sock = await connectUnix(relay.socketPath);
+  try {
+    assert.equal(tentativas, 3, "esgotar as tentativas (3) antes de desistir");
+    assert.equal(relay.peerPidEnforced, false);
+    // Fail-CLOSED preservado: sem INSECURE, request não-verificável é 503.
+    assert.equal((await httpGetKeepAlive(sock, "/api/bridge/ag_x/tasks_list")).status, 503);
   } finally {
     sock.destroy();
     relay.stop();

@@ -25,6 +25,10 @@
       "types": "./e2ee-fields.d.ts",
       "default": "./e2ee-fields.js"
     },
+    "./delegation": {
+      "types": "./delegation.d.ts",
+      "default": "./delegation.js"
+    },
     "./wire-version": {
       "types": "./wire-version.d.ts",
       "default": "./wire-version.js"

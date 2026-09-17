@@ -19,7 +19,7 @@ import os from "node:os";
 import path from "node:path";
 import { AgentRunner } from "../agent-runner.js";
 import { TextLoopGuard } from "../runners/turn-parsers.js";
-import { hangThresholds } from "../runners/turn-watchdog.js";
+import { hangThresholds, QWEN_HARD_TIMEOUT_MS, QWEN_STREAM_MAX_LIFETIME_MS, QWEN_TURN_LIFETIME_MS } from "../runners/turn-watchdog.js";
 import { turnGateStats } from "../runners/turn-gate.js";
 
 const STUB = `#!/usr/bin/env node
@@ -272,11 +272,17 @@ test("T-371 (c-integration): turno qwen em loop é abortado pela janela anti-rep
 
 /* ---------- (d) teto de lifetime absoluto ---------- */
 
-test("T-371 (d): ramo qwen em hangThresholds declara soft/hard/lifetime e o teto mata turno com clock renovado", () => {
+test("T-371 (d) / T-598: ramo qwen declara soft/hard/lifetime (30min) e o teto mata turno com clock renovado", () => {
   const q = hangThresholds("qwen");
   assert.equal(q.softMs, 6 * 60_000);
   assert.equal(q.hardMs, 10 * 60_000);
-  assert.equal(q.lifetimeMs, 8 * 60_000, "valores declarados no diff");
+  assert.equal(q.lifetimeMs, QWEN_TURN_LIFETIME_MS, "teto único declarado (T-598: era 8min)");
+  assert.equal(QWEN_TURN_LIFETIME_MS, 30 * 60_000);
+  assert.ok(
+    QWEN_STREAM_MAX_LIFETIME_MS > QWEN_TURN_LIFETIME_MS,
+    "par do CLI fica ACIMA do teto do daemon — o daemon corta primeiro (com re-fila)",
+  );
+  assert.ok(QWEN_HARD_TIMEOUT_MS > QWEN_TURN_LIFETIME_MS, "backstop do processo também acima do teto");
   assert.equal(hangThresholds("codex").lifetimeMs, undefined, "outros runners ficam como estavam");
 
   const h = makeHarness("hang");
@@ -291,7 +297,9 @@ test("T-371 (d): ramo qwen em hangThresholds declara soft/hard/lifetime e o teto
     tick(h.runner);
 
     assert.equal(a.messageSession.busy, false, "lifetime absoluto tem de matar o turno mesmo com clock renovado e tool viva");
-    assert.equal(a.hardRecoverTimes.length, 1);
+    // T-598: kill por lifetime não entra na janela de hang (é backstop, não
+    // hang) — a janela alimenta o resumo de hang da T-240 (d).
+    assert.equal(a.hardRecoverTimes.length, 0, "lifetime não conta na janela de hang");
   } finally {
     h.runner.stop();
   }

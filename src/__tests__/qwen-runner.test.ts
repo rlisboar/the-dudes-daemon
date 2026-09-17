@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import { parseQwenTurnEvent } from "../runners/turn-parsers.js";
 import { extractOneShotText } from "../runners/parsers.js";
 import { buildBaseRunnerEnv, buildQwenEnv } from "../runners/env.js";
+import { QWEN_STREAM_MAX_LIFETIME_MS } from "../runners/turn-watchdog.js";
 import { qwenConfigContextLimit, DEFAULT_CONTEXT_LIMIT } from "../runners/model-policy.js";
 
 const SID = "2ebf5fa4-a378-461b-bf5f-fb16545388e3";
@@ -82,6 +83,11 @@ test("qwen env: QWEN_HOME por agente só para o runner qwen; yolo warning silenc
   const claude = buildBaseRunnerEnv({ inherited: { ...base, QWEN_HOME: "stale" }, runner: "claude", agentId: "a1", agentName: "A", orchestratorUrl: "https://o" });
   assert.equal(claude.QWEN_HOME, undefined, "QWEN_HOME não vaza para outros runners");
   assert.equal(buildQwenEnv({}).QWEN_CODE_SUPPRESS_YOLO_WARNING, "1");
+  assert.equal(
+    buildQwenEnv({ QWEN_STREAM_MAX_LIFETIME_MS: "480000" }).QWEN_STREAM_MAX_LIFETIME_MS,
+    String(QWEN_STREAM_MAX_LIFETIME_MS),
+    "T-598: fonte única — env velho (8min) não vence o teto do binário",
+  );
 });
 
 test("qwen janela: contextWindowSize do settings do dono vence; ausente = 200k real do CLI", () => {

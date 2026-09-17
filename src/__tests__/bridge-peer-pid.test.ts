@@ -1,14 +1,25 @@
 import { afterEach, test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import net from "node:net";
+import os from "node:os";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { performance } from "node:perf_hooks";
 import { BridgeRelay } from "../bridge-relay.js";
 import {
   clearAgentPidRegistry,
+  getParentPid,
+  getUnixPeerPid,
+  readParentPidCached,
   registerAgentPid,
+  resetParentPidCache,
   resolveAgentIdFromPid,
   setParentPidReader,
   setUnixPeerPidReader,
   spawnDropped,
+  unregisterAgentPid,
 } from "../privileges.js";
 import { RunnerRuntimeFiles } from "../runners/runtime-files.js";
 
@@ -163,6 +174,90 @@ test("T-093: self-test real no host (python3) → enforce", async () => {
   } finally {
     relay.stop();
   }
+});
+
+/*
+ * T-592: o leitor default de peer-pid e a cadeia de ppid eram o gargalo real
+ * do 403 em rajada. Medido neste host com load ~80: `/usr/bin/python3` (stub
+ * do CommandLineTools, re-executa) levava 2,0–3,8s por spawn contra timeout de
+ * 800ms — a resolução devolvia null SEMPRE. `/usr/bin/perl` faz o mesmo
+ * getsockopt em ~66ms. Estes dois testes medem o caminho real, sem injeção.
+ */
+
+test("T-592: leitor default resolve o peer pid real do host (perl) dentro do timeout", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "t592-peer-"));
+  const sockPath = path.join(dir, "s.sock");
+  const srv = net.createServer();
+  await new Promise<void>((resolve) => srv.listen(sockPath, resolve));
+  const accepted = new Promise<net.Socket>((resolve) => srv.once("connection", resolve));
+  const client = net.connect(sockPath);
+  await new Promise<void>((resolve) => client.once("connect", () => resolve()));
+  const serverSock = await accepted;
+  try {
+    const t0 = performance.now();
+    const pid = getUnixPeerPid(serverSock);
+    const ms = performance.now() - t0;
+    console.log(`T-592 leitor default: ${ms.toFixed(1)}ms pid=${pid} esperado=${process.pid}`);
+    assert.equal(pid, process.pid, "leitor default tem de resolver o pid do peer");
+    assert.ok(ms < 1500, `resolução levou ${ms.toFixed(1)}ms — o timeout antigo era 800ms`);
+  } finally {
+    client.destroy();
+    serverSock.destroy();
+    srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("T-592: ppid do host é lido corretamente e o cache curto devolve o mesmo valor", () => {
+  resetParentPidCache();
+  const want = Number(
+    execFileSync("ps", ["-p", String(process.pid), "-o", "ppid="], { encoding: "utf8" }).trim(),
+  );
+  assert.equal(getParentPid(process.pid), want);
+  assert.equal(getParentPid(process.pid), want, "2ª leitura vem do cache (sem novo spawn)");
+});
+
+/*
+ * T-592: a política de cache do ppid. Os testes de relay injetam o reader e
+ * por isso NÃO passam pelo cache — sem este teste, guardar um ppid null no
+ * cache (o bug) ficava invisível: as tentativas da mesma request leriam todas
+ * o mesmo null e o walk nunca seria refeito no host.
+ */
+test("T-592 A9: ppid que FALHOU não entra no cache; ppid resolvido entra", () => {
+  resetParentPidCache();
+  let falhas = 0;
+  const estoura: (pid: number) => number | null = () => { falhas++; return null; };
+  assert.equal(readParentPidCached(4242, estoura), null);
+  assert.equal(readParentPidCached(4242, estoura), null);
+  assert.equal(falhas, 2, "null cacheado faria a 2ª tentativa reler o mesmo null do cache");
+
+  let oks = 0;
+  const resolve: (pid: number) => number | null = () => { oks++; return 111; };
+  assert.equal(readParentPidCached(4243, resolve), 111);
+  assert.equal(readParentPidCached(4243, resolve), 111);
+  assert.equal(oks, 1, "ppid resolvido tem de vir do cache (T-071: sem 1 spawn por request)");
+
+  // Um pid que passa a resolver sai do estado "falhou" na leitura seguinte.
+  let n = 0;
+  const instavel: (pid: number) => number | null = () => (++n === 1 ? null : 222);
+  assert.equal(readParentPidCached(4244, instavel), null);
+  assert.equal(readParentPidCached(4244, instavel), 222);
+  assert.equal(readParentPidCached(4244, instavel), 222, "agora sim, cacheado");
+  assert.equal(n, 2);
+  resetParentPidCache();
+});
+
+test("T-592: re-spawn do CLI não derruba o pid antigo enquanto ele vive (bridge do CLI antigo continua resolvendo)", () => {
+  registerAgentPid("ag_x", 111); // CLI antigo, vivo e ainda servindo o bridge
+  setParentPidReader((pid) => (pid === 900 ? 111 : 0)); // bridge 900 → CLI antigo
+  assert.equal(resolveAgentIdFromPid(900), "ag_x");
+
+  registerAgentPid("ag_x", 222); // hard recover: CLI NOVO para o MESMO agente
+  assert.equal(resolveAgentIdFromPid(222), "ag_x");
+  assert.equal(resolveAgentIdFromPid(900), "ag_x", "pid do CLI antigo continua no registro");
+
+  unregisterAgentPid(222); // o CLI novo sai: não pode levar o antigo junto
+  assert.equal(resolveAgentIdFromPid(900), "ag_x");
 });
 
 test("T-061: caminho feliz — agentId da URL ≠ peer → 403", async () => {

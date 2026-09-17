@@ -19,9 +19,9 @@ import {grokSignalsPath, parseGrokChatToolCalls, type GrokChatToolCall} from "./
 import {summarizeMcpServers} from "./runners/mcp-config.js";
 import {RunnerRuntimeFiles} from "./runners/runtime-files.js";
 import {ContextTracker, CumulativeUsageTracker} from "./runners/context-tracker.js";
-import {killGrokLeader, killProcess, processAlive as procAlive, terminateWithEscalation} from "./runners/process-lifecycle.js";
+import {killGrokLeader, killPidTree, killProcess, pidAlive, processAlive as procAlive, terminateWithEscalation} from "./runners/process-lifecycle.js";
 
-import {createActivityClock, hangPhase, hangThresholds, hardRecoverNotifyPolicy, toolsInFlightHardDue, touchActivityClock, turnLifetimeDue, type TurnActivityClock} from "./runners/turn-watchdog.js";
+import {createActivityClock, hangPhase, hangThresholds, hardRecoverNotifyPolicy, toolsInFlightHardDue, touchActivityClock, turnLifetimeDue, type HardRecoverKind, type TurnActivityClock} from "./runners/turn-watchdog.js";
 import {OpenCodeTransport} from "./runners/opencode-transport.js";
 import {HANG_RECOVER_NUDGE_BACKOFF_MS, HANG_RECOVER_NUDGE_MAX, deliverHangRecoverNudge, planHangRecoverNudge} from "./runners/hang-nudge.js";
 
@@ -358,6 +358,15 @@ export class AgentRunner {
   /** Hang watchdog: última atividade SEMÂNTICA (eventos parseados / tools / state).
    *  NÃO bytes brutos de stdout/stderr — ver touchActivity + runGrokMessage. */
   private activityClock: TurnActivityClock = createActivityClock();
+  /**
+   * T-593: pids de turnos spawnados por este runner cujo `close` ainda não
+   * chegou. `ocActiveProc` sozinho não basta: um `close` TARDIO de turno já
+   * recuperado anula o campo (grok.ts:350) e o `killProcess(null)` do recover
+   * seguinte vira no-op — foi assim que 10 CLIs grok ficaram vivos por horas no
+   * host do dono (2026-09-16). O pid é a fonte de verdade do kill; o campo
+   * continua sendo a do dead-proc-detect. Entrada só sai no `close`.
+   */
+  private liveTurnPids = new Set<number>();
   private hangWatchTimer: NodeJS.Timeout | null = null;
   /** T-055: true enquanto await acquireTurnSlot — hang watch NÃO conta. */
   private waitingTurnGate = false;
@@ -365,7 +374,7 @@ export class AgentRunner {
   /**
    * Release do turn-gate do turno per-message em voo. O 'close' do processo
    * costuma liberar; hard recover (SIGKILL sem close) PRECISA chamar isto
-   * senão o slot fica preso até MAX_HOLD_MS (15min) e a fila congela.
+   * senão o slot fica preso até MAX_HOLD_MS e a fila congela.
    */
   private activeTurnRelease: (() => void) | null = null;
   /**
@@ -533,7 +542,7 @@ export class AgentRunner {
     // toca em mais nada. O slot do gate que era dele tem de voltar AGORA:
     // antes o close tardio o libertava mesmo com epoch velho; com o guarda,
     // sem isto clear/compact a meio do turno vazava o slot até o guarda
-    // anti-deadlock do turn-gate (MAX_HOLD_MS, 15min) o liberar à força.
+    // anti-deadlock do turn-gate (MAX_HOLD_MS) o liberar à força.
     // Idempotente (releaseActiveTurnSlot puxa e nula o handle).
     this.releaseActiveTurnSlot();
     this.messageSession.reset(summary);
@@ -774,6 +783,10 @@ export class AgentRunner {
       try { killGrokLeader(this.runtimeFiles.grokLeaderSocket()); } catch { /* best-effort */ }
     }
     if (isPerMessageRunner(this.opts.cliRunner)) {
+      // T-593: turno abandonado por hard recover não está em `ocActiveProc` —
+      // sem isto o stop() deixava o CLI vivo (o daemon só morre junto com os
+      // filhos no shutdown; um stop de agente isolado vazava o processo).
+      this.killTrackedTurnPids("SIGKILL");
       if (procAlive(this.ocActiveProc)) {
         terminateWithEscalation(this.ocActiveProc);
       } else {
@@ -819,6 +832,10 @@ export class AgentRunner {
       // Mata turno em voo E one-shot de compact (simétrico a stop()).
       killProcess(this.oneShotProc, "SIGKILL");
       this.oneShotProc = null;
+      // T-593: e o turno abandonado por um recover anterior, que já não está
+      // referenciado em `ocActiveProc` (senão o clear deixa o CLI rodando o
+      // turno da sessão descartada).
+      this.killTrackedTurnPids("SIGKILL");
       terminateWithEscalation(this.ocActiveProc);
       this.messageSession.clearQueue();
       this.messageSession.busy = false;
@@ -949,6 +966,35 @@ export class AgentRunner {
     const r = this.activeTurnRelease;
     this.activeTurnRelease = null;
     try { r?.(); } catch { /* release do gate é best-effort */ }
+  }
+
+  /** T-593: registra o pid do turno recém-spawnado (chamar logo após o spawn). */
+  private trackTurnPid(pid: number | null | undefined): void {
+    if (pid && pid > 1) this.liveTurnPids.add(pid);
+  }
+
+  /** T-593: o `close` confirmou a morte — para de rastrear. Idempotente. */
+  private untrackTurnPid(pid: number | null | undefined): void {
+    if (pid) this.liveTurnPids.delete(pid);
+  }
+
+  /**
+   * T-593: mata TODO turno ainda rastreado, POR PID. Cobre o caso em que
+   * `ocActiveProc` já foi anulado por um close tardio (kill no-op) e o caso de
+   * processo cujo `close` nunca chega (netos herdam os pipes). Best-effort e
+   * idempotente: pid já morto devolve false.
+   *
+   * Pid que já morreu sai do rastreio: sem isso o Set cresceria por toda a vida
+   * do daemon quando o `close` não chega, e um pid reciclado pelo SO poderia
+   * apanhar um processo alheio.
+   */
+  private killTrackedTurnPids(signal: NodeJS.Signals = "SIGKILL"): number {
+    let killed = 0;
+    for (const pid of [...this.liveTurnPids]) {
+      if (!pidAlive(pid)) { this.liveTurnPids.delete(pid); continue; }
+      if (killPidTree(pid, signal)) killed += 1;
+    }
+    return killed;
   }
 
   /**
@@ -1135,11 +1181,14 @@ export class AgentRunner {
     // T-371 (d): teto ABSOLUTO de lifetime do turno — elapsed desde
     // markTurnStart, não se renova com atividade. É o que apanha o loop de
     // tokens que renova o relógio de ociosidade semântica para sempre (F4);
-    // tools em voo também não o adiam — 8min de turno qwen é o contrato.
+    // tools em voo também não o adiam.
+    // T-598: kind="lifetime" — corte por teto em turno vivo preserva a
+    // sessão (retry continua de onde parou) e não notifica no 1º attempt.
     if (this.messageSession.busy && turnLifetimeDue(this.activityClock, t, now)) {
       this.recoverHungTurn(
         `turn lifetime ${Math.round((now - this.activityClock.turnStartedAt) / 1000)}s ≥ ${Math.round((t.lifetimeMs ?? 0) / 1000)}s`,
         idleMs,
+        "lifetime",
       );
       return;
     }
@@ -1174,7 +1223,12 @@ export class AgentRunner {
     // isso fazia hangPhase nunca chegar em hard e busy ficar preso até
     // restart manual. Só stdout/stderr (touchActivity nos handlers) conta.
 
-    const phase = hangPhase(idleMs, t);
+    // T-593: cold start (turno ainda sem NENHUM evento semântico) usa a janela
+    // firstEventMs em vez do hardMs seco — medido: 121/124 hard recovers de prod
+    // disparavam no limiar de 120s com o turno apenas carregando o CLI. Depois
+    // do primeiro evento volta ao hardMs (turno que emitiu e ficou quieto segue
+    // sendo recolhido aos 120s — sem regressão).
+    const phase = hangPhase(idleMs, t, this.activityClock.firstEventAt == null);
     if (phase === "hard") {
       if (this.messageSession.busy) {
         // per-message: mata o turno e drena fila
@@ -1203,18 +1257,30 @@ export class AgentRunner {
     }
   }
 
-  /** Hard recover: mata turno, libera busy + turn-gate, avisa server. */
-  private recoverHungTurn(reason: string, idleMs: number): void {
+  /** Hard recover: mata turno, libera busy + turn-gate, avisa server.
+   *  T-598: `kind` distingue o corte por TETO DE LIFETIME (turno vivo,
+   *  parcial legítima → sessão preservada, sem notificação no 1º attempt)
+   *  do hang clássico (semântica T-240/T-371 intacta). */
+  private recoverHungTurn(reason: string, idleMs: number, kind: HardRecoverKind = "hang"): void {
     if (this.recoveringHung || this.stopped) return;
     this.recoveringHung = true;
     recordHardRecover(this.opts.cliRunner);
+    const label = kind === "lifetime" ? "lifetime" : "hang";
     try {
       this.opts.log(
         "warn",
-        `[hang:${this.info.name}] HARD recover: ${reason} (runner=${this.opts.cliRunner} idleMs=${Math.round(idleMs)})`,
+        `[${label}:${this.info.name}] HARD recover: ${reason} (runner=${this.opts.cliRunner} idleMs=${Math.round(idleMs)})`,
       );
       killProcess(this.ocActiveProc, "SIGKILL");
       killProcess(this.oneShotProc, "SIGKILL");
+      // T-593: `ocActiveProc` pode já ter sido anulado por um close TARDIO do
+      // turno anterior (grok.ts:350) — nesse caso o kill acima é no-op e o CLI
+      // antigo sobrevivia por horas. Mata também todo pid rastreado: turno
+      // abandonado é, por definição, todo turno vivo deste runner num recover.
+      const nTracked = this.killTrackedTurnPids("SIGKILL");
+      if (nTracked > 0) {
+        this.opts.log("warn", `[hang:${this.info.name}] matou ${nTracked} pid(s) de turno rastreado(s)`);
+      }
       // T-055: cliente headless morto NÃO mata o leader do Grok — se o leader
       // travou, o próximo turno fica mudo até restart. Mata o processo no
       // --leader-socket deste agente e limpa o sock.
@@ -1269,46 +1335,60 @@ export class AgentRunner {
       // novo em vez de replayar o lixo. (gemini/codex/crush seguem o mesmo
       // padrão quando houver medição análoga — declarado na entrega.)
       if (this.opts.cliRunner === "qwen" && this.messageSession.sessionId) {
-        this.opts.log("warn", `[hang:${this.info.name}] neutralizando sessão qwen pós-hard recover (parcial não será replayada)`);
-        this.messageSession.resetForRetry(this.messageSession.pendingSummary);
-        this.info.sessionId = undefined;
-        this.opts.onSessionId?.("");
+        if (kind === "lifetime") {
+          // T-598: corte por TETO em turno vivo — a parcial é legítima (não a
+          // degenerada do loop T-371 (c)). Preservar a sessão faz o retry
+          // RETOMAR de onde parou (resume) em vez de recomeçar do zero.
+          this.opts.log("warn", `[lifetime:${this.info.name}] sessão qwen preservada pós-teto (parcial será retomada)`);
+        } else {
+          this.opts.log("warn", `[hang:${this.info.name}] neutralizando sessão qwen pós-hard recover (parcial não será replayada)`);
+          this.messageSession.resetForRetry(this.messageSession.pendingSummary);
+          this.info.sessionId = undefined;
+          this.opts.onSessionId?.("");
+        }
       }
 
-      // Re-enfileira a mensagem em voo (1 retry). Sem isso a instrução
-      // Claude→Grok some e o agente fica idle sem processar nada.
+      // Re-enfileira a mensagem em voo. Sem isso a instrução some e o agente
+      // fica idle sem processar nada. Teto de tentativas: hang = 1 retry
+      // (contrato T-371 (b)); lifetime = 2 (o corte por teto não é defeito da
+      // mensagem — desistir dela no 1º corte perdia trabalho legítimo).
       const inflight = this.inflightPerMessage;
       const attemptBefore = inflight ? inflight.attempt : Number.MAX_SAFE_INTEGER;
+      const maxAttempts = kind === "lifetime" ? 2 : 1;
       let retried = false;
-      if (inflight && inflight.attempt < 1) {
+      if (inflight && inflight.attempt < maxAttempts) {
         this.inflightPerMessage = { ...inflight, attempt: inflight.attempt + 1 };
         this.messageSession.prepend({ content: inflight.content, images: inflight.images });
         retried = true;
         this.opts.log(
           "warn",
-          `[hang:${this.info.name}] re-enfileirando mensagem após hard recover (attempt ${this.inflightPerMessage.attempt})`,
+          `[${label}:${this.info.name}] re-enfileirando mensagem após hard recover (attempt ${this.inflightPerMessage.attempt})`,
         );
       } else {
         this.inflightPerMessage = null;
       }
+      const tag = kind === "lifetime" ? "[lifetime]" : "[hang]";
       const full = retried
-        ? `[hang] turno abortado: ${reason} — reenviando a última mensagem automaticamente (1×)`
-        : `[hang] turno abortado: ${reason}` + (inflight ? " — retry esgotado; envie de novo se necessário" : "");
+        ? `${tag} turno abortado: ${reason} — reenviando a última mensagem automaticamente` +
+          (kind === "lifetime" ? " (sessão preservada)" : " (1×)")
+        : `${tag} turno abortado: ${reason}` + (inflight ? " — retry esgotado; envie de novo se necessário" : "");
 
       // T-240 (d): 1º attempt não notifica individualmente (67/119 falsos
       // positivos em prod eram exatamente isso e TODOS completavam). Agrega:
       // ≥3 hard recovers de 1º attempt na janela de 1h → 1 resumo. A partir
       // do 2º attempt (ou sem mensagem pra re-enfileirar) notifica na hora.
+      // T-598: a janela/resumo é de HANG; corte por lifetime em 1º attempt é
+      // backstop esperado (silêncio). attempt≥1 de lifetime segue imediato.
       const nowTs = Date.now();
       this.hardRecoverTimes = this.hardRecoverTimes.filter(
         (ts) => nowTs - ts < AgentRunner.HARD_RECOVER_WINDOW_MS,
       );
-      this.hardRecoverTimes.push(nowTs);
-      const policy = hardRecoverNotifyPolicy(attemptBefore, this.hardRecoverTimes.length);
+      if (kind === "hang") this.hardRecoverTimes.push(nowTs);
+      const policy = hardRecoverNotifyPolicy(attemptBefore, this.hardRecoverTimes.length, kind);
       if (policy === "suppress") {
         this.opts.log(
           "warn",
-          `[hang:${this.info.name}] notificação suprimida (1º attempt; ${this.hardRecoverTimes.length}/${3} na janela) — turno re-enfileirado`,
+          `[${label}:${this.info.name}] notificação suprimida (1º attempt; ${this.hardRecoverTimes.length}/${3} na janela) — turno re-enfileirado`,
         );
       } else if (policy === "summary") {
         const summary =

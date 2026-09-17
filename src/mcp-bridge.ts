@@ -416,7 +416,7 @@ server.tool(
 
 server.tool(
   "add_task",
-  "Add a new task to the project board. Status defaults to 'todo'. Optional assignee is a teammate name. Use goal_id to link this task to a project goal.",
+  "Add a new task to the project board. Status defaults to 'todo'. Optional assignee is a teammate name. Use goal_id to link this task to a project goal. Use blockedByTaskId to declare a dependency (the new task cannot be locked while the blocker is not done).",
   {
     title: z.string().describe("Short title for the task"),
     description: z.string().optional().describe("Optional details"),
@@ -451,6 +451,9 @@ server.tool(
     description: z.string().optional(),
     status: z.enum(["todo", "doing", "done", "blocked"]).optional(),
     assignee: z.string().nullable().optional().describe("Teammate name; pass null to unassign"),
+    // T-553: sem este campo no schema o zod descartava o argumento antes do
+    // postJSON e a aresta de dependência nunca persistia. `null` limpa.
+    blockedByTaskId: z.string().nullable().optional().describe("Task id this one depends on; pass null to clear the dependency"),
   },
   async (args) => {
     try {

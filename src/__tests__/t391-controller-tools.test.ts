@@ -132,7 +132,12 @@ test("T-397: as tools MCP start/remove batem nas ops HTTP gémeas, corpo {name, 
 test("T-391: kind do relay é o op do path — nunca o nome MCP save_agent; agent_stop não passa do relay", () => {
   assert.match(RELAY, /\| "agent_save"/);
   assert.match(RELAY, /kind === "agent_save"/);
-  assert.match(RELAY, /plans_apply_tasks\|agent_save\)\$/);
+  // T-581: a tabela de paths que vivia inline no handleRequest virou
+  // `bridgeCipherRoute` + allowlist. O kind continua sendo o op do PATH.
+  assert.match(RELAY, /export function bridgeCipherRoute/);
+  assert.match(RELAY, /op === "send" \|\| op === "memory_add" \|\| op === "delegate"/);
+  assert.match(RELAY, /BRIDGE_CIPHER_OPS\.has\(op\)/);
+  assert.match(RELAY, /"plans_apply_tasks",\s*\n\s*"agent_save",/);
   assert.ok(!/"save_agent"/.test(RELAY), "string literal \"save_agent\" não pode ser kind do relay");
   assert.ok(!RELAY.includes("agent_stop"), "agent_stop não tem campos de catálogo — não entra no relay");
   // T-397: start/remove são cru como o stop — o nome é identificador.

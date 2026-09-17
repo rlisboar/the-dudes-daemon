@@ -94,17 +94,30 @@ export const E2EE_TABLE = Object.freeze({
  * T-083 call-out A — fallback de AAD SÓ na leitura.
  *
  * startPlan (server) copia o blob opaco cross-tabela: plan.title/description →
- * mission.title/description, item.title/prompt (AAD tasks.*) → mission_steps.*.
- * O server não tem a chave, então não re-cifra. EXATAMENTE 4 pares;
- * proibido loop genérico por todas as AAD. Destino primeiro, depois
- * UMA fonte. apply_plan_steps nascido no destino continua 1:1 (o
- * destino abre sozinho; a fonte não é consultada).
+ * mission.title/description, item.title/prompt → mission_steps.*.
+ * O server não tem a chave, então não re-cifra. EXATAMENTE 6 pares;
+ * proibido loop genérico por todas as AAD. Destino primeiro, depois as
+ * fontes canônicas. apply_plan_steps nascido no destino continua 1:1 (o
+ * destino abre sozinho; as fontes não são consultadas).
+ *
+ * T-581: um destino pode ter MAIS DE UMA fonte canônica, porque o mesmo
+ * campo de origem tem dois produtores legítimos de blob:
+ *   - item de plano herdado do draft materializado → AAD `tasks.*`
+ *     (o relay cifra o draft com tasks.title/description no addTask);
+ *   - item de plano editado por `update_plan_task` → AAD `plan_tasks.*`
+ *     (o patch cai na membership, não na board task).
+ * Os dois chegam a `mission_steps.*` pela cópia do startPlan, então os dois
+ * pares precisam estar aqui — sem isso o dispatch do step devolve
+ * `reason=decrypt` e o prompt é descartado.
  */
 export const AAD_READ_FALLBACK = Object.freeze([
   Object.freeze({ destTable: E2EE_TABLE.MISSIONS, destField: "title", sourceTable: E2EE_TABLE.PLANS, sourceField: "title" }),
   Object.freeze({ destTable: E2EE_TABLE.MISSIONS, destField: "description", sourceTable: E2EE_TABLE.PLANS, sourceField: "description" }),
   Object.freeze({ destTable: E2EE_TABLE.MISSION_STEPS, destField: "title", sourceTable: E2EE_TABLE.TASKS, sourceField: "title" }),
   Object.freeze({ destTable: E2EE_TABLE.MISSION_STEPS, destField: "prompt", sourceTable: E2EE_TABLE.TASKS, sourceField: "description" }),
+  // T-581: par por destino (o patch de update_plan_task cai em plan_tasks).
+  Object.freeze({ destTable: E2EE_TABLE.MISSION_STEPS, destField: "title", sourceTable: E2EE_TABLE.PLAN_TASKS, sourceField: "title" }),
+  Object.freeze({ destTable: E2EE_TABLE.MISSION_STEPS, destField: "prompt", sourceTable: E2EE_TABLE.PLAN_TASKS, sourceField: "prompt" }),
 ]);
 
 /** Prefixos de wire. v2 leva AAD; v1 abortado é fail-closed; `e2e:` é legado. */
@@ -126,14 +139,14 @@ export function aadV2({ projectId, table, field }) {
 }
 
 /**
- * Cadeia de AAD pra LEITURA: [destino, fonte?] — 1 ou 2 strings.
- * Nunca varre o catálogo inteiro.
+ * Cadeia de AAD pra LEITURA: destino primeiro, depois as fontes canônicas
+ * (1, 2 ou 3 strings — ver AAD_READ_FALLBACK). Nunca varre o catálogo inteiro.
  */
 export function aadReadChain({ projectId, table, field }) {
   const dest = aadV2({ projectId, table, field });
-  const pair = AAD_READ_FALLBACK.find((p) => p.destTable === table && p.destField === field);
-  if (!pair) return [dest];
-  return [dest, aadV2({ projectId, table: pair.sourceTable, field: pair.sourceField })];
+  const pairs = AAD_READ_FALLBACK.filter((p) => p.destTable === table && p.destField === field);
+  if (pairs.length === 0) return [dest];
+  return [dest, ...pairs.map((p) => aadV2({ projectId, table: p.sourceTable, field: p.sourceField }))];
 }
 
 export function isE2eV2(stored) {
@@ -147,6 +160,16 @@ export function isE2eV1Rejected(stored) {
 /** Texto de conteúdo em claro: string não-vazia sem prefixo e2e:. */
 export function isPlainCatalogText(v) {
   return typeof v === "string" && v.length > 0 && !v.startsWith(E2E_PREFIX);
+}
+
+/**
+ * Blob cifrado no wire (qualquer prefixo `e2e:`, qualquer versão).
+ * Espelho de `isPlainCatalogText`: quem precisa decidir "isto é blob?"
+ * (e portanto "não posso concatenar/fatiar") não repete o `startsWith` —
+ * a definição do prefixo vive só aqui.
+ */
+export function isCipherText(v) {
+  return typeof v === "string" && v.startsWith(E2E_PREFIX);
 }
 
 /**
@@ -188,6 +211,12 @@ export const AGENT_SEND_CIPHER_AADS = Object.freeze([
   Object.freeze({ table: E2EE_TABLE.MEMORIES, field: "title" }),
   Object.freeze({ table: E2EE_TABLE.MEMORIES, field: "body" }),
   Object.freeze({ table: E2EE_TABLE.MESSAGES, field: "content" }),
+  // T-581: o dispatch de step de mission manda o prompt do step como part
+  // cipher declarada (o step pode ser um blob — delegação do Brain, cópia de
+  // plano). Sem estes dois pares o daemon recusaria a part ("invalid") e o
+  // subagente receberia agent:error em vez do prompt.
+  Object.freeze({ table: E2EE_TABLE.MISSION_STEPS, field: "title" }),
+  Object.freeze({ table: E2EE_TABLE.MISSION_STEPS, field: "prompt" }),
 ]);
 
 export function isAgentSendCipherAad(table, field) {
@@ -327,6 +356,25 @@ export function catalogPlainHits(kind, payload) {
         if (isPlainCatalogText(e[f])) hits.push(`summary.${f}`);
       }
       if (isPlainCatalogText(e.original)) hits.push("summary.original");
+      return hits;
+    }
+    /**
+     * T-581: `delegate` (Brain) é conteúdo de agente que vira mission+step no
+     * DB. O relay cifra goal/context ANTES de subir (blobs com AAD de
+     * missions.title/description e mission_steps.title/prompt) — sem este
+     * ramo o gate D4 não via o payload e o delegate só estourava depois,
+     * dentro de createMission, com erro genérico.
+     *
+     * `taskType`/`complexity`/`preferred*` são identificadores: ficam claros.
+     * context vazio não conta (string vazia não é conteúdo).
+     */
+    case "delegate": {
+      const hits = [];
+      if (isPlainCatalogText(p.goal)) hits.push("delegate.goal");
+      if (isPlainCatalogText(p.context)) hits.push("delegate.context");
+      // Só o daemon com cifra manda estes dois; ausentes = daemon antigo.
+      if (p.stepTitle !== undefined && isPlainCatalogText(p.stepTitle)) hits.push("delegate.stepTitle");
+      if (p.stepPrompt !== undefined && isPlainCatalogText(p.stepPrompt)) hits.push("delegate.stepPrompt");
       return hits;
     }
     case "board_set_title":

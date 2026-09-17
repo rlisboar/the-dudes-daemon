@@ -102,8 +102,8 @@ test("T-094 catálogo: agents/credentials/summarize + AAD canônico", async () =
   assert.deepEqual(catalogPlainHits("summarize", { text: "e2e:v2:blob" }), []);
 });
 
-test("T-083 AAD_READ_FALLBACK: exatamente 4 pares; destino primeiro", () => {
-  assert.equal(AAD_READ_FALLBACK.length, 4);
+test("T-083 AAD_READ_FALLBACK: exatamente 6 pares; destino primeiro", () => {
+  assert.equal(AAD_READ_FALLBACK.length, 6);
   assert.deepEqual(
     AAD_READ_FALLBACK.map((p) => `${p.destTable}.${p.destField}->${p.sourceTable}.${p.sourceField}`),
     [
@@ -111,6 +111,9 @@ test("T-083 AAD_READ_FALLBACK: exatamente 4 pares; destino primeiro", () => {
       "missions.description->plans.description",
       "mission_steps.title->tasks.title",
       "mission_steps.prompt->tasks.description",
+      // T-581: update_plan_task cifra com o par do próprio plan_tasks.
+      "mission_steps.title->plan_tasks.title",
+      "mission_steps.prompt->plan_tasks.prompt",
     ],
   );
   const chain = aadReadChain({ projectId: "p", table: E2EE_TABLE.MISSIONS, field: "title" });
@@ -131,8 +134,30 @@ test("T-083 AAD_READ_FALLBACK: exatamente 4 pares; destino primeiro", () => {
   );
 });
 
+test("T-581 cadeia de leitura do step cobre as DUAS origens de blob de item de plano", () => {
+  // Draft materializado (tasks.*) e patch de update_plan_task (plan_tasks.*)
+  // chegam os dois a mission_steps.* pela cópia do startPlan. Destino primeiro,
+  // depois as duas fontes — e nenhuma varredura além delas.
+  for (const field of ["title", "prompt"]) {
+    const chain = aadReadChain({ projectId: "p", table: E2EE_TABLE.MISSION_STEPS, field });
+    assert.deepEqual(chain, [
+      aadV2({ projectId: "p", table: E2EE_TABLE.MISSION_STEPS, field }),
+      aadV2({
+        projectId: "p",
+        table: E2EE_TABLE.TASKS,
+        field: field === "title" ? "title" : "description",
+      }),
+      aadV2({ projectId: "p", table: E2EE_TABLE.PLAN_TASKS, field }),
+    ], `cadeia de mission_steps.${field}`);
+    assert.equal(chain.length, 3, "cadeia limitada: destino + 2 fontes, sem varredura");
+    assert.equal(new Set(chain).size, 3, "sem AAD repetida na cadeia");
+  }
+  // Destino sem fonte continua 1:1 (nada de fonte inventada).
+  assert.equal(aadReadChain({ projectId: "p", table: E2EE_TABLE.MISSIONS, field: "goalId" }).length, 1);
+});
+
 test("T-117 resolveAgentSendCipherAad: legado, par válido, parcial, inválido", () => {
-  assert.equal(AGENT_SEND_CIPHER_AADS.length, 7);
+  assert.equal(AGENT_SEND_CIPHER_AADS.length, 9);
   assert.equal(isAgentSendCipherAad(E2EE_TABLE.TASKS, "title"), true);
   assert.equal(isAgentSendCipherAad(E2EE_TABLE.BOARDS, "title"), false);
   assert.deepEqual(resolveAgentSendCipherAad({}), {
@@ -152,6 +177,81 @@ test("T-117 resolveAgentSendCipherAad: legado, par válido, parcial, inválido",
   const part = agentSendCipherPart("e2e:v2:x", E2EE_TABLE.TASKS, "title");
   assert.deepEqual(part, { kind: "cipher", text: "e2e:v2:x", table: "tasks", field: "title" });
   assert.throws(() => agentSendCipherPart("x", E2EE_TABLE.BOARDS, "title"));
+});
+
+test("T-581 parts: mission_steps.title/prompt são pares permitidos (dispatch de step)", () => {
+  // O dispatch de um step manda o prompt como part cipher declarada; sem o
+  // par na lista fechada, `agentSendCipherPart` lança e o subagente nunca
+  // recebe o prompt (o daemon recusaria a part como "invalid").
+  assert.equal(isAgentSendCipherAad(E2EE_TABLE.MISSION_STEPS, "title"), true);
+  assert.equal(isAgentSendCipherAad(E2EE_TABLE.MISSION_STEPS, "prompt"), true);
+  assert.deepEqual(
+    agentSendCipherPart("e2e:v2:x", E2EE_TABLE.MISSION_STEPS, "prompt"),
+    { kind: "cipher", text: "e2e:v2:x", table: "mission_steps", field: "prompt" },
+  );
+  assert.deepEqual(resolveAgentSendCipherAad({ table: E2EE_TABLE.MISSION_STEPS, field: "prompt" }), {
+    ok: true, table: "mission_steps", field: "prompt", legacy: false,
+  });
+  // Continua fechada: par fora da lista é drop, não varredura do catálogo.
+  assert.equal(isAgentSendCipherAad(E2EE_TABLE.MISSION_STEPS, "description"), false);
+});
+
+test("T-581 isCipherText: prefixo e2e: (qualquer versão) é blob; vazio não é", async () => {
+  const { isCipherText } = await import("./e2ee-fields.js");
+  assert.equal(isCipherText("e2e:v2:abc"), true);
+  assert.equal(isCipherText("e2e:abc"), true);
+  assert.equal(isCipherText("e2e:v1:abc"), true);
+  assert.equal(isCipherText("claro"), false);
+  assert.equal(isCipherText(""), false, "string vazia não é blob (nada a decifrar)");
+  assert.equal(isCipherText(undefined), false);
+  assert.equal(isCipherText(null), false);
+  assert.equal(isCipherText(7), false);
+  // Complementar de isPlainCatalogText no domínio não-vazio.
+  const { isPlainCatalogText } = await import("./e2ee-fields.js");
+  for (const v of ["e2e:v2:x", "claro"]) {
+    assert.notEqual(isCipherText(v), isPlainCatalogText(v));
+  }
+});
+
+test("T-581 catalogPlainHits: delegate recusa goal/context/step* em claro", async () => {
+  const { catalogPlainHits } = await import("./e2ee-fields.js");
+  // Payload inteiro em claro (daemon antigo, sem cifra) → o gate D4 tem de
+  // disparar: antes não havia `case "delegate"` e o delegate passava direto
+  // para o createMission, que recusava depois com erro genérico.
+  assert.deepEqual(
+    catalogPlainHits("delegate", { goal: "resuma o repo", context: "ctx" }),
+    ["delegate.goal", "delegate.context"],
+  );
+  assert.deepEqual(
+    catalogPlainHits("delegate", {
+      goal: "e2e:v2:g",
+      context: "e2e:v2:c",
+      stepTitle: "e2e:v2:t",
+      stepPrompt: "e2e:v2:p",
+    }),
+    [],
+  );
+  // Daemon novo cifra os quatro; um deles escapando em claro ainda recusa.
+  assert.deepEqual(
+    catalogPlainHits("delegate", { goal: "e2e:v2:g", stepTitle: "titulo em claro" }),
+    ["delegate.stepTitle"],
+  );
+  // stepTitle/stepPrompt são opcionais: ausentes = daemon antigo (que também
+  // manda goal/context em claro, então o ramo acima já cobre).
+  assert.deepEqual(catalogPlainHits("delegate", { goal: "e2e:v2:g" }), []);
+  // context vazio não é conteúdo.
+  assert.deepEqual(catalogPlainHits("delegate", { goal: "e2e:v2:g", context: "" }), []);
+  // Identificadores seguem em claro sem disparar o gate.
+  assert.deepEqual(
+    catalogPlainHits("delegate", {
+      goal: "e2e:v2:g",
+      taskType: "coding",
+      complexity: "complex",
+      preferredRunner: "grok",
+      preferredModel: "grok-4.6",
+    }),
+    [],
+  );
 });
 
 test("T-390 A6: kind agent_save bate save_agent — mesmo campo, mesma recusa", async () => {

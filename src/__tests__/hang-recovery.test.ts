@@ -29,6 +29,24 @@ import {
   recentLogs,
 } from "../health-monitor.js";
 
+/**
+ * T-599: espera por CONDIÇÃO com teto, no lugar de sleep fixo. Mesma forma do
+ * `until` já usado em t414/t251 (não inventa helper novo).
+ *
+ * O kernel não recolhe o process group morto num prazo garantido: sob runner de
+ * CI carregado os 200ms de sleep fixo estouravam e o teste falhava com
+ * "filho deveria ter morrido via kill(-pid)" mesmo com o kill correto (flake de
+ * timing, CI 35081600009 attempt 1 — verde no attempt 2 em runner limpo).
+ * Estourar o teto falha com mensagem própria, não com asserção genérica.
+ */
+async function until(cond: () => boolean, ms = 2_000, what = "condição"): Promise<void> {
+  const t0 = Date.now();
+  while (!cond()) {
+    if (Date.now() - t0 > ms) throw new Error(`timeout de ${ms}ms aguardando ${what}`);
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
+
 /** Espelha recoverHungTurn no essencial — testável sem AgentRunner monólito. */
 function simulateHardRecover(input: {
   proc: ChildProcess | null;
@@ -108,8 +126,8 @@ test("turno travado: kill por process group + release do turn-gate + re-fila + l
     idleMs,
   });
 
-  // Process group morto (espera breve pro kernel recolher)
-  await new Promise((r) => setTimeout(r, 200));
+  // Process group morto: espera determinística até o kernel recolher (T-599)
+  await until(() => !processAlive(child), 2_000, "filho morrer via kill(-pid)");
   assert.equal(processAlive(child), false, "filho deveria ter morrido via kill(-pid)");
   assert.equal(result.busy, false);
   assert.equal(result.requeued, "msg-travada");

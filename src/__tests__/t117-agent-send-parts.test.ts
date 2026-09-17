@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
 import { randomBytes, publicEncrypt, createPublicKey, constants } from "node:crypto";
-import { aadV2, E2EE_TABLE, agentSendCipherPart } from "@the-dudes/protocol/e2ee-fields";
+import { aadV2, E2EE_TABLE, agentSendCipherPart, resolveAgentSendCipherAad } from "@the-dudes/protocol/e2ee-fields";
 import { assembleAgentSendParts, type AgentSendPart } from "../protocol.js";
 
 process.env.THE_DUDES_DAEMON_KEY_PATH = path.join(os.tmpdir(), `td-t117-key-${process.pid}-${Date.now()}.pem`);
@@ -140,6 +140,39 @@ test("sem projectId em cipher e2e dropa missing_project", () => {
   );
   assert.equal(got.ok, false);
   if (!got.ok) assert.equal(got.reason, "missing_project");
+});
+
+test("T-581 dispatch de step: blob de tasks.description aberto no DESTINO mission_steps.prompt", () => {
+  // startPlan copia `tasks.description` para `mission_steps.prompt`; o server
+  // não tem a chave, então o blob chega ao daemon com o AAD da FONTE. O
+  // dispatch declara o AAD do DESTINO — a leitura cai na fonte via
+  // aadReadChain. Sem a cadeia, o decrypt falhava e o step era dropado.
+  const fonte = aadV2({ projectId: PID, table: E2EE_TABLE.TASKS, field: "description" });
+  const blob = encryptForProject("faça a coisa", PID, fonte)!;
+  const got = run([
+    agentSendCipherPart(blob, E2EE_TABLE.MISSION_STEPS, "prompt"),
+    { kind: "plain", text: "\n\nSENTINEL" },
+  ]);
+  assert.equal(got.ok, true);
+  if (got.ok) assert.equal(got.content, "faça a coisa\n\nSENTINEL");
+  // O destino sozinho não abre o blob copiado (é o que fazia a cadeia valer).
+  assert.equal(decryptForProject(blob, PID, aadV2({ projectId: PID, table: E2EE_TABLE.MISSION_STEPS, field: "prompt" })), null);
+});
+
+test("T-581 dispatch de step: blob nascido no destino (delegação) abre no primeiro elo", () => {
+  const destino = aadV2({ projectId: PID, table: E2EE_TABLE.MISSION_STEPS, field: "prompt" });
+  const blob = encryptForProject("Delegated task (from BACKEND)\nresuma", PID, destino)!;
+  const got = run([agentSendCipherPart(blob, E2EE_TABLE.MISSION_STEPS, "prompt")]);
+  assert.equal(got.ok, true);
+  if (got.ok) assert.equal(got.content, "Delegated task (from BACKEND)\nresuma");
+});
+
+test("T-581 dispatch de step: title e prompt do step são pares válidos (não caem em invalid)", () => {
+  const title = encryptForProject("título do step", PID, aadV2({ projectId: PID, table: E2EE_TABLE.MISSION_STEPS, field: "title" }))!;
+  const got = run([agentSendCipherPart(title, E2EE_TABLE.MISSION_STEPS, "title")]);
+  assert.equal(got.ok, true);
+  if (got.ok) assert.equal(got.content, "título do step");
+  assert.equal(resolveAgentSendCipherAad({ table: E2EE_TABLE.MISSION_STEPS, field: "prompt" }).ok, true);
 });
 
 test("cleanup T-117 key", () => {

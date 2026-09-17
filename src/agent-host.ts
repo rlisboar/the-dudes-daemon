@@ -213,6 +213,11 @@ export class AgentHost {
     return this.entries.get(agentId)?.projectId ?? null;
   }
 
+  /** T-581: nome do agente — o relay usa no prompt de delegação cifrado. */
+  getAgentName(agentId: string): string | null {
+    return this.entries.get(agentId)?.info.name ?? null;
+  }
+
   /** T-233: task ativa do agente — pass-through pro runner. Fonte
    *  autoritativa: server via agent:send.taskId / task:updated done. */
   setActiveTask(agentId: string, taskId: string): void {

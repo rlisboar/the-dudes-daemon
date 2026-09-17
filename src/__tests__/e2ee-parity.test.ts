@@ -26,8 +26,9 @@ import {
 
 process.env.THE_DUDES_DAEMON_KEY_PATH = path.join(os.tmpdir(), `td-parity-key-${process.pid}-${Date.now()}.pem`);
 process.env.THE_DUDES_PROJECT_KEYS_PATH = path.join(os.tmpdir(), `td-parity-pkeys-${process.pid}-${Date.now()}.json`);
-const { getDaemonPublicKey, rememberProjectKey, decryptForProject, encryptForProject, encryptBytesForProject, decryptBytesForProject } = await import("../daemon-crypto.js");
+const { getDaemonPublicKey, rememberProjectKey, decryptForProject, encryptForProject, encryptBytesForProject, decryptBytesForProject, isE2eEncrypted } = await import("../daemon-crypto.js");
 const { encryptBridgePayload } = await import("../bridge-relay.js");
+const { assembleAgentSendParts } = await import("../protocol.js");
 
 /**
  * PARIDADE cifra↔decifra, lado do daemon.
@@ -337,6 +338,29 @@ test("T-083 rework A: startPlan copy — missions.title abre plans.title; AAD n�
   assert.equal(decryptForProject(fromPlan, PID), null, "v2 sem AAD fail-closed");
 });
 
+test("T-581: blob de update_plan_task (plan_tasks.*) abre no destino mission_steps", () => {
+  // O item de plano tem DOIS produtores de blob: o draft materializado
+  // (tasks.*, coberto acima) e o patch de update_plan_task (plan_tasks.*).
+  // startPlan copia os dois para mission_steps.*, então a cadeia de leitura do
+  // destino precisa das duas fontes — sem a segunda o dispatch do step devolve
+  // reason=decrypt e o prompt é descartado.
+  const ptTitle = encryptForProject("item editado", PID, aadV2({ projectId: PID, table: E2EE_TABLE.PLAN_TASKS, field: "title" }))!;
+  const ptPrompt = encryptForProject("prompt editado", PID, aadV2({ projectId: PID, table: E2EE_TABLE.PLAN_TASKS, field: "prompt" }))!;
+
+  assert.equal(
+    decryptForProject(ptPrompt, PID, aadV2({ projectId: PID, table: E2EE_TABLE.MISSION_STEPS, field: "prompt" })),
+    null,
+    "destino sozinho não abre o blob de plan_tasks",
+  );
+  assert.equal(decryptWithReadChain(ptTitle, E2EE_TABLE.MISSION_STEPS, "title"), "item editado");
+  assert.equal(decryptWithReadChain(ptPrompt, E2EE_TABLE.MISSION_STEPS, "prompt"), "prompt editado");
+
+  // Assemble REAL do dispatch: o step com prompt de plan_tasks.* chega em claro.
+  const parts = [{ kind: "cipher" as const, text: ptPrompt, table: E2EE_TABLE.MISSION_STEPS, field: "prompt" }];
+  const assembled = assembleAgentSendParts(parts, PID, decryptForProject, isE2eEncrypted);
+  assert.deepEqual(assembled, { ok: true, content: "prompt editado" });
+});
+
 test("T-083 rework A: apply_plan_steps nascido no destino é 1:1 (destino abre, sem precisar da fonte)", () => {
   const destTitle = encryptForProject("step client", PID, aadV2({ projectId: PID, table: E2EE_TABLE.MISSION_STEPS, field: "title" }))!;
   const destPrompt = encryptForProject("prompt client", PID, aadV2({ projectId: PID, table: E2EE_TABLE.MISSION_STEPS, field: "prompt" }))!;
@@ -424,5 +448,138 @@ test("T-391 agent_save: required+chave cifra; sem chave recusa (fail-closed como
   assert.throws(
     () => encryptBridgePayload("agent_save", { spec: { name: "a", role: "r", systemPrompt: "claro" } }, "sem-chave-t391"),
     /e2ee-required/,
+  );
+});
+
+test("T-581 rota: /api/bridge/<agent>/delegate é rota de cifra (senão sobe em claro)", async () => {
+  const { bridgeCipherRoute } = await import("../bridge-relay.ts");
+  assert.deepEqual(bridgeCipherRoute("/api/bridge/ag-1/delegate"), { kind: "delegate", agentId: "ag-1" });
+  // Regressão das rotas que já existiam — a lista saiu do handleRequest.
+  assert.deepEqual(bridgeCipherRoute("/api/bridge/ag-1/send"), { kind: "send", agentId: "ag-1" });
+  assert.deepEqual(bridgeCipherRoute("/api/bridge/ag-1/memory_add"), { kind: "memory_add", agentId: "ag-1" });
+  assert.deepEqual(bridgeCipherRoute("/api/bridge/ag-1/board_upsert_block"), { kind: "board", agentId: "ag-1" });
+  assert.deepEqual(bridgeCipherRoute("/api/bridge/ag-1/tasks_add"), { kind: "tasks_add", agentId: "ag-1" });
+  assert.deepEqual(bridgeCipherRoute("/api/bridge/ag-1/agent_save"), { kind: "agent_save", agentId: "ag-1" });
+  // Rota sem campo de catálogo segue em claro.
+  assert.equal(bridgeCipherRoute("/api/bridge/ag-1/list"), null);
+  assert.equal(bridgeCipherRoute("/api/bridge/ag-1/delegate/extra"), null);
+});
+
+test("T-581 delegate: goal/context/step* saem e2e:v2 com AAD do campo de DESTINO", () => {
+  const out = encryptBridgePayload(
+    "delegate",
+    { goal: "resuma o repo", context: "só o server/", taskType: "coding", complexity: "complex" },
+    PID,
+    { parentName: "BACKEND" },
+  );
+  const aad = (table: string, field: string) => aadV2({ projectId: PID, table, field });
+
+  // goal → missions.title; context → missions.description (o step herda os dois).
+  assert.ok(cifradoV2(out.goal));
+  assert.equal(decryptForProject(out.goal as string, PID, aad(E2EE_TABLE.MISSIONS, "title")), "Delegação: resuma o repo");
+  assert.ok(cifradoV2(out.context));
+  assert.equal(decryptForProject(out.context as string, PID, aad(E2EE_TABLE.MISSIONS, "description")), "só o server/");
+
+  // O texto do step é montado AQUI (é o relay que tem o plaintext) e abre no
+  // AAD do campo de destino — que é o que o dispatch declara em parts.
+  assert.ok(cifradoV2(out.stepTitle));
+  assert.equal(decryptForProject(out.stepTitle as string, PID, aad(E2EE_TABLE.MISSION_STEPS, "title")), "resuma o repo");
+  assert.ok(cifradoV2(out.stepPrompt));
+  const prompt = decryptForProject(out.stepPrompt as string, PID, aad(E2EE_TABLE.MISSION_STEPS, "prompt"));
+  assert.ok(prompt && prompt.includes("resuma o repo"));
+  assert.ok(prompt!.includes("## Context\nsó o server/"));
+  assert.ok(prompt!.includes('send_message'), "prompt perdeu a instrução de resposta");
+  assert.ok(prompt!.includes('"BACKEND"'), "prompt perdeu o nome do pai");
+
+  // Identificadores ficam em claro (não são campo de catálogo).
+  assert.equal(out.taskType, "coding");
+  assert.equal(out.complexity, "complex");
+
+  // AAD cruzado não abre (prova que é o AAD do destino, não um qualquer).
+  assert.equal(decryptForProject(out.stepPrompt as string, PID, aad(E2EE_TABLE.MESSAGES, "content")), null);
+});
+
+test("T-581 delegate: sem context não inventa description; já cifrado passa; sem chave recusa", { concurrency: false }, async () => {
+  const { setE2eeRequired } = await import("../daemon-crypto.js");
+  const semCtx = encryptBridgePayload("delegate", { goal: "g", context: "" }, PID, { parentName: "PM" });
+  assert.equal(semCtx.context, "", "context vazio virou blob");
+  assert.ok(cifradoV2(semCtx.stepPrompt));
+
+  const jaCifrado = encryptBridgePayload(
+    "delegate",
+    { goal: "e2e:v2:ja", context: "context ainda em claro" },
+    PID,
+    { parentName: "PM" },
+  );
+  assert.equal(jaCifrado.goal, "e2e:v2:ja", "re-cifrou um blob (quebraria o AAD)");
+  // Sem o plaintext do goal não há título/prompt do step para recompor — o
+  // server cai no fallback. O context, esse, ainda sobe cifrado: deixá-lo em
+  // claro fazia o createMission recusar a description.
+  assert.equal("stepTitle" in jaCifrado, false, "inventou step para payload já cifrado");
+  assert.ok(cifradoV2(jaCifrado.context), "context em claro passou junto de um goal já cifrado");
+  assert.equal(
+    decryptForProject(jaCifrado.context as string, PID, aadV2({ projectId: PID, table: E2EE_TABLE.MISSIONS, field: "description" })),
+    "context ainda em claro",
+  );
+  const tudoCifrado = encryptBridgePayload("delegate", { goal: "e2e:v2:ja", context: "e2e:v2:ja" }, PID);
+  assert.equal(tudoCifrado.context, "e2e:v2:ja");
+
+  // goal vazio é no-op (o server devolve 400 "goal vazio").
+  assert.deepEqual(encryptBridgePayload("delegate", { goal: "  " }, PID), { goal: "  " });
+
+  setE2eeRequired("sem-chave-t581", true);
+  assert.throws(
+    () => encryptBridgePayload("delegate", { goal: "g" }, "sem-chave-t581"),
+    /e2ee-required/,
+  );
+  setE2eeRequired("sem-chave-t581", false);
+});
+
+test("T-581 C3: projeto sem E2EE (sem chave) — delegate sai como hoje, byte a byte", async () => {
+  const payload = { goal: "resuma o repo", context: "só o server/", taskType: "coding", complexity: "complex" };
+  const out = encryptBridgePayload("delegate", { ...payload }, "proj-sem-e2ee-t581", { parentName: "PM" });
+  // Sem chave registrada o relay é pass-through: MESMAS chaves, mesmos valores
+  // (nem `goal` reescrito para o título, nem step* inventados). O server compõe
+  // título/prompt com o template dele, como sempre fez.
+  assert.deepEqual(out, payload);
+  assert.equal(cifradoV2(out.goal), false);
+  // O template do fallback em claro do server é o MESMO do pacote (uma fonte):
+  // se ele divergisse, o caminho sem E2EE mudaria o texto sem ninguém ver.
+  const { delegationTaskPrompt } = await import("@the-dudes/protocol/delegation");
+  const src = await import("node:fs").then((fs) =>
+    fs.readFileSync(new URL("../../../server/src/project.ts", import.meta.url), "utf8"),
+  );
+  assert.ok(
+    src.includes("prompt: encrypted?.stepPrompt ?? DELEGATION_TASK_PROMPT(g, ctx, parent.info.name)"),
+    "o fallback em claro do server deixou de ser o mesmo template",
+  );
+  assert.equal(
+    delegationTaskPrompt("resuma o repo", "só o server/", "PM"),
+    "# Delegated task (from PM)\nresuma o repo\n\n## Context\nsó o server/\n\n"
+      + 'When you finish, send your concise result to "PM" using mcp__the-dudes__send_message (to: "PM"). Then you are done.',
+  );
+});
+
+test("T-581 delegate: context é truncado no TETO antes de cifrar (blob não aceita slice)", async () => {
+  const { DELEGATION_CONTEXT_MAX } = await import("@the-dudes/protocol/delegation");
+  const ctx = "x".repeat(DELEGATION_CONTEXT_MAX + 500);
+  const out = encryptBridgePayload("delegate", { goal: "g", context: ctx }, PID, { parentName: "PM" });
+  const aad = aadV2({ projectId: PID, table: E2EE_TABLE.MISSIONS, field: "description" });
+  const plain = decryptForProject(out.context as string, PID, aad);
+  assert.equal(plain!.length, DELEGATION_CONTEXT_MAX, "context não foi cortado no teto antes da cifra");
+});
+
+test("T-581 contrato: o prompt de delegação do relay é o MESMO do server (uma fonte)", async () => {
+  const { delegationTaskPrompt } = await import("@the-dudes/protocol/delegation");
+  const src = await import("node:fs").then((fs) =>
+    fs.readFileSync(new URL("../../../server/src/project.ts", import.meta.url), "utf8"),
+  );
+  // O server reusa a função do pacote (não uma segunda cópia do template):
+  // duas cópias divergiriam em silêncio entre o blob (relay) e o fallback
+  // em claro (daemon antigo).
+  assert.match(src, /const DELEGATION_TASK_PROMPT = delegationTaskPrompt;/);
+  assert.equal(
+    delegationTaskPrompt("g", "c", "PM"),
+    `# Delegated task (from PM)\ng\n\n## Context\nc\n\nWhen you finish, send your concise result to "PM" using mcp__the-dudes__send_message (to: "PM"). Then you are done.`,
   );
 });

@@ -54,6 +54,8 @@ export declare function aadReadChain(args: { projectId: string; table: string; f
 export declare function isE2eV2(stored: string): boolean;
 export declare function isE2eV1Rejected(stored: string): boolean;
 export declare function isPlainCatalogText(v: unknown): boolean;
+/** Blob cifrado no wire (qualquer prefixo `e2e:`) — não concatenar/fatiar. */
+export declare function isCipherText(v: unknown): boolean;
 
 /**
  * T-365/H-092: agent:error de metadados fixos — constantes do código (zero

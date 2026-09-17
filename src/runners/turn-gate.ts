@@ -18,6 +18,8 @@
  * MAX_HOLD_MS é liberado à força.
  */
 
+import { QWEN_HARD_TIMEOUT_MS } from "./turn-watchdog.js";
+
 type Log = (level: "info" | "warn", msg: string) => void;
 
 export type TurnGatePool = "main" | "bg";
@@ -33,8 +35,15 @@ const MAX_BG = (() => {
   return Number.isFinite(raw) && raw >= 1 ? raw : 2;
 })();
 
-/** Acima do hard-timeout do grok (720s) + folga: só dispara em slot vazado. */
-const MAX_HOLD_MS = 15 * 60_000;
+/** Acima do MAIOR hard-timeout legítimo (qwen, T-598: 35min) + folga: só
+ *  dispara em slot vazado. Antes era 15min (grok 720s + folga) e um turno
+ *  qwen saudável >15min — que a T-598 tornou o caso normal — era "liberado à
+ *  força" no meio do turno com log falso de slot preso. */
+const MAX_HOLD_MS = QWEN_HARD_TIMEOUT_MS + 5 * 60_000;
+
+/** Exposto pra teste (T-598): o valve anti-deadlock tem de ficar ACIMA do
+ *  maior hold legítimo, senão um turno saudável é liberado à força. */
+export const TURN_GATE_MAX_HOLD_MS = MAX_HOLD_MS;
 
 interface PoolState {
   max: number;

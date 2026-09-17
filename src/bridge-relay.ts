@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import { chmodSync, chownSync, existsSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
 import type { DropTarget } from "./privileges.js";
-import { getParentPid, getUnixPeerPid, resolveAgentIdFromPid, setParentPidReader } from "./privileges.js";
+import { getParentPid, getParentPidReader, getUnixPeerPid, resolveAgentIdFromPid, setParentPidReader } from "./privileges.js";
 import {
   aadReadChain,
   aadV2,
@@ -15,6 +15,7 @@ import {
   PLAN_FIELDS,
   TASK_FIELDS,
 } from "@the-dudes/protocol/e2ee-fields";
+import { DELEGATION_CONTEXT_MAX, delegationMissionTitle, delegationStepTitle, delegationTaskPrompt } from "@the-dudes/protocol/delegation";
 import { decryptForProject, encryptForProject, E2eeRequiredError, isE2eEncrypted, isE2eeRequired, rememberCredentialPlaintext } from "./daemon-crypto.js";
 
 /**
@@ -49,15 +50,57 @@ export type BridgeEncryptKind =
   | "plans_create"
   | "plans_add_task"
   | "plans_apply_tasks"
+  // T-581: delegação do Brain. goal/context viram mission+step no DB — sem
+  // cifra o createMission do server recusa em claro (e2ee_required) e o
+  // subagente nunca nasce.
+  | "delegate"
   // T-391: kind = op do path (não o nome MCP `save_agent`) — bate com o
   // `catalogPlainHits("agent_save", …)` da T-390 e com o 409 e2ee-required do
   // server, que deriva o kind do op.
   | "agent_save";
 
+/**
+ * Ops do bridge cujo corpo carrega campo de catálogo e por isso precisa de
+ * cifra antes de subir (T-581: a lista saiu do `handleRequest` — um path novo
+ * sem entrada aqui era payload em claro silencioso, e só um teste de rota
+ * pega isso).
+ */
+const BRIDGE_CIPHER_OPS: ReadonlySet<string> = new Set<string>([
+  "tasks_add",
+  "tasks_update",
+  "tasks_comment_add",
+  "goals_add",
+  "goals_update",
+  "plans_create",
+  "plans_add_task",
+  "plans_apply_tasks",
+  "agent_save",
+]);
+
+/**
+ * Rota de cifra de um path `/api/bridge/<agentId>/<op>`.
+ * `null` = path não carrega campo de catálogo (segue em claro, como hoje).
+ */
+export function bridgeCipherRoute(pathname: string): { kind: BridgeEncryptKind; agentId: string } | null {
+  const m = pathname.match(/^\/api\/bridge\/([^/]+)\/([A-Za-z0-9_]+)$/);
+  if (!m) return null;
+  const agentId = m[1]!;
+  const op = m[2]!;
+  if (op === "send" || op === "memory_add" || op === "delegate") return { kind: op, agentId };
+  if (op.startsWith("board_")) return { kind: "board", agentId };
+  if (BRIDGE_CIPHER_OPS.has(op)) return { kind: op as BridgeEncryptKind, agentId };
+  return null;
+}
+
 export function encryptBridgePayload(
   kind: BridgeEncryptKind,
   json: Record<string, unknown>,
   projectId: string,
+  opts?: {
+    /** Nome do agente que delegou — o subagente responde por send_message
+     *  usando este nome, e ele entra no texto do prompt. Só o `delegate` usa. */
+    parentName?: string;
+  },
 ): Record<string, unknown> {
   const cifra = (v: unknown, table: string, field: string): unknown => {
     if (typeof v !== "string" || !v || isE2eEncrypted(v)) return v;
@@ -151,6 +194,43 @@ export function encryptBridgePayload(
     }
     return json;
   }
+  // T-581: `delegate` (Brain) — goal/context são conteúdo do agente e viram
+  // mission + step no Postgres. Cifra com o AAD do campo de DESTINO (é o par
+  // que o web lê em decryptMission/decryptMissionStep e o que o dispatch do
+  // step declara em agent:send.parts). O prompt inteiro é um blob só: quem
+  // tem o plaintext e o nome do pai é este processo, não o server.
+  if (kind === "delegate") {
+    const raw = typeof json.goal === "string" ? json.goal.trim() : "";
+    if (!raw) return json;
+    if (isE2eEncrypted(raw)) {
+      // goal já subiu cifrado (quem cifrou foi outro hop): sem o plaintext não
+      // há como recompor título/prompt do step. O server cai no fallback dele
+      // (usa o próprio blob). O que ainda dá pra fazer aqui é não deixar o
+      // context em claro — senão o createMission recusa a description.
+      const ctx = (typeof json.context === "string" ? json.context : "").trim().slice(0, DELEGATION_CONTEXT_MAX);
+      if (ctx && !isE2eEncrypted(ctx)) json.context = cifra(ctx, E2EE_TABLE.MISSIONS, "description");
+      return json;
+    }
+    // Normaliza ANTES de cifrar: o blob não aceita trim nem slice depois
+    // (cortar base64 quebra a autenticação). Mesmas regras do server em claro.
+    const context = (typeof json.context === "string" ? json.context : "").trim().slice(0, DELEGATION_CONTEXT_MAX);
+    const goalTitulo = cifra(delegationMissionTitle(raw), E2EE_TABLE.MISSIONS, "title");
+    // C3: projeto SEM chave (sem E2EE) sai byte a byte como hoje — se o relay
+    // reescrevesse `goal` aqui, o server (que recompõe o título quando o valor
+    // não é blob) emitiria "Delegação: Delegação: ...". Sem cifra, quem compõe
+    // título/prompt continua sendo o server, com o mesmo template.
+    if (typeof goalTitulo !== "string" || !isE2eEncrypted(goalTitulo)) return json;
+    json.goal = goalTitulo;
+    json.context = context ? cifra(context, E2EE_TABLE.MISSIONS, "description") : "";
+    const parentName = opts?.parentName || "?";
+    json.stepTitle = cifra(delegationStepTitle(raw), E2EE_TABLE.MISSION_STEPS, "title");
+    json.stepPrompt = cifra(
+      delegationTaskPrompt(raw, context, parentName),
+      E2EE_TABLE.MISSION_STEPS,
+      "prompt",
+    );
+    return json;
+  }
   // T-391: agent_save — só spec.systemPrompt é campo do catálogo (AGENTS /
   // system_prompt, o AAD exato que o server lê e que o WS save_agent já usa em
   // main.ts). name/role/... são identificadores, não texto de usuário.
@@ -195,12 +275,32 @@ export function encryptBridgePayload(
 /** Teto alinhado a AGENT_PID_WALK_MAX em privileges.ts (não exportado). */
 const PEER_OS_WALK_MAX = 10;
 
+/**
+ * T-592: tentativas de resolução POR REQUEST. Sob carga o leitor de peer-pid
+ * pode estourar o timeout e um hop do walk pode ficar ilegível; nenhum dos
+ * dois pode virar 403 permanente. 3 tentativas custam ~200ms no caminho bom
+ * (perl ~66ms + walk cacheado) e só são gastas quando o fato do SO falhou.
+ */
+const PEER_RESOLVE_ATTEMPTS = 3;
+
 /** Fatos do SO por conexão Unix — nunca o resultado da autorização. */
 type PeerOsFacts = {
   peerPid?: number | null;
   parentByPid: Map<number, number | null>;
   walked: boolean;
 };
+
+/**
+ * #592: estado do peer-pid em uma palavra, para observabilidade. Sem isso o
+ * dono só descobre o downgrade lendo o log da máquina — e "não-enforced" tem
+ * DUAS causas opostas que precisam ser distinguíveis:
+ *  - `downgrade-insecure`: alguém setou THE_DUDES_PEER_PID_INSECURE=1 →
+ *    conexão não verificável é ACEITA (qualquer processo do mesmo uid fala
+ *    como qualquer agente do daemon);
+ *  - `fail-closed`: sem o env e com o self-test falho → conexão não
+ *    verificável é RECUSADA (503).
+ */
+export type PeerPidMode = "enforced" | "downgrade-insecure" | "fail-closed" | "pending";
 
 export class BridgeRelay {
   public readonly socketPath: string;
@@ -213,26 +313,40 @@ export class BridgeRelay {
    *  agent-to-agent message bodies before letting them traverse the
    *  server. Wired by the daemon at startup. */
   private agentProjectLookup?: (agentId: string) => string | null;
+  /** T-581: nome do agente — entra no prompt de delegação cifrado pelo relay
+   *  (o subagente responde por send_message para este nome). */
+  private agentNameLookup?: (agentId: string) => string | null;
 
   private socketDir: string;
   private peerPidSelfTest?: () => Promise<boolean>;
-  /** true só depois do self-test passar. */
+  /** true só depois do self-test passar E sem downgrade explícito ligado. */
   peerPidEnforced = false;
   /**
-   * Self-test falhou e THE_DUDES_PEER_PID_INSECURE=1: aceita conexões
-   * não-verificáveis (downgrade explícito). Default = fail-CLOSED.
+   * T-604: true sempre que THE_DUDES_PEER_PID_INSECURE=1 está setado — o env é
+   * um downgrade EXPLÍCITO (aceita conexão não verificável), não um consolo
+   * para o self-test falho. Sem o env, default = fail-CLOSED.
    */
   peerPidAllowInsecure = false;
+  /**
+   * #592: o start JÁ decidiu o estado do peer-pid. Sem esta flag, `false` nos
+   * dois campos acima é ambíguo — "ainda não decidiu" e "decidiu fail-closed"
+   * ficariam indistinguíveis para quem lê o estado de fora (health).
+   */
+  private peerPidDecided = false;
 
   constructor(
     orchUrl: string,
     dropTo: DropTarget | null,
     agentProjectLookup?: (agentId: string) => string | null,
-    opts?: { peerPidSelfTest?: () => Promise<boolean> },
+    opts?: {
+      peerPidSelfTest?: () => Promise<boolean>;
+      agentNameLookup?: (agentId: string) => string | null;
+    },
   ) {
     this.orchUrl = orchUrl.replace(/\/$/, "");
     this.dropTo = dropTo;
     this.agentProjectLookup = agentProjectLookup;
+    this.agentNameLookup = opts?.agentNameLookup;
     this.peerPidSelfTest = opts?.peerPidSelfTest;
     // Symlink attack defense: socket vivia em /tmp/the-dudes-bridge-<pid>.sock
     // — path previsível (PID sequential). Atacante local poderia pré-criar
@@ -257,6 +371,10 @@ export class BridgeRelay {
 
   setAgentProjectLookup(fn: (agentId: string) => string | null) {
     this.agentProjectLookup = fn;
+  }
+
+  setAgentNameLookup(fn: (agentId: string) => string | null) {
+    this.agentNameLookup = fn;
   }
 
   start(): Promise<void> {
@@ -287,16 +405,27 @@ export class BridgeRelay {
   }
 
   private applyPeerPidSelfTestResult(ok: boolean, err?: unknown): void {
-    this.peerPidEnforced = ok;
-    this.peerPidAllowInsecure = !ok && process.env.THE_DUDES_PEER_PID_INSECURE === "1";
-    if (ok) return;
+    // T-604: o env é um downgrade EXPLÍCITO — vale com ou sem self-test.
+    // Antes, `peerPidAllowInsecure = !ok && env`: o downgrade só existia se o
+    // self-test falhasse. A T-592 subiu o teto (1500 -> 4500ms) e pôs o leitor
+    // perl antes do python3, então o self-test passou a PASSAR em CI; o
+    // enforcement ligava, o fixture do T-135 perdia o downgrade e o processo do
+    // playwright — IRMÃO do daemon (o globalSetup spawna o daemon), não filho —
+    // levava 403 "bridge peer does not match agent" na sonda bridgeCall.
+    // Sem o env, nada muda: self-test ok => enforcement; self-test falho =>
+    // fail-CLOSED (503) após esgotar as tentativas. Produção não seta o env.
+    const insecure = process.env.THE_DUDES_PEER_PID_INSECURE === "1";
+    this.peerPidEnforced = ok && !insecure;
+    this.peerPidAllowInsecure = insecure;
+    this.peerPidDecided = true;
     const why = err != null ? String((err as Error).message ?? err) : "self-test failed";
-    if (this.peerPidAllowInsecure) {
+    if (insecure) {
       console.error(
-        `[bridge-relay] ERROR: peer-pid ${why} — INSECURE override THE_DUDES_PEER_PID_INSECURE=1 (downgrade; cross-agent token theft not enforced)`,
+        `[bridge-relay] ERROR: peer-pid ${ok ? "self-test passed" : why} — INSECURE override THE_DUDES_PEER_PID_INSECURE=1 (downgrade; cross-agent token theft not enforced)`,
       );
       return;
     }
+    if (ok) return;
     console.error(
       `[bridge-relay] ERROR: peer-pid ${why} — fail-CLOSED. Install python3 (ctypes/getsockopt) or set THE_DUDES_PEER_PID_INSECURE=1 to accept unverifiable bridge connections.`,
     );
@@ -307,7 +436,101 @@ export class BridgeRelay {
     this.applyPeerPidSelfTestResult(ok);
   }
 
-  private defaultPeerPidSelfTest(): Promise<boolean> {
+  /**
+   * #592: estado do peer-pid para fora (health do daemon → /api/health).
+   *
+   * DERIVADO DA DECISÃO, não do ambiente: `applyPeerPidSelfTestResult` lê o
+   * env UMA VEZ, no start. Editar o daemon.env não muda nada aqui até o
+   * restart — e é isso que o observador precisa ver, não o env atual (que
+   * mentiria sobre o que o relay está de fato aplicando).
+   *
+   * `enforced: null` = o start ainda não decidiu (o self-test roda depois do
+   * listen). Nunca é "false" por omissão: um observador que lê `false` cedo
+   * demais concluiria downgrade onde ainda não há decisão.
+   */
+  peerPidState(): { enforced: boolean | null; mode: PeerPidMode } {
+    if (!this.peerPidDecided) return { enforced: null, mode: "pending" };
+    if (this.peerPidAllowInsecure) return { enforced: false, mode: "downgrade-insecure" };
+    if (this.peerPidEnforced) return { enforced: true, mode: "enforced" };
+    return { enforced: false, mode: "fail-closed" };
+  }
+
+  /**
+   * Teto do self-test de peer-pid. DONO DO VALOR: T-592 (o valor não tem
+   * outro dono; o #569, que retenta o estouro, REUSA esta constante em vez de
+   * declarar teto próprio). Um só dono evita o teto ser rebaixado por engano
+   * na resolução do conflito de rebase entre os dois cards.
+   *
+   * Por que 4500 e não 1500: 1500ms não cabia no caminho de fallback (python3
+   * neste host leva 2,0–3,8s sob carga). Sem folga aqui, o self-test falhava e
+   * o relay ia a fail-CLOSED (503 para todo mundo) com o leitor funcionando.
+   */
+  private static readonly SELF_TEST_TIMEOUT_MS = 4_500;
+
+  /**
+   * Teto POR TENTATIVA do self-test (T-569). Num host calmo a tentativa fecha
+   * em ~30ms. O valor é o mesmo teto único que o T-592 entregou: o T-569 não
+   * reverte para 1500ms, ele passa a repetir a tentativa.
+   */
+  /**
+   * Teto POR TENTATIVA do self-test (T-569) — não um total agregado. Cada
+   * tentativa tem a folga própria, e o que o teto realmente guarda é a CHEGADA
+   * do `connection`: o leitor de peer-pid roda dentro do handler via spawnSync
+   * e bloqueia o loop, então leitor lento não é cortado por este timer (o
+   * handler resolve a promessa antes de o timer vencer). Medido no host do dono
+   * (load ~32 em 18 cpus): accept em 0–13ms, 12 amostras.
+   */
+  /**
+   * Teto POR TENTATIVA do self-test (T-569) — não um total agregado. O valor é
+   * o MESMO do T-592 (card task_1890aa3a, dono do valor; lá ele é a constante
+   * nomeada usada pelo timer): aqui o teto passa a ser por tentativa e NÃO
+   * volta para 1500ms. Tolerância efetiva 3 × 4500 = 13,5s.
+   *
+   * Por que 4500 e não 2500 (ruling do PM, ~20:3xZ): o que o teto guarda é a
+   * CHEGADA do `connection` — o leitor de peer-pid roda dentro do handler via
+   * spawnSync e bloqueia o loop, então leitor lento não é cortado por este
+   * timer (o handler resolve a promessa antes do timer vencer; medido no host
+   * do dono, load ~32 em 18 cpus: accept em 0–13ms, 12 amostras). Mas com 2500
+   * sobra a faixa (2500, 4500] de bloqueio de loop SUSTENTADO — exatamente a
+   * que o T-592 mediu (accept sem chegar em 1620ms, python3 de fallback em
+   * 2,0–3,8s): as 3 tentativas cairiam na mesma faixa curta, esgotariam e o
+   * relay iria a fail-CLOSED. Com o teto no valor do T-592 a faixa some, e a
+   * evidência do T-592 (que está sendo julgada) não é invalidada em silêncio.
+   */
+  /**
+   * Tentativas antes de aplicar o fail-closed (T-569). Tolerância efetiva =
+   * tentativas × teto; num host calmo só a 1ª roda.
+   */
+  private static readonly SELF_TEST_TENTATIVAS = 3;
+
+  /**
+   * T-569: o self-test mede uma capacidade DEPENDENTE DA CARGA e o estouro do
+   * teto era DEFINITIVO: `peerPidEnforced` ficava false e, sem
+   * THE_DUDES_PEER_PID_INSECURE, o relay passava a responder 503 em TODA
+   * request do bridge, sem retry, até restart. Medido no host do dono (load ~40
+   * em 18 cpus): o caso A6 do t071 morreu no teto (1620ms) e o bridge ficou
+   * fail-CLOSED por um pico transitório.
+   *
+   * Agora o estouro é RETENTADO: o fail-closed só vale depois de esgotar as
+   * tentativas (aí sim é "este host não consegue"). A tolerância é a SOMA das
+   * janelas, e a última janela sozinha não precisa cobrir o pior caso agregado
+   * — cada tentativa carrega a folga dela.
+   *
+   * Interação com o T-592 (card task_1890aa3a, mesma função): o T-592 elevou o
+   * teto único de 1500 -> 4500ms; aqui o teto passa a ser por tentativa e não
+   * volta para 1500. Tolerância efetiva 3 × 4500 = 13,5s contra os 4,5s de uma
+   * tentativa única. O valor é o mesmo do T-592 de propósito: o delta tolera o
+   * pico sem depender de o T-592 já estar na base, e no rebase as duas pontas
+   * apontam para o mesmo número.
+   */
+  private async defaultPeerPidSelfTest(): Promise<boolean> {
+    for (let i = 1; i <= BridgeRelay.SELF_TEST_TENTATIVAS; i++) {
+      if (await this.attemptPeerPidSelfTest()) return true;
+    }
+    return false;
+  }
+
+  private attemptPeerPidSelfTest(): Promise<boolean> {
     return new Promise((resolve) => {
       let settled = false;
       let client: net.Socket | undefined;
@@ -319,7 +542,10 @@ export class BridgeRelay {
         try { client?.destroy(); } catch { /* */ }
         resolve(ok);
       };
-      const timer = setTimeout(() => finish(false), 1500);
+      // T-592: 1500ms não cabia no caminho de fallback (python3 neste host
+      // leva 2,0–3,8s sob carga). Sem folga aqui, o self-test falhava e o
+      // relay ia a fail-CLOSED (503 para todo mundo) com o leitor funcionando.
+      const timer = setTimeout(() => finish(false), BridgeRelay.SELF_TEST_TIMEOUT_MS);
       const onConn = (sock: net.Socket) => {
         finish(getUnixPeerPid(sock) === process.pid);
       };
@@ -359,36 +585,80 @@ export class BridgeRelay {
   /**
    * Resolve o agentId do peer desta conexão. Cacheia só fatos do SO
    * (pid + ppid); o registro de autorização é consultado a cada request.
+   *
+   * T-592: fato do SO que FALHOU não pode ser cacheado como definitivo — sem
+   * isso um único timeout do leitor de peer-pid (ou um hop ilegível do walk)
+   * deixava a conexão inteira em 403 até o cliente reconectar. Foi o que o QA
+   * e o PM mediram (12 curls → 7×403; 5 conexões novas → 5×403).
    */
   private resolvePeerAgentId(sock: object): string | null {
     const facts = this.bindPeerOsFacts(sock);
+    for (let attempt = 0; attempt < PEER_RESOLVE_ATTEMPTS; attempt++) {
+      const id = this.resolvePeerAgentIdOnce(sock, facts);
+      if (id) return id;
+      // Cadeia lida por inteiro e pid lido: o registro é que não bate (403
+      // legítimo, T-061) — repetir não muda nada e custa spawn.
+      if (facts.peerPid != null && facts.walked) return null;
+      // Invalida só o que falhou; o que já foi lido (hops válidos) fica.
+      if (facts.peerPid == null) facts.peerPid = undefined;
+      facts.walked = false;
+    }
+    console.warn(
+      `[bridge-relay] peer-pid do peer não resolveu em ${PEER_RESOLVE_ATTEMPTS} tentativas ` +
+      `(peerPid=${facts.peerPid ?? "null"}) — 403 na conexão`,
+    );
+    return null;
+  }
+
+  private resolvePeerAgentIdOnce(sock: object, facts: PeerOsFacts): string | null {
     if (facts.peerPid === undefined) {
-      facts.peerPid = getUnixPeerPid(sock);
+      // Leitor devolveu null (spawn estourou) → fica undefined, não null: a
+      // próxima tentativa volta a perguntar ao SO em vez de congelar o null.
+      const pid = getUnixPeerPid(sock);
+      if (pid != null) facts.peerPid = pid;
     }
     const peerPid = facts.peerPid;
     if (peerPid == null) return null;
 
-    if (!facts.walked) {
-      let current: number | null = peerPid;
-      const seen = new Set<number>();
-      for (let i = 0; i < PEER_OS_WALK_MAX; i++) {
-        if (!current || current <= 1 || seen.has(current)) break;
-        seen.add(current);
-        const ppid = getParentPid(current);
-        facts.parentByPid.set(current, ppid);
-        current = ppid;
-      }
-      facts.walked = true;
-    }
+    if (!facts.walked) facts.walked = this.walkParents(facts, peerPid);
 
-    // Walk de resolveAgentIdFromPid usa só o cache desta conexão — o
-    // reader global volta ao default em seguida (testes re-injetam via afterEach).
+    // Walk de resolveAgentIdFromPid usa só o cache desta conexão. O reader
+    // vigente é PRESERVADO e devolvido: restaurar `null` incondicionalmente
+    // (T-592) descartava o reader de quem chamou, e o retry da request caía no
+    // `ps` real contra pids que só existiam na injeção.
+    const prevReader = getParentPidReader();
     setParentPidReader((pid) => (facts.parentByPid.has(pid) ? facts.parentByPid.get(pid) ?? 0 : 0));
     try {
       return resolveAgentIdFromPid(peerPid);
     } finally {
-      setParentPidReader(null);
+      setParentPidReader(prevReader);
     }
+  }
+
+  /**
+   * Sobe a cadeia de ppid a partir do peer, guardando cada hop no cache da
+   * conexão. Devolve true só quando a cadeia terminou de forma LEGÍTIMA
+   * (chegou a pid 1, ciclo, ou ao teto de hops).
+   *
+   * T-592: hop ilegível (`ps` estourou) devolve false e não fica cacheado —
+   * antes bastava um hop falho para `walked=true` congelar uma cadeia truncada
+   * e o 403 virar permanente na conexão.
+   */
+  private walkParents(facts: PeerOsFacts, peerPid: number): boolean {
+    let current: number | null = peerPid;
+    const seen = new Set<number>();
+    for (let i = 0; i < PEER_OS_WALK_MAX; i++) {
+      if (!current || current <= 1 || seen.has(current)) return true;
+      seen.add(current);
+      const ppid = getParentPid(current);
+      if (ppid == null) {
+        facts.parentByPid.delete(current);
+        return false;
+      }
+      facts.parentByPid.set(current, ppid);
+      current = ppid;
+    }
+    return true;
   }
 
   /** Cap defensivo no body relayed pelo Unix socket. Qualquer processo do
@@ -477,11 +747,16 @@ export class BridgeRelay {
     // Encrypt the `content` field with the source agent's project key so
     // the server only forwards ciphertext. Target daemon decrypts on the
     // agent:send path. If we don't hold the key, fall through to plain.
-    const encryptOr409 = (kind: BridgeEncryptKind, projectId: string, buf: Buffer): boolean => {
+    const encryptOr409 = (
+      kind: BridgeEncryptKind,
+      projectId: string,
+      buf: Buffer,
+      opts?: { parentName?: string },
+    ): boolean => {
       try {
         const json = JSON.parse(buf.toString("utf8"));
         if (json && typeof json === "object") {
-          body = Buffer.from(JSON.stringify(encryptBridgePayload(kind, json, projectId)), "utf8");
+          body = Buffer.from(JSON.stringify(encryptBridgePayload(kind, json, projectId, opts)), "utf8");
         }
         return true;
       } catch (e) {
@@ -494,32 +769,15 @@ export class BridgeRelay {
       }
     };
     if (body && body.length > 0 && this.agentProjectLookup) {
-      const m = parsed.pathname.match(/^\/api\/bridge\/([^/]+)\/send$/);
-      if (m) {
-        const agentId = m[1];
-        const projectId = this.agentProjectLookup(agentId);
-        if (projectId && !encryptOr409("send", projectId, body)) return;
-      }
-      // E2EE: memory_add carrega title/body em plaintext do agente. Cifra
-      // com a project key antes de subir, igual ao `send` — server guarda
-      // só ciphertext (titleCipher/bodyCipher). Mantém a memória de agente
-      // no mesmo formato cipher que a memória criada pelo user na UI.
-      const mm = parsed.pathname.match(/^\/api\/bridge\/([^/]+)\/memory_add$/);
-      if (mm) {
-        const projectId = this.agentProjectLookup(mm[1]);
-        if (projectId && !encryptOr409("memory_add", projectId, body)) return;
-      }
-      const bm = parsed.pathname.match(/^\/api\/bridge\/([^/]+)\/(board_[a-z_]+)$/);
-      if (bm) {
-        const projectId = this.agentProjectLookup(bm[1]);
-        if (projectId && !encryptOr409("board", projectId, body)) return;
-      }
-      const wm = parsed.pathname.match(
-        /^\/api\/bridge\/([^/]+)\/(tasks_add|tasks_update|tasks_comment_add|goals_add|goals_update|plans_create|plans_add_task|plans_apply_tasks|agent_save)$/,
-      );
-      if (wm) {
-        const projectId = this.agentProjectLookup(wm[1]);
-        if (projectId && !encryptOr409(wm[2] as BridgeEncryptKind, projectId, body)) return;
+      const route = bridgeCipherRoute(parsed.pathname);
+      if (route) {
+        const projectId = this.agentProjectLookup(route.agentId);
+        // T-581: delegate — goal/context viram mission+step no DB. O prompt
+        // cifrado precisa do nome do pai (o subagente responde pra ele).
+        const opts = route.kind === "delegate"
+          ? { parentName: this.agentNameLookup?.(route.agentId) ?? route.agentId }
+          : undefined;
+        if (projectId && !encryptOr409(route.kind, projectId, body, opts)) return;
       }
     }
     // Strip headers that don't make sense to forward (host/connection/etc).

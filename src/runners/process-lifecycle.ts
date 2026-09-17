@@ -54,6 +54,38 @@ export function killProcess(child: ChildProcess | null | undefined, signal: Node
   try { return child.kill(signal); } catch { return false; }
 }
 
+/**
+ * T-593: mata por PID, sem depender do bookkeeping do ChildProcess.
+ *
+ * `killProcess` sai cedo em `!processAlive(child)`: um `close` já entregue
+ * (exitCode/signalCode setados pelo Node) torna o kill um no-op mesmo quando o
+ * process group do turno ainda está vivo. O pgid sobrevive ao líder enquanto
+ * qualquer membro existir (netos herdam pipes e ficam no mesmo grupo), então
+ * `kill(-pid)` continua alcançando a árvore — e o alvo aqui é o PID, não o
+ * objeto. Fallback individual quando o pid não é líder de grupo (ESRCH).
+ *
+ * Best-effort: pid morto/inexistente devolve false, nunca lança.
+ */
+export function killPidTree(pid: number | null | undefined, signal: NodeJS.Signals = "SIGKILL"): boolean {
+  if (!pid || pid <= 1) return false;
+  try {
+    process.kill(-pid, signal);
+    return true;
+  } catch { /* sem grupo com esse pgid → individual */ }
+  try {
+    process.kill(pid, signal);
+    return true;
+  } catch { return false; }
+}
+
+/** T-593: o pid ainda existe no SO? Sonda por sinal 0 — `processAlive` só sabe
+ *  de ChildProcess do Node, e o alvo aqui é o pid. Zumbi ainda conta como vivo
+ *  (o Node o recolhe logo depois do SIGKILL). */
+export function pidAlive(pid: number | null | undefined): boolean {
+  if (!pid || pid <= 1) return false;
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
 export function terminateWithEscalation(process: ChildProcess | null | undefined, graceMs = 1_500): () => void {
   if (!processAlive(process)) return () => {};
   let escalation: NodeJS.Timeout | undefined;
