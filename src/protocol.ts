@@ -8,13 +8,58 @@
 export * from "@the-dudes/protocol/daemon-wire";
 
 import type { AgentSendPart, AssemblePartsResult } from "@the-dudes/protocol/daemon-wire";
-import { aadReadChain, resolveAgentSendCipherAad } from "@the-dudes/protocol/e2ee-fields";
+import { aadReadChain, E2EE_TABLE, resolveAgentSendCipherAad } from "@the-dudes/protocol/e2ee-fields";
 
 export function cipherWirePrefix(text: string): "e2e:v2" | "e2e:v1" | "e2e" | "none" {
   if (text.startsWith("e2e:v2:")) return "e2e:v2";
   if (text.startsWith("e2e:v1:")) return "e2e:v1";
   if (text.startsWith("e2e:")) return "e2e";
   return "none";
+}
+
+/**
+ * T-597 F1 — abre um cipher tentando o pid da linha e, se não abrir, TODOS os
+ * pids candidatos (o par chave+AAD por candidato é responsabilidade do
+ * `attempt`). Cobre remetente que selou com pid de OUTRO projeto (caminho
+ * direto do bridge, sem passar pelo relay que selaria com o pid do entry).
+ * Fail-closed: null = nenhum candidato abriu. Devolve o valor + o pid que
+ * abriu (o caller usa o pid p/ log e p/ os anexos do mesmo frame).
+ */
+export function openWithAnyHeldProject<T>(
+  projectId: string | undefined,
+  candidatePids: readonly string[],
+  attempt: (pid: string) => T | null,
+): { value: T; pid: string } | null {
+  if (projectId) {
+    const v = attempt(projectId);
+    if (v !== null) return { value: v, pid: projectId };
+  }
+  for (const pid of candidatePids) {
+    if (pid === projectId) continue;
+    const v = attempt(pid);
+    if (v !== null) return { value: v, pid };
+  }
+  return null;
+}
+
+/**
+ * T-649 — cadeia de AAD do caminho de `content` (frame SEM parts). O remetente
+ * pode ter selado o blob com o AAD de OUTRO table/field (blob copiado
+ * cross-tabela — ex.: o dispatch de step carrega a `description` da task) e o
+ * content só tentava `messages.content`, então o frame dropava mesmo com a
+ * chave detida. Conjunto pequeno e na ordem canônica: messages.content e, em
+ * seguida, tasks.description. Fail-closed: lista vazia = nada abre (o caller
+ * dropa como antes). Espelha o `aadReadChain` do campo de destino.
+ */
+export function contentAadChain(projectId: string): string[] {
+  const out: string[] = [];
+  for (const aad of [
+    ...aadReadChain({ projectId, table: E2EE_TABLE.MESSAGES, field: "content" }),
+    ...aadReadChain({ projectId, table: E2EE_TABLE.TASKS, field: "description" }),
+  ]) {
+    if (!out.includes(aad)) out.push(aad);
+  }
+  return out;
 }
 
 /**

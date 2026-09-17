@@ -13,6 +13,21 @@ import { runCliText } from "../summarizer-runner.js";
 
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
+/**
+ * Budget derivado T-588 (2026-09-17) — boot do fake CLI até o pid file
+ * parseável; não é "mais folga".
+ *
+ * Medido no host (18 cpus, com a suíte de outro worktree rodando junto):
+ *   - sequencial n=20: p50=901ms p100=1474ms
+ *   - 12 spawns simultâneos ×3: p50=2498ms p90=3020ms p100=3219ms
+ *   - suíte completa (a condição que falhou): pid file AUSENTE quando o kill
+ *     de 2.5s disparou → boot > 2.5s com dezenas de ficheiros em paralelo.
+ * O timeout do summarizer corre contra este boot: se o kill chega antes do
+ * write, o processo morre sem escrever e o teste falha por corrida, não por
+ * defeito. Teto = 2 × p100 concorrente ≈ 6.5s.
+ */
+const BOOT_BUDGET_MS = 6_500;
+
 test("T-445: timeout do summarizer mata o grupo inteiro (líder + neto)", async () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), "t445-"));
   const pidFile = path.join(dir, "child.pid");
@@ -29,20 +44,32 @@ setInterval(() => {}, 1000);
   const r = await runCliText("resume isto", {
     runner: "crush",
     cliCommands: { crush: { available: true, command: script } } as never,
-    // 2.5s: boot do node script sob carga da suíte completa pode passar de
-    // 700ms — o pid file tem de existir ANTES do timeout disparar.
-    timeoutMs: 2_500,
+    // BOOT_BUDGET_MS (derivado acima): o pid file tem de existir ANTES do
+    // timeout disparar — o kill mata o fake CLI e ele nunca mais escreve.
+    timeoutMs: BOOT_BUDGET_MS,
   });
   assert.equal(r.ok, false);
   assert.match(r.error ?? "", /timeout/);
 
+  // FATO = JSON parseável com leader+child (T-588). Existir o ficheiro não
+  // basta: sob carga da suíte o write pode ser parcial e JSON.parse(raw)
+  // rebentava o teste antes de o grupo sequer ser observado.
+  let parsed: { leader: number; child: number } | null = null;
   let raw = "";
-  const pidDeadline = Date.now() + 3_000;
-  while (!raw && Date.now() < pidDeadline) {
-    try { raw = readFileSync(pidFile, "utf8"); } catch { await new Promise((r2) => setTimeout(r2, 50)); }
+  const pidDeadline = Date.now() + BOOT_BUDGET_MS;
+  while (!parsed && Date.now() < pidDeadline) {
+    try {
+      raw = readFileSync(pidFile, "utf8");
+      const j = JSON.parse(raw) as { leader?: unknown; child?: unknown };
+      if (typeof j.leader === "number" && j.leader > 0 && typeof j.child === "number" && j.child > 0) {
+        parsed = { leader: j.leader, child: j.child };
+        break;
+      }
+    } catch { /* ainda não existe ou JSON parcial */ }
+    await new Promise((r2) => setTimeout(r2, 50));
   }
-  const { leader, child } = JSON.parse(raw) as { leader: number; child: number };
-  assert.ok(leader > 0 && child > 0, "fake CLI registrou líder e neto");
+  assert.ok(parsed, `pid file não ficou parseável em ${BOOT_BUDGET_MS}ms (último raw=${JSON.stringify(raw)})`);
+  const { leader, child } = parsed;
   const deadline = Date.now() + 5_000;
   while ((alive(leader) || alive(child)) && Date.now() < deadline) await new Promise((r2) => setTimeout(r2, 50));
   assert.equal(alive(leader), false, "líder morto");

@@ -414,6 +414,9 @@ export class BridgeRelay {
     // levava 403 "bridge peer does not match agent" na sonda bridgeCall.
     // Sem o env, nada muda: self-test ok => enforcement; self-test falho =>
     // fail-CLOSED (503) após esgotar as tentativas. Produção não seta o env.
+    // Footgun: env setado desliga o enforcement mesmo com self-test OK;
+    // nenhum daemon.env de campo tem a var hoje, mas se alguém a colocar
+    // em prod o peer-pid deixa de ser exigido em silêncio.
     const insecure = process.env.THE_DUDES_PEER_PID_INSECURE === "1";
     this.peerPidEnforced = ok && !insecure;
     this.peerPidAllowInsecure = insecure;

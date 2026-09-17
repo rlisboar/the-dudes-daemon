@@ -964,6 +964,11 @@ export interface MissionStep {
   reviewerAgentId?: string;
   /** Board task vinculada (ex.: plano materializado como mission). */
   taskId?: string;
+  /**
+   * T-460/R5: quando o humano aprovou o gate (`requiresHuman`) — o step só é
+   * despachado DEPOIS deste carimbo (semântica A: aprovar antes de executar).
+   */
+  approvedAt?: number;
   startedAt?: number;
   finishedAt?: number;
 }

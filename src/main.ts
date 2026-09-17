@@ -33,10 +33,10 @@ import { detectDropTarget, spawnDropped, type DropTarget } from "./privileges.js
 import { BridgeRelay, type PeerPidMode } from "./bridge-relay.js";
 import { defaultDaemonConfigPath, formatCliStatus, loadDaemonCliConfig, mergeCliConfig, resolveCliCommands, type DaemonCliConfig, type ResolvedCliCommands } from "./cli-config.js";
 import { applyRunnerPolicy, buildInstalledRunnerAvailability, helloRunnerLists, POLICY_GATED_RUNNERS, type InstalledRunnerAvailability } from "./runner-policy.js";
-import { assembleAgentSendParts, type FromDaemon, type FromOrch, type TaskUpdatedEv } from "./protocol.js";
+import { assembleAgentSendParts, contentAadChain, openWithAnyHeldProject, type FromDaemon, type FromOrch, type TaskUpdatedEv } from "./protocol.js";
 import { runSummarizer } from "./summarizer-runner.js";
 import { aadV2, E2EE_TABLE } from "@the-dudes/protocol/e2ee-fields";
-import { decryptForProject, decryptImageAttachments, encryptForProject, countUsableProjectKeys, forgetAllProjectKeys, getDaemonPublicKey, hasProjectKey, isE2eEncrypted, isE2eeRequired, rememberProjectKey, setE2eeRequired } from "./daemon-crypto.js";
+import { decryptForProject, decryptImageAttachments, encryptForProject, countUsableProjectKeys, forgetAllProjectKeys, getDaemonPublicKey, hasProjectKey, isE2eEncrypted, isE2eeRequired, listHeldProjectIds, rememberProjectKey, setE2eeRequired } from "./daemon-crypto.js";
 import { decryptTranscriptBlobs, TRANSCRIPT_DECRYPT_REASONS } from "./transcript-decrypt.js";
 import { dispatchWebhook } from "./webhook-dispatch.js";
 import { ModelDiscovery } from "./model-discovery.js";
@@ -744,27 +744,33 @@ export class DaemonClient {
           return;
         }
         let content: string;
+        // T-597 F1: pid com que o frame foi de fato selado. Começa no pid da
+        // linha; se um fallback abrir, vira o pid que abriu — os anexos do
+        // mesmo frame usam o mesmo pid.
+        let sealPid = msg.projectId;
         const dropMissingKey = () => {
-          log("warn", `agent:send to ${msg.agentId} encrypted but project key not held — dropping`);
-          const plain = "daemon sem chave do projeto — recarregue a página ou reinicie o daemon";
+          log("warn", `agent:send to ${msg.agentId} cipher nao abre com nenhuma chave detida (linha=${msg.projectId ?? "-"}) — dropping`);
+          const plain = `daemon sem chave que abra a mensagem (linha=${msg.projectId ?? "sem pid"}) — recarregue a página ou reinicie o daemon`;
           const sealed = sealAgentErrorMessage(msg.projectId, plain);
           if (sealed) {
             this.send({ type: "agent:error", agentId: msg.agentId, message: sealed, errorKind: agentErrorKind(plain) });
           } else log("error", `agent:error recusado: e2ee-required sem chave project=${msg.projectId}`);
         };
         if (msg.parts && msg.parts.length > 0) {
-          const assembled = assembleAgentSendParts(
-            msg.parts,
-            msg.projectId,
-            decryptForProject,
-            isE2eEncrypted,
-          );
-          if (!assembled.ok) {
+          // T-597 F1: tenta o pid da linha e, se não abrir, os demais pids
+          // detidos (o remetente pode ter selado com OUTRO pid — caminho
+          // direto do bridge). Mesmo primitivo do caminho de content.
+          const opened = openWithAnyHeldProject(msg.projectId, listHeldProjectIds(), (pid) => {
+            const a = assembleAgentSendParts(msg.parts!, pid, decryptForProject, isE2eEncrypted);
+            return a.ok ? a : null;
+          });
+          if (opened === null) {
+            const assembled = assembleAgentSendParts(msg.parts, msg.projectId, decryptForProject, isE2eEncrypted);
             const hasKey = !!(msg.projectId && hasProjectKey(msg.projectId));
             if (hasKey) {
               log(
                 "warn",
-                `agent:send to ${msg.agentId} cipher drop reason=${assembled.reason} prefix=${assembled.prefix} hasKey=true`,
+                `agent:send to ${msg.agentId} cipher drop reason=${assembled.ok ? "-" : assembled.reason} prefix=${assembled.ok ? "-" : assembled.prefix} hasKey=true line=${msg.projectId ?? "-"}`,
               );
               const plain = "agent:send cipher recusado";
               const sealed = sealAgentErrorMessage(msg.projectId, plain);
@@ -776,18 +782,46 @@ export class DaemonClient {
             }
             return;
           }
-          content = assembled.content;
+          if (opened.pid !== msg.projectId) {
+            sealPid = opened.pid;
+            log("warn", `agent:send to ${msg.agentId} parts abertas por fallback pid=${opened.pid} (linha=${msg.projectId ?? "-"})`);
+          }
+          content = opened.value.content;
         } else {
           content = msg.content;
-          if (msg.projectId && isE2eEncrypted(content)) {
-            const dec = decryptForProject(content, msg.projectId, aadV2({ projectId: msg.projectId, table: E2EE_TABLE.MESSAGES, field: "content" }));
-            if (dec !== null) content = dec;
-            else { dropMissingKey(); return; }
+          if (isE2eEncrypted(content)) {
+            // T-649: além do pid, varia o AAD por candidato (conjunto pequeno,
+            // canônico primeiro: messages.content → tasks.description — o
+            // dispatch de step carrega a description da task). Fail-closed:
+            // nada abre → drop como antes.
+            let openedAad: string | null = null;
+            const opened = openWithAnyHeldProject(msg.projectId, listHeldProjectIds(), (pid) => {
+              for (const aad of contentAadChain(pid)) {
+                const v = decryptForProject(content, pid, aad);
+                if (v !== null) { openedAad = aad; return v; }
+              }
+              return null;
+            });
+            if (opened === null) { dropMissingKey(); return; }
+            if (opened.pid !== msg.projectId || openedAad !== contentAadChain(msg.projectId)[0]) {
+              sealPid = opened.pid;
+              log("warn", `agent:send to ${msg.agentId} aberto por fallback pid=${opened.pid} aad=${openedAad} (linha=${msg.projectId ?? "-"})`);
+            }
+            content = opened.value;
           }
           if (msg.systemPrefix) content = msg.systemPrefix + content;
           if (msg.systemSuffix) content = content + msg.systemSuffix;
         }
-        const images = decryptImageAttachments(msg.images, msg.projectId);
+        let images = decryptImageAttachments(msg.images, sealPid);
+        if (images === null) {
+          // Conteúdo e anexos podem ter sido selados com pids diferentes —
+          // mesma varredura fail-closed antes de dropar o frame.
+          for (const pid of listHeldProjectIds()) {
+            if (pid === sealPid) continue;
+            const alt = decryptImageAttachments(msg.images, pid);
+            if (alt !== null) { images = alt; log("warn", `agent:send to ${msg.agentId} anexos abertos por fallback pid=${pid}`); break; }
+          }
+        }
         if (images === null) { dropMissingKey(); return; }
         if (msg.telegram !== undefined) this.host.setTelegramMirror(msg.agentId, msg.telegram);
         // T-233: proveniência de task ativa — SOMENTE pelo sinal autoritativo

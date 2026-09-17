@@ -287,7 +287,13 @@ export class AgentHost {
         existing.info?.effort !== msg.agent.effort ||
         existing.info?.collectThinking !== msg.agent.collectThinking ||
         existing.info?.planMode !== msg.agent.planMode ||
-        existing.info?.claudeConfigDir !== msg.agent.claudeConfigDir;
+        existing.info?.claudeConfigDir !== msg.agent.claudeConfigDir ||
+        // T-597 F1: pid diferente = re-spawn completo. O reconnect puro não
+        // atualiza o entry (nem a closure do runner) e os DOIS selos ficariam
+        // no pid velho — com o reconfig, entry e closure nascem juntos no pid
+        // novo. Cobre também entry sem pid (daemon antigo) que passaria a
+        // selar em plaintext no relay.
+        existing.projectId !== msg.projectId;
       // M17 (T-440): reconnect só vale para runner VIVO. Claude cujo proc
       // nunca subiu (spawn error) ou morreu sem exit ficava marcado running e
       // nada rodava; aqui o cadáver cai no spawn completo abaixo.

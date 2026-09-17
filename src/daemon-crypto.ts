@@ -388,6 +388,15 @@ export function countUsableProjectKeys(): number {
   return ids.size;
 }
 
+/** T-597 F1: pids com chave utilizável (RAM + wraps em disco) — candidatos do
+ *  fallback de decrypt quando o pid da linha não abre o blob (remetente selou
+ *  com OUTRO projeto). Ordem: RAM primeiro (ativos), depois o disco. */
+export function listHeldProjectIds(): string[] {
+  const ids = new Set(projectKeys.keys());
+  for (const id of Object.keys(readPersistedStore())) ids.add(id);
+  return [...ids];
+}
+
 export function forgetAllProjectKeys(): void {
   for (const k of projectKeys.values()) k.fill(0);
   projectKeys.clear();
