@@ -29,6 +29,10 @@
       "types": "./delegation.d.ts",
       "default": "./delegation.js"
     },
+    "./mission-memory": {
+      "types": "./mission-memory.d.ts",
+      "default": "./mission-memory.js"
+    },
     "./wire-version": {
       "types": "./wire-version.d.ts",
       "default": "./wire-version.js"
@@ -43,6 +47,6 @@
     "test": "node --test *.test.js"
   },
   "dependencies": {
-    "zod": "^3.23.8"
+    "zod": "^4.6.4"
   }
 }

@@ -31,6 +31,10 @@ export interface TurnCounters {
   ok: number;
   failed: number;
   hardRecovers: number;
+  /** T-662: hard recovers que a política de notificação decidiu avisar
+   *  (summary|immediate). Supressões NÃO contam — é o contador que o banner
+   *  do web usa, então ele reflete exatamente o que o dono vê. */
+  hardRecoversNotified: number;
   hangs: number;
 }
 
@@ -56,7 +60,7 @@ const ring: HealthLogLine[] = [];
 const durations: number[] = [];
 let wsRttMs: number | null = null;
 
-const zero = (): TurnCounters => ({ started: 0, ok: 0, failed: 0, hardRecovers: 0, hangs: 0 });
+const zero = (): TurnCounters => ({ started: 0, ok: 0, failed: 0, hardRecovers: 0, hardRecoversNotified: 0, hangs: 0 });
 const total: TurnCounters = zero();
 const byRunner = new Map<string, TurnCounters>();
 
@@ -100,6 +104,13 @@ export function recordHang(runner: string): void {
 export function recordHardRecover(runner: string): void {
   total.hardRecovers++;
   counters(runner).hardRecovers++;
+}
+
+/** T-662: hard recover NOTIFICADO (a política decidiu summary|immediate).
+ *  Chamar no mesmo ponto em que a notificação sai (agent-runner). */
+export function recordHardRecoverNotified(runner: string): void {
+  total.hardRecoversNotified++;
+  counters(runner).hardRecoversNotified++;
 }
 
 export function recordWsRtt(ms: number): void {

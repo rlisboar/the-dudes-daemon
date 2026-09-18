@@ -61,10 +61,12 @@ export const daemonWireSchemas = {
       memRssMb: n,
       wsRttMs: n.nullable(),
       turnGate: z.object({ active: n, queued: n, max: n }),
-      turns: z.object({ started: n, ok: n, failed: n, hardRecovers: n, hangs: n }),
+      // T-662: hardRecoversNotified opcional — daemon antigo não envia; o web
+      // cai no contador cru nesse caso (fallback).
+      turns: z.object({ started: n, ok: n, failed: n, hardRecovers: n, hardRecoversNotified: n.optional(), hangs: n }),
       turnP50Ms: n.nullable(),
       turnP95Ms: n.nullable(),
-      byRunner: z.record(z.object({ started: n, ok: n, failed: n, hardRecovers: n, hangs: n })),
+      byRunner: z.record(z.object({ started: n, ok: n, failed: n, hardRecovers: n, hardRecoversNotified: n.optional(), hangs: n })),
       agentsRunning: n,
       e2eeProjects: n,
       binaryHash: t.optional(),
@@ -322,6 +324,15 @@ export const fromOrchSchemas = {
     systemPrefix: t.optional(),
     systemSuffix: t.optional(),
     parts: z.array(agentSendPart).optional(),
+    /**
+     * T-594: mission scratch (`{{mem.NAME}}`) pra o daemon interpolar no
+     * conteúdo JÁ decifrado. Valores em claro: a mission_memory é texto claro
+     * at rest (o server a lê e é ele quem a escreve, a partir do MEM_SET do
+     * output). Costuma acompanhar `parts` (o prompt de step manda junto, porque
+     * sem parts o server já fez a passada); o prompt de reviewer pode vir sem
+     * elas, porque o server não o passa.
+     */
+    mem: z.record(t).optional(),
     projectId: t.optional(),
     images: z.array(imageAtt).optional(),
     telegram: z.object({ botToken: t, chatId: t }).nullable().optional(),

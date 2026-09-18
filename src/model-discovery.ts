@@ -15,11 +15,16 @@ import { RUNNERS } from "@the-dudes/protocol";
 
 const CACHE_TTL_MS = 5 * 60_000;
 const COMMAND_TIMEOUT_MS = 12_000;
-// T-262 r1 (QA): tentativa `models --verbose` com timeout PRÓPRIO e curto —
-// sem isto, um CLI que trava no modo verbose estoura os 12s e o fallback de
-// lista simples estoura mais 12s → scan inteiro demora ~24s pra falhar.
-// 8s limita o pior caso a ~8s (verbose) + 12s (fallback) e falha antes.
-const OPENCODE_VERBOSE_TIMEOUT_MS = 8_000;
+// T-664: tetos PRÓPRIOS do opencode, DERIVADOS do medido nesta máquina
+// (opencode 1.18.29, host carregado): `models --verbose` 27.3–30.0s (546KB,
+// ~450 modelos) e `models` 27.7s. Margem ~1/3 sobre o máximo medido → 40s
+// (verbose) e 35s (fallback simples — único caminho em CLI antigo sem a
+// flag). Pior caso do runner = 75s (verbose estoura + fallback estoura) e o
+// TTL do server (MODEL_DISCOVERY_TTL_MS=90s) acomoda com margem. Os 8s/12s
+// antigos estouravam os DOIS caminhos no caminho feliz → catálogo vazio com
+// "timeout consultando modelos".
+const OPENCODE_VERBOSE_TIMEOUT_MS = 40_000;
+const OPENCODE_SIMPLE_TIMEOUT_MS = 35_000;
 const MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
 const MAX_MODELS = 2_000;
 const ANSI_RE = /\x1b\[[0-?]*[ -/]*[@-~]/g;
@@ -507,7 +512,7 @@ export class ModelDiscovery {  private readonly cache = new Map<CliRunner, Runne
           models = [];
         }
         if (models.length === 0) {
-          models = parseLineModelCatalog(await runCommand(resolved.command, ["models"], this.dropTo), "opencode");
+          models = parseLineModelCatalog(await runCommand(resolved.command, ["models"], this.dropTo, OPENCODE_SIMPLE_TIMEOUT_MS), "opencode");
         }
       } else {
         models = parseLineModelCatalog(

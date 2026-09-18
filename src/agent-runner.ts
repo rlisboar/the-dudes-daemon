@@ -10,7 +10,7 @@ import type {ResolvedCliCommands} from "./cli-config.js";
 
 
 import {acquireTurnSlot} from "./runners/turn-gate.js";
-import {recordHang, recordHardRecover} from "./health-monitor.js";
+import {recordHang, recordHardRecover, recordHardRecoverNotified} from "./health-monitor.js";
 import {isGrokFamily, isPerMessageRunner, runnerAdapter} from "./runners/index.js";
 
 
@@ -1385,6 +1385,9 @@ export class AgentRunner {
       );
       if (kind === "hang") this.hardRecoverTimes.push(nowTs);
       const policy = hardRecoverNotifyPolicy(attemptBefore, this.hardRecoverTimes.length, kind);
+      // T-662: o contador do health espelha o que a política decidiu avisar —
+      // o banner do web deixa de disparar em supressões (spam de "1 hard recover").
+      if (policy !== "suppress") recordHardRecoverNotified(this.opts.cliRunner);
       if (policy === "suppress") {
         this.opts.log(
           "warn",

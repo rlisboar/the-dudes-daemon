@@ -53,15 +53,21 @@ function defsToExtras(defs: MCPDefinition[]): Record<string, McpServerConfig> {
   return out;
 }
 
-/** Isola HOME/XDG pro scan só enxergar os fixtures. */
+/** Isola HOME/XDG/QWEN_HOME pro scan só enxergar os fixtures. */
 function useFakeHome(home: string): void {
   const prevHome = process.env.HOME;
   const prevXdg = process.env.XDG_CONFIG_HOME;
+  const prevQwen = process.env.QWEN_HOME;
   process.env.HOME = home;
   process.env.XDG_CONFIG_HOME = path.join(home, ".config");
+  // QWEN_HOME aponta pro settings.json REAL quando a suíte roda dentro de uma
+  // sessão de agente (o path fica FORA do fake HOME) — sem neutralizar, os
+  // MCPs do host vazam no scan e a asserção de conjunto exato quebra.
+  process.env.QWEN_HOME = path.join(home, ".qwen");
   after(() => {
     if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
     if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = prevXdg;
+    if (prevQwen === undefined) delete process.env.QWEN_HOME; else process.env.QWEN_HOME = prevQwen;
   });
 }
 

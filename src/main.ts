@@ -36,11 +36,13 @@ import { applyRunnerPolicy, buildInstalledRunnerAvailability, helloRunnerLists, 
 import { assembleAgentSendParts, contentAadChain, openWithAnyHeldProject, type FromDaemon, type FromOrch, type TaskUpdatedEv } from "./protocol.js";
 import { runSummarizer } from "./summarizer-runner.js";
 import { aadV2, E2EE_TABLE } from "@the-dudes/protocol/e2ee-fields";
+import { interpolateMissionMemory } from "@the-dudes/protocol/mission-memory";
 import { decryptForProject, decryptImageAttachments, encryptForProject, countUsableProjectKeys, forgetAllProjectKeys, getDaemonPublicKey, hasProjectKey, isE2eEncrypted, isE2eeRequired, listHeldProjectIds, rememberProjectKey, setE2eeRequired } from "./daemon-crypto.js";
 import { decryptTranscriptBlobs, TRANSCRIPT_DECRYPT_REASONS } from "./transcript-decrypt.js";
 import { dispatchWebhook } from "./webhook-dispatch.js";
 import { ModelDiscovery } from "./model-discovery.js";
 import { parseGitPorcelain } from "./git-status.js";
+import { runPs, runSuiteParkCli, startSuitePark, suiteParkCliArgs, type SuiteParkHandle } from "./suite-park.js";
 import { createTaskWorktree, removeTaskWorktree } from "./task-workspace.js";
 import { applyMemoryBlockBudget, MEMORY_HOTSET_BUDGET_CHARS, type MemoryBlockItem } from "./memory-utils.js";
 
@@ -175,7 +177,15 @@ Options:
   --cli-config  Local JSON file with cliPaths overrides (default: ~/.the-dudes/daemon-config.json)
   --claude-path / --opencode-path / --gemini-path / --qwen-path / --codex-path / --crush-path / --grok-path
              Manual executable overrides for each CLI
-  -h, --help Show this help`);
+  -h, --help Show this help
+
+Diagnóstico (roda sem --orch/--token, não abre WS):
+  --list-suites        Lista as suites de teste vivas no host e classifica
+                       cada uma como viva/pendurada pelo critério de CPU
+  --reap-suites        Igual, e mata a ÁRVORE das penduradas (raiz + workers
+                       + o grep do pipeline). SIGTERM e, se resistir, SIGKILL
+  --suite-window-ms N  Janela de medição de CPU (default 60000)
+  --suite-min-age-ms N Idade mínima da raiz para ser candidata (default 600000)`);
 }
 
 /** Exportado p/ teste unitário (T-252) — o bootstrap real continua privado
@@ -341,6 +351,16 @@ export class DaemonClient {
       const status = this.cliCommands[runner];
       log(status.available ? "info" : "warn", formatCliStatus(runner, status));
     });
+    // T-582: suites de teste abandonadas por turnos que terminaram sobrevivem
+    // no host para sempre (13 acumuladas, a mais antiga com 1d18h). O loop
+    // classifica por CPU parada e mata a árvore. Opt-out: THE_DUDES_SUITE_PARK=0.
+    if (process.env.THE_DUDES_SUITE_PARK !== "0") {
+      try {
+        this.suitePark = startSuitePark({ log: (level, msg) => log(level, msg) });
+      } catch (e) {
+        log("warn", `suite-park init falhou: ${(e as Error).message}`);
+      }
+    }
     this.connect();
   }
 
@@ -811,6 +831,20 @@ export class DaemonClient {
           }
           if (msg.systemPrefix) content = msg.systemPrefix + content;
           if (msg.systemSuffix) content = content + msg.systemSuffix;
+        }
+        // T-594: `{{mem.NAME}}` do prompt de step. Sob E2EE o placeholder mora
+        // DENTRO do blob cifrado, então o `replace` que o server faz no tick não
+        // casa nada e o subagente recebia o literal. O plaintext só existe aqui,
+        // então o server manda o mapa da mission scratch no campo opcional
+        // `mem` e a interpolação acontece sobre o conteúdo JÁ montado/decifrado
+        // — a MESMA função que o server usa no caminho em claro. Sem `mem`
+        // (server antigo) nada muda.
+        if (msg.mem) {
+          const antes = content;
+          content = interpolateMissionMemory(content, msg.mem);
+          if (content !== antes) {
+            log("info", `agent:send mem: ${Object.keys(msg.mem).length} chave(s) — placeholder resolvido agent=${msg.agentId}`);
+          }
         }
         let images = decryptImageAttachments(msg.images, sealPid);
         if (images === null) {
@@ -2165,6 +2199,8 @@ export class DaemonClient {
     }, DaemonClient.HEARTBEAT_INTERVAL_MS);
   }
   private selfUpdateTimer: NodeJS.Timeout | null = null;
+  /** T-582: detector + reaper de suites de teste penduradas. */
+  private suitePark: SuiteParkHandle | null = null;
   /** T-051: GC de ~/.grok/sessions/the-dudes-cli-* (summarizer). */
   private grokSessionCleanup: { stop: () => void } | null = null;
 
@@ -2265,6 +2301,8 @@ export class DaemonClient {
       this.stopHeartbeat();
       try { this.grokSessionCleanup?.stop(); } catch { /* noop */ }
       this.grokSessionCleanup = null;
+      try { this.suitePark?.stop(); } catch { /* noop */ }
+      this.suitePark = null;
       forgetAllProjectKeys();
       try { this.ws?.close(1000, "shutdown"); } catch {}
       // Remove o marker de liveness pra não bloquear o sweep do próximo boot.
@@ -2348,6 +2386,20 @@ function cliLog(level: "info" | "warn" | "error", msg: string) {
  * 100% idêntico ao de antes.
  */
 const SELF_BOOTSTRAP = process.env.THE_DUDES_DAEMON_TEST !== "1";
+
+/**
+ * T-582: modo diagnóstico — `--list-suites` (lista) / `--reap-suites`
+ * (lista e mata). Roda e sai ANTES do parseCli, que exige --orch/--token e
+ * que não tem a ver com um comando de inspeção do host. `fs.writeSync(1, …)`
+ * porque `process.exit` truncaria um stdout em pipe.
+ */
+if (SELF_BOOTSTRAP) {
+  const park = suiteParkCliArgs(process.argv.slice(2));
+  if (park) {
+    process.exit(runSuiteParkCli(park, { out: (s) => { fs.writeSync(1, s); }, ps: runPs }));
+  }
+}
+
 const args: Args = SELF_BOOTSTRAP
   ? parseCli()
   : {

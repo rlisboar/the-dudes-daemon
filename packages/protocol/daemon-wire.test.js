@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, URL } from "node:url";
 import { daemonWireSchemas, fromOrchSchemas, validateDaemonMessage } from "./daemon-wire.js";
 
 /**
@@ -81,6 +81,16 @@ test("T-423: payload válido conhecido passa; campo errado recusa", () => {
   assert.equal(validateDaemonMessage({ type: "agent:text", agentId: "a1" }).ok, false);
   // erro aponta o campo
   assert.match(validateDaemonMessage({ type: "agent:text", agentId: 7, text: "x" }).error, /agentId/);
+});
+
+test("T-594: agent:send aceita `mem` (mapa de mission scratch) e recusa valor não-string", () => {
+  const schema = fromOrchSchemas["agent:send"];
+  assert.ok(schema, "agent:send sumiu do contrato FromOrch");
+  const base = { type: "agent:send", agentId: "a1", content: "oi" };
+  assert.equal(schema.safeParse(base).success, true, "sem mem continua válido (campo opcional)");
+  assert.equal(schema.safeParse({ ...base, mem: {} }).success, true);
+  assert.equal(schema.safeParse({ ...base, mem: { RESULTADO: "relatorio" } }).success, true);
+  assert.equal(schema.safeParse({ ...base, mem: { RESULTADO: 42 } }).success, false, "valor não-string");
 });
 
 test("T-423: scanner aninhado tolera campo novo (passthrough) mas exige o núcleo", () => {

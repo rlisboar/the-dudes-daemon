@@ -283,6 +283,14 @@ const PEER_OS_WALK_MAX = 10;
  */
 const PEER_RESOLVE_ATTEMPTS = 3;
 
+/**
+ * #596: ops do bridge cuja resposta traz UM task em `{ task }`. São as rotas
+ * de leitura/escrita do MESMO par title/description do `tasks_list` — a
+ * allowlist de decrypt tem de cobri-las, senão o agente lê `e2e:v2:…` no
+ * `get_task` e no retorno do `update_task` enquanto a lista entrega em claro.
+ */
+const TASK_SINGLE_OPS = new Set(["tasks_get", "tasks_add", "tasks_update", "tasks_lock", "tasks_unlock"]);
+
 /** Fatos do SO por conexão Unix — nunca o resultado da autorização. */
 type PeerOsFacts = {
   peerPid?: number | null;
@@ -824,7 +832,13 @@ export class BridgeRelay {
       // plaintext. Server stores ciphertext per project; daemon holds the
       // project key and rewrites the response body in place before handing
       // it to the MCP bridge child.
-      const m2 = parsed.pathname.match(/^\/api\/bridge\/([^/]+)\/(tasks_list|tasks_comment_list|goals_list|memory_list|plans_list|plans_get|plans_create|plans_add_task|plans_apply_tasks)$/);
+      //
+      // #596: a allowlist tinha só ops de LISTA. As ops que devolvem UMA task
+      // (`tasks_get` e as confirmações de escrita) ficavam de fora — o agente
+      // via `e2e:v2:…` no `get_task`/`add_task` enquanto `list_tasks full=true`
+      // entregava em claro. Mesma classe de bug: rota de leitura do mesmo
+      // campo com allowlist diferente.
+      const m2 = parsed.pathname.match(/^\/api\/bridge\/([^/]+)\/(tasks_list|tasks_get|tasks_add|tasks_update|tasks_lock|tasks_unlock|tasks_comment_list|goals_list|memory_list|plans_list|plans_get|plans_create|plans_add_task|plans_apply_tasks)$/);
       if (m2 && this.agentProjectLookup && upstream.status === 200) {
         const agentId = m2[1];
         const op = m2[2];
@@ -841,6 +855,11 @@ export class BridgeRelay {
                 if (p != null) return p;
               }
               return s;
+            };
+            const decTask = (t: any): void => {
+              if (!t || typeof t !== "object") return;
+              if (t.title) t.title = dec(t.title, E2EE_TABLE.TASKS, "title");
+              if (t.description) t.description = dec(t.description, E2EE_TABLE.TASKS, "description");
             };
             const decryptPlanTasks = (tasks: any[]) => {
               for (const t of tasks) {
@@ -859,10 +878,18 @@ export class BridgeRelay {
               }
             };
             if (op === "tasks_list" && Array.isArray(json.tasks)) {
-              for (const t of json.tasks) {
-                if (t.title) t.title = dec(t.title, E2EE_TABLE.TASKS, "title");
-                if (t.description) t.description = dec(t.description, E2EE_TABLE.TASKS, "description");
-              }
+              for (const t of json.tasks) decTask(t);
+            } else if (TASK_SINGLE_OPS.has(op) && json.task && typeof json.task === "object") {
+              // #596: tasks_get / tasks_add / tasks_update / tasks_lock /
+              // tasks_unlock devolvem `{ task }` — a mesma projeção cifrada
+              // que o tasks_list. Sem isto o agente recebe o blob no lugar do
+              // texto (e o `update_task` "confirma" com ciphertext).
+              //
+              // Gate por OP (e não só por `json.task`) de propósito: `plans_*`
+              // devolve `{ plan }` e o ramo do plano tem de continuar sendo
+              // alcançado. Um `else if` só por forma de campo engoliria
+              // qualquer op futura que carregue `task` de outra tabela.
+              decTask(json.task);
             } else if (op === "tasks_comment_list" && Array.isArray(json.comments)) {
               for (const c of json.comments) {
                 if (c.content) c.content = dec(c.content, E2EE_TABLE.TASK_COMMENTS, "content");

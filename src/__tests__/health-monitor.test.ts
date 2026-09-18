@@ -2,7 +2,7 @@ import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import {
   _resetForTest, healthSnapshot, recentLogs, recordHang, recordHardRecover,
-  recordLog, recordTurnEnd, recordTurnStart, recordWsRtt,
+  recordHardRecoverNotified, recordLog, recordTurnEnd, recordTurnStart, recordWsRtt,
 } from "../health-monitor.js";
 
 const deps = { turnGate: { ativos: 1, fila: 0, max: 3 }, agentsRunning: 2, e2eeProjects: 1 };
@@ -13,9 +13,10 @@ test("contadores por runner e totais fecham", () => {
   recordTurnStart("grok"); recordTurnEnd("grok", 1200, true);
   recordTurnStart("grok"); recordTurnEnd("grok", 3400, false);
   recordTurnStart("gemini"); recordTurnEnd("gemini", 800, true);
-  recordHang("grok"); recordHardRecover("grok");
+  recordHang("grok"); recordHardRecover("grok"); recordHardRecoverNotified("grok");
   const h = healthSnapshot(deps);
-  assert.deepEqual(h.turns, { started: 3, ok: 2, failed: 1, hardRecovers: 1, hangs: 1 });
+  assert.deepEqual(h.turns, { started: 3, ok: 2, failed: 1, hardRecovers: 1, hardRecoversNotified: 1, hangs: 1 });
+  assert.equal(h.byRunner.grok!.hardRecoversNotified, 1, "T-662: contador notificado por runner");
   assert.equal(h.byRunner.grok!.failed, 1);
   assert.equal(h.byRunner.gemini!.ok, 1);
   assert.equal(h.agentsRunning, 2);

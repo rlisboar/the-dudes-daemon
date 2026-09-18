@@ -281,6 +281,15 @@ export interface AgentSend {
    *  `systemSuffix` and concatenates parts in order, decrypting each
    *  cipher part with the project key. */
   parts?: AgentSendPart[];
+  /**
+   * T-594: mission scratch (`{{mem.NAME}}`) pro daemon interpolar DEPOIS de
+   * decifrar/montar o conteúdo. Existe porque o placeholder pode morar dentro
+   * de um blob cifrado — o server, sem a chave, não o vê. Os valores vão em
+   * CLARO: a mission_memory é texto claro at rest (o server é quem a escreve,
+   * via `<<<MEM_SET k=v>>>` do output). Opcional; costuma acompanhar `parts`,
+   * mas o prompt de reviewer (que o server não passa) pode vir sem elas.
+   */
+  mem?: Record<string, string>;
   /** Project the message belongs to — required for E2EE decrypt. */
   projectId?: string;
   images?: ImageAttachment[];
@@ -963,10 +972,10 @@ export interface DaemonHealthEv {
     memRssMb: number;
     wsRttMs: number | null;
     turnGate: { active: number; queued: number; max: number };
-    turns: { started: number; ok: number; failed: number; hardRecovers: number; hangs: number };
+    turns: { started: number; ok: number; failed: number; hardRecovers: number; hardRecoversNotified?: number; hangs: number };
     turnP50Ms: number | null;
     turnP95Ms: number | null;
-    byRunner: Record<string, { started: number; ok: number; failed: number; hardRecovers: number; hangs: number }>;
+    byRunner: Record<string, { started: number; ok: number; failed: number; hardRecovers: number; hardRecoversNotified?: number; hangs: number }>;
     agentsRunning: number;
     e2eeProjects: number;
     /** T-088: identidade da imagem em execução (mesmo contrato do hello). */

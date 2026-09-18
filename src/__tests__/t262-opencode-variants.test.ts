@@ -106,11 +106,11 @@ test("T-262 r1 (QA): registry ADITIVO — scan não apaga modelos de fora do bat
 
 test("T-262 r1 (QA): timeout por run — --verbose não pode herdar/stampar o default", () => {
   // O contrato é estático (sem relógio no unit): runCommand aceita timeoutMs
-  // e o ramo opencode passa OPENCODE_VERBOSE_TIMEOUT_MS < default. Fonte lida
-  // direto para provar que a tentativa verbose tem teto PRÓPRIO.
+  // e o ramo opencode passa OPENCODE_VERBOSE_TIMEOUT_MS (teto PRÓPRIO; T-664
+  // subiu o valor para o medido real — o teste trava o CALL-SITE, não o 8s).
   const src = readFileSync(new URL("../model-discovery.ts", import.meta.url), "utf8");
   assert.match(src, /function runCommand\([^)]*timeoutMs/);
-  assert.match(src, /OPENCODE_VERBOSE_TIMEOUT_MS\s*=\s*8_000/);
+  assert.match(src, /OPENCODE_VERBOSE_TIMEOUT_MS\s*=\s*40_000/);
   assert.match(src, /\["models", "--verbose"\], this\.dropTo, OPENCODE_VERBOSE_TIMEOUT_MS/);
 });
 

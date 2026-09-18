@@ -31,7 +31,7 @@
     "@the-dudes/protocol": "file:packages/protocol",
     "undici": "^8.10.2",
     "ws": "^8.21.3",
-    "zod": "^3.23.8"
+    "zod": "^4.6.4"
   },
   "devDependencies": {
     "@types/node": "^22.7.4",

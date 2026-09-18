@@ -350,7 +350,7 @@ server.tool(
 
 server.tool(
   "list_tasks",
-  "List tasks of the current project in BRIEF form (id, number, title, status, assignee, lock/blocker/goal markers) — descriptions are NOT included to keep the payload small. Filter with status/assignee/limit; pass full=true to include descriptions, or call get_task for one task's details.",
+  "List tasks of the current project in BRIEF form (id, number, title, status, assignee, lock/blocker/goal markers) — descriptions are NOT included to keep the payload small. Filter with status/assignee/limit; pass full=true to include descriptions, or call get_task for one task's details. A primeira linha e a contagem: `M de N task(s)` (N = casam com o filtro, ANTES do `limit`); se M < N a lista esta CAPADA e a marcacao diz isso — nao trate uma lista capada como o board inteiro.",
   {
     status: z.enum(["todo", "doing", "done", "blocked"]).optional(),
     assignee: z.string().optional().describe("Teammate name or id"),
@@ -361,10 +361,24 @@ server.tool(
     try {
       const r = await postJSON("tasks_list", { status, assignee, limit, brief: !full });
       const tasks = r.tasks ?? [];
+      // T-574: `total` (quantas casam com o filtro, ANTES do slice) existe para o
+      // leitor distinguir lista COMPLETA de lista CAPADA. Sem expor isto aqui, o
+      // cliente que mais usamos — este — nao veria a novidade, e um cap na rota
+      // continuaria invisivel: a varredura de locks sairia parcial em silencio.
+      // Servidor anterior ao deploy nao manda `total`: cai no formato antigo.
+      const total = typeof r.total === "number" && Number.isInteger(r.total) && r.total >= 0
+        ? r.total as number
+        : undefined;
+      const capado = total !== undefined && total > tasks.length;
+      const cabecalho = total === undefined
+        ? ""
+        : `${tasks.length} de ${total} task(s)` +
+          (capado ? " — CAPADO: lista PARCIAL, refine o filtro ou aumente o `limit`" : "") +
+          "\n";
       if (tasks.length === 0) {
-        return { content: [{ type: "text", text: "(no tasks yet)" }] };
+        return { content: [{ type: "text", text: `${cabecalho}(no tasks yet)` }] };
       }
-      const text = tasks
+      const text = cabecalho + tasks
         .map((t: any) => {
           const assignee = t.assigneeAgentId ? ` @${t.assigneeAgentId}` : "";
           const locked = t.lockedByAgentId ? ` 🔒` : "";

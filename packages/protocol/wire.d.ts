@@ -1096,10 +1096,10 @@ export interface DaemonHealth {
   /** RTT do ping WS daemon↔orchestrator (ms); null antes da 1ª medição. */
   wsRttMs: number | null;
   turnGate: { active: number; queued: number; max: number };
-  turns: { started: number; ok: number; failed: number; hardRecovers: number; hangs: number };
+  turns: { started: number; ok: number; failed: number; hardRecovers: number; /** T-662: ausente em daemon antigo — web cai no contador cru. */ hardRecoversNotified?: number; hangs: number };
   turnP50Ms: number | null;
   turnP95Ms: number | null;
-  byRunner: Record<string, { started: number; ok: number; failed: number; hardRecovers: number; hangs: number }>;
+  byRunner: Record<string, { started: number; ok: number; failed: number; hardRecovers: number; hardRecoversNotified?: number; hangs: number }>;
   agentsRunning: number;
   e2eeProjects: number;
   /** T-088: identidade da imagem em execução (mesmo contrato do hello). */
