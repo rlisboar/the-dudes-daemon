@@ -35,6 +35,7 @@ test("T-442: abortSession chama POST /session/:id/abort no serve", async () => {
     spawnServer: () => {
       return spawn(process.execPath, [stub], { stdio: ["ignore", "pipe", "pipe"] });
     },
+    port,
     streamEvents: false,
   });
   await transport.ensureServer();
@@ -42,12 +43,16 @@ test("T-442: abortSession chama POST /session/:id/abort no serve", async () => {
   transport.stop();
   await new Promise<void>((r) => server.close(() => r()));
 
-  assert.deepEqual(hits, [{ method: "POST", url: "/session/ses_abc123/abort" }]);
+  // T-703: readiness é GET /config (1+ probes) antes do abort.
+  const abortIdx = hits.findIndex((h) => h.method === "POST");
+  assert.ok(abortIdx > 0 && hits.slice(0, abortIdx).every((h) => h.method === "GET" && h.url === "/config"));
+  assert.deepEqual(hits.slice(abortIdx), [{ method: "POST", url: "/session/ses_abc123/abort" }]);
 });
 
 test("T-442: abortSession sem serve é no-op", async () => {
   const transport = new OpenCodeTransport({
     spawnServer: () => { throw new Error("não deve subir"); },
+    port: 1,
     streamEvents: false,
   });
   await transport.abortSession("s1");

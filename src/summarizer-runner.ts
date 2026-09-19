@@ -25,6 +25,7 @@ import { buildSummarizerEnv } from "./runners/env.js";
 import { grokHomePath } from "./runners/runtime-files.js";
 import { acquireTurnSlot } from "./runners/turn-gate.js";
 import type { CliRunner } from "./types.js";
+import { OPENCODE_BOOT_TIMEOUT_MS, OPENCODE_PROBE_TIMEOUT_MS, freeLoopbackPort } from "./runners/opencode-transport.js";
 
 /** Env Grok do one-shot (summarizer/reply-suggester). T-164/T-168:
  *  grok-custom NÃO aponta pra ~/.grok — GROK_HOME vem do helper T-166
@@ -226,8 +227,16 @@ async function runOpenCodeText(prompt: string, args: CliTextArgs, cwd: string, e
   const modelID = slash > 0 ? raw.slice(slash + 1) : raw;
 
   let proc;
+  // T-703: porta livre do SO passada explícita; readiness por GET /config.
+  let port: number;
   try {
-    proc = spawnDropped(cliCommand, ["serve", "--port", "0", "--hostname", "127.0.0.1"], { cwd, env, stdio: ["ignore", "pipe", "pipe"] }, args.dropTo ?? null);
+    port = await freeLoopbackPort();
+  } catch (e) {
+    try { rmSync(cwd, { recursive: true, force: true }); } catch { /* ignore */ }
+    return { ok: false, error: `opencode serve sem porta loopback livre: ${(e as Error).message}` };
+  }
+  try {
+    proc = spawnDropped(cliCommand, ["serve", "--port", String(port), "--hostname", "127.0.0.1"], { cwd, env, stdio: ["ignore", "pipe", "pipe"] }, args.dropTo ?? null);
   } catch (e) {
     try { rmSync(cwd, { recursive: true, force: true }); } catch { /* ignore */ }
     return { ok: false, error: `opencode serve spawn falhou: ${(e as Error).message}` };
@@ -240,15 +249,15 @@ async function runOpenCodeText(prompt: string, args: CliTextArgs, cwd: string, e
   };
 
   try {
-    const serveUrl = await new Promise<string>((resolve, reject) => {
-      let buf = "";
-      const onData = (c: string) => { buf += c; const m = buf.match(/https?:\/\/[\w.:-]+:\d+/); if (m) resolve(m[0]); };
-      proc.stdout?.setEncoding("utf8");
-      proc.stderr?.setEncoding("utf8");
-      proc.stdout?.on("data", onData);
-      proc.stderr?.on("data", onData);
+    const serveUrl = `http://127.0.0.1:${port}`;
+    await new Promise<void>((resolve, reject) => {
+      const until = Date.now() + OPENCODE_BOOT_TIMEOUT_MS;
+      const probe = () => void ocFetch(serveUrl, "/config", "GET", undefined, OPENCODE_PROBE_TIMEOUT_MS).then(() => resolve()).catch(() => {
+        if (Date.now() >= until) reject(new Error(`serve boot timeout (${OPENCODE_BOOT_TIMEOUT_MS / 1000}s)`));
+        else setTimeout(probe, 100);
+      });
       proc.on("exit", (code) => reject(new Error(`serve saiu antes de subir (code ${code})`)));
-      setTimeout(() => reject(new Error("serve boot timeout (10s)")), 10_000);
+      probe();
     });
 
     const sess = await ocFetch(serveUrl, "/session", "POST", providerID && modelID ? { model: { id: modelID, providerID } } : {}, 15_000);

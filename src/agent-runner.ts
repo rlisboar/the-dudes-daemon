@@ -504,9 +504,11 @@ export class AgentRunner {
     }
     this.startHangWatch();
     this.openCodeTransport = new OpenCodeTransport({
-      spawnServer: () => spawnDropped(
+      // T-703: porta loopback explícita (livre, escolhida pelo transporte);
+      // readiness por GET /config — o serve 1.18.31 não depende de URL no stdout.
+      spawnServer: (port) => spawnDropped(
         this.runnerCommand("opencode"),
-        ["serve", "--port", "0", "--hostname", "127.0.0.1"],
+        ["serve", "--port", String(port), "--hostname", "127.0.0.1"],
         { cwd: this.opts.workspaceRoot, env: this.buildEnv(), stdio: ["ignore", "pipe", "pipe"] },
         this.opts.dropTo ?? null,
       ),

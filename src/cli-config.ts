@@ -192,7 +192,7 @@ export function formatCliStatus(label: CliRunner, resolved: ResolvedCliCommand):
  * `exit != 0` limpo, que é resposta. */
 
 /* Orçamentos lado a lado (padrão soft/hard da T-371), ruling PM 2026-09-07:
- * 1.5s inicial / 6s retry único. O retry só se gasta quando a 1ª tentativa
+ * 1.5s inicial / 6s retry único (retry → 20s na T-713, abaixo). O retry só se gasta quando a 1ª tentativa
  * não respondeu; binário que pendura paga 1.5+6 e fica `timeout`
  * (inconclusivo, não cacheado). Mudar números exige medição declarada —
  * ver daemon/medir-boot-375.ts e a entrega da task_28d9976d.
@@ -202,8 +202,16 @@ export function formatCliStatus(label: CliRunner, resolved: ResolvedCliCommand):
  * em série = 22 552ms ≈ 7.5s×3, linear. Com N grande o teto é real — se um
  * dia doer, a mitigação é paralelizar as sondas (a série é escolha, não
  * necessidade), não encurtar orçamentos. */
+/* T-713 (medição declarada, host do dono, 19/09): `opencode --version` 1.18.31
+ * levou 7.26/7.31/7.47/7.63/8.83s de parede com ~1.0s de CPU (espera de I/O,
+ * não pendura). Ficava na fronteira de 1.5s+6s, e a disponibilidade oscilava
+ * a cada boot. O retry único sobe para 20s (2.3× o pior medido). O ruling
+ * T-375 fica igual: timeout continua não sendo prova, inconclusivo não é
+ * cacheado, só exit 0 dá available. Custo: só binário que NÃO responde paga
+ * mais no boot (1.5+20 = 21.5s por pendurado, antes 7.5s). O lento que
+ * responde paga uma vez por path:size:mtime (fica cacheado). */
 export const PROBE_TIMEOUT_MS = 1_500;
-export const PROBE_RETRY_TIMEOUT_MS = 6_000;
+export const PROBE_RETRY_TIMEOUT_MS = 20_000;
 
 export interface RunnerProbeResult {
   ok: boolean;
@@ -325,7 +333,7 @@ function runProbe(binPath: string, timeoutMs: number, retryTimeoutMs: number): R
       // Ruling PM: timeout NÃO é prova. O binário pode estar à espera de
       // auth, com montagem lenta ou FS bloqueado — é o verde incondicional
       // com um cronómetro à frente. Não se passa ao arg seguinte: se não
-      // respondeu num orçamento de 6s, o segundo arg também não responde.
+      // respondeu no orçamento do retry, o segundo arg também não responde.
       return {
         ok: false,
         inconclusive: true,
@@ -356,7 +364,7 @@ function runProbe(binPath: string, timeoutMs: number, retryTimeoutMs: number): R
 /** probeTimeoutMs: injectável para testes (sob carga do suite completo um
  * spawn pode inchar para além do timeout e cair no estado `timeout`
  * — inconclusivo — onde o teste esperava um veredicto; os casos negativos
- * pedem orçamento folgado). Produção usa os defaults: 1.5s + retry 6s. */
+ * pedem orçamento folgado). Produção usa os defaults: 1.5s + retry 20s (T-713). */
 export function resolveCliCommand(
   label: CliRunner | string,
   override?: string,

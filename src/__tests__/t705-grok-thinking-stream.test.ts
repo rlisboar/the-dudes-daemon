@@ -59,6 +59,8 @@ process.stdout.write(JSON.stringify({ type: "end", sessionId: "aaaaaaaa-bbbb-4cc
 
 interface StreamHarness {
   runner: AgentRunner;
+  /** T-712: ordem dos callbacks + marcador do close do processo do turno. */
+  seq: Array<"thinking" | "text" | "close">;
   thinking: Array<{ t: number; text: string }>;
   texts: Array<{ t: number; text: string }>;
   cliLogs: string[];
@@ -85,6 +87,7 @@ function makeStreamHarness(opts: {
     "grok-custom": opts.runnerId === "grok-custom" ? cmd : off(),
     graphify: off(), graphifyMcp: off(),
   };
+  const seq: StreamHarness["seq"] = [];
   const thinking: StreamHarness["thinking"] = [];
   const texts: StreamHarness["texts"] = [];
   const cliLogs: string[] = [];
@@ -103,12 +106,12 @@ function makeStreamHarness(opts: {
     log: (lvl: string, msg: string) => { if (lvl === "warn") warns.push(msg); },
     cliLog: (_lvl: string, msg: string) => { cliLogs.push(msg); },
     onState: () => {},
-    onAssistantText: (text: string) => { texts.push({ t: Date.now(), text }); return true; },
-    onThinkingText: (text: string) => { thinking.push({ t: Date.now(), text }); },
+    onAssistantText: (text: string) => { seq.push("text"); texts.push({ t: Date.now(), text }); return true; },
+    onThinkingText: (text: string) => { seq.push("thinking"); thinking.push({ t: Date.now(), text }); },
     onToolUse: () => {},
     onError: () => {}, onHung: () => {}, onSessionId: () => {}, onExit: () => {},
   } as never);
-  return { runner, thinking, texts, cliLogs, warns };
+  return { runner, seq, thinking, texts, cliLogs, warns };
 }
 
 async function until(cond: () => boolean, what: string, ms = 12_000): Promise<void> {
@@ -136,10 +139,21 @@ async function runStreamCase(runnerId: "grok" | "grok-custom", stub: string): Pr
   const h = makeStreamHarness({ runnerId, stub, collectThinking: true });
   after(() => cleanupRunner(h.runner));
   h.runner.pushUserMessage("ping");
-  await until(() => h.thinking.length > 0, `${runnerId} thinking em stream`);
-  assert.equal(h.texts.length, 0, "thinking ANTES do agent:text — não no close/emitOnce");
+  // T-712: marca o close do processo do turno ANTES do handler do grok.ts
+  // (prependListener), que é quem chama emitOnce → agent:text.
+  const a = h.runner as unknown as Record<string, any>;
+  await until(() => !!a.ocActiveProc, `${runnerId} spawn do turno`);
+  (a.ocActiveProc as import("node:child_process").ChildProcess).prependListener("close", () => h.seq.push("close"));
   await until(() => h.texts.length > 0, `${runnerId} text`);
-  await until(() => !(h.runner as unknown as Record<string, any>).messageSession.busy, `${runnerId} idle`);
+  await until(() => !a.messageSession.busy, `${runnerId} idle`);
+  // Mesma exigência de antes, sem polling de janela: o 1º thinking vem antes
+  // do 1º text E foi emitido no ingest (antes do close/emitOnce).
+  const iThinking = h.seq.indexOf("thinking");
+  const iClose = h.seq.indexOf("close");
+  const iText = h.seq.indexOf("text");
+  assert.ok(iThinking >= 0 && iClose >= 0 && iText >= 0, `seq=${h.seq.join(",")}`);
+  assert.ok(iThinking < iText, `thinking ANTES do agent:text — seq=${h.seq.join(",")}`);
+  assert.ok(iThinking < iClose, `thinking no ingest, não no close/emitOnce — seq=${h.seq.join(",")}`);
   return h;
 }
 

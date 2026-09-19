@@ -17,6 +17,19 @@ import {recordTurnEnd, recordTurnStart} from "../../health-monitor.js";
 import {spawnDropped} from "../../privileges.js";
 
 import path from "node:path";
+/**
+ * T-712: o CLI grok emite `thought` POR TOKEN (QA mediu 24-36 por turno) e
+ * cada onThinkingText vira um bloco na UI. O segmento contíguo de thought é
+ * acumulado e sai como UM bloco quando termina (text, tool, result/error ou
+ * close). Os tetos abaixo mantêm o raciocínio longo visível durante o turno:
+ *  - 8s desde o 1º token do segmento: a UI não fica muda num raciocínio
+ *    longo e, com ~5-30 tokens/s, um bloco reúne dezenas/centenas de tokens;
+ *  - 2000 chars (~400 palavras): um bloco legível sem rolagem longa; acima
+ *    disso vira bloco novo. Nunca 1 bloco por token.
+ */
+export const GROK_THINKING_FLUSH_MS = 8_000;
+export const GROK_THINKING_FLUSH_CHARS = 2_000;
+
 export function buildGrokHeadlessArgs(self: any, 
     prompt: string,
     opts: { resume?: string; outputFormat: "streaming-json" | "json" | "plain"; forCompact?: boolean },
@@ -281,6 +294,9 @@ export async function runGrokMessage(self: any, content: string, images?: ImageA
     let errOut = "";
     let errFromJson = "";
     let emittedAny = false;
+    // T-712: segmento de thought em curso (ver GROK_THINKING_FLUSH_*).
+    let thinkingSeg = "";
+    let thinkingTimer: NodeJS.Timeout | undefined;
     /** @returns true se parseou ≥1 evento semântico (conta pro hang watch). */
     const ingestLine = (line: string): boolean => {
       if (!line.startsWith("{") || !self.messageSession.owns(epoch)) return false;
@@ -288,6 +304,10 @@ export async function runGrokMessage(self: any, content: string, images?: ImageA
         let sawSemantic = false;
         for (const event of parseGrokStreamEvent(JSON.parse(line))) {
           sawSemantic = true;
+          // Fim do segmento de thought: sai ANTES do text/tool (T-705 + T-712).
+          if (event.type === "text" || event.type === "tool" || event.type === "result" || event.type === "error") {
+            flushThinking();
+          }
           if (event.type === "text") {
             fullText += event.text;
             // Texto de assistant após tools = tool loop andou; libera proteção.
@@ -300,7 +320,11 @@ export async function runGrokMessage(self: any, content: string, images?: ImageA
               "info",
               `[cli:${self.info.id}:grok:thinking] block_received len=${event.text.length} collectFlag=${self.info.collectThinking}`,
             );
-            if (self.info.collectThinking && event.text) self.opts.onThinkingText?.(event.text);
+            if (self.info.collectThinking && event.text) {
+              thinkingSeg += event.text;
+              if (thinkingSeg.length >= GROK_THINKING_FLUSH_CHARS) flushThinking();
+              else if (!thinkingTimer) thinkingTimer = setTimeout(flushThinking, GROK_THINKING_FLUSH_MS);
+            }
             self.setState("thinking");
           } else if (event.type === "tool") {
             // Stream ACP emite tool_call ao vivo (CLI ≥0.2) — não esperar poll 3s.
@@ -332,6 +356,15 @@ export async function runGrokMessage(self: any, content: string, images?: ImageA
         if (sawSemantic) self.touchActivity();
         return sawSemantic;
       } catch { /* linha incompleta / ruído */ return false; }
+    };
+    /** T-712: emite o segmento acumulado como UM agent:thinking (texto cru,
+     *  espaços dos tokens preservados). Chamado no fim do segmento e no close. */
+    const flushThinking = (): void => {
+      if (thinkingTimer) { clearTimeout(thinkingTimer); thinkingTimer = undefined; }
+      const seg = thinkingSeg;
+      thinkingSeg = "";
+      if (!seg.trim() || !self.messageSession.owns(epoch)) return;
+      self.opts.onThinkingText?.(seg);
     };
     /** Emite no máximo 1 agent_to_user por turno. @returns false se WS dropou. */
     const emitOnce = (): boolean => {
@@ -377,6 +410,7 @@ export async function runGrokMessage(self: any, content: string, images?: ImageA
     proc.on("close", (code) => {
       // Resto de buffer sem newline final (json single-object ou última linha).
       if (buf.trim()) ingestLine(buf.trim());
+      flushThinking();
       emitOnce();
       if (errFromJson && !emittedAny) {
         self.opts.onError(`grok: ${errFromJson.slice(0, 500)}`);

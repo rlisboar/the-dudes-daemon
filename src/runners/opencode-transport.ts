@@ -1,5 +1,6 @@
 import type { ChildProcess } from "node:child_process";
 import http, { type ClientRequest } from "node:http";
+import net from "node:net";
 import { terminateWithEscalation } from "./process-lifecycle.js";
 
 export class SseJsonDecoder {
@@ -24,6 +25,33 @@ export class SseJsonDecoder {
 export function parseJsonResponse(status: number, text: string): unknown {
   if (status < 200 || status >= 300) throw new Error(`HTTP ${status}${text ? ` — ${text.slice(0, 200)}` : ""}`);
   try { return text ? JSON.parse(text) : {}; } catch { return {}; }
+}
+
+/** Default do boot. Medido no host com o serve 1.18.31: 17.8s e 54.5s até o
+ *  1º /config 2xx (43.8s só para escutar). 10s matava um processo saudável. */
+export const OPENCODE_BOOT_TIMEOUT_MS = 120_000;
+/** Cada GET /config do probe. O 1º /config levou 9.2s (e 3.9s num serve já
+ *  quente); 500ms nunca completava e o boot expirava com o serve saudável.
+ *  Connection refused volta na hora, então isto só pesa com o serve escutando. */
+export const OPENCODE_PROBE_TIMEOUT_MS = 15_000;
+
+/**
+ * T-703: porta loopback livre, escolhida ANTES do spawn e passada explícita
+ * ao `serve --port`. Readiness é GET /config nessa porta, nunca o texto da
+ * URL no stdout. Pedir ao SO (listen 0) evita colisão entre agents e com
+ * serve órfão de um daemon anterior, que responderia /config e daria
+ * ready falso.
+ */
+export function freeLoopbackPort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const probe = net.createServer();
+    probe.unref();
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", () => {
+      const { port } = probe.address() as net.AddressInfo;
+      probe.close(() => resolve(port));
+    });
+  });
 }
 
 export function requestJson(baseUrl: string, requestPath: string, method: string, body?: unknown, timeoutMs = 20_000): Promise<unknown> {
@@ -69,7 +97,9 @@ export class OpenCodeTransport {
   constructor(private readonly input: {
     // ChildProcess (não ...WithoutNullStreams): o serve sobe com
     // stdio ['ignore','pipe','pipe'], ou seja stdin nulo por construção.
-    spawnServer: () => ChildProcess;
+    spawnServer: (port: number) => ChildProcess;
+    /** Porta fixa (testes/stubs). Ausente: porta livre do SO a cada boot. */
+    port?: number;
     streamEvents: boolean;
     onReady?: (url: string) => void;
     onExit?: (code: number | null) => void;
@@ -85,29 +115,51 @@ export class OpenCodeTransport {
     if (this.stopped) return Promise.reject(new Error("serve encerrado"));
     if (this.serverUrl) return Promise.resolve();
     if (this.bootPromise) return this.bootPromise;
-    const boot = new Promise<void>((resolve, reject) => {
-      const process = this.input.spawnServer();
+    const bootTimeoutMs = this.input.bootTimeoutMs ?? OPENCODE_BOOT_TIMEOUT_MS;
+    const boot = (this.input.port != null ? Promise.resolve(this.input.port) : freeLoopbackPort()).then((port) => new Promise<void>((resolve, reject) => {
+      if (this.stopped) { reject(new Error("serve encerrado")); return; }
+      const process = this.input.spawnServer(port);
       this.serverProcess = process;
       let settled = false;
-      let bootOutput = "";
-      const bootTimer = setTimeout(() => {
-        if (settled) return;
+      const targetUrl = `http://127.0.0.1:${port}`;
+      // Probe em voo = o serve já aceitou a conexão. Expirar o boot nesse
+      // momento mataria um processo que está respondendo HTTP: o kill fica
+      // para depois do desfecho desse probe.
+      let probing = false;
+      let timedOut = false;
+      const failBoot = () => {
         settled = true;
         terminateWithEscalation(process);
         if (this.serverProcess === process) {
           this.serverProcess = null;
           this.bootPromise = null;
         }
-        reject(new Error(`opencode serve boot timeout (${(this.input.bootTimeoutMs ?? 10_000) / 1000}s)`));
-      }, this.input.bootTimeoutMs ?? 10_000);
-      const onData = (chunk: string) => {
-        bootOutput = (bootOutput + chunk).slice(-4_096);
-        const match = bootOutput.match(/https?:\/\/[\w.:-]+:\d+/);
-        if (!match || settled || this.serverProcess !== process) return;
+        reject(new Error(`opencode serve boot timeout (${bootTimeoutMs / 1000}s)`));
+      };
+      const bootTimer = setTimeout(() => {
+        if (settled) return;
+        timedOut = true;
+        if (!probing) failBoot();
+      }, bootTimeoutMs);
+      const probe = async () => {
+        if (settled || this.serverProcess !== process) return;
+        probing = true;
+        let ok = false;
+        try {
+          await requestJson(targetUrl, "/config", "GET", undefined, OPENCODE_PROBE_TIMEOUT_MS);
+          ok = true;
+        } catch { /* ainda não escuta, ou respondeu não-2xx */ }
+        probing = false;
+        if (settled || this.serverProcess !== process) return;
+        if (!ok) {
+          if (timedOut) failBoot();
+          else setTimeout(() => { void probe(); }, 100);
+          return;
+        }
         settled = true;
         clearTimeout(bootTimer);
-        this.serverUrl = match[0];
-        this.input.onReady?.(match[0]);
+        this.serverUrl = targetUrl;
+        this.input.onReady?.(targetUrl);
         if (this.input.streamEvents) this.startEventStream();
         resolve();
       };
@@ -119,10 +171,9 @@ export class OpenCodeTransport {
         reject(new Error("opencode serve: stdout/stderr não foram pipeados"));
         return;
       }
-      stdout.setEncoding("utf8");
-      stderr.setEncoding("utf8");
-      stdout.on("data", onData);
-      stderr.on("data", onData);
+      stdout.resume();
+      stderr.resume();
+      void probe();
       process.once("exit", (code) => {
         clearTimeout(bootTimer);
         if (this.serverProcess === process) {
@@ -136,7 +187,7 @@ export class OpenCodeTransport {
           reject(new Error(`opencode serve exited before listening (code ${code})`));
         } else if (!this.stopped) this.input.onExit?.(code);
       });
-    });
+    }));
     this.bootPromise = boot;
     void boot.catch(() => { if (this.bootPromise === boot) this.bootPromise = null; });
     return boot;
