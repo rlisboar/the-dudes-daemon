@@ -86,11 +86,12 @@ test("T-448 wiring: stop e shutdown removem o worktree do entry", () => {
   assert.match(src, /\.\.\.\(agentWorktree \? \{ worktreePath: agentWorktree\.path, gitRoot: agentWorktree\.gitRoot \} : \{\}\)/);
   const stopIdx = src.indexOf("  stop(agentId: string) {");
   assert.match(src.slice(stopIdx, stopIdx + 300), /void this\.removeWorktreeOf\(e\)/);
-  const shutdownIdx = src.indexOf("  async shutdown(): Promise<void> {");
+  // T-710b: shutdown ganhou opts.reexec e devolve a contagem de runners.
+  const shutdownIdx = src.indexOf("  async shutdown(opts: { reexec?: boolean } = {}): Promise<number> {");
   assert.ok(shutdownIdx > 0, "shutdown async");
   assert.match(src.slice(shutdownIdx, shutdownIdx + 600), /removals\.push\(this\.removeWorktreeOf\(e\)\)/);
   const main = readFileSync(new URL("../main.ts", import.meta.url), "utf8");
-  assert.match(main, /await this\.host\.shutdown\(\)/);
+  assert.match(main, /await this\.host\.shutdown\(\{ reexec: !!opts\.keepRunning \}\)/);
 });
 
 test("T-448: AgentHost.shutdown existe e é async", async () => {

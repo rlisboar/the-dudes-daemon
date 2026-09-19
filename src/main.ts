@@ -2224,7 +2224,7 @@ export class DaemonClient {
           && !this.host.hasActiveTurn();
       },
       // T-100: idle-restart mata CLIs (detached:true) ANTES do exit 42.
-      prepareReexec: () => this.prepareReexec(),
+      prepareReexec: () => this.prepareReexec({ keepRunning: true }),
     }),
     log: (level, msg) => log(level, msg),
   });
@@ -2278,10 +2278,14 @@ export class DaemonClient {
   private shuttingDown = false;
 
   /** T-100: só os filhos/CLIs — NÃO process.exit. O caller decide 0 vs 42. */
-  private async prepareReexec(): Promise<void> {
+  /** T-710b: keepRunning=true só no re-exec do self-update (exit 42): os
+   *  agentes seguem running no server e o hello do processo novo os religa.
+   *  O shutdown normal (SIGTERM) chama sem flag e anuncia o exit. */
+  private async prepareReexec(opts: { keepRunning?: boolean } = {}): Promise<void> {
     log("info", "[self-update] parando CLIs filhos antes do re-exec");
     try { stopAllGraphWatches(); } catch { /* noop */ }
-    await this.host.shutdown();
+    const n = await this.host.shutdown({ reexec: !!opts.keepRunning });
+    if (opts.keepRunning) log("info", `[self-update] reexec: ${n} agent(s) mantidos running`);
     // terminateWithEscalation agenda SIGKILL em ~1.5s; espera o timer.
     await new Promise((r) => setTimeout(r, 2_500));
   }

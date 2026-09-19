@@ -649,6 +649,11 @@ export class AgentHost {
           return;
         }
         if (e) e.runner = null;
+        if (this.reexecuting) {
+          // T-710b: re-exec do self-update — sem exit/running false (ver `reexecuting`).
+          breadcrumb("agent", "exit-reexec", { agentId: msg.agent.id, code, runner: cliRunner });
+          return;
+        }
         this.deliver({ type: "agent:exit", agentId: msg.agent.id, code });
         this.deliver({ type: "agent:running", agentId: msg.agent.id, running: false });
         breadcrumb("agent", "exit", { agentId: msg.agent.id, code, runner: cliRunner });
@@ -801,9 +806,23 @@ export class AgentHost {
 
   /** M25 (T-448): async — além de parar os runners, remove os worktrees
    *  (com teto de 2s; main espera 2.5s antes do re-exec). */
-  async shutdown(): Promise<void> {
+  /** T-710b: re-exec do self-update em curso — os CLIs morrem, mas o agente
+   *  NÃO parou para o time. onExit não anuncia exit/running false ao server
+   *  (ele seguiria marcando parada normal, e o hello do processo novo não
+   *  teria o que religar). O server mantém running=true, a graça de offline
+   *  cobre o gap e o replay do hello re-spawna. Processo novo que não volta:
+   *  a graça expira e daemonWentOffline marca + auto-resume. */
+  private reexecuting = false;
+
+  /** @param opts.reexec re-exec do self-update (exit 42): não anuncia exit.
+   *  Shutdown normal (SIGTERM/stop): anuncia, como sempre.
+   *  @returns quantos agentes com runner foram parados (mantidos running no server se reexec). */
+  async shutdown(opts: { reexec?: boolean } = {}): Promise<number> {
+    if (opts.reexec) this.reexecuting = true;
+    let comRunner = 0;
     const removals: Promise<void>[] = [];
     for (const e of this.entries.values()) {
+      if (e.runner) comRunner++;
       if (e.runner) try { e.runner.stop(); } catch {}
       removals.push(this.removeWorktreeOf(e));
     }
@@ -811,5 +830,6 @@ export class AgentHost {
       Promise.allSettled(removals),
       new Promise<void>((r) => setTimeout(r, 2_000)),
     ]);
+    return comRunner;
   }
 }

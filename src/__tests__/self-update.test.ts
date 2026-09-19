@@ -456,7 +456,8 @@ test("T-100 sem launcher: pending, sem exit, sem matar filhos", async () => {
 
 test("T-100 main.ts injeta prepareReexec no checkAndApplyUpdate", () => {
   const src = readFileSync(new URL("../main.ts", import.meta.url), "utf8");
-  assert.match(src, /prepareReexec:\s*\(\)\s*=>\s*this\.prepareReexec\(\)/);
+  // T-710b: o self-update injeta com keepRunning (re-exec não anuncia exit).
+  assert.match(src, /prepareReexec:\s*\(\)\s*=>\s*this\.prepareReexec\(\{\s*keepRunning:\s*true\s*\}\)/);
   assert.match(src, /parando CLIs filhos antes do re-exec/);
   assert.doesNotMatch(src, /process\.exit\(42\)/);
 });
