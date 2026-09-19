@@ -5,6 +5,9 @@
  *     real ⇒ zero sintéticas; 3º dentro da janela ⇒ notifica e não enfileira.
  * (b) fase SOFT nunca arma nudge.
  *
+ * T-689: o 3º (park) leva `parked: true` no onHung — o server usa a flag para
+ * o push ativo ao orquestrador; o hard comum NÃO leva a flag.
+ *
  * Padrão T-240: AgentRunner REAL com tick chamado à mão e drainOcQueue stubado
  * (o stub deixa o respawn observável sem spawnar CLI).
  */
@@ -25,11 +28,11 @@ const MIN = 60_000;
 
 function makeRunner(cliRunner: string): {
   runner: AgentRunner;
-  events: Array<{ soft: boolean; reason: string }>;
+  events: Array<{ soft: boolean; reason: string; parked?: boolean }>;
   logs: string[];
   drains: { n: number };
 } {
-  const events: Array<{ soft: boolean; reason: string }> = [];
+  const events: Array<{ soft: boolean; reason: string; parked?: boolean }> = [];
   const logs: string[] = [];
   const drains = { n: 0 };
   const info = {
@@ -45,7 +48,7 @@ function makeRunner(cliRunner: string): {
     cliLog: () => {}, onState: () => {},
     onAssistantText: () => true, onToolUse: () => {},
     onError: () => {},
-    onHung: (h: { soft: boolean; reason: string }) => { events.push(h); },
+    onHung: (h: { soft: boolean; reason: string; parked?: boolean }) => { events.push(h); },
     onExit: () => {},
   } as never;
   const runner = new AgentRunner(info, opts);
@@ -132,10 +135,29 @@ test("T-364 (a3): 3º auto-continue na janela de 30min ⇒ notifica o dono, log 
   const notice = events.filter((e) => /auto-continue esgotado/.test(e.reason));
   assert.equal(notice.length, 1, "1 notificação ao dono");
   assert.equal(notice[0]!.soft, false, "notificação de fase hard");
+  // T-689: o park é marcado — o server converte em push ativo ao orquestrador.
+  assert.equal(notice[0]!.parked, true, "park marcado no onHung");
+  assert.match(notice[0]!.reason, /agente parado, envia mensagem pra retomar/);
   assert.ok(
     logs.some((l) => /auto-continue esgotado/.test(l)),
     "log warn do orçamento esgotado",
   );
+});
+
+test("T-689: hard comum NÃO leva parked — só o park leva (registro distinto de idle)", async () => {
+  // attempt≥1: o recover notifica na hora (immediate) e AINDA há orçamento de
+  // nudge (o park não acontece) — o onHung vem do recover, sem a flag.
+  const { runner, events } = makeRunner("codex");
+  const a = asAny(runner);
+  armDeadTurn(a, { content: "msg", attempt: 1 });
+
+  tick(runner);
+  await settle();
+
+  assert.equal(events.length, 1, "1 notificação (immediate do recover)");
+  assert.equal(events[0]!.soft, false);
+  assert.equal(events[0]!.parked, undefined, "hard comum não é park");
+  assert.match(events[0]!.reason, /retry esgotado/);
 });
 
 test("T-364 (a3b): janela é rolante — timestamps fora dos 30min não contam", () => {

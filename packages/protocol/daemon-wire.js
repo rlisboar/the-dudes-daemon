@@ -107,7 +107,7 @@ export const daemonWireSchemas = {
     errorKind: z.enum(["rate_limit", "other"]).optional(),
     migrationId: t.optional(),
   }),
-  "agent:hung": msg("agent:hung", { agentId: id, soft: b, reason: t, idleMs: n, runner: t.optional() }),
+  "agent:hung": msg("agent:hung", { agentId: id, soft: b, reason: t, idleMs: n, runner: t.optional(), parked: b.optional() }),
   "agent:exit": msg("agent:exit", { agentId: id, code: n.nullable() }),
   "agent:context": msg("agent:context", { agentId: id, used: n, limit: n }),
   "agent:context_warning": msg("agent:context_warning", { agentId: id, used: n, limit: n }),

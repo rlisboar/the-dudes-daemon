@@ -55,8 +55,10 @@ test("T-055 aceite: turno enfileirado >hardMs NÃO dispara hang (queued)", async
   assert.equal(waiterGranted, false);
   assert.ok(logs.some((l) => l.includes("aguardando slot")), `forense log: ${logs.join(" | ")}`);
 
-  // Simula idle >= hardMs enquanto queued (antes: hang falso)
-  const idleMs = t.hardMs + 5_000;
+  // Simula idle acima do teto EFETIVO enquanto queued (antes: hang falso).
+  // T-685: pós-evento quem decide é o teto declarado (postEventMs), não o
+  // limiar seco de 120s.
+  const idleMs = (t.postEventMs ?? t.hardMs) + 5_000;
   assert.equal(
     wouldHardRecover({ waitingTurnGate: true, state: "queued", idleMs }),
     false,
@@ -155,15 +157,24 @@ test("T-055 aceite: BridgeRelay timeout = 25s", () => {
   assert.equal(BridgeRelay.UPSTREAM_FETCH_TIMEOUT_MS, 25_000);
 });
 
-test("T-055 regressão: turno COM processo spawned mudo >hardMs ainda hard", () => {
+test("T-055 regressão: turno COM processo spawned mudo >teto pós-evento ainda hard (T-685)", () => {
   const t = hangThresholds("grok");
+  const ceiling = t.postEventMs ?? t.hardMs;
+  // T-685: o limiar seco de 120s deixou de matar pós-evento (vira soft);
+  // o recolhimento segue no teto declarado.
+  assert.equal(
+    wouldHardRecover({ waitingTurnGate: false, state: "thinking", idleMs: t.hardMs + 1 }),
+    false,
+    "pós-evento aos 120s já não é hard (T-685)",
+  );
   assert.equal(
     wouldHardRecover({
       waitingTurnGate: false,
       state: "thinking",
-      idleMs: t.hardMs + 1,
+      idleMs: ceiling + 1,
     }),
     true,
+    "no teto pós-evento o turno mudo ainda é recolhido",
   );
 });
 

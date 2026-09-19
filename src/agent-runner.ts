@@ -149,8 +149,11 @@ export interface AgentRunnerOptions {
   /**
    * Hang detection (0 tokens): soft = stalled/avisando; hard = turno morto
    * e busy liberado. Server usa hard pra abortar mission steps.
+   * T-689: `parked` marca o hard que é PARK (orçamento de auto-continue
+   * esgotado, fila vazia) — o server emite push ativo ao orquestrador e um
+   * registro próprio, distinto de idle e do hard comum.
    */
-  onHung?: (info: { soft: boolean; reason: string; idleMs: number }) => void;
+  onHung?: (info: { soft: boolean; reason: string; idleMs: number; parked?: boolean }) => void;
   /** projectId (pra rotular graph:status emitido pelo auto-build do grafo). */
   projectId?: string;
   /** Reporta status do índice graphify durante o auto-build no spawn. */
@@ -1225,9 +1228,10 @@ export class AgentRunner {
 
     // T-593: cold start (turno ainda sem NENHUM evento semântico) usa a janela
     // firstEventMs em vez do hardMs seco — medido: 121/124 hard recovers de prod
-    // disparavam no limiar de 120s com o turno apenas carregando o CLI. Depois
-    // do primeiro evento volta ao hardMs (turno que emitiu e ficou quieto segue
-    // sendo recolhido aos 120s — sem regressão).
+    // disparavam no limiar de 120s com o turno apenas carregando o CLI.
+    // T-685: DEPOIS do primeiro evento vale o teto postEventMs — o silêncio do
+    // modelo (xhigh) estourava o hardMs seco com o turno vivo; a trava real
+    // segue recolhida, no teto declarado (grok: 5min), não aos 120s.
     const phase = hangPhase(idleMs, t, this.activityClock.firstEventAt == null);
     if (phase === "hard") {
       if (this.messageSession.busy) {
@@ -1435,7 +1439,9 @@ export class AgentRunner {
         `[hang] auto-continue esgotado (${HANG_RECOVER_NUDGE_MAX} por 30min, ` +
         `runner=${this.opts.cliRunner}) — agente parado, envia mensagem pra retomar`;
       this.opts.log("warn", `[hang:${this.info.name}] ${reason}`);
-      this.opts.onHung?.({ soft: false, reason, idleMs });
+      // T-689: `parked` = este hard é um PARK — o server emite push ativo ao
+      // orquestrador (agente+runner+ts), distinto do hard comum e de idle.
+      this.opts.onHung?.({ soft: false, reason, idleMs, parked: true });
       return;
     }
     if (!plan.nudge) return;

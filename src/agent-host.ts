@@ -558,6 +558,9 @@ export class AgentHost {
           reason: info.reason,
           idleMs: info.idleMs,
           runner: cliRunner,
+          // T-689: park (auto-continue esgotado) — o server emite o push ao
+          // orquestrador. Campo ausente nos hards comuns (compat).
+          ...(info.parked ? { parked: true } : {}),
         });
       },
       onAssistantText: (text) => {

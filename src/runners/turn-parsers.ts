@@ -207,60 +207,93 @@ export function parseOpenCodeTurnEvent(raw: unknown): NormalizedTurnEvent[] {
 }
 
 /**
- * Grok headless `--output-format streaming-json` (docs/user-guide/14-headless-mode.md):
- *   thought | text | tool_call | tool_call_update | usage | plan | end | error
- *
- * `tool_call` / `tool_call_update` existem desde o stream ACP — não depender
- * só do poll de chat_history.jsonl pra estado/RUNS.
+ * Grok headless `--output-format streaming-json`:
+ *   legado (medido 1.0.34 / grok-custom 1.6.3): thought | text | tool_call |
+ *     tool_call_update | usage | plan | end | error
+ *   defesa ACP (help 1.0.34: "one ACP session update per line"):
+ *     sessionUpdate / jsonrpc session/update. Sem isso, um stdout ACP
+ *     sem `type` devolveria [] e o watchdog leria silêncio.
  */
-export function parseGrokStreamEvent(raw: unknown): NormalizedTurnEvent[] {
+function grokInnerEvent(raw: unknown): Record<string, unknown> | null {
   const event = record(raw);
+  if (!event) return null;
+  const method = typeof event.method === "string" ? event.method : "";
+  if (method === "session/update" || method === "_x.ai/session_notification") {
+    const params = record(event.params);
+    if (!params) return event;
+    const update = record(params.update) ?? params;
+    if (typeof params.sessionId === "string" && update.sessionId == null) {
+      return { ...update, sessionId: params.sessionId };
+    }
+    return update;
+  }
+  return event;
+}
+
+function grokDeltaText(event: Record<string, unknown>): string {
+  if (typeof event.data === "string") return event.data;
+  if (typeof event.text === "string") return event.text;
+  const content = event.content;
+  if (typeof content === "string") return content;
+  const rec = record(content);
+  if (rec && typeof rec.text === "string") return rec.text;
+  return "";
+}
+
+function grokEventKind(event: Record<string, unknown>): string {
+  if (typeof event.sessionUpdate === "string" && event.sessionUpdate) return event.sessionUpdate;
+  if (typeof event.type === "string" && event.type) return event.type;
+  return "";
+}
+
+export function parseGrokStreamEvent(raw: unknown): NormalizedTurnEvent[] {
+  const event = grokInnerEvent(raw);
   if (!event) return [];
-  if (event.type === "text" && typeof event.data === "string") return [{ type: "text", text: event.data }];
-  if (event.type === "thought" && typeof event.data === "string") return [{ type: "thought", text: event.data }];
-  if (event.type === "tool_call" || event.type === "tool_call_update") {
-    // tool_call: início (in_progress). tool_call_update: progresso/conclusão.
-    // Estado "thinking" em ambos — o agente ainda está no loop de tools.
+  const kind = grokEventKind(event);
+  if (kind === "thought" || kind === "agent_thought_chunk") {
+    const text = grokDeltaText(event);
+    return text ? [{ type: "thought", text }] : [{ type: "plan" }];
+  }
+  if (kind === "text" || kind === "agent_message_chunk") {
+    const text = grokDeltaText(event);
+    return text ? [{ type: "text", text }] : [{ type: "plan" }];
+  }
+  if (kind === "tool_call" || kind === "tool_call_update" || kind === "tool_call_delta_chunk") {
     const name = String(event.toolName ?? event.title ?? event.name ?? "");
     const input = event.rawInput ?? event.input ?? {};
-    const id = typeof event.toolCallId === "string" && event.toolCallId
-      ? event.toolCallId
-      : undefined;
+    const idRaw = event.toolCallId ?? event.tool_call_id;
+    const id = typeof idRaw === "string" && idRaw ? idRaw : undefined;
     const tool: NormalizedTurnEvent = id
       ? { type: "tool", name, input, id }
       : { type: "tool", name, input };
     return [tool];
   }
-  if (event.type === "end") return typeof event.sessionId === "string" && event.sessionId
+  if (kind === "end") return typeof event.sessionId === "string" && event.sessionId
     ? [{ type: "session", sessionId: event.sessionId }, { type: "result" }]
     : [{ type: "result" }];
-  if (event.type === "error") return [{ type: "error", message: String(event.message ?? event.data ?? "grok error") }];
-  // T-055: usage/plan = progresso real (billing mid-turn, plano de tools) —
-  // contam como atividade pro hang watch. Antes eram descartados e o relógio
-  // só avançava em text/tool, gerando hard recover em turns legítimos longos.
-  if (event.type === "usage") {
+  if (kind === "error") return [{ type: "error", message: String(event.message ?? event.data ?? "grok error") }];
+  if (kind === "usage" || kind === "usage_update") {
     const u = record(event.data) ?? record(event.usage) ?? event;
     return [{
       type: "usage",
-      input: Number(u.input_tokens ?? u.input ?? 0),
+      input: Number(u.input_tokens ?? u.input ?? u.used ?? 0),
       output: Number(u.output_tokens ?? u.output ?? 0),
       cacheCreate: Number(u.cache_creation_input_tokens ?? u.cacheCreate ?? 0),
       cacheRead: Number(u.cache_read_input_tokens ?? u.cached_input_tokens ?? u.cacheRead ?? 0),
       cumulative: false,
     }];
   }
-  if (event.type === "plan") return [{ type: "plan" }];
+  if (kind === "plan") return [{ type: "plan" }];
   // JSON final (output-format json): { text, sessionId, … }
-  if (!event.type && typeof event.text === "string") {
+  if (!kind && typeof event.text === "string") {
     const out: NormalizedTurnEvent[] = [{ type: "text", text: event.text }];
     if (typeof event.sessionId === "string" && event.sessionId) out.push({ type: "session", sessionId: event.sessionId });
     out.push({ type: "result" });
     return out;
   }
-  // T-055: JSON válido com type desconhecido = batimento de vida do CLI
-  // (não vira mensagem; só conta atividade via sawSemantic no runner).
-  if (typeof event.type === "string" && event.type.length > 0) {
-    return [{ type: "plan" }]; // reusa tag leve de "progresso sem texto"
+  // T-055: JSON válido com kind desconhecido = batimento de vida do CLI.
+  if (kind.length > 0) {
+    return [{ type: "plan" }];
   }
   return [];
 }

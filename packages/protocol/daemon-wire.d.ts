@@ -357,6 +357,9 @@ export interface AgentHungEv {
   reason: string;
   idleMs: number;
   runner?: string;
+  /** T-689: hard que é PARK (auto-continue esgotado, fila vazia) — o server
+   *  emite push ativo ao orquestrador; distinto de idle e do hard comum. */
+  parked?: boolean;
 }
 export interface AgentExitEv { type: "agent:exit"; agentId: string; code: number | null }
 export interface AgentContextWarningEv { type: "agent:context_warning"; agentId: string; used: number; limit: number }

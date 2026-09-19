@@ -55,6 +55,60 @@ test("Grok normalizes stream chunks, final objects, sessions and errors", () => 
   assert.equal(parseGrokStreamEvent({ type: "model_status", x: 1 }).length, 1);
 });
 
+test("T-705: Grok ACP sessionUpdate thought/text (defesa; stdout medido 1.0.34 é legado type=thought) vira thought/text, não []", () => {
+  assert.deepEqual(
+    parseGrokStreamEvent({
+      sessionUpdate: "agent_thought_chunk",
+      content: { type: "text", text: "hmm" },
+    }),
+    [{ type: "thought", text: "hmm" }],
+  );
+  assert.deepEqual(
+    parseGrokStreamEvent({
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "OK" },
+    }),
+    [{ type: "text", text: "OK" }],
+  );
+  assert.deepEqual(
+    parseGrokStreamEvent({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "s1",
+        update: {
+          sessionUpdate: "agent_thought_chunk",
+          content: { type: "text", text: "The" },
+        },
+      },
+    }),
+    [{ type: "thought", text: "The" }],
+  );
+  // legado intacto
+  assert.deepEqual(parseGrokStreamEvent({ type: "thought", data: "why" }), [{ type: "thought", text: "why" }]);
+  // ACP tool_call (sessionUpdate, sem `type`) — thought/tool renovam o clock
+  assert.deepEqual(
+    parseGrokStreamEvent({
+      sessionUpdate: "tool_call",
+      toolCallId: "call_1",
+      title: "read_file",
+      rawInput: { path: "a.ts" },
+    }),
+    [{ type: "tool", name: "read_file", input: { path: "a.ts" }, id: "call_1" }],
+  );
+  assert.equal(
+    parseGrokStreamEvent({
+      jsonrpc: "2.0",
+      method: "_x.ai/session_notification",
+      params: {
+        sessionId: "s1",
+        update: { sessionUpdate: "tool_call_delta_chunk", tool_call_id: "call_1", name: "bash" },
+      },
+    })[0]?.type,
+    "tool",
+  );
+});
+
 test("Grok stream tool_call / tool_call_update → tool (estado thinking no runner)", () => {
   assert.deepEqual(
     parseGrokStreamEvent({

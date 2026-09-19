@@ -148,12 +148,12 @@ test("OPEN saudável entrega na hora (sem fila)", () => {
 
 /* ---------- critério 5: tool longa grok NÃO hard-recover ---------- */
 
-test("toolsInFlight protege hang: tool legítima >120s idle semântico NÃO é hard", () => {
+test("toolsInFlight protege hang: tool legítima além do teto pós-evento NÃO é hard", () => {
   const t = hangThresholds("grok");
   const maxTools = 20 * 60_000;
-  // Tool aberta há 3min, zero eventos semânticos → hangPhase seria hard,
-  // mas toolsInFlightBlocksHang impede o recover.
-  const idleMs = 3 * 60_000;
+  // Tool aberta há 6min (> teto pós-evento T-685), zero eventos semânticos →
+  // hangPhase seria hard, mas toolsInFlightBlocksHang impede o recover.
+  const idleMs = 6 * 60_000;
   assert.equal(hangPhase(idleMs, t), "hard", "sem proteção seria hard");
   assert.equal(
     toolsInFlightBlocksHang(1, idleMs, maxTools),
@@ -166,8 +166,8 @@ test("toolsInFlight protege hang: tool legítima >120s idle semântico NÃO é h
   assert.equal(toolsInFlightBlocksHang(0, idleMs, maxTools), false);
 });
 
-test("hang real sem tools continua hard em ≤120s", () => {
+test("hang real sem tools continua hard no teto declarado (T-685: 300s)", () => {
   const t = hangThresholds("grok");
-  assert.equal(hangPhase(t.hardMs, t), "hard");
+  assert.equal(hangPhase(t.postEventMs!, t), "hard");
   assert.equal(toolsInFlightBlocksHang(0, t.hardMs, 20 * 60_000), false);
 });

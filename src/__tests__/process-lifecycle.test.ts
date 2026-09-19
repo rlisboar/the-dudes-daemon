@@ -5,6 +5,7 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import {
   appendCapped,
+  armHardTimeout,
   collectProcessOutput,
   processAlive,
   RUNNER_OUTPUT_CAP_BYTES,
@@ -110,4 +111,21 @@ test("termination escalates and terminateAndWait handles synchronous exit", asyn
   cooperative.exitOnSignal = true;
   await terminateAndWait(cooperative.child(), { graceMs: 5, maxWaitMs: 20 });
   assert.deepEqual(cooperative.signals, ["SIGTERM"]);
+});
+
+test("T-705: armHardTimeout re-arma quando shouldKill recusa; mata no skip seguinte", async () => {
+  const fake = new FakeProcess();
+  fake.exitOnSignal = true;
+  let allow = false;
+  let checks = 0;
+  armHardTimeout(fake.child(), 40, () => {}, () => {
+    checks += 1;
+    return allow;
+  }, 40);
+  await new Promise((r) => setTimeout(r, 120));
+  assert.equal(fake.killed, false, "skip no 1º teto não mata");
+  assert.ok(checks >= 1, `shouldKill não rodou checks=${checks}`);
+  allow = true;
+  await new Promise((r) => setTimeout(r, 120));
+  assert.equal(fake.killed, true, "re-arm mata quando shouldKill autoriza");
 });

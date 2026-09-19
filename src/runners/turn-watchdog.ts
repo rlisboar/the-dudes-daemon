@@ -10,7 +10,9 @@ export type HangPhase = "ok" | "soft" | "hard";
 export interface HangThresholds {
   /** Sem atividade → estado stalled + aviso (ainda não mata). */
   softMs: number;
-  /** Sem atividade → SIGKILL do turno + liberar busy. */
+  /** Sem atividade → SIGKILL do turno + liberar busy. Piso do teto EFETIVO:
+   *  com firstEventMs (T-593) ou postEventMs (T-685) declarados, o teto sobe
+   *  nessa fase — ver effectiveHardMs. */
   hardMs: number;
   /** Processo morto com busy=true por este tempo → hard recover. */
   deadProcMs: number;
@@ -29,6 +31,13 @@ export interface HangThresholds {
    *  e 191 avisos soft a ~60-65s — os dois limiares ficavam abaixo do
    *  time-to-first-event real. Ausente = sem janela (comportamento anterior). */
   firstEventMs?: number;
+  /** T-685: teto de hard DEPOIS do primeiro evento semântico, SEM tool em voo.
+   *  O silêncio do MODELO entre eventos (effort alto, contexto grande) não é
+   *  zumbi; medido no host do dono em 2026-09-18: 11 kills da classe em
+   *  120-124s com turno VIVO e toolsInFlight==0 — o 1º token fechava a janela
+   *  firstEventMs (T-593) e o hardMs seco voltava a valer. Ausente = hardMs
+   *  (comportamento anterior preservado). */
+  postEventMs?: number;
 }
 
 /** T-598: teto ABSOLUTO de lifetime do turno qwen. Era 8min (T-371 (d)) —
@@ -67,12 +76,18 @@ export function hangThresholds(runner?: string): HangThresholds {
     // cobre (a tool só existe DEPOIS do 1º evento). 5min fica 2,4× abaixo do
     // GROK_TURN_TIMEOUT_MS (720s), então um turno travado ANTES de emitir
     // qualquer coisa continua sendo recolhido, só não aos 120s.
+    // T-685: e DEPOIS do 1º evento o silêncio real do modelo (effort xhigh,
+    // contexto ~138k) estourava o hardMs seco — 11 kills da classe em 120-124s
+    // em 2026-09-18, todos com turno vivo e 0 tool em voo. O teto pós-evento
+    // ganha o mesmo orçamento de 5min (postEventMs): trava real segue
+    // recolhida, aos 5min em vez de 2min (custo aceito pela direção).
     return {
       softMs: 60_000,
       hardMs: 120_000,
       deadProcMs: 12_000,
       toolsHardMs: 10 * 60_000,
       firstEventMs: 5 * 60_000,
+      postEventMs: 5 * 60_000,
     };
   }
   if (runner === "opencode") {
@@ -104,15 +119,18 @@ export function hangThresholds(runner?: string): HangThresholds {
   return { softMs: 5 * 60_000, hardMs: 12 * 60_000, deadProcMs: 20_000, toolsHardMs: 20 * 60_000 };
 }
 
-/** T-593: hard EFETIVO do turno. Antes do primeiro evento semântico vale a
- *  janela de cold start (firstEventMs); depois, o hardMs normal — um turno
- *  que já emitiu e ficou quieto continua sendo recolhido aos 120s. */
+/** T-593/T-685: hard EFETIVO do turno. Antes do primeiro evento semântico
+ *  vale a janela de cold start (firstEventMs); DEPOIS dele vale o teto
+ *  pós-evento (postEventMs) — um turno que já emitiu e ficou quieto segue
+ *  sendo recolhido, no teto declarado, não no hardMs seco. */
 export function effectiveHardMs(t: HangThresholds, coldStart: boolean): number {
-  return coldStart && t.firstEventMs != null ? Math.max(t.hardMs, t.firstEventMs) : t.hardMs;
+  if (coldStart) return t.firstEventMs != null ? Math.max(t.hardMs, t.firstEventMs) : t.hardMs;
+  return t.postEventMs != null ? Math.max(t.hardMs, t.postEventMs) : t.hardMs;
 }
 
 /** `coldStart` (T-593) = o turno ainda não emitiu nenhum evento semântico.
- *  Default false preserva todos os call sites anteriores à T-593. */
+ *  Default false = regime pós-evento (T-685: postEventMs quando declarado);
+ *  para runners sem janelas declaradas preserva os call sites anteriores. */
 export function hangPhase(idleMs: number, t: HangThresholds, coldStart = false): HangPhase {
   if (idleMs >= effectiveHardMs(t, coldStart)) return "hard";
   if (idleMs >= t.softMs) return "soft";
@@ -123,6 +141,25 @@ export function hangPhase(idleMs: number, t: HangThresholds, coldStart = false):
  *  ou tool realmente eterna — reavalia o hang em vez de proteger forever.) */
 export function toolsInFlightHardDue(toolsAgeMs: number, t: HangThresholds): boolean {
   return toolsAgeMs >= t.toolsHardMs;
+}
+
+/**
+ * T-705: GROK_TURN_TIMEOUT_MS (720s) era SIGKILL absoluto — matava turno
+ * saudável com thought/tool recentes. Amarrado no watchdog: só mata se o
+ * relógio de ociosidade já venceu o teto pós-evento (e a proteção de tool
+ * em voo, se houver). Turno SEM evento recente continua recolhido.
+ */
+export function grokAbsoluteTimeoutShouldKill(opts: {
+  idleMs: number;
+  toolsInFlight: number;
+  toolsAgeMs: number;
+  runner?: string;
+}): boolean {
+  const t = hangThresholds(opts.runner ?? "grok");
+  const grace = t.postEventMs ?? t.hardMs;
+  if (opts.idleMs < grace) return false;
+  if (opts.toolsInFlight > 0 && !toolsInFlightHardDue(opts.toolsAgeMs, t)) return false;
+  return true;
 }
 
 /** T-240 (d): política de notificação de hard recover. `attempt` = contador
@@ -162,7 +199,8 @@ export interface TurnActivityClock {
   turnStartedAt: number;
   /** T-593: quando o turno corrente emitiu o PRIMEIRO evento semântico.
    *  `null` = ainda em cold start (janela firstEventMs). `markTurnStart`
-   *  reabre a janela a cada spawn; `touchActivityClock` a fecha uma única vez. */
+   *  reabre a janela a cada spawn; `touchActivityClock` a fecha uma única vez.
+   *  Fechada = regime pós-evento (T-685: teto postEventMs). */
   firstEventAt: number | null;
 }
 

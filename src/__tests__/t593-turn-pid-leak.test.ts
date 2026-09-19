@@ -184,11 +184,13 @@ async function recoverAndWaitNewTurn(h: Harness, label: string): Promise<number>
   return proc.pid as number;
 }
 
-/** Coloca o relógio do turno acima do hard e dispara o watchdog. `cold` = o
- *  turno ainda não emitiu nenhum evento semântico (janela firstEventMs). */
+/** Coloca o relógio do turno acima do teto EFETIVO e dispara o watchdog.
+ *  `cold` = o turno ainda não emitiu nenhum evento semântico (janela
+ *  firstEventMs); default = pós-evento (teto postEventMs, T-685). */
 function forceHard(h: Harness, opts: { cold?: boolean; idleMs?: number } = {}): void {
   const a = asAny(h.runner);
-  const hard = hangThresholds("grok-custom").hardMs;
+  const t = hangThresholds("grok-custom");
+  const hard = t.postEventMs ?? t.hardMs;
   a.activityClock.lastActivityAt = Date.now() - (opts.idleMs ?? hard + 5_000);
   a.activityClock.firstEventAt = opts.cold ? null : Date.now() - 60_000;
   tick(h.runner);
@@ -289,7 +291,7 @@ test("T-593: stop() mata o turno abandonado mesmo com ocActiveProc já anulado",
 
 /* ---------- critério 4: turno ainda em cold start não é morto ---------- */
 
-test("T-593 critério 4: turno que ainda não emitiu evento (cold start) NÃO é morto aos 120s", async () => {
+test("T-593 critério 4: cold start NÃO é morto aos 120s; pós-evento só no teto (T-685)", async () => {
   const h = makeHarness();
   const a = asAny(h.runner);
   _resetTurnGateForTest();
@@ -308,21 +310,33 @@ test("T-593 critério 4: turno que ainda não emitiu evento (cold start) NÃO é
     assert.equal(h.spawnedPids.length, 1, "nenhum turno novo: o turno original segue vivo");
     assert.equal(pidAlive(pid1), true, "o turno em cold start continua vivo");
 
-    // Mesmo idle, mas já com primeiro evento emitido → volta ao hardMs (sem
-    // regressão: turno que emitiu e ficou quieto continua sendo recolhido).
-    a.activityClock.firstEventAt = Date.now() - 300_000;
+    // Mesmo idle, mas já com primeiro evento emitido: 125s NÃO mata mais
+    // (T-685) — o recolhimento volta no teto pós-evento declarado (300s).
+    a.activityClock.firstEventAt = Date.now() - 400_000;
     a.activityClock.lastActivityAt = Date.now() - 125_000;
     tick(h.runner);
-    assert.ok(h.warns.some((w) => w.includes("HARD recover")), "turno já iniciado e quieto tem de ser recolhido aos 120s");
+    assert.equal(
+      h.warns.some((w) => w.includes("HARD recover")),
+      false,
+      `125s pós-evento não pode mais hard-recover (T-685): ${h.warns.join(" | ")}`,
+    );
+    assert.equal(pidAlive(pid1), true, "turno pós-evento com 125s de silêncio segue vivo");
+
+    a.activityClock.lastActivityAt = Date.now() - (hangThresholds("grok-custom").postEventMs! + 5_000);
+    tick(h.runner);
+    assert.ok(
+      h.warns.some((w) => w.includes("HARD recover")),
+      "trava real pós-evento tem de ser recolhida no teto novo (T-685)",
+    );
     await until(() => !pidAlive(pid1), "morte do turno recolhido", h);
   } finally {
     await cleanup(h);
   }
 });
 
-/* ---------- unidade: o limiar é condicional, não um hardMs maior ---------- */
+/* ---------- unidade: os limiares são condicionais, não um hardMs maior ---------- */
 
-test("T-593: effectiveHardMs só vale em cold start; sem janela o comportamento anterior é preservado", () => {
+test("T-593/T-685: janelas condicionais (cold start e pós-evento); demais runners preservados", () => {
   const t = hangThresholds("grok-custom");
   assert.ok(t.firstEventMs && t.firstEventMs > t.hardMs, "família grok tem janela de cold start");
 
@@ -332,15 +346,19 @@ test("T-593: effectiveHardMs só vale em cold start; sem janela o comportamento 
   assert.equal(hangPhase(t.softMs, t, true), "soft");
   assert.equal(hangPhase(t.softMs - 1_000, t, true), "ok");
   assert.equal(hangPhase(t.firstEventMs, t, true), "hard");
-  // já emitiu: volta ao limiar seco
-  assert.equal(hangPhase(t.hardMs + 1_000, t, false), "hard");
-  // default (3º arg omitido) = comportamento anterior à T-593
-  assert.equal(hangPhase(t.hardMs + 1_000, t), "hard");
+  // já emitiu (T-685): 121s também não mata — o teto pós-evento é que recolhe
+  assert.ok(t.postEventMs && t.postEventMs > t.hardMs, "família grok tem teto pós-evento");
+  assert.equal(hangPhase(t.hardMs + 1_000, t, false), "soft");
+  assert.equal(hangPhase(t.postEventMs, t, false), "hard");
+  // default (3º arg omitido) = regime pós-evento
+  assert.equal(hangPhase(t.hardMs + 1_000, t), "soft");
+  assert.equal(hangPhase(t.postEventMs, t), "hard");
 
-  // runners sem firstEventMs não mudam de comportamento
+  // runners sem janelas não mudam de comportamento
   for (const r of ["qwen", "gemini", "codex", "crush", "opencode", "claude"]) {
     const o = hangThresholds(r);
     assert.equal(o.firstEventMs, undefined, `${r} não tem janela declarada`);
+    assert.equal(o.postEventMs, undefined, `${r} não tem teto pós-evento`);
     assert.equal(hangPhase(o.hardMs + 1_000, o, true), "hard", `${r} mantém o hard seco`);
   }
 });

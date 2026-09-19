@@ -3,7 +3,7 @@
  *
  * Simula o que o hang watch + recoverHungTurn fazem em prod:
  *  - filho que não responde (sleep infinito / process group)
- *  - detecção por idle semântico ≤120s (thresholds grok)
+ *  - detecção por idle semântico no teto pós-evento (T-685; 300s na família grok)
  *  - kill por process group
  *  - release do turn-gate
  *  - re-fila da mensagem (1×)
@@ -73,11 +73,14 @@ function simulateHardRecover(input: {
   return { requeued, busy: false };
 }
 
-test("thresholds grok: soft→hard em ≤120s (critério de aceite T-009)", () => {
+test("thresholds grok: soft aos 60s; hard no teto pós-evento (T-009 reescopado pela T-685)", () => {
   const t = hangThresholds("grok");
   assert.equal(hangPhase(t.softMs - 1, t), "ok");
   assert.equal(hangPhase(t.softMs, t), "soft");
-  assert.equal(hangPhase(t.hardMs, t), "hard");
+  // T-685: pós-evento o limiar seco de 120s virou soft; o recolhimento é no
+  // teto declarado (postEventMs) — sem tool em voo e processo vivo.
+  assert.equal(hangPhase(t.hardMs, t), "soft");
+  assert.equal(hangPhase(t.postEventMs!, t), "hard");
   assert.ok(t.hardMs <= 120_000);
 });
 
@@ -110,11 +113,12 @@ test("turno travado: kill por process group + release do turn-gate + re-fila + l
   assert.ok(child.pid);
   assert.equal(processAlive(child), true);
 
-  // Simula hang watch: idle ≥ hardMs sem atividade semântica
-  const clock = createActivityClock(Date.now() - t.hardMs - 1_000);
+  // Simula hang watch: idle acima do teto pós-evento (T-685) sem atividade
+  // semântica — o limiar seco de 120s virou soft.
+  const clock = createActivityClock(Date.now() - t.postEventMs! - 1_000);
   const idleMs = Date.now() - clock.lastActivityAt;
   assert.equal(hangPhase(idleMs, t), "hard");
-  assert.ok(idleMs <= 120_000 + 5_000, `detecção deve ser ≤120s (+margem tick); idleMs=${idleMs}`);
+  assert.ok(idleMs <= t.postEventMs! + 5_000, `detecção no teto pós-evento (+margem tick); idleMs=${idleMs}`);
 
   const result = simulateHardRecover({
     proc: child,

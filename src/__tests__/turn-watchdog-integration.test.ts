@@ -35,9 +35,9 @@ describe("hang detection scenario (Grok)", () => {
     assert.equal(clock.softReported, false);
     assert.equal(hangPhase(0, t), "ok");
 
-    // freeze again until hard
+    // freeze again until hard (teto pós-evento — T-685: 120s seco vira soft)
     clock.lastActivityAt = 200_000;
-    const idleHard = t.hardMs;
+    const idleHard = t.postEventMs!;
     assert.equal(hangPhase(idleHard, t), "hard");
     events.push("hard");
 
@@ -50,11 +50,14 @@ describe("hang detection scenario (Grok)", () => {
     assert.ok(t.deadProcMs <= 20_000);
   });
 
-  it("grok hard is ≤120s (aceitável; armHardTimeout 12min é só backstop)", () => {
-    // T-009: detecção ≤120s. hard 4min era longo demais sob thrash e ainda
-    // assim não disparava se activity contasse bytes brutos.
+  it("grok: hardMs 120s é piso; teto efetivo pós-evento 300s (T-685); armHardTimeout 12min é só backstop", () => {
+    // T-009: piso de detecção 120s. hard 4min era longo demais sob thrash e
+    // ainda assim não disparava se activity contasse bytes brutos.
+    // T-685: pós-1º-evento o teto efetivo sobe para postEventMs (300s) — o
+    // silêncio real do modelo estourava o limiar seco com o turno vivo.
     const t = hangThresholds("grok");
     assert.ok(t.hardMs <= 120_000, `hardMs=${t.hardMs} > 120s`);
+    assert.equal(t.postEventMs, 300_000, "teto pós-evento declarado");
     assert.ok(t.hardMs > t.softMs);
     assert.ok(t.softMs <= 90_000);
   });

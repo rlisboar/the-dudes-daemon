@@ -4,7 +4,7 @@ import {ChildProcess} from "node:child_process";
 import {GROK_TURN_TIMEOUT_MS, grokSignalsCandidatesFor, grokUpdatesCandidatesFor, resolveGrokChatHistoryPath, sweepGrokChatToolCallsFromPath} from "../../agent-runner.js";
 import {GrokContextSignals, GrokTurnBilling, mergeGrokContextOccupancy, parseGrokContextSignals, parseGrokTurnBillingFromUpdates, parseGrokUpdatesContextTokens} from "../parsers.js";
 import {acquireTurnSlot} from "../turn-gate.js";
-import {markTurnStart} from "../turn-watchdog.js";
+import {grokAbsoluteTimeoutShouldKill, hangThresholds, markTurnStart} from "../turn-watchdog.js";
 import {appendPathAttachmentPrompt} from "../attachments.js";
 import {armHardTimeout, processAlive as procAlive} from "../process-lifecycle.js";
 import {buildGrokEnv} from "../env.js";
@@ -212,10 +212,15 @@ export async function runGrokMessage(self: any, content: string, images?: ImageA
     // (firstEventMs) para o hard de 120s não matar o turno enquanto o CLI só
     // está carregando. Depois de `touchActivity`, que fecha a janela.
     markTurnStart(self.activityClock);
-    // Watchdog: se o CLI não sair em GROK_TURN_TIMEOUT_MS, mata e libera
-    // a fila (sintoma real: resume + prompt enorme fica em 0% CPU por horas).
+    // T-705: GROK_TURN_TIMEOUT_MS (720s) deixa de ser SIGKILL absoluto.
+    // Decisão: AMARRAR no watchdog (não subir o teto). shouldKill só
+    // autoriza se idle ≥ postEventMs e a tool em voo (se houver) já
+    // venceu toolsHardMs. Skip re-arma no postEventMs — senão o backstop
+    // morria no primeiro thought recente aos 720s.
     // Pós-SIGKILL o 'close' NÃO é garantido (netos herdam pipes) — se busy
     // continuar, force recoverHungTurn em 3s (senão agente mudo até restart).
+    const grokHang = hangThresholds(self.opts.cliRunner);
+    const grokRearmMs = grokHang.postEventMs ?? grokHang.hardMs;
     armHardTimeout(proc, GROK_TURN_TIMEOUT_MS, () => {
       self.opts.log("warn", `[grok:${self.info.name}] turno excedeu ${GROK_TURN_TIMEOUT_MS / 1000}s — SIGKILL (session=${self.messageSession.sessionId?.slice(0, 8) ?? "nova"})`);
       setTimeout(() => {
@@ -228,7 +233,24 @@ export async function runGrokMessage(self: any, content: string, images?: ImageA
           );
         }
       }, 3_000);
-    }, () => self.messageSession.owns(epoch));
+    }, () => {
+      if (!self.messageSession.owns(epoch)) return false;
+      const idleMs = Date.now() - self.activityClock.lastActivityAt;
+      const toolsAgeMs = self.toolsInFlightSince ? Date.now() - self.toolsInFlightSince : 0;
+      const kill = grokAbsoluteTimeoutShouldKill({
+        idleMs,
+        toolsInFlight: self.toolsInFlight ?? 0,
+        toolsAgeMs,
+        runner: self.opts.cliRunner,
+      });
+      if (!kill) {
+        self.opts.log(
+          "info",
+          `[grok:${self.info.name}] lifetime ${GROK_TURN_TIMEOUT_MS / 1000}s adiado (idle=${Math.round(idleMs / 1000)}s, evento semântico recente)`,
+        );
+      }
+      return kill;
+    }, grokRearmMs);
     // Tool calls ao vivo durante o turno (só possível em resume, quando o
     // sessionId já é conhecido; turno cold emite tudo no sweep final).
     // Auto-limpa quando o turno morreu: 'close' NÃO é garantido pós-SIGKILL
@@ -245,18 +267,15 @@ export async function runGrokMessage(self: any, content: string, images?: ImageA
     proc.on("close", clearGrokPoll);
     proc.on("exit", clearGrokPoll);
     proc.on("error", clearGrokPoll);
-    // Acumula o turno inteiro e emite UMA vez no final.
+    // Texto de assistant: acumula o turno e emite UMA vez no final.
     // onAssistantText no orch cria uma mensagem por chamada — flush por
     // chunk/newline virava dezenas de balões "PM → Você" (UI quebrada).
+    // Thought (T-705) NÃO entra nesse buffer: sai em stream via
+    // onThinkingText (wire agent:thinking), como claude/qwen.
     //
-    // Estado: o stream emite text/thought/tool_call ao longo do tool-loop.
-    // O texto só chega no usuário no emitOnce — por isso NÃO marcamos
-    // "speaking" em cada chunk (ficava SPEAKING o turno inteiro enquanto
-    // o agente ainda lia arquivos / rodava bash). Fica thinking durante
-    // thought/tools; speaking só na entrega final da mensagem.
+    // Estado: thought/tools → thinking; speaking só na entrega final.
     let buf = "";
     let fullText = "";
-    let fullThought = "";
     let sawEnd = false;
     let endSessionId: string | undefined;
     let errOut = "";
@@ -275,7 +294,13 @@ export async function runGrokMessage(self: any, content: string, images?: ImageA
             if (event.text.trim()) self.clearGrokToolsInFlight();
             // Mantém thinking: texto é bufferizado; "speaking" só no emitOnce.
           } else if (event.type === "thought") {
-            fullThought += event.text;
+            // T-705: thought em STREAM (paridade claude/qwen). Antes só
+            // emitOnce() no close — UI sem thinking durante o turno.
+            self.traceInternalCli(
+              "info",
+              `[cli:${self.info.id}:grok:thinking] block_received len=${event.text.length} collectFlag=${self.info.collectThinking}`,
+            );
+            if (self.info.collectThinking && event.text) self.opts.onThinkingText?.(event.text);
             self.setState("thinking");
           } else if (event.type === "tool") {
             // Stream ACP emite tool_call ao vivo (CLI ≥0.2) — não esperar poll 3s.
@@ -311,9 +336,6 @@ export async function runGrokMessage(self: any, content: string, images?: ImageA
     /** Emite no máximo 1 agent_to_user por turno. @returns false se WS dropou. */
     const emitOnce = (): boolean => {
       if (!self.messageSession.owns(epoch) || emittedAny) return true;
-      if (fullThought && self.info.collectThinking && self.opts.onThinkingText) {
-        self.opts.onThinkingText(fullThought);
-      }
       const t = fullText.trim();
       if (t) {
         self.setState("speaking");

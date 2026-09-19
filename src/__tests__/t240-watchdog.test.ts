@@ -57,7 +57,8 @@ test("T-240 thresholds: grok ganha teto absoluto de tool (~10min); demais runner
   const g = hangThresholds("grok");
   const c = hangThresholds("claude");
   assert.equal(g.toolsHardMs, 10 * 60_000);
-  assert.equal(g.hardMs, 120_000, "sem tool: hard segue ~120s (T-009 reinterpretado)");
+  assert.equal(g.hardMs, 120_000, "piso do teto efetivo (T-009 reinterpretado)");
+  assert.equal(g.postEventMs, 5 * 60_000, "T-685: teto pós-evento declarado (5min)");
   assert.equal(g.deadProcMs, 12_000);
   assert.equal(c.toolsHardMs, 20 * 60_000, "claude: comportamento atual preservado");
 });
@@ -115,22 +116,22 @@ test("T-240 (2): processo MORTO com busy=true (e tool in-flight) → hard ≤15s
   assert.equal(a.inflightPerMessage?.attempt, 1, "mensagem re-enfileirada (attempt 1)");
 });
 
-test("T-240 (3): loop sem tool (sem eventos, sem processo) → hard ~120s como hoje", () => {
+test("T-240 (3): loop sem tool (sem eventos, sem processo) → hard no teto pós-evento (T-685: 300s)", () => {
   const { runner, events } = makeRunner();
   const a = asAny(runner);
   a.messageSession.busy = true;
   a.toolsInFlight = 0;
   a.ocActiveProc = null;
   a.inflightPerMessage = { content: "msg", images: undefined, attempt: 0 };
-  a.activityClock.lastActivityAt = Date.now() - 121_000; // > hardMs grok (120s)
-  // T-593: o limiar seco de 120s só vale DEPOIS do primeiro evento semântico.
-  // Turno ainda em cold start (firstEventAt null) tem a janela firstEventMs —
-  // é o que o T-593 critério 4 trava. Aqui: turno que já emitiu e ficou quieto.
-  a.activityClock.firstEventAt = Date.now() - 130_000;
+  // T-593/T-685: nem o limiar seco de 120s nem o cold start (firstEventMs)
+  // decidem aqui — turno que JÁ emitiu e ficou quieto recolhe no teto
+  // pós-evento (postEventMs, T-685).
+  a.activityClock.lastActivityAt = Date.now() - (hangThresholds("grok").postEventMs! + 5_000);
+  a.activityClock.firstEventAt = Date.now() - 400_000;
 
   tick(runner);
 
-  assert.equal(a.messageSession.busy, false, "trava sem tool segue hard ~120s");
+  assert.equal(a.messageSession.busy, false, "trava sem tool segue hard, no teto declarado");
   assert.equal(events.length, 0, "1º attempt: suprimido pela política de notificação");
   assert.ok(a.hardRecoverTimes.length === 1, "evento registrado na janela de agregação");
 });
@@ -151,8 +152,8 @@ test("T-240 (4b): agregação end-to-end — 3º evento de 1º attempt na janela
   a.messageSession.busy = true;
   a.ocActiveProc = null;
   a.inflightPerMessage = { content: "msg", images: undefined, attempt: 0 };
-  a.activityClock.lastActivityAt = Date.now() - 121_000;
-  a.activityClock.firstEventAt = Date.now() - 130_000; // T-593: já saiu do cold start
+  a.activityClock.lastActivityAt = Date.now() - 305_000; // > teto pós-evento (T-685)
+  a.activityClock.firstEventAt = Date.now() - 400_000; // T-593: já saiu do cold start
   // janela já com 2 eventos de 1º attempt (sem resumo emitido)
   a.hardRecoverTimes = [Date.now() - 60_000, Date.now() - 30_000];
 
@@ -171,8 +172,8 @@ test("T-240 (4c): attempt≥1 (retry esgotado/re-enfileirado antes) notifica ind
   a.messageSession.busy = true;
   a.ocActiveProc = null;
   a.inflightPerMessage = { content: "msg", images: undefined, attempt: 1 };
-  a.activityClock.lastActivityAt = Date.now() - 121_000;
-  a.activityClock.firstEventAt = Date.now() - 130_000; // T-593: já saiu do cold start
+  a.activityClock.lastActivityAt = Date.now() - 305_000; // > teto pós-evento (T-685)
+  a.activityClock.firstEventAt = Date.now() - 400_000; // T-593: já saiu do cold start
 
   tick(runner);
 

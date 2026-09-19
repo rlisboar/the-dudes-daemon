@@ -55,8 +55,8 @@ test("T-662 (C1): hang de 1º attempt suprimido → cru sobe, notificado fica pa
   a.messageSession.busy = true;
   a.ocActiveProc = null;
   a.inflightPerMessage = { content: "msg", images: undefined, attempt: 0 };
-  a.activityClock.lastActivityAt = Date.now() - 121_000; // > hardMs grok
-  a.activityClock.firstEventAt = Date.now() - 130_000; // fora do cold start (T-593)
+  a.activityClock.lastActivityAt = Date.now() - 305_000; // > teto pós-evento (T-685)
+  a.activityClock.firstEventAt = Date.now() - 400_000; // fora do cold start (T-593)
 
   tick(runner);
 
@@ -75,8 +75,8 @@ test("T-662 (C1): 3º evento de 1º attempt na janela (summary) incrementa o not
   a.messageSession.busy = true;
   a.ocActiveProc = null;
   a.inflightPerMessage = { content: "msg", images: undefined, attempt: 0 };
-  a.activityClock.lastActivityAt = Date.now() - 121_000;
-  a.activityClock.firstEventAt = Date.now() - 130_000;
+  a.activityClock.lastActivityAt = Date.now() - 305_000; // > teto pós-evento (T-685)
+  a.activityClock.firstEventAt = Date.now() - 400_000;
   a.hardRecoverTimes = [Date.now() - 60_000, Date.now() - 30_000]; // 2 eventos anteriores na janela
 
   tick(runner);
@@ -95,8 +95,8 @@ test("T-662 (C1): attempt≥1 (immediate) incrementa o notificado na hora", () =
   a.messageSession.busy = true;
   a.ocActiveProc = null;
   a.inflightPerMessage = { content: "msg", images: undefined, attempt: 1 };
-  a.activityClock.lastActivityAt = Date.now() - 121_000;
-  a.activityClock.firstEventAt = Date.now() - 130_000;
+  a.activityClock.lastActivityAt = Date.now() - 305_000; // > teto pós-evento (T-685)
+  a.activityClock.firstEventAt = Date.now() - 400_000;
 
   tick(runner);
 

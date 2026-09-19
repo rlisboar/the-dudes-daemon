@@ -20,7 +20,7 @@ import { fileURLToPath } from "node:url";
 import {
   assessSuites,
   collectSuites,
-  cpuMapOf,
+  sampleOf,
   fmtDuration,
   isTestRoot,
   parsePsDuration,
@@ -49,8 +49,8 @@ const RUNCLI_TIMEOUT_MS = 120_000;
  *  RUNCLI_TIMEOUT_MS + folga, e fica abaixo do burn da fixture. */
 const CLI_TEST_TIMEOUT_MS = 150_000;
 
-function row(pid: number, ppid: number, pgid: number, etime: string, cpu: string, command: string): ProcRow {
-  const [r] = parsePsOutput(`${pid} ${ppid} ${pgid} ${etime} ${cpu} ${command}`);
+function row(pid: number, ppid: number, pgid: number, etime: string, cpu: string, command: string, stat = "S"): ProcRow {
+  const [r] = parsePsOutput(`${pid} ${ppid} ${pgid} ${stat} ${etime} ${cpu} ${command}`);
   assert.ok(r, `linha de ps parseável: ${command}`);
   return r;
 }
@@ -86,15 +86,16 @@ test("T-582: assinatura da raiz — `node … --test` nu, não o worker nem o `s
 
 test("T-582: parse do ps ignora cabeçalho/ruído e preserva o comando inteiro", () => {
   const rows = parsePsOutput(
-    "  101   100   100   1:23   0:12.50 node --test a.test.mjs\n" +
+    "  101   100   100 S    1:23   0:12.50 node --test a.test.mjs\n" +
     "lixo\n" +
-    "  102   101   100  02-09:34:28   23:17.65 /opt/node --test-concurrency=0 a.test.mjs\n",
+    "  102   101   100 R+  02-09:34:28   23:17.65 /opt/node --test-concurrency=0 a.test.mjs\n",
   );
   assert.equal(rows.length, 2);
   assert.deepEqual(rows[0], {
-    pid: 101, ppid: 100, pgid: 100, elapsedMs: 83_000, cpuMs: 12_500, command: "node --test a.test.mjs",
+    pid: 101, ppid: 100, pgid: 100, stat: "S", elapsedMs: 83_000, cpuMs: 12_500, command: "node --test a.test.mjs",
   });
   assert.equal(rows[1].command, "/opt/node --test-concurrency=0 a.test.mjs");
+  assert.equal(rows[1].stat, "R+");
 });
 
 // ─────────────────────────── árvore e classificação ─────────────────────────
@@ -138,7 +139,7 @@ test("T-582: raiz aninhada (teste que dispara outro runner) é suite própria", 
 
 test("T-582 C1/C2 (unidade): pendurada exige CPU plana E idade; CPU a crescer = viva", () => {
   const antes = arvoreComPipeline();
-  const baseline = cpuMapOf(antes);
+  const baseline = sampleOf(antes);
   const opts = { minAgeMs: 30_000, maxCpuDeltaMs: 1_000, windowMs: 180_000 };
 
   const parada = collectSuites(arvoreComPipeline(), 999);
@@ -156,6 +157,47 @@ test("T-582 C1/C2 (unidade): pendurada exige CPU plana E idade; CPU a crescer = 
 
   // primeira amostra (sem baseline) é indeterminada, nunca pendurada
   assert.equal(assessSuites(parada, null, opts)[0].state, "indeterminada");
+});
+
+test("T-667: CPU plana só é pendurada sem sinal RUNNABLE REPETIDO (≥2 procs, ou o mesmo pid nas duas pontas)", () => {
+  const opts = { minAgeMs: 30_000, maxCpuDeltaMs: 1_000, windowMs: 180_000 };
+  const avaliar = (agora: ProcRow[], antes: ProcRow[] = agora) =>
+    assessSuites(collectSuites(agora, 999), sampleOf(antes), opts)[0];
+
+  // (a) delta 0 com VÁRIOS procs RUNNABLE no snapshot — a árvore queima, só
+  // não recebeu CPU na janela. É o flake do CI (dCPU 0ms sob contenção):
+  // medido nas fixtures reais, a viva tem 3–4 procs RUNNABLE em 100% das
+  // amostras.
+  const starvada = arvoreComPipeline();
+  starvada[1].stat = "R";
+  starvada[2].stat = "R";
+  const a = avaliar(starvada);
+  assert.equal(a.state, "viva", a.motivo);
+  assert.match(a.motivo, /2 procs RUNNABLE/);
+
+  // (b) um ÚNICO proc RUNNABLE que também estava RUNNABLE na outra ponta da
+  // janela → viva (cobre a suite de um queimador só).
+  const soUmAntes = arvoreComPipeline();
+  soUmAntes[2].stat = "R";
+  const soUm = arvoreComPipeline();
+  soUm[2].stat = "R";
+  const b = avaliar(soUm, soUmAntes);
+  assert.equal(b.state, "viva", b.motivo);
+  assert.match(b.motivo, /DUAS pontas/);
+
+  // (c) BLIP: um proc RUNNABLE só no snapshot de agora (um `setInterval` que
+  // acordou), AUSENTE na outra ponta da janela, não é liveness — é o que
+  // derrubava o C4 sob contenção.
+  const blip = arvoreComPipeline();
+  blip[3].stat = "R";
+  const c = avaliar(blip, arvoreComPipeline()); // baseline sem o blip
+  assert.equal(c.state, "pendurada", c.motivo);
+  assert.equal(c.cpuDeltaMs, 0);
+
+  // (d) árvore INTEIRA dormindo nas duas pontas → pendurada (controle).
+  const d = avaliar(arvoreComPipeline());
+  assert.equal(d.state, "pendurada", d.motivo);
+  assert.equal(d.cpuDeltaMs, 0);
 });
 
 test("T-582: reapSuites mata o grupo primeiro e escala para SIGKILL no que resiste", () => {
@@ -309,6 +351,34 @@ test("T-582 C2: suite EM VOO (CPU a crescer) não é classificada pendurada nem 
   }
 });
 
+test("T-667: janela com dCPU ~0 (limiar absurdo) NÃO lê a suite EM VOO como pendurada — RUNNABLE manda", { timeout: CLI_TEST_TIMEOUT_MS }, async () => {
+  // Pina o flake do CI (run 35295629976 attempt 1): sob starvation o dCPU da
+  // fixture viva fica ~0 na janela e a árvore era lida como pendurada. Com
+  // limiar absurdo (100s) o dCPU real fica SEMPRE abaixo → exercita o ramo
+  // "CPU plana" de forma determinística: a viva só escapa pelo RUNNABLE
+  // (≥2 procs queimando no snapshot), e a pendurada — cujo RUNNABLE é blip —
+  // segue pendurada.
+  const viva = spawnFakeSuite("viva");
+  const pendurada = spawnFakeSuite("pendurada");
+  try {
+    const sv = await findSuite(viva.dir);
+    const sp = await findSuite(pendurada.dir);
+    assert.ok(sv && sp, "as duas fixtures visíveis no ps");
+    const out = runCli([
+      "--list-suites", "--suite-window-ms", "300", "--suite-min-age-ms", "0",
+      "--suite-max-cpu-delta-ms", "100000",
+    ]);
+    assert.equal(out.status, 0, out.stderr);
+    assert.match(out.stdout, new RegExp(`VIVA\\s+${sv.rootPid}\\b`), `viva classificada viva:\n${out.stdout}`);
+    assert.doesNotMatch(out.stdout, new RegExp(`PENDURADA\\s+${sv.rootPid}\\b`));
+    assert.match(out.stdout, new RegExp(`PENDURADA\\s+${sp.rootPid}\\b`), `controle segue pendurada:\n${out.stdout}`);
+    assert.match(out.stdout, /E nenhum sinal RUNNABLE repetido/);
+  } finally {
+    killByDir(viva.dir, viva.child);
+    killByDir(pendurada.dir, pendurada.child);
+  }
+});
+
 test("T-582 C4: o reap mata a ÁRVORE (raiz + worker + neto + grep) sem deixar órfão", { timeout: 45_000 }, async () => {
   const { dir, child } = spawnFakeSuite("pendurada");
   try {
@@ -318,7 +388,7 @@ test("T-582 C4: o reap mata a ÁRVORE (raiz + worker + neto + grep) sem deixar �
     assert.ok(suite.members.includes(suite.pgid), "o `sh` do pipeline está na árvore");
     const members = [...suite.members];
 
-    const baseline = cpuMapOf(runPs());
+    const baseline = sampleOf(runPs());
     await sleep(1_200);
     const cur = collectSuites(runPs()).find((s) => s.command.includes(dir));
     assert.ok(cur, "suite ainda visível na 2ª amostra");

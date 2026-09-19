@@ -126,13 +126,29 @@ export function armHardTimeout(
   timeoutMs: number,
   onTimeout?: () => void,
   shouldKill?: () => boolean,
+  /** T-705: se shouldKill() recusar, volta a armar com este intervalo.
+   *  Sem isto o skip no teto absoluto (720s grok) abandonava o backstop. */
+  rearmOnSkipMs?: number,
 ): () => void {
-  const timer = setTimeout(() => {
-    if (!processAlive(process) || (shouldKill && !shouldKill())) return;
-    onTimeout?.();
-    killProcess(process, "SIGKILL");
-  }, timeoutMs);
-  const clear = () => clearTimeout(timer);
+  let timer: NodeJS.Timeout | undefined;
+  let cleared = false;
+  const clear = () => {
+    cleared = true;
+    if (timer) clearTimeout(timer);
+    timer = undefined;
+  };
+  const schedule = (ms: number) => {
+    timer = setTimeout(() => {
+      if (cleared || !processAlive(process)) return;
+      if (shouldKill && !shouldKill()) {
+        if (rearmOnSkipMs && rearmOnSkipMs > 0) schedule(rearmOnSkipMs);
+        return;
+      }
+      onTimeout?.();
+      killProcess(process, "SIGKILL");
+    }, ms);
+  };
+  schedule(timeoutMs);
   process.once("exit", clear);
   process.once("close", clear);
   process.once("error", clear);

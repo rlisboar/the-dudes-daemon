@@ -17,11 +17,12 @@ describe("turn-watchdog", () => {
     assert.ok(c.softMs >= 10 * 60_000);
   });
 
-  it("hangPhase transitions ok → soft → hard", () => {
+  it("hangPhase transitions ok → soft → hard (teto pós-evento, T-685)", () => {
     const t = hangThresholds("grok");
     assert.equal(hangPhase(0, t), "ok");
     assert.equal(hangPhase(t.softMs, t), "soft");
-    assert.equal(hangPhase(t.hardMs, t), "hard");
+    assert.equal(hangPhase(t.hardMs, t), "soft", "pós-evento: o limiar seco de 120s é soft (T-685)");
+    assert.equal(hangPhase(t.postEventMs!, t), "hard");
   });
 
   it("touchActivityClock resets soft flag", () => {

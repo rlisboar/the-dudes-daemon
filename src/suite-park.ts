@@ -10,14 +10,30 @@
  * indistinguível de "suite a correr".
  *
  * CRITÉRIO DE CORTE (declarado, binário): uma raiz `node … --test` é
- * PENDURADA quando as DUAS condições valem ao mesmo tempo:
+ * PENDURADA quando as TRÊS condições valem ao mesmo tempo:
  *   1. a raiz está viva há pelo menos `minAgeMs` (default 10 min);
  *   2. a CPU acumulada de TODA a árvore (raiz + workers + pipeline) cresceu
  *      menos de `maxCpuDeltaMs` (default 1s) numa janela de `flatWindowMs`
- *      (default 3 min no daemon, 60s no comando manual).
+ *      (default 3 min no daemon, 60s no comando manual);
+ *   3. (T-667) não há sinal de LIVENESS RUNNABLE no snapshot: NENHUM membro
+ *      está RUNNABLE (stat R do ps), ou o RUNNABLE observado é um BLIP de 1
+ *      proc que não se repete na outra ponta da janela.
  * Uma suite a trabalhar produz dezenas de segundos de CPU numa janela de
- * minutos; uma pendurada produz milissegundos. O gate de idade protege a
- * janela de boot/teardown do `node --test`.
+ * minutos; uma pendurada produz milissegundos E tem a árvore inteira dormindo.
+ * O gate de idade protege a janela de boot/teardown do `node --test`.
+ *
+ * T-667 — POR QUE RUNNABLE (e por que não basta um olhar): sob starvation
+ * extrema a CPU da árvore fica 0ms na janela mesmo com a árvore queimando (o
+ * proc está na fila do scheduler, não recebeu CPU), então CPU plana lia a
+ * fixture VIVA como pendurada e o reaper matava suite em voo (medido no CI,
+ * run 35295629976 attempt 1). O estado `stat` do ps separa as duas classes,
+ * mas um ÚNICO instante não separa: um proc dormindo que acorda (um
+ * `setInterval`) também aparece R por um átimo. Medido nas duas fixtures
+ * reais (sonda `evidence/T-667/probe-runnable2.mjs`, 13 amostras, load ~40):
+ * a viva tem 3–4 procs RUNNABLE em 100% das amostras; a pendurada tem 0 (no
+ * máximo 1 blip, nunca o mesmo pid em duas amostras). Daí o critério exigir
+ * REPETIÇÃO: ≥ 2 procs RUNNABLE no snapshot, ou o MESMO pid RUNNABLE nas
+ * duas pontas da janela (o que também cobre a suite de um único queimador).
  *
  * CONTROLE NEGATIVO (C2): enquanto a CPU da árvore crescer acima do teto a
  * suite é classificada `viva` e o reaper não a toca — inclusive se ela tiver
@@ -47,6 +63,14 @@ export const SUITE_PARK_DEFAULTS = {
   /** Teto de amostras guardadas no histórico do daemon. */
   historyMax: 30,
 } as const;
+
+/**
+ * T-667: mínimo de procs RUNNABLE no snapshot para o sinal de starvation
+ * valer sem esperar a outra ponta da janela. Derivado da sonda das duas
+ * fixtures reais: viva = 3–4 procs RUNNABLE em 100% das amostras; pendurada
+ * = 0 (blip de no máximo 1). O 2 fica entre as duas classes com margem.
+ */
+export const RUNNABLE_MIN = 2;
 
 export interface SuiteParkOpts {
   sampleMs: number;
@@ -80,6 +104,8 @@ export interface ProcRow {
   pid: number;
   ppid: number;
   pgid: number;
+  /** Estado do processo (stat do ps); 1º char "R" = running/runnable. */
+  stat: string;
   /** Idade do processo (etime). */
   elapsedMs: number;
   /** CPU acumulada (time). */
@@ -121,15 +147,16 @@ export function parsePsOutput(text: string): ProcRow[] {
   for (const line of text.split("\n")) {
     const t = line.trim();
     if (!t) continue;
-    const m = /^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(.*)$/.exec(t);
+    const m = /^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.*)$/.exec(t);
     if (!m) continue;
     rows.push({
       pid: Number(m[1]),
       ppid: Number(m[2]),
       pgid: Number(m[3]),
-      elapsedMs: parsePsDuration(m[4]),
-      cpuMs: parsePsDuration(m[5]),
-      command: m[6],
+      stat: m[4],
+      elapsedMs: parsePsDuration(m[5]),
+      cpuMs: parsePsDuration(m[6]),
+      command: m[7],
     });
   }
   return rows;
@@ -152,7 +179,7 @@ export function isTestRoot(command: string): boolean {
 }
 
 export function runPs(): ProcRow[] {
-  const r = spawnSync("ps", ["-axo", "pid=,ppid=,pgid=,etime=,time=,command="], {
+  const r = spawnSync("ps", ["-axo", "pid=,ppid=,pgid=,stat=,etime=,time=,command="], {
     encoding: "utf8",
     timeout: 5_000,
     maxBuffer: 8 * 1024 * 1024,
@@ -170,6 +197,8 @@ export interface Suite {
   members: number[];
   /** CPU acumulada por membro NO snapshot em que a suite foi colhida. */
   cpuByPid: Map<number, number>;
+  /** Membros RUNNABLE (stat R) no snapshot — T-667: liveness sob starvation. */
+  runnablePids: number[];
   ageMs: number;
   cpuMs: number;
   /** true quando dá para matar por grupo sem atingir o daemon. */
@@ -236,11 +265,15 @@ export function collectSuites(rows: ProcRow[], ownPid: number = process.pid): Su
       }
     }
     const cpuByPid = new Map<number, number>();
+    const runnablePids: number[] = [];
     let cpuMs = 0;
     for (const pid of members) {
-      const cpu = byPid.get(pid)?.cpuMs ?? 0;
+      const row = byPid.get(pid);
+      const cpu = row?.cpuMs ?? 0;
       cpuByPid.set(pid, cpu);
       cpuMs += cpu;
+      // T-667: 1º char "R" = running/runnable — na fila do scheduler.
+      if (row?.stat.startsWith("R")) runnablePids.push(pid);
     }
     suites.push({
       rootPid: root.pid,
@@ -248,6 +281,7 @@ export function collectSuites(rows: ProcRow[], ownPid: number = process.pid): Su
       command: root.command,
       members: [...members].sort((a, b) => a - b),
       cpuByPid,
+      runnablePids,
       ageMs: root.elapsedMs,
       cpuMs,
       killGroup,
@@ -276,13 +310,13 @@ export interface AssessOpts {
 }
 
 /**
- * Classifica cada suite contra uma amostra ANTERIOR (pid → CPU acumulada).
- * `baseline` null = primeira amostra: nada pode ser declarado pendurado ainda
- * (o critério exige delta de CPU, e delta exige duas amostras).
+ * Classifica cada suite contra uma amostra ANTERIOR (CPU por pid + conjunto
+ * RUNNABLE). `baseline` null = primeira amostra: nada pode ser declarado
+ * pendurado ainda (o critério exige delta de CPU, e delta exige duas amostras).
  */
 export function assessSuites(
   suites: Suite[],
-  baseline: Map<number, number> | null,
+  baseline: Sample | null,
   opts: AssessOpts,
 ): Assessment[] {
   return suites.map((suite) => {
@@ -295,7 +329,7 @@ export function assessSuites(
         cpuDeltaMs: null,
       };
     }
-    if (!baseline || !baseline.has(suite.rootPid)) {
+    if (!baseline || !baseline.cpu.has(suite.rootPid)) {
       return {
         ...base,
         state: "indeterminada" as const,
@@ -305,15 +339,32 @@ export function assessSuites(
     }
     let delta = 0;
     for (const pid of suite.members) {
-      const before = baseline.get(pid);
+      const before = baseline.cpu.get(pid);
       if (before === undefined) continue;
       delta += (suite.cpuByPid.get(pid) ?? 0) - before;
     }
     if (delta < opts.maxCpuDeltaMs) {
+      // T-667: CPU plana não basta sob starvation extrema. Processo RUNNABLE
+      // está vivo e na fila do scheduler — só não recebeu CPU na janela. O
+      // sinal, porém, tem de ser REPETIDO (um proc que acorda também aparece
+      // R por um átimo): vale com ≥ RUNNABLE_MIN procs, ou com o MESMO pid
+      // RUNNABLE nas duas pontas da janela.
+      const persistentes = suite.runnablePids.filter((pid) => baseline.runnable.has(pid));
+      if (suite.runnablePids.length >= RUNNABLE_MIN || persistentes.length > 0) {
+        const como = suite.runnablePids.length >= RUNNABLE_MIN
+          ? `${suite.runnablePids.length} procs RUNNABLE`
+          : `pid ${persistentes.join(",")} RUNNABLE nas DUAS pontas da janela`;
+        return {
+          ...base,
+          state: "viva" as const,
+          motivo: `CPU da árvore cresceu ${delta}ms < ${opts.maxCpuDeltaMs}ms em ${fmtDuration(opts.windowMs)}, mas ${como} (starvation) — viva`,
+          cpuDeltaMs: delta,
+        };
+      }
       return {
         ...base,
         state: "pendurada" as const,
-        motivo: `CPU da árvore cresceu ${delta}ms < ${opts.maxCpuDeltaMs}ms em ${fmtDuration(opts.windowMs)}`,
+        motivo: `CPU da árvore cresceu ${delta}ms < ${opts.maxCpuDeltaMs}ms em ${fmtDuration(opts.windowMs)} e nenhum sinal RUNNABLE repetido (árvore dormindo; RUNNABLE no snapshot: ${suite.runnablePids.length})`,
         cpuDeltaMs: delta,
       };
     }
@@ -326,11 +377,20 @@ export function assessSuites(
   });
 }
 
-/** CPU acumulada por pid — a "amostra" contra a qual o próximo tick compara. */
-export function cpuMapOf(rows: ProcRow[]): Map<number, number> {
-  const m = new Map<number, number>();
-  for (const r of rows) m.set(r.pid, r.cpuMs);
-  return m;
+/** Amostra contra a qual o próximo tick compara: CPU por pid + pids RUNNABLE. */
+export interface Sample {
+  cpu: Map<number, number>;
+  runnable: Set<number>;
+}
+
+export function sampleOf(rows: ProcRow[]): Sample {
+  const cpu = new Map<number, number>();
+  const runnable = new Set<number>();
+  for (const r of rows) {
+    cpu.set(r.pid, r.cpuMs);
+    if (r.stat.startsWith("R")) runnable.add(r.pid);
+  }
+  return { cpu, runnable };
 }
 
 // ──────────────────────────────── morte ─────────────────────────────────────
@@ -459,6 +519,8 @@ export function formatReport(assessments: Assessment[], opts: AssessOpts): strin
   const pend = assessments.filter((a) => a.state === "pendurada");
   lines.push(`criterio: raiz \`node … --test\` viva ha >= ${fmtDuration(opts.minAgeMs)} E CPU da arvore`);
   lines.push(`          (raiz + workers + pipeline) crescendo < ${opts.maxCpuDeltaMs}ms em ${fmtDuration(opts.windowMs)}`);
+  lines.push(`          E nenhum sinal RUNNABLE repetido — T-667: sob starvation CPU plana nao basta;`);
+  lines.push(`          conta com >= ${RUNNABLE_MIN} procs RUNNABLE (state R) ou o MESMO pid R nas duas pontas`);
   lines.push(`suites encontradas: ${assessments.length} · penduradas: ${pend.length}`);
   lines.push("");
   lines.push("ESTADO        PID     PGID    IDADE      CPU      dCPU    ARV  CMD / CWD");
@@ -512,7 +574,7 @@ export function runSuiteParkCli(
     windowMs: opts.windowMs,
   };
   const first = io.ps();
-  const baseline = cpuMapOf(first);
+  const baseline = sampleOf(first);
   io.out(`amostra 1/2 colhida — aguardando ${fmtDuration(opts.windowMs)} para medir a CPU da janela...\n`);
   sleepSync(opts.windowMs);
   const rows = io.ps();
@@ -593,7 +655,7 @@ export function startSuitePark(input: StartSuiteParkInput): SuiteParkHandle {
   const ps = input.ps ?? runPs;
   const deps = input.deps ?? defaultReapDeps;
   const ownPid = input.ownPid ?? process.pid;
-  const history: Array<{ at: number; cpu: Map<number, number> }> = [];
+  const history: Array<{ at: number; sample: Sample }> = [];
   let timer: NodeJS.Timeout | null = null;
 
   const tick = (): Assessment[] => {
@@ -601,16 +663,16 @@ export function startSuitePark(input: StartSuiteParkInput): SuiteParkHandle {
     const suites = collectSuites(rows, ownPid);
     const now = Date.now();
     // Baseline = amostra mais recente que já dista >= flatWindowMs.
-    let baseline: Map<number, number> | null = null;
+    let baseline: Sample | null = null;
     for (let i = history.length - 1; i >= 0; i--) {
-      if (now - history[i].at >= opts.flatWindowMs) { baseline = history[i].cpu; break; }
+      if (now - history[i].at >= opts.flatWindowMs) { baseline = history[i].sample; break; }
     }
     const assessments = assessSuites(suites, baseline, {
       minAgeMs: opts.minAgeMs,
       maxCpuDeltaMs: opts.maxCpuDeltaMs,
       windowMs: opts.flatWindowMs,
     });
-    history.push({ at: now, cpu: cpuMapOf(rows) });
+    history.push({ at: now, sample: sampleOf(rows) });
     while (history.length > opts.historyMax) history.shift();
 
     const penduradas = assessments.filter((a) => a.state === "pendurada");
