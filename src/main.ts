@@ -347,6 +347,11 @@ export class DaemonClient {
     } catch (e) {
       log("warn", `bridge relay failed to start (${(e as Error).message}) — agents will fetch orch directly`);
     }
+    // T-720: mensagens retidas pelo dreno do re-exec anterior (spool cifrado).
+    // Entregues no spawn de cada agente (replay do hello, T-710b).
+    try { this.host.loadReexecSpool(); } catch (e) {
+      log("warn", `[self-update] spool: leitura falhou (${(e as Error).message})`);
+    }
     POLICY_GATED_RUNNERS.forEach((runner) => {
       const status = this.cliCommands[runner];
       log(status.available ? "info" : "warn", formatCliStatus(runner, status));
@@ -2225,6 +2230,9 @@ export class DaemonClient {
       },
       // T-100: idle-restart mata CLIs (detached:true) ANTES do exit 42.
       prepareReexec: () => this.prepareReexec({ keepRunning: true }),
+      // T-720: pendente sem idle natural → dreno (sem turno novo; mensagens
+      // retidas para o spool cifrado do re-exec).
+      startDrain: () => { this.host.startDrain(); },
     }),
     log: (level, msg) => log(level, msg),
   });
@@ -2284,8 +2292,20 @@ export class DaemonClient {
   private async prepareReexec(opts: { keepRunning?: boolean } = {}): Promise<void> {
     log("info", "[self-update] parando CLIs filhos antes do re-exec");
     try { stopAllGraphWatches(); } catch { /* noop */ }
+    // T-720: no re-exec, retém tudo que chegar daqui em diante (idle natural
+    // não passou pelo dreno) e tira o que ainda estiver nas filas.
+    if (opts.keepRunning && !this.host.isDraining()) this.host.startDrain();
     const n = await this.host.shutdown({ reexec: !!opts.keepRunning });
     if (opts.keepRunning) log("info", `[self-update] reexec: ${n} agent(s) mantidos running`);
+    if (opts.keepRunning) {
+      // Depois do shutdown: menor janela para mensagem chegar e ficar de fora.
+      try {
+        const sp = this.host.writeReexecSpool();
+        log("info", `[self-update] spool: ${sp.spooled} msg(s) gravadas cifradas${sp.lost ? `, ${sp.lost} perdida(s) sem chave (não gravadas em claro)` : ""}`);
+      } catch (e) {
+        log("warn", `[self-update] spool falhou: ${(e as Error).message} — mensagens retidas perdidas no re-exec`);
+      }
+    }
     // terminateWithEscalation agenda SIGKILL em ~1.5s; espera o timer.
     await new Promise((r) => setTimeout(r, 2_500));
   }

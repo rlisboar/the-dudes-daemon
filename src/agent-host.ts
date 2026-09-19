@@ -1,5 +1,6 @@
 import path from "node:path";
 import fs from "node:fs";
+import os from "node:os";
 import {AgentRunner, type AgentRunnerOptions} from "./agent-runner.js";
 import {breadcrumb, captureWarn} from "./sentry.js";
 import {assertWorkspaceScoped, autoWorkspaceCwd, cloneRepoIfMissing, expandBasePath, findGitRoot, getWorkspaceRoot, isInsideRoot, repoCwd} from "./workspace.js";
@@ -138,10 +139,46 @@ export function runGitWorktreeRemove(
   });
 }
 
+/** T-720: mensagem retida no dreno (em memória, plaintext — nunca em disco). */
+interface SpoolItem {
+  content: string;
+  images?: ImageAttachment[];
+  deliveryId?: string;
+  enqueuedAt: number;
+}
+/** T-720: registro do spool em disco — só metadados + blob e2e:v2 re-cifrado. */
+interface SpoolRecord {
+  agentId: string;
+  projectId: string;
+  deliveryId?: string;
+  enqueuedAt: number;
+  blob: string;
+}
+const SPOOL_FILE = "reexec-spool.json";
+/** Spool mais velho que isto não é entregue (o contexto já passou). */
+const SPOOL_TTL_MS = 60 * 60_000;
+/** AAD próprio: blob do spool não abre como nenhum campo do catálogo e vice-versa. */
+function spoolAad(projectId: string): string {
+  return aadV2({ projectId, table: "daemon_reexec_spool", field: "message" });
+}
+export function reexecSpoolDir(): string {
+  return process.env.THE_DUDES_REEXEC_SPOOL_DIR || path.join(os.homedir(), ".the-dudes", "reexec-spool");
+}
+
 export class AgentHost {
   private entries = new Map<string, Entry>();
   /** T-037: agent:send chegando antes do runner (gap pós-spawn/self-update). */
   private inboundBuffer = createAgentInboundBuffer({ maxPerAgent: 20 });
+  /** T-720: ids com mensagem no inboundBuffer (o buffer não lista agentes). */
+  private inboundAgentIds = new Set<string>();
+
+  /** T-720: dreno do self-update — nenhum turno novo; mensagens retidas aqui
+   *  (e nas filas tiradas dos runners) até o spool do re-exec. */
+  private draining = false;
+  private drainHeld = new Map<string, SpoolItem[]>();
+  /** T-720: spool carregado no boot do processo novo, entregue no spawn. */
+  private spooled = new Map<string, SpoolRecord[]>();
+  private spoolPath: string | null = null;
 
   /** Quantos agentes este daemon mantém vivos — indicador de saúde da UI. */
   agentCount(): number {
@@ -756,11 +793,19 @@ export class AgentHost {
   }
 
   send_message(agentId: string, content: string, images?: ImageAttachment[], deliveryId?: string) {
+    if (this.draining) {
+      // T-720: dreno — não alimenta o runner (turno novo atrasaria o re-exec);
+      // a mensagem vai no spool cifrado e é entregue pelo processo novo.
+      this.holdForDrain(agentId, { content, images, deliveryId, enqueuedAt: Date.now() });
+      this.log("info", `[self-update] dreno: send_message para ${agentId} retido para o re-exec (${this.drainHeld.get(agentId)?.length ?? 0} retidas)`);
+      return;
+    }
     const e = this.entries.get(agentId);
     if (!e?.runner) {
       // T-037: em vez de dropar, buffera até o spawn (gap self-update / auto-resume).
       // Se o agente nunca subir, TTL 15min limpa. Antes: drop + agent:error e a
       // TASK_ASSIGN sumia mesmo com o server reenviando.
+      this.inboundAgentIds.add(agentId);
       this.inboundBuffer.push(agentId, {
         deliveryId,
         content,
@@ -778,6 +823,14 @@ export class AgentHost {
 
   /** Chamado após spawn bem-sucedido — drena fila local T-037. */
   flushInboundBuffer(agentId: string): number {
+    // T-720: spool do re-exec anterior (mais antigo) antes do buffer local.
+    this.deliverSpoolFor(agentId);
+    if (this.draining) {
+      for (const m of this.inboundBuffer.drain(agentId)) this.holdForDrain(agentId, { ...m, images: m.images as ImageAttachment[] | undefined });
+      this.inboundAgentIds.delete(agentId);
+      return 0;
+    }
+    this.inboundAgentIds.delete(agentId);
     const pending = this.inboundBuffer.drain(agentId);
     const e = this.entries.get(agentId);
     if (!e?.runner || pending.length === 0) return 0;
@@ -806,6 +859,156 @@ export class AgentHost {
 
   /** M25 (T-448): async — além de parar os runners, remove os worktrees
    *  (com teto de 2s; main espera 2.5s antes do re-exec). */
+  /* ---------------------- T-720: dreno + spool do re-exec ---------------------- */
+
+  private holdForDrain(agentId: string, item: SpoolItem): void {
+    const list = this.drainHeld.get(agentId) ?? [];
+    if (item.deliveryId && list.some((m) => m.deliveryId === item.deliveryId)) return;
+    list.push(item);
+    this.drainHeld.set(agentId, list);
+  }
+
+  /** T-720: liga o dreno. Tira dos runners as mensagens enfileiradas e ainda
+   *  NÃO iniciadas (o turno em curso segue e termina normalmente) e passa a
+   *  reter todo send_message novo. @returns mensagens retiradas das filas. */
+  startDrain(): number {
+    this.draining = true;
+    let moved = 0;
+    for (const [agentId, e] of this.entries) {
+      const take = (e.runner as unknown as { takeQueuedForDrain?: () => Array<{ content: string; images?: ImageAttachment[] }> } | null)?.takeQueuedForDrain;
+      if (!e.runner || typeof take !== "function") continue;
+      for (const m of take.call(e.runner)) {
+        this.holdForDrain(agentId, { content: m.content, images: m.images, enqueuedAt: Date.now() });
+        moved++;
+      }
+    }
+    this.log("info", `[self-update] dreno ligado: ${moved} msg(s) tiradas das filas dos runners; nenhum turno novo até o re-exec`);
+    return moved;
+  }
+
+  isDraining(): boolean { return this.draining; }
+
+  /** T-720: grava o spool ANTES do re-exec. Só blob e2e:v2 re-cifrado com a
+   *  chave do projeto; sem chave (ou projeto desconhecido) a mensagem NÃO vai
+   *  para o disco — perda declarada no log, nunca plaintext. Arquivo 0600 em
+   *  diretório 0700, escrita atômica (tmp + rename). */
+  writeReexecSpool(dir: string = reexecSpoolDir()): { spooled: number; lost: number; path: string | null } {
+    for (const agentId of this.inboundAgentIds) {
+      for (const m of this.inboundBuffer.drain(agentId)) this.holdForDrain(agentId, { ...m, images: m.images as ImageAttachment[] | undefined });
+    }
+    this.inboundAgentIds.clear();
+    const records: SpoolRecord[] = [];
+    let lost = 0;
+    for (const [agentId, items] of this.drainHeld) {
+      const projectId = this.entries.get(agentId)?.projectId;
+      for (const item of items) {
+        const blob = projectId
+          ? encryptForProject(JSON.stringify({ content: item.content, images: item.images }), projectId, spoolAad(projectId))
+          : null;
+        if (!projectId || !blob || !blob.startsWith("e2e:v2:")) {
+          lost++;
+          this.log("warn", `[self-update] spool: msg para ${agentId} (project=${projectId ?? "?"}) sem chave do projeto — NÃO gravada em claro; perdida no re-exec`);
+          continue;
+        }
+        records.push({ agentId, projectId, deliveryId: item.deliveryId, enqueuedAt: item.enqueuedAt, blob });
+      }
+    }
+    this.drainHeld.clear();
+    if (records.length === 0) return { spooled: 0, lost, path: null };
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    fs.chmodSync(dir, 0o700);
+    const file = path.join(dir, SPOOL_FILE);
+    const tmp = `${file}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify({ v: 1, createdAt: Date.now(), records }), { mode: 0o600 });
+    fs.renameSync(tmp, file);
+    return { spooled: records.length, lost, path: file };
+  }
+
+  /** T-720: boot do processo novo — carrega o spool (entregue no spawn de
+   *  cada agente). Só aceita e2e:v2; registros vencidos saem com log. */
+  loadReexecSpool(dir: string = reexecSpoolDir(), now = Date.now()): number {
+    const file = path.join(dir, SPOOL_FILE);
+    let parsed: { v?: number; records?: SpoolRecord[] };
+    try {
+      parsed = JSON.parse(fs.readFileSync(file, "utf8")) as { v?: number; records?: SpoolRecord[] };
+    } catch {
+      return 0;
+    }
+    this.spoolPath = file;
+    let n = 0;
+    for (const r of Array.isArray(parsed.records) ? parsed.records : []) {
+      if (!r || typeof r.agentId !== "string" || typeof r.projectId !== "string" || typeof r.blob !== "string" || !r.blob.startsWith("e2e:v2:")) {
+        this.log("warn", `[self-update] spool: registro inválido descartado`);
+        continue;
+      }
+      if (now - Number(r.enqueuedAt || 0) > SPOOL_TTL_MS) {
+        this.log("warn", `[self-update] spool: msg para ${r.agentId} vencida (> ${SPOOL_TTL_MS / 60_000}min) — descartada`);
+        continue;
+      }
+      const list = this.spooled.get(r.agentId) ?? [];
+      list.push(r);
+      this.spooled.set(r.agentId, list);
+      n++;
+    }
+    this.persistSpool();
+    if (n > 0) this.log("info", `[self-update] spool do re-exec: ${n} msg(s) para ${this.spooled.size} agente(s), entregues no spawn`);
+    return n;
+  }
+
+  private deliverSpoolFor(agentId: string): void {
+    const list = this.spooled.get(agentId);
+    if (!list || list.length === 0) return;
+    const e = this.entries.get(agentId);
+    if (!e?.runner) return;
+    this.spooled.delete(agentId);
+    let ok = 0;
+    const deliver = (content: string, images?: ImageAttachment[]) => {
+      // Dreno de um NOVO update já ligado: segue retido para o próximo spool.
+      if (this.draining) this.holdForDrain(agentId, { content, images, enqueuedAt: Date.now() });
+      else e.runner!.pushUserMessage(content, images);
+    };
+    for (const r of list) {
+      const plain = decryptForProject(r.blob, r.projectId, spoolAad(r.projectId));
+      if (plain == null) {
+        this.log("warn", `[self-update] spool: msg para ${agentId} não autenticou com a chave do projeto — descartada`);
+        continue;
+      }
+      try {
+        const m = JSON.parse(plain) as { content?: unknown; images?: ImageAttachment[] };
+        if (typeof m.content !== "string") continue;
+        deliver(m.content, m.images);
+        ok++;
+      } catch {
+        this.log("warn", `[self-update] spool: msg para ${agentId} com payload inválido — descartada`);
+      }
+    }
+    this.log("info", `[self-update] spool: entregue ${ok}/${list.length} msg(s) a ${agentId}`);
+    this.persistSpool();
+  }
+
+  /** Reescreve o spool com o que falta entregar; remove o arquivo quando vazio. */
+  private persistSpool(): void {
+    if (!this.spoolPath) return;
+    const records = [...this.spooled.values()].flat();
+    try {
+      if (records.length === 0) {
+        fs.rmSync(this.spoolPath, { force: true });
+        this.spoolPath = null;
+        return;
+      }
+      const tmp = `${this.spoolPath}.tmp-${process.pid}`;
+      fs.writeFileSync(tmp, JSON.stringify({ v: 1, createdAt: Date.now(), records }), { mode: 0o600 });
+      fs.renameSync(tmp, this.spoolPath);
+    } catch (err) {
+      this.log("warn", `[self-update] spool: falha ao persistir (${(err as Error).message})`);
+    }
+  }
+
+  /** T-720: pendente de entrega no spool (teste/health). */
+  spoolPendingCount(): number {
+    return [...this.spooled.values()].reduce((n, l) => n + l.length, 0);
+  }
+
   /** T-710b: re-exec do self-update em curso — os CLIs morrem, mas o agente
    *  NÃO parou para o time. onExit não anuncia exit/running false ao server
    *  (ele seguiria marcando parada normal, e o hello do processo novo não

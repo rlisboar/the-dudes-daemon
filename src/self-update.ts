@@ -79,7 +79,23 @@ export interface SelfUpdateDeps {
   prepareReexec?: () => void | Promise<void>;
   /** Teto do prepareReexec. Estouro → exit 42 mesmo assim. Default 10s. */
   reexecTimeoutMs?: number;
+  /**
+   * T-720: pendente há mais que isto sem idle natural → DRENO: o host para de
+   * alimentar os runners (nenhum turno novo começa) e os turnos em curso
+   * terminam normalmente; o re-exec sai no primeiro idle. Default 10min.
+   */
+  drainAfterMs?: number;
+  /** T-720: liga o dreno no host (sem turno novo; mensagens retidas p/ spool). */
+  startDrain?: () => void;
+  /** Relógio injetável (testes). */
+  nowFn?: () => number;
 }
+
+/** T-720: janela de idle natural antes do dreno. */
+export const DRAIN_AFTER_MS = 10 * 60_000;
+/** T-720: dreno acima disto só é logado (nunca mata turno): os caps de turno
+ *  (qwen 35min T-598, grok 720s + pós-evento) já limitam o tempo real. */
+export const DRAIN_WARN_MS = 45 * 60_000;
 
 /** Teto de segurança: idle-restart não pode travar esperando filho zumbi. */
 export const REEXEC_SHUTDOWN_MS = 10_000;
@@ -147,6 +163,11 @@ export function verifyBundle(
 let idleRestartArmed = false;
 /** Swap aplicado; processo ainda na imagem do boot. */
 let updatePending = false;
+/** T-720: epoch ms do swap (null = nada pendente). Vai no health. */
+let updatePendingSince: number | null = null;
+/** T-720: dreno ligado (nenhum turno novo até o re-exec). Vai no health. */
+let updateDraining = false;
+let drainWarned = false;
 /** SHA publicado do último swap bem-sucedido neste processo. */
 let appliedReleaseHash: string | undefined;
 /** SHA da imagem carregada — capturado uma vez, nunca re-lê o arquivo. */
@@ -173,11 +194,15 @@ export function runningReleaseInfo(): {
   binaryHash: string | undefined;
   buildTs: number;
   updatePending: boolean;
+  updatePendingSince: number | null;
+  updateDraining: boolean;
 } {
   return {
     binaryHash: bootBinaryHash,
     buildTs: DAEMON_BUILD_TS,
     updatePending,
+    updatePendingSince,
+    updateDraining,
   };
 }
 
@@ -185,6 +210,9 @@ export function runningReleaseInfo(): {
 export function _resetIdleRestartForTest(): void {
   idleRestartArmed = false;
   updatePending = false;
+  updatePendingSince = null;
+  updateDraining = false;
+  drainWarned = false;
   appliedReleaseHash = undefined;
   bootBinaryHash = undefined;
   bootHashCaptured = false;
@@ -244,11 +272,28 @@ function planRestartWhenIdle(deps: SelfUpdateDeps): Promise<"updated" | "updated
   deps.log("info", "[self-update] update aplicado, aguardando idle");
   const ms = deps.idleRecheckMs ?? IDLE_RECHECK_MS;
   const later = deps.setTimeoutFn ?? setTimeout;
+  const now = deps.nowFn ?? Date.now;
+  const drainAfter = deps.drainAfterMs ?? DRAIN_AFTER_MS;
   const tick = () => {
     if (idle()) {
       idleRestartArmed = false;
       void requestReexec(deps);
       return;
+    }
+    // T-720: com o time sempre ativo o idle natural nunca fecha. Passada a
+    // janela, drena: turno novo não começa, o em curso termina (nunca é
+    // morto) e o idle acima fecha sozinho.
+    const pendingMs = now() - (updatePendingSince ?? now());
+    if (!updateDraining && deps.startDrain && pendingMs >= drainAfter) {
+      updateDraining = true;
+      deps.log("info", `[self-update] pendente há ${Math.round(pendingMs / 60_000)}min sem idle — DRENO: nenhum turno novo; aplica quando os turnos em curso terminarem`);
+      try { deps.startDrain(); } catch (e) {
+        deps.log("warn", `[self-update] startDrain falhou: ${(e as Error).message}`);
+      }
+    }
+    if (updateDraining && !drainWarned && pendingMs >= drainAfter + DRAIN_WARN_MS) {
+      drainWarned = true;
+      deps.log("warn", `[self-update] dreno há ${Math.round((pendingMs - drainAfter) / 60_000)}min e ainda há turno ativo — segue esperando (turno em curso nunca é morto)`);
     }
     later(tick, ms);
   };
@@ -302,6 +347,7 @@ export async function checkAndApplyUpdate(deps: SelfUpdateDeps): Promise<string>
     deps.log("info", `[self-update] binários trocados (release ${published.slice(0, 12)}) — assinatura e sha256 verificados`);
     appliedReleaseHash = published;
     updatePending = true;
+    updatePendingSince = (deps.nowFn ?? Date.now)();
 
     return planRestartWhenIdle(deps);
   } catch (e) {

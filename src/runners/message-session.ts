@@ -60,6 +60,15 @@ export class PerMessageSessionState {
   dequeue(): QueuedMessage | undefined { return this.queue.shift(); }
   queuedCount(): number { return this.queue.length; }
 
+  /** T-720: dreno do self-update — devolve e esvazia a fila de mensagens
+   *  ainda NÃO iniciadas (o turno em curso não está aqui). Sintéticas
+   *  (ex.: hang-recover) não são do usuário e ficam de fora. */
+  takeAllForDrain(): QueuedMessage[] {
+    const out = this.queue.filter((m) => !m.synthetic);
+    this.queue = [];
+    return out;
+  }
+
   clearQueue(): number {
     const count = this.queue.length;
     this.queue = [];

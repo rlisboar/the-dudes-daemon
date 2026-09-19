@@ -499,6 +499,14 @@ export function startDsh(self: any): void {
   })();
 }
 
+/** T-720: dreno do self-update — devolve e esvazia a fila de prompts ainda
+ *  NÃO enviados (o prompt em voo não está nela). Só leitura/limpeza. */
+export function dshTakeQueue(self: any): Array<{ content: string }> {
+  const queue = (self.dshQueue as DshQueued[] | undefined) ?? [];
+  self.dshQueue = [];
+  return queue.map((q) => ({ content: q.content }));
+}
+
 /** Enfileira mensagem do usuário; o pump serializa (ACP: 1 prompt por vez). */
 export function dshPushUserMessage(self: any, content: string, images?: ImageAttachment[]): void {
   const queue = (self.dshQueue as DshQueued[] | undefined) ?? [];

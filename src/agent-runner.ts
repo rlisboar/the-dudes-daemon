@@ -39,7 +39,7 @@ import {runQwenMessage} from "./runners/turns/qwen.js";
 import {writeCodexConfig, runCodexMessage, handleCodexEvent, codexSessionsRoot, readCodexRolloutSignals, pollCodexContextOccupancy} from "./runners/turns/codex.js";
 import {buildGrokHeadlessArgs, writeGrokConfig, grokTurnEnv, runGrokMessage, finishGrokTurn, grokSignalsCandidates, readGrokContextSignals, grokChatHistoryPath, grokSweepToolCalls, grokUpdatesCandidates, readGrokUpdatesContextTokens, readGrokTurnBilling, pollGrokContextOccupancy} from "./runners/turns/grok.js";
 import {writeCrushConfig, crushTurnEnv, crushSessionJson, runCrushMessage, finishCrushTurn, ingestCrushChunk} from "./runners/turns/crush.js";
-import {startDsh, dshPushUserMessage, dshStop, dshIsInTurn, dshKillForRestart} from "./runners/turns/dsh.js";
+import {startDsh, dshPushUserMessage, dshStop, dshIsInTurn, dshKillForRestart, dshTakeQueue} from "./runners/turns/dsh.js";
 import {compactContext, compactContextInner, waitOcIdle, parseAndStripMemory, saveExtractedMemory, fetchExistingMemories, memoryAlreadyBlock, parseEpisodeJson, memoryTitleNearDup, postBridgeJson, handleUndeliveredTurnResult, resetContextAccounting, checkContextUsage, reportContextOccupancy, notifyContextFull, registerCompactFailure, checkContextFullError} from "./runners/compact.js";
 import {runOneShot, runOneShotWithSession, killClaudeForRestart} from "./runners/one-shot.js";
 import {traceCli, traceSpawn, renderVerboseIoBlock, traceInternalCli, renderVerboseBlock, colorizeAgentName, supportsAnsi, hexToRgb, extractVerbosePayload, extractValueText, prettyPrintVerboseText, cleanupAgentTmpDir, grokSessionRecentWrite} from "./runners/support.js";
@@ -725,6 +725,20 @@ export class AgentRunner {
   // 20 cobre retomada legítima; loop agent↔agent com Grok enchia 100 e
   // queimava tokens por horas.
   private static readonly MAX_BUFFERED_MESSAGES = 20;
+
+  /**
+   * T-720: dreno do self-update. Devolve e LIMPA as mensagens enfileiradas e
+   * ainda não iniciadas — fila per-message, pendingMessages do claude (restart)
+   * e fila do dsh — na ordem de chegada. O turno em curso não está em nenhuma
+   * delas e segue intacto. O host re-cifra isto no spool do re-exec.
+   */
+  takeQueuedForDrain(): Array<{ content: string; images?: ImageAttachment[] }> {
+    const out: Array<{ content: string; images?: ImageAttachment[] }> = [];
+    for (const m of this.messageSession.takeAllForDrain()) out.push({ content: m.content, images: m.images });
+    out.push(...this.pendingMessages.splice(0));
+    out.push(...dshTakeQueue(this as unknown as Record<string, unknown>));
+    return out;
+  }
 
   pushUserMessage(content: string, images?: ImageAttachment[]) {
     if (isLoopStopMessage(content)) {
