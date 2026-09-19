@@ -10,6 +10,7 @@ import { killProcess } from "./runners/process-lifecycle.js";
 import { openCodeEffortsFor, openCodeHeuristicEffortsFor, parseOpenCodeModelVariants, registerOpenCodeVariants } from "./runners/opencode-effort.js";
 import { EFFORT_SUFFIX_RE, grokWireEfforts, providerModelParts } from "./runners/model-policy.js";
 import { isGrokFamily } from "./runners/index.js";
+import { DshClient } from "./runners/turns/dsh.js";
 import { withModelCapability } from "./model-capability.js";
 import { RUNNERS } from "@the-dudes/protocol";
 
@@ -154,6 +155,70 @@ export function parseLineModelCatalog(output: string, runner: "opencode" | "crus
     if (match) match.isDefault = true;
   }
   return models;
+}
+
+/**
+ * T-690: catálogo do dsh a partir das configOptions do `session/new` (ACP).
+ * O option `model` traz grupos (provider) com options aninhadas
+ * {value, name, description} — o value é o par opaco do set_config_option e
+ * vira o `id` do catálogo; `currentValue` marca o default. Os efforts saem do
+ * option `reasoning_effort` (off/low/high/max → `none` mapeado p/ o EffortLevel).
+ */
+export function parseDshConfigOptions(
+  configOptions: Array<{ id?: string; currentValue?: string; options?: unknown[] }>,
+): DiscoveredRunnerModel[] {
+  const modelOpt = configOptions.find((o) => o?.id === "model");
+  if (!modelOpt || !Array.isArray(modelOpt.options)) return [];
+  const effortOpt = configOptions.find((o) => o?.id === "reasoning_effort");
+  const efforts = Array.isArray(effortOpt?.options)
+    ? effortOpt.options
+        .map((o) => String((o as { value?: string })?.value ?? ""))
+        .filter(Boolean)
+        .map((v) => (v === "off" ? "none" : v))
+    : ["none", "low", "high", "max"];
+  const models: DiscoveredRunnerModel[] = [];
+  const seen = new Set<string>();
+  const push = (value: unknown, name: unknown, description?: unknown) => {
+    const id = String(value ?? "");
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    models.push(withModelCapability({
+      id,
+      label: String(name ?? "") || id,
+      description: description ? String(description) : undefined,
+      isDefault: modelOpt.currentValue === id || undefined,
+      efforts,
+    }));
+  };
+  for (const entry of modelOpt.options) {
+    const e = entry as { value?: unknown; name?: unknown; description?: unknown; options?: Array<{ value?: unknown; name?: unknown; description?: unknown }> };
+    if (Array.isArray(e.options)) {
+      for (const sub of e.options) push(sub?.value, sub?.name, sub?.description);
+    } else if (e.value !== undefined) {
+      push(e.value, e.name, e.description);
+    }
+  }
+  return models;
+}
+
+/** Discovery do dsh: sobe o profile ACP, session/new e lê as configOptions. */
+export async function discoverDsh(command: string, dropTo: DropTarget | null): Promise<DiscoveredRunnerModel[]> {
+  const cwd = dropTo?.home ?? os.homedir();
+  const client = new DshClient({
+    onText: () => {}, onThought: () => {}, onTool: () => {}, onUsage: () => {},
+    onConfig: () => {}, onStderr: () => {}, onExit: () => {},
+  });
+  try {
+    client.start(command, ["--profile", "acp"], { cwd, env: safeDiscoveryEnv() },
+      (cmd, args, opts) => spawnDropped(cmd, args, opts, dropTo) as unknown as ChildProcess);
+    await client.initialize();
+    const sess = await client.newSession(cwd, []);
+    const models = parseDshConfigOptions(sess.configOptions);
+    await client.close();
+    return models;
+  } finally {
+    client.kill();
+  }
 }
 
 /**
@@ -499,6 +564,9 @@ export class ModelDiscovery {  private readonly cache = new Map<CliRunner, Runne
       let models: DiscoveredRunnerModel[];
       if (runner === "codex") {
         models = await discoverCodex(resolved.command, this.dropTo);
+      } else if (runner === "dsh") {
+        // T-690: catálogo via ACP (configOptions do session/new).
+        models = await discoverDsh(resolved.command, this.dropTo);
       } else if (runner === "opencode") {
         // T-262: --verbose traz os variants reais por modelo (fonte do
         // /variants). CLI antigo sem a flag → exit≠0 → fallback p/ lista

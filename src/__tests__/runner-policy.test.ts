@@ -16,6 +16,7 @@ function fakeCommands(installed: Record<string, boolean>): ResolvedCliCommands {
     crush: mk(installed.crush ?? false),
     grok: mk(installed.grok ?? false),
     "grok-custom": mk(installed["grok-custom"] ?? false),
+    dsh: mk(installed.dsh ?? false),
     graphify: mk(false),
     graphifyMcp: mk(false),
   };

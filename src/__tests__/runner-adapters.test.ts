@@ -4,9 +4,10 @@ import { compatibleSessionId, isPerMessageRunner, RUNNER_ADAPTERS, runnerAdapter
 
 const uuid = "123e4567-e89b-12d3-a456-426614174000";
 
-test("catalog contains exactly the supported runners (T-150: + grok-custom)", () => {
-  assert.deepEqual(Object.keys(RUNNER_ADAPTERS).sort(), ["claude", "codex", "crush", "gemini", "grok", "grok-custom", "opencode", "qwen"]);
+test("catalog contains exactly the supported runners (T-150: + grok-custom; T-690: + dsh)", () => {
+  assert.deepEqual(Object.keys(RUNNER_ADAPTERS).sort(), ["claude", "codex", "crush", "dsh", "gemini", "grok", "grok-custom", "opencode", "qwen"]);
   assert.equal(isPerMessageRunner("claude"), false);
+  assert.equal(isPerMessageRunner("dsh"), false, "dsh é persistent (ACP)");
   for (const id of ["codex", "crush", "gemini", "grok", "grok-custom", "opencode", "qwen"] as const) assert.equal(isPerMessageRunner(id), true);
 });
 

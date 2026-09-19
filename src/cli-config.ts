@@ -15,6 +15,8 @@ export interface CliPathConfig {
   grok?: string;
   /** T-150: binário do runner grok-custom (apontado pelo dono). */
   "grok-custom"?: string;
+  /** T-690: binário do runner dsh (DeepSeek Harness; `dsh --profile acp`). */
+  dsh?: string;
   graphify?: string;
   graphifyMcp?: string;
 }
@@ -45,6 +47,8 @@ export interface ResolvedCliCommands {
   grok: ResolvedCliCommand;
   /** T-150: binário do runner grok-custom (semântica grok, executável do dono). */
   "grok-custom": ResolvedCliCommand;
+  /** T-690: dsh (DeepSeek Harness) — servidor ACP v1 stdio via `--profile acp`. */
+  dsh: ResolvedCliCommand;
   /** graphify CLI (build/index do knowledge graph) — opcional, só usado
    *  quando a feature graph está ligada no projeto. */
   graphify: ResolvedCliCommand;
@@ -98,6 +102,9 @@ export function resolveCliCommands(config: DaemonCliConfig = {}): ResolvedCliCom
     // T-150: grok-custom — semântica grok, binário apontado pelo dono
     // (cliPaths["grok-custom"] ou binário `grok-custom` em userRunnerBinDirs).
     "grok-custom": resolveOne("grok-custom", config.cliPaths?.["grok-custom"], userDirs),
+    // T-690: dsh (DeepSeek Harness) — binário global (npm -g/homebrew) em
+    // userRunnerBinDirs/PATH; `--profile acp` é arg de spawn, não do path.
+    dsh: resolveOne("dsh", config.cliPaths?.dsh, userDirs),
     // graphify/graphify-mcp costumam ser instalados via pip --user/pipx em
     // dirs FORA do PATH herdado pelo daemon (ex: ~/Library/Python/X.Y/bin,
     // ~/.local/bin). Além do `which`, varre esses dirs de script do pip.

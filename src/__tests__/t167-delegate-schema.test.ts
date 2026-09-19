@@ -21,7 +21,8 @@ test("T-167 A2: schema MCP delegate aceita grok-custom (POLICY_GATED_RUNNERS)", 
   );
   assert.ok((POLICY_GATED_RUNNERS as readonly string[]).includes("grok-custom"));
   assert.ok((POLICY_GATED_RUNNERS as readonly string[]).includes("qwen"));
-  assert.equal(POLICY_GATED_RUNNERS.length, 8);
+  assert.ok((POLICY_GATED_RUNNERS as readonly string[]).includes("dsh"));
+  assert.equal(POLICY_GATED_RUNNERS.length, 9);
 
   const schema = z.enum(POLICY_GATED_RUNNERS);
   assert.equal(schema.parse("grok-custom"), "grok-custom");

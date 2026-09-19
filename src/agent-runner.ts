@@ -39,6 +39,7 @@ import {runQwenMessage} from "./runners/turns/qwen.js";
 import {writeCodexConfig, runCodexMessage, handleCodexEvent, codexSessionsRoot, readCodexRolloutSignals, pollCodexContextOccupancy} from "./runners/turns/codex.js";
 import {buildGrokHeadlessArgs, writeGrokConfig, grokTurnEnv, runGrokMessage, finishGrokTurn, grokSignalsCandidates, readGrokContextSignals, grokChatHistoryPath, grokSweepToolCalls, grokUpdatesCandidates, readGrokUpdatesContextTokens, readGrokTurnBilling, pollGrokContextOccupancy} from "./runners/turns/grok.js";
 import {writeCrushConfig, crushTurnEnv, crushSessionJson, runCrushMessage, finishCrushTurn, ingestCrushChunk} from "./runners/turns/crush.js";
+import {startDsh, dshPushUserMessage, dshStop, dshIsInTurn, dshKillForRestart} from "./runners/turns/dsh.js";
 import {compactContext, compactContextInner, waitOcIdle, parseAndStripMemory, saveExtractedMemory, fetchExistingMemories, memoryAlreadyBlock, parseEpisodeJson, memoryTitleNearDup, postBridgeJson, handleUndeliveredTurnResult, resetContextAccounting, checkContextUsage, reportContextOccupancy, notifyContextFull, registerCompactFailure, checkContextFullError} from "./runners/compact.js";
 import {runOneShot, runOneShotWithSession, killClaudeForRestart} from "./runners/one-shot.js";
 import {traceCli, traceSpawn, renderVerboseIoBlock, traceInternalCli, renderVerboseBlock, colorizeAgentName, supportsAnsi, hexToRgb, extractVerbosePayload, extractValueText, prettyPrintVerboseText, cleanupAgentTmpDir, grokSessionRecentWrite} from "./runners/support.js";
@@ -626,6 +627,12 @@ export class AgentRunner {
       this.bootPerMessageRunner();
       return;
     }
+    if (this.opts.cliRunner === "dsh") {
+      // T-690: servidor ACP v1 stdio persistente (`dsh --profile acp`).
+      if (!this.ensureRunnerAvailable("dsh")) { this.emitExit(1); return; }
+      startDsh(this as unknown as Record<string, unknown>);
+      return;
+    }
     if (!this.ensureRunnerAvailable("claude")) { this.emitExit(1); return; }
     this.startClaude();
   }
@@ -735,6 +742,12 @@ export class AgentRunner {
     }
     // Durante restart (clearContext/compact) ou se proc ainda não está
     // writable, buffera. Flush acontece no spawn callback do startClaude.
+    if (this.opts.cliRunner === "dsh") {
+      // T-690: fila própria do ACP (1 prompt por vez por sessão); o driver
+      // buffera até o handshake concluir.
+      dshPushUserMessage(this as unknown as Record<string, unknown>, content, images);
+      return;
+    }
     if (this.restarting || !this.proc || !this.proc.stdin.writable) {
       if (this.pendingMessages.length >= AgentRunner.MAX_BUFFERED_MESSAGES) {
         this.opts.log("warn", `[cli:${this.info.id}:claude] pendingMessages cheia (${this.pendingMessages.length}) — drop mensagem durante restart`);
@@ -797,6 +810,12 @@ export class AgentRunner {
       }
       return;
     }
+    if (this.opts.cliRunner === "dsh") {
+      // T-690: o driver fecha a sessão (best-effort) e mata o processo ACP.
+      dshStop(this as unknown as Record<string, unknown>);
+      this.emitExit(0);
+      return;
+    }
     if (procAlive(this.proc)) {
       try { this.proc!.stdin.end(); } catch {}
       terminateWithEscalation(this.proc);
@@ -830,6 +849,17 @@ export class AgentRunner {
         this.resetContextAccounting();
         this.startClaude();
         this.opts.onError("[ctx] context cleared — claude restarted with new session");
+        return;
+      }
+      if (this.opts.cliRunner === "dsh") {
+        // T-690: mesmo contrato do claude — sessão nova, sem resume.
+        await dshKillForRestart(this as unknown as Record<string, unknown>);
+        this.opts.resumeSessionId = undefined;
+        this.info.sessionId = undefined;
+        if (this.opts.onSessionId) this.opts.onSessionId("");
+        this.resetContextAccounting();
+        startDsh(this as unknown as Record<string, unknown>);
+        this.opts.onError("[ctx] context cleared — dsh restarted with new session");
         return;
       }
       // Mata turno em voo E one-shot de compact (simétrico a stop()).
@@ -1090,6 +1120,7 @@ export class AgentRunner {
     // T-055: "queued" = esperando slot do gate — NÃO é turno em execução.
     if (this.waitingTurnGate || this.currentState === "queued") return false;
     if (this.messageSession.busy) return true;
+    if (this.opts.cliRunner === "dsh" && dshIsInTurn(this as unknown as Record<string, unknown>)) return true;
     const s = this.currentState;
     return s === "thinking" || s === "speaking" || s === "sending" || s === "stalled";
   }
@@ -1180,6 +1211,13 @@ export class AgentRunner {
       void this.recoverClaudeContinuousHang(`claude process dead while state=${this.currentState}`, idleMs);
       return;
     }
+    if (runner === "dsh" && this.isInTurn()) {
+      const client = (this as unknown as { dsh?: { alive?: boolean } }).dsh;
+      if (client && client.alive === false) {
+        void this.recoverDshContinuousHang(`dsh process dead while state=${this.currentState}`, idleMs);
+        return;
+      }
+    }
 
     // T-371 (d): teto ABSOLUTO de lifetime do turno — elapsed desde
     // markTurnStart, não se renova com atividade. É o que apanha o loop de
@@ -1244,6 +1282,13 @@ export class AgentRunner {
         // até restart manual. Hard = reinicia o processo claude com resume.
         void this.recoverClaudeContinuousHang(
           `no activity for ${Math.round(idleMs / 1000)}s (continuous)`,
+          idleMs,
+        );
+        return;
+      }
+      if (runner === "dsh" && this.isInTurn()) {
+        void this.recoverDshContinuousHang(
+          `no activity for ${Math.round(idleMs / 1000)}s (dsh)`,
           idleMs,
         );
         return;
@@ -1498,6 +1543,39 @@ export class AgentRunner {
       this.opts.onError(full + " — sessão resumida; envie de novo se a última msg não entrou");
     } catch (e) {
       this.opts.log("error", `[hang:${this.info.name}] recoverClaude falhou: ${(e as Error).message}`);
+      this.setState("idle");
+    } finally {
+      this.recoveringHung = false;
+    }
+  }
+
+  /** T-690: dsh é persistent como o claude — hard hang sem busy deixava o
+   *  agente stalled pra sempre. Mata o ACP e ressobe com session/resume. */
+  private async recoverDshContinuousHang(reason: string, idleMs: number): Promise<void> {
+    if (this.recoveringHung || this.stopped) return;
+    if (this.opts.cliRunner !== "dsh") return;
+    this.recoveringHung = true;
+    try {
+      this.opts.log(
+        "warn",
+        `[hang:${this.info.name}] HARD recover dsh: ${reason}`,
+      );
+      this.toolsInFlight = 0;
+      this.toolsInFlightSince = null;
+      this.activityClock.softReported = false;
+      this.activityClock.deadSince = null;
+      const sid = this.info.sessionId || this.opts.resumeSessionId;
+      if (sid) this.opts.resumeSessionId = sid;
+      await dshKillForRestart(this as unknown as Record<string, unknown>);
+      if (this.stopped) return;
+      startDsh(this as unknown as Record<string, unknown>);
+      this.touchActivity();
+      this.setState("idle");
+      const full = `[hang] dsh reiniciado: ${reason}`;
+      this.opts.onHung?.({ soft: false, reason: full, idleMs });
+      this.opts.onError(full + " — sessão resumida; envie de novo se a última msg não entrou");
+    } catch (e) {
+      this.opts.log("error", `[hang:${this.info.name}] recoverDsh falhou: ${(e as Error).message}`);
       this.setState("idle");
     } finally {
       this.recoveringHung = false;

@@ -39,6 +39,10 @@ export const RUNNER_ADAPTERS: Readonly<Record<CliRunner, RunnerAdapter>> = {
   // signals.json, watchdog/turn-gate) — só muda o binário, apontado pelo
   // dono via cliPaths/userRunnerBinDirs (T-032), sem path hardcoded.
   "grok-custom": adapter("grok-custom", "per-message", (id) => UUID.test(id)),
+  // T-690: dsh (DeepSeek Harness) — servidor ACP v1 stdio PERSISTENTE
+  // (`dsh --profile acp`); sessão = UUID do session/new; o log é durável e o
+  // resume NÃO re-injeta o system prompt (replayedSessionAlreadyHas...=true).
+  dsh: adapter("dsh", "persistent", (id) => UUID.test(id), true),
 };
 
 /** T-150: família grok — comportamento idêntico entre grok e grok-custom. */

@@ -45,6 +45,8 @@ export const RUNNER_CATALOG = [
   { value: "crush", label: "Crush" },
   { value: "grok", label: "Grok" },
   { value: "grok-custom", label: "Grok Custom" },
+  // T-690: dsh = DeepSeek Harness via ACP v1 stdio (`dsh --profile acp`).
+  { value: "dsh", label: "DSH" },
 ];
 
 /** Ordem canônica de iteração (ex.: descoberta de models no daemon). */

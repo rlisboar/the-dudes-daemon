@@ -115,6 +115,22 @@ export function hangThresholds(runner?: string): HangThresholds {
       lifetimeMs: QWEN_TURN_LIFETIME_MS,
     };
   }
+  if (runner === "dsh") {
+    // T-690: ACP v1 stdio (persistent) — NÃO família grok, o hard seco de
+    // 120s não vale. Medição (PM, 16:5xZ): boot+compose do profile ~13-19s,
+    // session/new ~1s, prompt trivial ~2s; updates semânticos (message/
+    // thought/tool/usage) repõem o clock durante o turno. Sem tool em voo:
+    // soft 3min / hard 6min (compor contexto pode ficar minutos sem update);
+    // tool em voo: teto próprio de 15min (build/suíte). Cold start: janela de
+    // 5min cobre boot+compose com >3× de margem.
+    return {
+      softMs: 3 * 60_000,
+      hardMs: 6 * 60_000,
+      deadProcMs: 15_000,
+      toolsHardMs: 15 * 60_000,
+      firstEventMs: 5 * 60_000,
+    };
+  }
   // codex / crush / gemini (per-message)
   return { softMs: 5 * 60_000, hardMs: 12 * 60_000, deadProcMs: 20_000, toolsHardMs: 20 * 60_000 };
 }

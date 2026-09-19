@@ -1,0 +1,593 @@
+/**
+ * T-690: cliente ACP v1 (Agent Client Protocol) sobre stdio NDJSON para o
+ * runner `dsh` (DeepSeek Harness, `dsh --profile acp`).
+ *
+ * Contrato (README do dsh-acp, doc-fonte no host):
+ *  - stdout é SÓ protocolo (JSON-RPC 2.0 por linha); logs vão p/ stderr.
+ *  - Fluxo: initialize → session/new{cwd, mcpServers} → set_config_option
+ *    (model; reasoning_effort quando setado) → session/prompt por turno.
+ *  - Restart do daemon → session/resume(sessionId) SEM replay (o log é durável
+ *    e o system prompt NÃO é re-injetado).
+ *  - Updates: session/update com update.sessionUpdate = agent_message_chunk
+ *    (texto), agent_thought_chunk (thinking), tool_call/tool_call_update
+ *    (tool), usage_update, config_option_update.
+ *  - session/request_permission (request do server) é auto-respondido com
+ *    allow_once.
+ *
+ * Este módulo é o transporte puro (sem política de turno): o turn handler
+ * decide o que fazer com cada evento.
+ */
+import { spawn, type ChildProcess } from "node:child_process";
+import { isAbsolute } from "node:path";
+import { spawnDropped } from "../../privileges.js";
+import { appendPathAttachmentPrompt } from "../attachments.js";
+import { compatibleSessionId } from "../index.js";
+import type { ImageAttachment } from "../../types.js";
+
+/** Args de spawn do binário dsh (contrato: `dsh --profile acp`). */
+export const DSH_ACP_ARGS = ["--profile", "acp"] as const;
+
+/** Default do runner: a rota `deepseek-official` falha sem API key (-32603). */
+export const DSH_DEFAULT_MODEL = '["dsflash","deepseek-flash-41"]';
+
+export interface DshConfigOption {
+  id: string;
+  name?: string;
+  category?: string;
+  type?: string;
+  currentValue?: string;
+  options?: unknown[];
+}
+
+export interface DshMcpServer {
+  name: string;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+  headers?: Record<string, string>;
+}
+
+/** Par name/value do wire ACP (EnvVariable / HttpHeader). */
+export interface AcpNameValue {
+  name: string;
+  value: string;
+}
+
+/**
+ * Forma no fio ACP v1. O schema do SDK (`x-deserialize-skip-invalid-items`)
+ * DESCARTA silenciosamente itens inválidos — env Record ou command relativo
+ * some da sessão e o modelo nunca vê as tools. dsh-acp ainda exige command
+ * absoluto depois da deserialização.
+ */
+export type AcpMcpServerWire =
+  | { name: string; command: string; args: string[]; env: AcpNameValue[] }
+  | { type: "http"; name: string; url: string; headers: AcpNameValue[] };
+
+function recordToNameValues(rec?: Record<string, string>): AcpNameValue[] {
+  if (!rec) return [];
+  const out: AcpNameValue[] = [];
+  for (const [name, value] of Object.entries(rec)) {
+    if (typeof value !== "string") continue;
+    if (!name || name.includes("=") || name.includes("\0") || value.includes("\0")) continue;
+    out.push({ name, value });
+  }
+  return out;
+}
+
+function acpAbsoluteCommand(command: string | undefined, index: number): string {
+  if (!command) throw new DshAcpError(`mcpServers[${index}].command ausente`);
+  if (isAbsolute(command)) return command;
+  if (command === "node" || command === "nodejs") return process.execPath;
+  throw new DshAcpError(`mcpServers[${index}].command deve ser path absoluto (ACP); recebi ${JSON.stringify(command)}`);
+}
+
+/** Converte a forma interna (Record) para o wire ACP (arrays + command absoluto). */
+export function toAcpMcpServers(servers: DshMcpServer[]): AcpMcpServerWire[] {
+  return servers.map((s, i) => {
+    if (s.url) {
+      return { type: "http", name: s.name, url: s.url, headers: recordToNameValues(s.headers) };
+    }
+    return {
+      name: s.name,
+      command: acpAbsoluteCommand(s.command, i),
+      args: Array.isArray(s.args) ? s.args : [],
+      env: recordToNameValues(s.env),
+    };
+  });
+}
+
+export interface DshSession {
+  sessionId: string;
+  configOptions: DshConfigOption[];
+}
+
+export interface DshHandlers {
+  onText(text: string): void;
+  onThought(text: string): void;
+  onTool(ev: { id: string; title?: string; status?: string; kind?: string; phase: "call" | "update" }): void;
+  onUsage(used: number, size: number): void;
+  onConfig(options: DshConfigOption[]): void;
+  onStderr(line: string): void;
+  onExit(code: number | null): void;
+}
+
+interface Pending {
+  resolve: (v: unknown) => void;
+  reject: (e: Error) => void;
+  timer: NodeJS.Timeout;
+}
+
+/** Timeout de requests de controle (boot+compose mede ~13-19s; margem 3×). */
+const CONTROL_TIMEOUT_MS = 60_000;
+/** Teto de segurança do prompt (o turno é longo; o watchdog do daemon cobre). */
+const PROMPT_TIMEOUT_MS = 60 * 60_000;
+
+export class DshAcpError extends Error {}
+
+/** Injetável para testes/dropTo (spawnDropped no driver). */
+export type DshSpawnLike = (cmd: string, args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv; stdio: ["pipe", "pipe", "pipe"] }) => ChildProcess;
+
+export class DshClient {
+  private proc: ChildProcess | null = null;
+  private nextId = 1;
+  private pending = new Map<number, Pending>();
+  private buf = "";
+  private stopping = false;
+  private sessionId: string | null = null;
+
+  constructor(private readonly handlers: DshHandlers) {}
+
+  get alive(): boolean {
+    return !!this.proc && this.proc.exitCode === null && !this.proc.killed;
+  }
+
+  get currentSessionId(): string | null {
+    return this.sessionId;
+  }
+
+  start(command: string, args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv }, spawnImpl?: DshSpawnLike): void {
+    if (this.proc) throw new DshAcpError("dsh já iniciado");
+    const impl = spawnImpl ?? (spawn as unknown as DshSpawnLike);
+    const proc = impl(command, args, { cwd: opts.cwd, env: opts.env, stdio: ["pipe", "pipe", "pipe"] });
+    this.proc = proc;
+    proc.stdout!.setEncoding("utf8");
+    proc.stderr!.setEncoding("utf8");
+    proc.stdout!.on("data", (chunk: string) => this.onStdout(chunk));
+    let stderrBuf = "";
+    proc.stderr!.on("data", (chunk: string) => {
+      stderrBuf += chunk;
+      let idx: number;
+      while ((idx = stderrBuf.indexOf("\n")) >= 0) {
+        const line = stderrBuf.slice(0, idx);
+        stderrBuf = stderrBuf.slice(idx + 1);
+        if (line.trim()) this.handlers.onStderr(line);
+      }
+    });
+    proc.on("exit", (code) => {
+      this.failAll(new DshAcpError(`dsh saiu (code=${code})`));
+      this.handlers.onExit(code);
+    });
+    proc.on("error", (err) => {
+      this.failAll(err instanceof Error ? err : new DshAcpError(String(err)));
+    });
+  }
+
+  /** Encerra o processo (SIGTERM → SIGKILL em 3s). */
+  kill(): void {
+    this.stopping = true;
+    const proc = this.proc;
+    if (!proc || proc.exitCode !== null) return;
+    proc.kill("SIGTERM");
+    const t = setTimeout(() => {
+      try { proc.kill("SIGKILL"); } catch { /* já morreu */ }
+    }, 3_000);
+    t.unref?.();
+  }
+
+  /** initialize — handshake; devolve as capabilities do agente. */
+  async initialize(): Promise<{ protocolVersion: number }> {
+    return (await this.request("initialize", {
+      protocolVersion: 1,
+      clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
+    }, CONTROL_TIMEOUT_MS)) as { protocolVersion: number };
+  }
+
+  async newSession(cwd: string, mcpServers: DshMcpServer[]): Promise<DshSession> {
+    const res = (await this.request("session/new", { cwd, mcpServers: toAcpMcpServers(mcpServers) }, CONTROL_TIMEOUT_MS)) as DshSession;
+    this.sessionId = res.sessionId;
+    if (Array.isArray(res.configOptions)) this.handlers.onConfig(res.configOptions);
+    return res;
+  }
+
+  /** Resume pós-restart: mesmo sessionId, sem replay de updates. */
+  async resumeSession(sessionId: string, cwd: string, mcpServers: DshMcpServer[]): Promise<DshSession> {
+    const res = (await this.request("session/resume", { sessionId, cwd, mcpServers: toAcpMcpServers(mcpServers) }, CONTROL_TIMEOUT_MS)) as DshSession;
+    this.sessionId = res.sessionId ?? sessionId;
+    if (Array.isArray(res.configOptions)) this.handlers.onConfig(res.configOptions);
+    return { sessionId: this.sessionId!, configOptions: res.configOptions ?? [] };
+  }
+
+  async setConfigOption(configId: string, value: string): Promise<DshConfigOption[]> {
+    if (!this.sessionId) throw new DshAcpError("sem sessão");
+    const res = (await this.request("session/set_config_option", { sessionId: this.sessionId, configId, value }, CONTROL_TIMEOUT_MS)) as { configOptions?: DshConfigOption[] };
+    if (Array.isArray(res.configOptions)) this.handlers.onConfig(res.configOptions);
+    return res.configOptions ?? [];
+  }
+
+  /** Envia um turno; resolve no settle (stopReason). Updates fluem por handlers. */
+  async prompt(text: string): Promise<string> {
+    if (!this.sessionId) throw new DshAcpError("sem sessão");
+    const res = (await this.request("session/prompt", {
+      sessionId: this.sessionId,
+      prompt: [{ type: "text", text }],
+    }, PROMPT_TIMEOUT_MS)) as { stopReason?: string };
+    return res.stopReason ?? "end_turn";
+  }
+
+  /** Cancelamento do prompt em voo (notification, sem resposta). */
+  cancel(): void {
+    if (!this.sessionId || !this.proc) return;
+    this.notify("session/cancel", { sessionId: this.sessionId });
+  }
+
+  async close(): Promise<void> {
+    if (!this.sessionId) return;
+    const sid = this.sessionId;
+    this.sessionId = null;
+    try {
+      await this.request("session/close", { sessionId: sid }, CONTROL_TIMEOUT_MS);
+    } catch {
+      /* close é best-effort; kill cobre */
+    }
+  }
+
+  /* ------------------------------ transporte ------------------------------ */
+
+  private onStdout(chunk: string): void {
+    this.buf += chunk;
+    let idx: number;
+    while ((idx = this.buf.indexOf("\n")) >= 0) {
+      const line = this.buf.slice(0, idx).trim();
+      this.buf = this.buf.slice(idx + 1);
+      if (!line) continue;
+      let msg: Record<string, unknown>;
+      try {
+        msg = JSON.parse(line) as Record<string, unknown>;
+      } catch {
+        this.handlers.onStderr(`[frame inválido] ${line.slice(0, 200)}`);
+        continue;
+      }
+      this.route(msg);
+    }
+  }
+
+  private route(msg: Record<string, unknown>): void {
+    if (typeof msg.id === "number" && ("result" in msg || "error" in msg)) {
+      const p = this.pending.get(msg.id);
+      if (!p) return;
+      this.pending.delete(msg.id);
+      clearTimeout(p.timer);
+      if (msg.error) {
+        const err = msg.error as { code?: number; message?: string };
+        p.reject(new DshAcpError(`acp ${err.code ?? "?"}: ${err.message ?? "erro"}`));
+      } else {
+        p.resolve(msg.result);
+      }
+      return;
+    }
+    const method = typeof msg.method === "string" ? msg.method : "";
+    if (method === "session/update") {
+      const params = msg.params as { update?: Record<string, unknown> } | undefined;
+      const update = params?.update;
+      if (!update) return;
+      const kind = String(update.sessionUpdate ?? "");
+      if (kind === "agent_message_chunk") {
+        const c = update.content as { type?: string; text?: string } | undefined;
+        if (c?.type === "text" && typeof c.text === "string") this.handlers.onText(c.text);
+      } else if (kind === "agent_thought_chunk") {
+        const c = update.content as { type?: string; text?: string } | undefined;
+        if (c?.type === "text" && typeof c.text === "string") this.handlers.onThought(c.text);
+      } else if (kind === "tool_call" || kind === "tool_call_update") {
+        this.handlers.onTool({
+          id: String(update.toolCallId ?? ""),
+          title: typeof update.title === "string" ? update.title : undefined,
+          status: typeof update.status === "string" ? update.status : undefined,
+          kind: typeof update.kind === "string" ? update.kind : undefined,
+          phase: kind === "tool_call" ? "call" : "update",
+        });
+      } else if (kind === "usage_update") {
+        this.handlers.onUsage(Number(update.used) || 0, Number(update.size) || 0);
+      } else if (kind === "config_option_update") {
+        const opts = update.configOptions;
+        if (Array.isArray(opts)) this.handlers.onConfig(opts as DshConfigOption[]);
+      }
+      return;
+    }
+    if (typeof msg.id === "number" && method) {
+      // Request do server (ex.: session/request_permission) — auto-allow once.
+      if (method === "session/request_permission") {
+        const params = msg.params as { options?: Array<{ optionId?: string; kind?: string }> } | undefined;
+        const opts = params?.options ?? [];
+        const allow = opts.find((o) => o.kind === "allow_once") ?? opts.find((o) => (o.optionId ?? "").includes("allow")) ?? opts[0];
+        this.respond(msg.id, { outcome: { outcome: "selected", optionId: allow?.optionId ?? "allow_once" } });
+        return;
+      }
+      // Métodos desconhecidos: resposta vazia evita o server pendurar.
+      this.respond(msg.id, {});
+    }
+  }
+
+  private request(method: string, params: unknown, timeoutMs: number): Promise<unknown> {
+    if (!this.proc || !this.alive) return Promise.reject(new DshAcpError("dsh não está vivo"));
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new DshAcpError(`${method} timeout após ${Math.round(timeoutMs / 1000)}s`));
+      }, timeoutMs);
+      timer.unref?.();
+      this.pending.set(id, { resolve, reject, timer });
+      this.write({ jsonrpc: "2.0", id, method, params });
+    });
+  }
+
+  private notify(method: string, params: unknown): void {
+    this.write({ jsonrpc: "2.0", method, params });
+  }
+
+  private respond(id: number, result: unknown): void {
+    this.write({ jsonrpc: "2.0", id, result });
+  }
+
+  private write(obj: unknown): void {
+    const stdin = this.proc?.stdin;
+    if (!stdin || stdin.destroyed) return;
+    stdin.write(JSON.stringify(obj) + "\n");
+  }
+
+  private failAll(err: Error): void {
+    for (const [, p] of this.pending) {
+      clearTimeout(p.timer);
+      p.reject(err);
+    }
+    this.pending.clear();
+  }
+}
+
+/** `reasoning_effort` do ACP aceita off/low/high/max; EffortLevel→valor. */
+export function dshEffortValue(effort: string | undefined): string | undefined {
+  if (!effort) return undefined;
+  if (effort === "none" || effort === "minimal") return "off";
+  if (effort === "low") return "low";
+  if (effort === "high") return "high";
+  if (effort === "max" || effort === "xhigh") return "max";
+  return undefined;
+}
+
+/* ---------------------- driver do AgentRunner (self) ---------------------- */
+
+const MAX_DSH_QUEUE = 20;
+/** Backoff do restart pós-exit inesperado (resume da mesma sessão). */
+const DSH_RESTART_DELAY_MS = 500;
+
+interface DshQueued { content: string }
+
+/** mcpServers do session/new: bridge the-dudes + extras (stdio ou http). */
+function dshMcpServers(self: any): DshMcpServer[] {
+  const servers: DshMcpServer[] = [{
+    name: "the-dudes",
+    command: self.opts.bridgeCommand,
+    args: self.opts.bridgeArgs,
+    env: self.bridgeEnv(),
+  }];
+  for (const [name, def] of Object.entries(self.opts.extraMcpServers ?? {})) {
+    const d = def as { command?: string; args?: string[]; env?: Record<string, string>; url?: string; headers?: Record<string, string> };
+    if (d?.command) servers.push({ name, command: d.command, args: d.args ?? [], env: d.env });
+    else if (d?.url) servers.push({ name, url: d.url, headers: d.headers });
+  }
+  return servers;
+}
+
+/**
+ * Sobe o servidor ACP, faz o handshake (initialize → session/new|resume →
+ * set_config_option) e drena a fila. Espelha o startClaude: proc em `self.proc`
+ * (o stop/kill do runner alcança), identidade `self.dsh` guarda chunks tardios.
+ */
+export function startDsh(self: any): void {
+  const client = new DshClient({
+    onText: (t) => {
+      if (self.dsh !== client) return;
+      self.touchActivity();
+      self.setState("speaking");
+      self.opts.onAssistantText(t);
+    },
+    onThought: (t) => {
+      if (self.dsh !== client) return;
+      self.touchActivity();
+      if (self.info.collectThinking && t) self.opts.onThinkingText?.(t);
+      if (self.currentState !== "speaking") self.setState("thinking");
+    },
+    onTool: (ev) => {
+      if (self.dsh !== client) return;
+      self.touchActivity();
+      if (ev.phase === "call") {
+        if (self.toolsInFlight === 0) self.toolsInFlightSince = Date.now();
+        self.toolsInFlight++;
+        self.opts.onToolUse(ev.title ?? ev.id, {});
+        self.setState((ev.title ?? "").includes("send_message") ? "sending" : "thinking");
+      } else if (ev.status === "completed" || ev.status === "failed") {
+        self.toolsInFlight = Math.max(0, self.toolsInFlight - 1);
+        if (self.toolsInFlight === 0) self.toolsInFlightSince = null;
+      }
+    },
+    onUsage: (used, size) => {
+      if (self.dsh !== client) return;
+      self.touchActivity();
+      self.opts.onContextUsage?.(used, size);
+    },
+    onConfig: (opts) => { self.dshConfig = opts; },
+    onStderr: (line) => {
+      if (self.dsh !== client) return;
+      self.traceCli("dsh", "stderr", line);
+      self.opts.onError(line);
+    },
+    onExit: (code) => {
+      if (self.dsh !== client) return;
+      self.dsh = null;
+      self.dshReady = false;
+      self.dshPromptInFlight = false;
+      self.toolsInFlight = 0;
+      self.toolsInFlightSince = null;
+      if (self.stopped || self.recoveringHung) return;
+      self.opts.log("warn", `[cli:${self.info.id}:dsh] processo saiu (code=${code}) — restart com resume`);
+      self.dshRestartTimer = setTimeout(() => {
+        if (!self.stopped && !self.recoveringHung) startDsh(self);
+      }, DSH_RESTART_DELAY_MS);
+      self.dshRestartTimer?.unref?.();
+    },
+  });
+  self.dsh = client;
+  self.dshReady = false;
+  self.dshPromptInFlight = false;
+  self.dshQueue = (self.dshQueue as DshQueued[] | undefined) ?? [];
+  const args = [...DSH_ACP_ARGS];
+  self.traceSpawn?.("dsh", args);
+  try {
+    client.start(self.runnerCommand("dsh"), args, { cwd: self.opts.workspaceRoot, env: self.buildEnv() },
+      (cmd, a, o) => spawnDropped(cmd, a, o, self.opts.dropTo ?? null) as unknown as ChildProcess);
+  } catch (e) {
+    self.opts.onError(`[dsh] spawn error: ${(e as Error).message}`);
+    self.dsh = null;
+    self.emitExit(1);
+    return;
+  }
+
+  void (async () => {
+    const resumeId = compatibleSessionId("dsh", self.opts.resumeSessionId ?? self.info.sessionId);
+    try {
+      await client.initialize();
+      const mcp = dshMcpServers(self);
+      const sess = resumeId
+        ? await client.resumeSession(resumeId, self.opts.workspaceRoot, mcp)
+        : await client.newSession(self.opts.workspaceRoot, mcp);
+      if (self.dsh !== client) return;
+      self.opts.onSessionId?.(sess.sessionId);
+      self.info.sessionId = sess.sessionId;
+      // Espelha no messageSession e marca se a sessão é NOVA (first-turn leva
+      // system+contexto; resume NÃO re-injeta — o log é durável).
+      self.messageSession.sessionId = sess.sessionId;
+      self.dshFreshSession = !resumeId;
+      const model = (typeof self.info.model === "string" ? self.info.model.trim() : "") || DSH_DEFAULT_MODEL;
+      await client.setConfigOption("model", model);
+      const effort = dshEffortValue(self.info.effort);
+      if (effort) await client.setConfigOption("reasoning_effort", effort);
+      if (self.dsh !== client) return;
+      self.dshReady = true;
+      self.setState("idle");
+      dshPump(self);
+    } catch (e) {
+      if (self.dsh !== client) return;
+      self.opts.onError(`[dsh] handshake: ${(e as Error).message}`);
+      // Resume inválido: próxima subida faz session/new (não loopa no mesmo id).
+      if (resumeId) {
+        self.opts.resumeSessionId = undefined;
+        self.info.sessionId = undefined;
+      }
+      client.kill();
+    }
+  })();
+}
+
+/** Enfileira mensagem do usuário; o pump serializa (ACP: 1 prompt por vez). */
+export function dshPushUserMessage(self: any, content: string, images?: ImageAttachment[]): void {
+  const queue = (self.dshQueue as DshQueued[] | undefined) ?? [];
+  if (queue.length >= MAX_DSH_QUEUE) {
+    self.opts.log("warn", `[cli:${self.info.id}:dsh] fila cheia (${queue.length}) — drop mensagem`);
+    return;
+  }
+  let message = content;
+  if (images && images.length) {
+    const { files, cleanup } = self.writeAttachmentFiles(images);
+    self.scheduleAttachmentCleanup(cleanup);
+    message = appendPathAttachmentPrompt(message, files, "dsh");
+  }
+  queue.push({ content: message });
+  self.dshQueue = queue;
+  dshPump(self);
+}
+
+function dshPump(self: any): void {
+  const client = self.dsh as DshClient | null;
+  if (!client || !self.dshReady || self.dshPromptInFlight) return;
+  const queue = (self.dshQueue as DshQueued[] | undefined) ?? [];
+  const next = queue.shift();
+  if (!next) return;
+  self.dshQueue = queue;
+  self.dshPromptInFlight = true;
+  self.setState("thinking");
+  void (async () => {
+    try {
+      // First-turn de sessão NOVA leva system+contexto; resume NÃO re-injeta
+      // (contrato: o log é durável).
+      let text = next.content;
+      if (self.messageSession.firstTurn && self.dshFreshSession) {
+        self.messageSession.consumeFirstTurn();
+        text = self.initialMessage(next.content, self.messageSession.pendingSummary);
+      } else if (self.messageSession.firstTurn) {
+        self.messageSession.firstTurn = false; // resume: só avança a flag
+      }
+      const stop = await client.prompt(text);
+      if (self.dsh !== client) return;
+      self.dshFreshSession = false;
+      self.dshPromptInFlight = false;
+      if (stop !== "cancelled") self.setState("idle");
+      self.touchActivity();
+      dshPump(self);
+    } catch (e) {
+      if (self.dsh !== client) return;
+      self.dshPromptInFlight = false;
+      self.opts.onError(`[dsh] prompt: ${(e as Error).message}`);
+      // Prompt falhou com processo vivo (ex.: timeout de controle): devolve a
+      // mensagem e tenta de novo no próximo pump.
+      queue.unshift(next);
+      self.dshQueue = queue;
+    }
+  })();
+}
+
+export function dshIsInTurn(self: any): boolean {
+  return !!self.dshPromptInFlight;
+}
+
+/** Stop/kill: fecha a sessão (best-effort) e mata o processo. */
+export function dshStop(self: any): void {
+  if (self.dshRestartTimer) {
+    clearTimeout(self.dshRestartTimer);
+    self.dshRestartTimer = null;
+  }
+  const client = self.dsh as DshClient | null;
+  self.dsh = null;
+  self.dshReady = false;
+  self.dshPromptInFlight = false;
+  self.dshQueue = [];
+  if (!client) return;
+  void client.close().finally(() => client.kill());
+  // Kill imediato garante o exit mesmo se o close pendurar.
+  client.kill();
+}
+
+/** clearContext/compact: mata e ressobe com sessão nova (caller zera ids). */
+export async function dshKillForRestart(self: any): Promise<void> {
+  if (self.dshRestartTimer) {
+    clearTimeout(self.dshRestartTimer);
+    self.dshRestartTimer = null;
+  }
+  const client = self.dsh as DshClient | null;
+  self.dsh = null;
+  self.dshReady = false;
+  self.dshPromptInFlight = false;
+  if (!client) return;
+  await client.close().catch(() => { /* best-effort */ });
+  client.kill();
+}
