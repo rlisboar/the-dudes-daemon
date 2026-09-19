@@ -493,38 +493,18 @@ function decryptWithRawKey(stored: string, key: Buffer, aad?: string): string | 
   }
 }
 
-/** #596: leitura TOLERANTE de blob TRUNCADO no write (T-102/T-104 cortaram o
- *  base64 no meio do quantum e comeram o tag do GCM junto com o rabo).
- *
- *  GCM é CTR por baixo: sem o tag o miolo ainda decifra com update() sem
- *  final(). Entra SÓ como fallback (quando o decrypt normal falhou) — no
- *  caminho feliz o update trataria o tag como corpo e devolveria lixo no fim.
- *  Devolve o texto parcial (sem auth); null se nem IV + corpo mínimo couberem.
- *
- *  Os bytes do tag que o update() decifra como se fossem corpo viram um rabo
- *  de U+FFFD (quando o corte deixa sobras) — apara-se a cauda de U+FFFD, que
- *  é artefato e não texto. O caller só aceita o parcial quando ele fica SEM
- *  U+FFFD: blob com o tag ainda presente (AAD/chave errados, adulteração) tem
- *  o rabo sujado pelo update e segue caindo no null de antes; blob truncado de
- *  verdade (tag comido no write) decifra texto limpo e é devolvido. A chave
- *  certa discrimina das erradas pelo mesmo crivo (bytes aleatórios = U+FFFD).
- *  Único custo: um original que termine de fato em U+FFFD perde o char. */
-function decryptPartialWithRawKey(stored: string, key: Buffer, aad?: string): string | null {
-  if (isE2eV1Rejected(stored)) return null;
-  if (key.length !== 32) return null;
-  const v2 = isE2eV2(stored);
-  if (!v2 && !stored.startsWith(E2E_PREFIX)) return null;
-  if (v2 && (aad == null || aad === "")) return null;
-  try {
-    const all = Buffer.from(stored.slice(v2 ? E2E_V2_PREFIX.length : E2E_PREFIX.length), "base64");
-    // Sem corpo além do IV: nada a recuperar que o caminho normal não dê.
-    if (all.length <= 12 + 16) return null;
-    const decipher = createDecipheriv("aes-256-gcm", key, all.subarray(0, 12));
-    if (v2) decipher.setAAD(Buffer.from(aad as string, "utf8"));
-    return decipher.update(all.subarray(12)).toString("utf8").replace(/\uFFFD+$/, "");
-  } catch {
-    return null;
-  }
+/** T-718: diagnóstico SEM conteúdo para blob que não autentica. A leitura
+ *  tolerante do #596 (decifrar o corpo sem o tag) foi REMOVIDA: GCM só amarra
+ *  AAD e integridade pelo tag, e o parcial devolvia plaintext com AAD errado
+ *  ou ciphertext adulterado (medido: 0,05% cada). Truncado agora é erro
+ *  VISÍVEL (este log) e null, nunca texto. Só metadados: kind (AAD, sem
+ *  segredo), tamanho e se o formato sugere corte no write. */
+function describeAuthFailure(stored: string, aad?: string): string {
+  const b64 = stored.slice(isE2eV2(stored) ? E2E_V2_PREFIX.length : E2E_PREFIX.length);
+  const bytes = Math.floor((b64.replace(/=+$/, "").length * 3) / 4);
+  // base64 fora do quantum (len%4==1) ou sem espaço para iv+tag = corte no write.
+  const truncado = b64.length % 4 === 1 || bytes <= 12 + 16;
+  return `kind=${aad ?? "v1"} len=${stored.length} bytes≈${bytes} suspeita=${truncado ? "truncado" : "auth"}`;
 }
 
 /** T-074: fail-closed por projeto. Default false (fail-open, comportamento atual). */
@@ -579,18 +559,9 @@ export function decryptForProject(stored: string, projectId: string, aad?: strin
     const p = decryptWithRawKey(stored, antiga, aad);
     if (p != null) return p;
   }
-  // #596: nenhum caminho ÍNTEGRO abriu. Se o blob foi TRUNCADO no write, o
-  // tag não existe em lugar nenhum e nada autentica — leitura tolerante
-  // devolve o miolo parcial em vez de null. Só vale para parcial de TEXTO
-  // LIMPO (sem U+FFFD): com o tag presente o update o decifra como corpo e
-  // suja o rabo, então AAD/chave errados e adulteração seguem no null de
-  // antes. O crivo também discrimina a chave — a certa decifra texto, as
-  // erradas bytes inválidos — sem precisar de auth (que o truncamento comeu).
-  const limpo = [key, ...antigas]
-    .map((k) => decryptPartialWithRawKey(stored, k, aad))
-    .find((p): p is string => p != null && !p.includes("\uFFFD"));
-  if (limpo != null) return limpo;
-  console.warn(`[the-dudes] decrypt failed for ${projectId}: nenhuma chave do ring abriu o blob`);
+  // T-718: nada autenticou → null. Sem fallback que devolva texto não
+  // autenticado (o #596 decifrava sem tag e aceitava AAD errado/adulteração).
+  console.warn(`[the-dudes] decrypt failed for ${projectId}: nenhuma chave do ring autenticou o blob (${describeAuthFailure(stored, aad)})`);
   return null;
 }
 

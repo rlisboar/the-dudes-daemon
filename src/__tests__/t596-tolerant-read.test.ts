@@ -1,16 +1,15 @@
 /**
- * #596 (B) — leitura TOLERANTE de blob TRUNCADO no write.
+ * #596 → T-718: blob TRUNCADO no write NÃO é mais lido "tolerante".
  *
  * As 4 fixtures são blobs REAIS do board (#105/task_9b424641 e #106/task_8dbdaa43): os 2
  * truncados originais (o write cortou o base64 no meio do quantum e levou o
  * tag do GCM) e os 2 reparados (íntegros). A chave AES do projeto é a real,
- * re-embrulhada com a pubkey do daemon de teste — o teste é hermetico.
+ * re-embrulhada com a pubkey do daemon de teste — o teste é hermético.
  *
- * Na base não existe fallback: decryptForProject devolve null para os
- * truncados e o teste morre. No fix devolve o miolo parcial recuperado.
- * NUNCA no caminho feliz: um blob íntegro tem de sair pelo caminho normal
- * (se o tolerante rodasse nele, o update comeria o tag como corpo e
- * sobrariam 16 bytes de lixo — a igualdade íntegro==parcial pina isso).
+ * O #596 decifrava o corpo sem o tag (update sem final) e devolvia o parcial.
+ * Sem tag não há autenticação: o mesmo caminho aceitava AAD errado e
+ * ciphertext adulterado (T-709/T-718: 0,05% cada). Contrato agora: autentica
+ * ou null. O truncado vira erro VISÍVEL no log (kind/tamanho, sem conteúdo).
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -56,42 +55,49 @@ test("fixtures: os 2 truncados são mesmo truncados (len 2000, base64 %4==1, sem
   }
 });
 
-test("#596: blob truncado abre PARCIAL (na base é null — o teste morre lá)", () => {
-  const t105 = decryptForProject(T105_TRUNCADO, PID, AAD_DESC);
-  assert.ok(t105 != null, "base: null | fix: miolo parcial");
-  assert.equal(t105!.length, T105_LEN);
-  assert.ok(t105!.startsWith(T105_HEAD), "cabeça recuperada");
-  assert.ok(t105!.endsWith(T105_TAIL), "rabo recuperado (o que o truncamento levou foi só o tag)");
+function capturaWarn<T>(fn: () => T): { out: T; warns: string[] } {
+  const warns: string[] = [];
+  const orig = console.warn;
+  console.warn = (...a: unknown[]) => { warns.push(a.map(String).join(" ")); };
+  try { return { out: fn(), warns }; } finally { console.warn = orig; }
+}
 
-  const t106 = decryptForProject(T106_TRUNCADO, PID, AAD_DESC);
-  assert.ok(t106 != null);
-  assert.equal(t106!.length, T106_LEN);
-  assert.ok(t106!.startsWith(T106_HEAD));
-  assert.ok(t106!.endsWith(T106_TAIL));
+test("T-718: blob truncado → null + log de erro com kind e tamanho, SEM conteúdo", () => {
+  for (const [blob, head, tail] of [[T105_TRUNCADO, T105_HEAD, T105_TAIL], [T106_TRUNCADO, T106_HEAD, T106_TAIL]] as const) {
+    const { out, warns } = capturaWarn(() => decryptForProject(blob, PID, AAD_DESC));
+    assert.equal(out, null, "sem tag não autentica: nunca devolve texto");
+    const w = warns.join("\n");
+    assert.match(w, /decrypt failed for proj_d0d9a3f8/);
+    assert.match(w, new RegExp(`kind=${AAD_DESC.replace(/\|/g, "\\|")}`), "kind (AAD) no log");
+    assert.match(w, /len=2000 /, "tamanho no log");
+    assert.match(w, /suspeita=truncado/, "o formato (base64 fora do quantum) aponta o corte");
+    assert.ok(!w.includes(head.slice(0, 20)) && !w.includes(tail.slice(-20)), "nenhum conteúdo no log");
+  }
 });
 
-test("#596: íntegro NÃO passa pelo tolerante (igualdade com o parcial prova o roteamento)", () => {
+test("T-718: íntegros (reparados) seguem abrindo pelo caminho autenticado", () => {
   const i105 = decryptForProject(T105_INTACTO, PID, AAD_DESC);
   const i106 = decryptForProject(T106_INTACTO, PID, AAD_DESC);
-  assert.ok(i105 != null && i106 != null, "reparados abrem pelo caminho normal");
-  assert.equal(i105, decryptForProject(T105_TRUNCADO, PID, AAD_DESC), "se o update rodasse no íntegro, sobrariam 16 bytes de lixo");
-  assert.equal(i106, decryptForProject(T106_TRUNCADO, PID, AAD_DESC));
   assert.equal(i105!.length, T105_LEN);
+  assert.ok(i105!.startsWith(T105_HEAD) && i105!.endsWith(T105_TAIL));
+  assert.equal(i106!.length, T106_LEN);
+  assert.ok(i106!.startsWith(T106_HEAD) && i106!.endsWith(T106_TAIL));
 });
 
-test("#596: corte arbitrário também devolve prefixo (não só o padrão %4==1)", () => {
-  const cortado = T105_INTACTO.slice(0, T105_INTACTO.length - 60);
-  const p = decryptForProject(cortado, PID, AAD_DESC);
-  assert.ok(p != null, "corte no meio do corpo ainda recupera o miolo");
-  const corpo = p!.replace(/\uFFFD$/, ""); // corte pode cair no meio de um char multibyte
-  assert.ok(decryptForProject(T105_INTACTO, PID, AAD_DESC)!.startsWith(corpo), "é prefixo do texto íntegro");
-  assert.ok(p!.length > 1300);
+test("T-718: corte arbitrário do íntegro → null (não devolve prefixo)", () => {
+  // Corta DADO: o padding base64 ('=') não carrega bytes (cortá-lo mantém o blob íntegro).
+  const semPad = T105_INTACTO.replace(/=+$/, "");
+  for (const corte of [1, 16, 17, 60, 400]) {
+    const { out } = capturaWarn(() => decryptForProject(semPad.slice(0, semPad.length - corte), PID, AAD_DESC));
+    assert.equal(out, null, `corte de ${corte} chars`);
+  }
 });
 
-test("#596: o crivo é texto LIMPO — só o truncado abre; AAD/chave errados seguem null", () => {
+test("T-718: AAD errado e chave errada → null (truncado e íntegro)", () => {
   const aadErrado = aadV2({ projectId: PID, table: "tasks", field: "title" });
-  assert.equal(decryptForProject(T105_TRUNCADO, PID, aadErrado), decryptForProject(T105_TRUNCADO, PID, AAD_DESC), "sem tag não há auth: AAD não muda o keystream do truncado");
-  const lixo = decryptForProject(T105_TRUNCADO, "proj-t596-outro", aadV2({ projectId: "proj-t596-outro", table: "tasks", field: "description" }));
-  assert.equal(lixo, null, "chave errada decifra bytes inválidos (U+FFFD) e o parcial não passa no crivo");
-  assert.equal(decryptForProject(T105_INTACTO, PID, aadErrado), null, "íntegro com AAD errado: o update comeria o tag como corpo e sujaria o rabo — o null de antes fica de pé");
+  capturaWarn(() => {
+    assert.equal(decryptForProject(T105_TRUNCADO, PID, aadErrado), null);
+    assert.equal(decryptForProject(T105_INTACTO, PID, aadErrado), null);
+    assert.equal(decryptForProject(T105_TRUNCADO, "proj-t596-outro", aadV2({ projectId: "proj-t596-outro", table: "tasks", field: "description" })), null);
+  });
 });
