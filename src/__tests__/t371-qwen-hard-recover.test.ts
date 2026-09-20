@@ -19,7 +19,7 @@ import os from "node:os";
 import path from "node:path";
 import { AgentRunner } from "../agent-runner.js";
 import { TextLoopGuard } from "../runners/turn-parsers.js";
-import { hangThresholds, QWEN_HARD_TIMEOUT_MS, QWEN_STREAM_MAX_LIFETIME_MS, QWEN_TURN_LIFETIME_MS } from "../runners/turn-watchdog.js";
+import { hangThresholds, QWEN_HARD_TIMEOUT_MS, QWEN_STREAM_MAX_LIFETIME_MS, QWEN_TURN_LIFETIME_CAP_MS, QWEN_TURN_LIFETIME_MS } from "../runners/turn-watchdog.js";
 import { turnGateStats } from "../runners/turn-gate.js";
 
 const STUB = `#!/usr/bin/env node
@@ -254,10 +254,17 @@ test("T-371 (c-integration): turno qwen em loop é abortado pela janela anti-rep
     h.runner.pushUserMessage("gera texto");
     await until(() => h.argvLines().length === 1, 5000, "spawn do loop");
 
+    // Quem mata o loop aqui é o TextLoopGuard (T-371 (c)): o marcador é o warn
+// "token loop detectado" + SIGKILL, ANTES de qualquer teto de lifetime.
     await until(
       () => h.warns.some((w) => w.includes("token loop detectado")),
       5000,
       "aborto por janela anti-repetição",
+    );
+    assert.equal(
+      h.warns.some((w) => w.includes("turn lifetime")),
+      false,
+      "loop morto pelo guard em segundos — não pelo cap/janela de lifetime",
     );
     // O warn dispara no SIGKILL; recoverHungTurn só corre no `close` do
     // filho. Assert imediato era flake (~500ms no CI) com busy ainda true
@@ -272,31 +279,32 @@ test("T-371 (c-integration): turno qwen em loop é abortado pela janela anti-rep
 
 /* ---------- (d) teto de lifetime absoluto ---------- */
 
-test("T-371 (d) / T-598: ramo qwen declara soft/hard/lifetime (30min) e o teto mata turno com clock renovado", () => {
+test("T-371 (d) / T-598 / T-749: ramo qwen declara soft/hard/janela/cap e o cap mata turno com clock renovado", () => {
   const q = hangThresholds("qwen");
   assert.equal(q.softMs, 6 * 60_000);
   assert.equal(q.hardMs, 10 * 60_000);
-  assert.equal(q.lifetimeMs, QWEN_TURN_LIFETIME_MS, "teto único declarado (T-598: era 8min)");
+  assert.equal(q.lifetimeMs, QWEN_TURN_LIFETIME_MS, "janela renovável de 30min (T-598: era teto de 8min)");
   assert.equal(QWEN_TURN_LIFETIME_MS, 30 * 60_000);
+  assert.equal(q.lifetimeCapMs, QWEN_TURN_LIFETIME_CAP_MS, "T-749: cap absoluto de 60min");
   assert.ok(
-    QWEN_STREAM_MAX_LIFETIME_MS > QWEN_TURN_LIFETIME_MS,
-    "par do CLI fica ACIMA do teto do daemon — o daemon corta primeiro (com re-fila)",
+    QWEN_STREAM_MAX_LIFETIME_MS > q.lifetimeCapMs!,
+    "par do CLI fica ACIMA do cap do daemon — o daemon corta primeiro (com re-fila)",
   );
-  assert.ok(QWEN_HARD_TIMEOUT_MS > QWEN_TURN_LIFETIME_MS, "backstop do processo também acima do teto");
-  assert.equal(hangThresholds("codex").lifetimeMs, undefined, "outros runners ficam como estavam");
+  assert.ok(QWEN_HARD_TIMEOUT_MS > q.lifetimeCapMs!, "backstop do processo também acima do cap");
+  assert.equal(hangThresholds("codex").lifetimeCapMs, undefined, "outros runners ficam como estavam");
 
   const h = makeHarness("hang");
   try {
     const a = asAny(h.runner);
     a.messageSession.busy = true;
     a.activityClock.lastActivityAt = Date.now(); // o loop renova o clock semântico continuamente
-    a.activityClock.turnStartedAt = Date.now() - (q.lifetimeMs! + 1_000);
+    a.activityClock.turnStartedAt = Date.now() - (q.lifetimeCapMs! + 1_000);
     a.toolsInFlight = 1;
-    a.toolsInFlightSince = Date.now(); // tool viva: não pode adiar o teto absoluto
+    a.toolsInFlightSince = Date.now(); // tool viva: não pode adiar o cap absoluto
 
     tick(h.runner);
 
-    assert.equal(a.messageSession.busy, false, "lifetime absoluto tem de matar o turno mesmo com clock renovado e tool viva");
+    assert.equal(a.messageSession.busy, false, "cap de lifetime tem de matar o turno mesmo com clock renovado e tool viva");
     // T-598: kill por lifetime não entra na janela de hang (é backstop, não
     // hang) — a janela alimenta o resumo de hang da T-240 (d).
     assert.equal(a.hardRecoverTimes.length, 0, "lifetime não conta na janela de hang");

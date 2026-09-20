@@ -15,7 +15,7 @@ import assert from "node:assert/strict";
 import os from "node:os";
 import { AgentRunner } from "../agent-runner.js";
 import { _resetForTest, healthSnapshot } from "../health-monitor.js";
-import { QWEN_TURN_LIFETIME_MS } from "../runners/turn-watchdog.js";
+import { QWEN_TURN_LIFETIME_CAP_MS } from "../runners/turn-watchdog.js";
 
 const deps = { turnGate: { ativos: 0, fila: 0, max: 3 }, agentsRunning: 0, e2eeProjects: 0 };
 
@@ -115,11 +115,11 @@ test("T-662 (C1): lifetime 1º attempt suprime (notificado parado); re-corte att
   a.inflightPerMessage = { content: "msg", images: undefined, attempt: 0 };
   a.activityClock.lastActivityAt = Date.now();
   a.activityClock.firstEventAt = Date.now() - 60_000;
-  a.activityClock.turnStartedAt = Date.now() - (QWEN_TURN_LIFETIME_MS + 1_000);
+  a.activityClock.turnStartedAt = Date.now() - (QWEN_TURN_LIFETIME_CAP_MS + 1_000);
 
   tick(runner); // 1º corte por teto: backstop esperado → suppress
 
-  assert.ok(warns.some((w) => w.includes("HARD recover: turn lifetime")), `esperava corte por lifetime: ${warns.join(" | ")}`);
+  assert.ok(warns.some((w) => w.includes("HARD recover") && w.includes("turn lifetime")), `esperava corte por lifetime: ${warns.join(" | ")}`);
   assert.equal(snap().hardRecovers, 1);
   assert.equal(snap().hardRecoversNotified, 0, "T-662: backstop de lifetime NÃO incrementa o notificado");
   assert.equal(events.length, 0, "1º attempt de lifetime silencioso");
@@ -129,7 +129,7 @@ test("T-662 (C1): lifetime 1º attempt suprime (notificado parado); re-corte att
   a.messageSession.busy = true;
   a.ocActiveProc = null;
   a.activityClock.lastActivityAt = Date.now();
-  a.activityClock.turnStartedAt = Date.now() - (QWEN_TURN_LIFETIME_MS + 1_000);
+  a.activityClock.turnStartedAt = Date.now() - (QWEN_TURN_LIFETIME_CAP_MS + 1_000);
 
   tick(runner);
 

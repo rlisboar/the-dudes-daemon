@@ -5,6 +5,10 @@ export type SessionMode = "cold" | "resume";
 export type TurnEndReason = "completed" | "error" | "process-exit" | "spawn-error" | "stopped" | "cancelled" | "reset" | "retry" | "hard-recover" | "queue-cleared" | "drained";
 export type RecoverKind = "hang" | "lifetime";
 export type KilledBy = "watchdog" | "hard-timeout" | "stop" | "context-reset" | "token-loop";
+/** T-749 (review T-754): QUAL teto de lifetime venceu — separado do texto livre
+ *  do motivo para parser nenhum depender de prosa ("cap absoluto"/"sem
+ *  progresso"). "cap" = teto absoluto; "progress" = janela sem progresso. */
+export type LifetimeLimit = "cap" | "progress";
 
 /** Metadata only. Durations use a monotonic clock; no payload is retained. */
 export class TurnTiming {
@@ -17,6 +21,7 @@ export class TurnTiming {
   private gateMs: number | null = null;
   private bootAt: number | null = null;
   private bootMs: number | null = null;
+  private lifetimeLimit: LifetimeLimit | null = null;
   private ended = false;
   sessionMode: SessionMode | null = null;
 
@@ -29,6 +34,8 @@ export class TurnTiming {
   bootStart(): void { if (!this.ended) this.bootAt = this.now(); }
   bootReady(): void { if (!this.ended && this.bootAt !== null && this.bootMs === null) this.bootMs = this.now() - this.bootAt; }
   setBootMs(ms: number): void { if (!this.ended) this.bootMs = ms; }
+  /** T-749: registra QUAL teto venceu; chamar antes do finish do recover. */
+  setLifetimeLimit(limit: LifetimeLimit): void { if (!this.ended) this.lifetimeLimit = limit; }
   semantic(kind: SemanticKind): void {
     if (this.ended || this.startedAt === null || this.firstAt !== null) return;
     this.firstAt = this.now(); this.firstKind = kind;
@@ -44,6 +51,7 @@ export class TurnTiming {
       firstEventMs: ms(this.firstAt === null || this.startedAt === null ? null : this.firstAt - this.startedAt),
       durationMs: ms(this.startedAt === null ? null : end - this.startedAt),
       firstEventKind: this.firstKind, endReason, killedBy, recoverKind,
+      lifetimeLimit: this.lifetimeLimit,
       sessionMode: this.sessionMode, bootMs: ms(this.bootMs) });
   }
 }

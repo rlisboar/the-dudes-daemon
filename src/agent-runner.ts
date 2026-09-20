@@ -22,7 +22,7 @@ import {RunnerRuntimeFiles} from "./runners/runtime-files.js";
 import {ContextTracker, CumulativeUsageTracker} from "./runners/context-tracker.js";
 import {killGrokLeader, killPidTree, killProcess, pidAlive, processAlive as procAlive, terminateWithEscalation} from "./runners/process-lifecycle.js";
 
-import {createActivityClock, hangPhase, hangThresholds, hardRecoverNotifyPolicy, toolsInFlightHardDue, touchActivityClock, turnLifetimeDue, type HardRecoverKind, type TurnActivityClock} from "./runners/turn-watchdog.js";
+import {createActivityClock, hangPhase, hangThresholds, hardRecoverNotifyPolicy, toolsInFlightHardDue, touchActivityClock, turnLifetimeExceeded, type HardRecoverKind, type TurnActivityClock} from "./runners/turn-watchdog.js";
 import {OpenCodeTransport} from "./runners/opencode-transport.js";
 import {HANG_RECOVER_NUDGE_BACKOFF_MS, HANG_RECOVER_NUDGE_MAX, deliverHangRecoverNudge, planHangRecoverNudge} from "./runners/hang-nudge.js";
 
@@ -1270,18 +1270,22 @@ export class AgentRunner {
       }
     }
 
-    // T-371 (d): teto ABSOLUTO de lifetime do turno — elapsed desde
-    // markTurnStart, não se renova com atividade. É o que apanha o loop de
-    // tokens que renova o relógio de ociosidade semântica para sempre (F4);
-    // tools em voo também não o adiam.
+    // T-371 (d) / T-749: tetos de lifetime do turno — cap absoluto (elapsed
+    // desde markTurnStart, NÃO renovável: apanha o loop de tokens que renova
+    // o idle para sempre, F4) e janela de progresso (sem evento há
+    // lifetimeMs; renovada por touchActivityClock). tools em voo não adiam.
     // T-598: kind="lifetime" — corte por teto em turno vivo preserva a
     // sessão (retry continua de onde parou) e não notifica no 1º attempt.
-    if (this.messageSession.busy && turnLifetimeDue(this.activityClock, t, now)) {
-      this.recoverHungTurn(
-        `turn lifetime ${Math.round((now - this.activityClock.turnStartedAt) / 1000)}s ≥ ${Math.round((t.lifetimeMs ?? 0) / 1000)}s`,
-        idleMs,
-        "lifetime",
-      );
+    const lifetime = turnLifetimeExceeded(this.activityClock, t, now);
+    if (this.messageSession.busy && lifetime) {
+      // Qualificador como PREFIXO: "turn lifetime Xs ≥ Ys (runner=..." fica
+      // contíguo e os greps/parsers de prod (T-730) continuam casando.
+      const reason = lifetime === "cap"
+        ? `cap absoluto — turn lifetime ${Math.round((now - this.activityClock.turnStartedAt) / 1000)}s ≥ ${Math.round((t.lifetimeCapMs ?? 0) / 1000)}s`
+        : `sem progresso — turn lifetime ${Math.round((now - this.activityClock.lastActivityAt) / 1000)}s ≥ ${Math.round((t.lifetimeMs ?? 0) / 1000)}s`;
+      // T-749 (review T-754): campo próprio — parser não depende do texto.
+      this.turnLatency.current?.setLifetimeLimit(lifetime);
+      this.recoverHungTurn(reason, idleMs, "lifetime");
       return;
     }
 

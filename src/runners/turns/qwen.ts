@@ -21,8 +21,10 @@ export async function runQwenMessage(self: any, content: string, images?: ImageA
     self.writeQwenConfig();
     // T-371 (b): o hard recover só re-enfileira se houver inflight registrado
     // (mecanismo herdado do caminho grok, :2898). O turno qwen nunca o
-    // populava ⇒ null ⇒ zero prepend ⇒ mensagem perdida. (d): o teto de
-    // lifetime é medida desde o início deste turno, não do último evento.
+    // populava ⇒ null ⇒ zero prepend ⇒ mensagem perdida. (d) / T-749: a
+    // janela de lifetime mede ociosidade semântica desde o último evento
+    // (renova a cada touchActivityClock); só o cap absoluto conta do início
+    // deste turno e não se renova.
     const prevAttempt =
       self.inflightPerMessage?.content === content
         ? self.inflightPerMessage.attempt
@@ -96,6 +98,7 @@ export async function runQwenMessage(self: any, content: string, images?: ImageA
     // seco (close sem result não re-enfileira e a mensagem em voo se perdia).
     armHardTimeout(proc, QWEN_HARD_TIMEOUT_MS, () => {
       self.opts.log("warn", `[qwen:${self.info.name}] turno excedeu o backstop de ${QWEN_HARD_TIMEOUT_MS / 60_000}min — recover`);
+      self.turnLatency?.current?.setLifetimeLimit("cap");
       self.recoverHungTurn(
         `hard timeout ${Math.round(QWEN_HARD_TIMEOUT_MS / 1000)}s`,
         Date.now() - self.activityClock.lastActivityAt,
