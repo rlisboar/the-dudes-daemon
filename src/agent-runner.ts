@@ -71,7 +71,14 @@ export { DEFAULT_CONTEXT_LIMIT, MODEL_CONTEXT_LIMITS, contextLimitFor, lookupCon
 export const ONE_SHOT_TIMEOUT_MS = 300_000;
 /** Timeout do turno opencode via API do serve (POST /message é síncrono e pode
  *  rodar tools por minutos). Generoso; o serve é morto no stop() se preciso. */
-export const OPENCODE_TURN_TIMEOUT_MS = 600_000;
+/** T-750: teto do POST síncrono `/session/:id/message` do opencode.
+ *  Era 600s (10min) fixos — mas o POST só resolve quando o RUN termina, e um
+ *  turno real com tools longas passa disso: em 20/09 o BACKEND morreu 4× em
+ *  error com durationMs 600.002ms cravados enquanto o run SEGUIA no serve
+ *  (steps 10+ após o abort — log do provedor em evidence/T-750). O teto
+ *  precisa cobrir o pior toolsHardMs do watchdog (~20min) com folga: quem
+ *  apanha run travado é o watchdog (idle 10min / tool 20min), não este POST. */
+export const OPENCODE_TURN_TIMEOUT_MS = 30 * 60_000;
 /** Timeout do turno headless Grok (`grok -p …`). Sem isso, um resume + system
  *  prompt gigante (skills) deixa o processo zumbi por horas com busy=true e
  *  a fila enche (`ocQueue cheia`). 12 min cobre turnos longos com tools. */

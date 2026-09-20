@@ -61,6 +61,23 @@ export function ocUsageSemantics(self: any, ): UsageSemantics {
     const { providerID } = providerModelParts(self.info.model);
     return providerID.startsWith("anthropic") ? "anthropic" : "auto";
   }
+/** T-750: erro do runner visível no LOG local além do chat (padrão T-743 do
+ *  dsh): o endReason=error da instrumentação não carrega texto, e o onError
+ *  sozinho não escreve no daemon.log — sem isto o turno morre mudo no log. */
+export function ocReportError(self: any, message: string): void {
+    self.opts.log("warn", `[cli:${self.info.id}:opencode] ${message}`);
+    self.opts.onError(message);
+  }
+
+/** T-750: distingue o timeout do NOSSO POST (cliente) de erro do provider e
+ *  devolve texto útil — o run pode seguir no serve após o abort do POST. */
+export function ocTurnFailureReason(errorMessage: string): { timedOut: boolean; detail: string } {
+    const m = /^timeout (\d+)ms/.exec(errorMessage);
+    if (!m) return { timedOut: false, detail: errorMessage };
+    const min = Math.round(Number(m[1]) / 60_000);
+    return { timedOut: true, detail: `teto de ${min}min do POST excedido (run pode seguir no serve) — ${errorMessage}` };
+  }
+
 export async function runOpenCodeMessage(self: any, content: string, images?: ImageAttachment[], retry = 0) {
     const timing = self.turnLatency?.current;
     if (self.stopped) return;
@@ -79,7 +96,7 @@ export async function runOpenCodeMessage(self: any, content: string, images?: Im
       (err: any) => {
         timing?.finish("spawn-error");
         self.releaseActiveTurnSlot();
-        self.opts.onError(`opencode serve falhou: ${err?.message ?? err}`);
+        ocReportError(self, `opencode serve falhou: ${err?.message ?? err}`);
         self.messageSession.busy = false;
         self.setState("idle");
         self.drainOcQueue();
@@ -117,7 +134,7 @@ export async function runOpenCodeMessageAttached(self: any, content: string, ima
         if (self.opts.onSessionId) self.opts.onSessionId(sess.id);
       } catch (e) {
         timing?.finish("error");
-        self.opts.onError(`opencode: falha criando sessão no serve: ${(e as Error).message}`);
+        ocReportError(self, `opencode: falha criando sessão no serve: ${(e as Error).message}`);
         self.messageSession.busy = false; self.setState("idle"); self.drainOcQueue(); return;
       }
     }
@@ -168,8 +185,11 @@ export async function runOpenCodeMessageAttached(self: any, content: string, ima
       self.messageSession.busy = false;
       timing?.finish("error");
       const emsg = (e as Error).message;
+      // T-750: timeout do POST ganha texto próprio (run pode seguir no serve).
+      const fail = ocTurnFailureReason(emsg);
+      if (fail.timedOut) self.traceCli("opencode", "stderr", `[turn-timeout] ${fail.detail}`);
       if (retry < AgentRunner.OC_EMPTY_RETRIES) {
-        self.opts.onError(`opencode: turno falhou (${emsg}) — retry ${retry + 1}/${AgentRunner.OC_EMPTY_RETRIES}`);
+        ocReportError(self, `opencode: turno falhou (${fail.detail}) — retry ${retry + 1}/${AgentRunner.OC_EMPTY_RETRIES}`);
         self.messageSession.restoreFirstTurn(firstTurnSnapshot);
         self.messageSession.busy = true;
         const retryMessage = {};
@@ -186,7 +206,7 @@ export async function runOpenCodeMessageAttached(self: any, content: string, ima
         }, 1200);
         return;
       }
-      self.opts.onError(`opencode: turno falhou após retry: ${emsg}`);
+      ocReportError(self, `opencode: turno falhou após retry: ${fail.detail}`);
       // Estouro de janela chega como reject do POST (HTTP 4xx com o banner do
       // provider no corpo) — única rota reativa do transporte via serve; sem
       // isso o agente trava repetindo o mesmo erro até clear manual.
@@ -212,7 +232,7 @@ export async function runOpenCodeMessageAttached(self: any, content: string, ima
       self.checkContextFullError(im);
       const status = infoErr?.data?.statusCode;
       const nome = infoErr?.name ? `${infoErr.name}: ` : "";
-      self.opts.onError(`opencode: ${nome}${status ? `${status} — ` : ""}${im}`);
+      ocReportError(self, `opencode: ${nome}${status ? `${status} — ` : ""}${im}`);
     }
     // O POST /message só retorna a ÚLTIMA mensagem do assistant; as tool calls
     // ficam em mensagens INTERMEDIÁRIAS do loop (uma msg por step). Busca TODAS
@@ -228,7 +248,7 @@ export async function runOpenCodeMessageAttached(self: any, content: string, ima
     // reportado acima, repetir isso escondia a causa atrás de um palpite
     // ("provável flap") — e retentar 401/403 só queima chamada.
     if (!self.ocRunSawOutput && !infoErr && retry < AgentRunner.OC_EMPTY_RETRIES) {
-      self.opts.onError(`opencode: resposta vazia (provável flap do provider) — retry ${retry + 1}/${AgentRunner.OC_EMPTY_RETRIES}`);
+      ocReportError(self, `opencode: resposta vazia (provável flap do provider) — retry ${retry + 1}/${AgentRunner.OC_EMPTY_RETRIES}`);
       self.messageSession.restoreFirstTurn(firstTurnSnapshot);
       self.messageSession.busy = true;
       timing?.finish("retry");
@@ -243,7 +263,7 @@ export async function runOpenCodeMessageAttached(self: any, content: string, ima
       return;
     }
     if (!self.ocRunSawOutput) {
-      self.opts.onError(`opencode: turno terminou sem texto — o modelo "${self.info.model ?? "?"}" pode não retornar resposta. Troque o modelo.`);
+      ocReportError(self, `opencode: turno terminou sem texto — o modelo "${self.info.model ?? "?"}" pode não retornar resposta. Troque o modelo.`);
     }
     timing?.finish(infoErr || !self.ocRunSawOutput ? "error" : "completed");
     self.setState("idle");
