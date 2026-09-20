@@ -293,6 +293,17 @@ export class AgentRunner {
   readonly info: AgentInfo;
   private readonly turnLatency: TurnLatency;
   private claudeTimings: TurnTiming[] = [];
+  /** T-758: o claude contínuo descarta linha que chega no MESMO chunk de outra
+   *  (repro: 3 pushes seguidos → a 2ª some) e não lê stdin enquanto um turno
+   *  roda, então a pendente só é consumida quando OUTRA escrita chega (paradas
+   *  de 25min em prod). Serializa: 1 write por vez; o próximo só sai no result.
+   *  A espera fica no NOSSO queue (observável), não no pipe do CLI. */
+  private claudeWriteQueue: Array<{ content: string; images?: ImageAttachment[]; timingMessage: object }> = [];
+  /** T-758: mensagem escrita e ainda não aceita pelo CLI (sem `system/init`).
+   *  `claudeUnacceptedSince` arma o watchdog; zera no accept. */
+  private claudeInflight: { content: string; images?: ImageAttachment[]; timingMessage: object; timing: TurnTiming } | null = null;
+  private claudeUnacceptedSince: number | null = null;
+  private claudeUnacceptedWarned = false;
   private readonly runtimeFiles: RunnerRuntimeFiles;
   private readonly contextTracker: ContextTracker;
   private proc: ChildProcessWithoutNullStreams | null = null;
@@ -425,6 +436,13 @@ export class AgentRunner {
   private static readonly COMPACT_STUCK_MS = 15 * 60_000;
   /** Intervalo mínimo entre tentativas de destravar a fila (ver tickHangWatch). */
   private static readonly QUEUE_HEAL_INTERVAL_MS = 30_000;
+
+  /** T-758: X declarado do watchdog de aceitação do stdin do claude — mensagem
+   *  escrita e não aceita (sem system/init) vira evento VISÍVEL (log+chat) em
+   *  30s; se persistir até 90s, reinicia o claude com resume e re-envia (o
+   *  caso medido de 25min mudo). */
+  private static readonly CLAUDE_ACCEPT_WARN_MS = 30_000;
+  private static readonly CLAUDE_ACCEPT_RESTART_MS = 90_000;
   private lastQueueHealAt = 0;
   /** T-426: valores referenciados por `$VAR` no `.crush.json` (por turno). */
   private crushMcpEnvRefs: Record<string, string> = {};
@@ -599,6 +617,8 @@ export class AgentRunner {
     if (this.exited || this.stopped) return false;
     if (this.opts.cliRunner !== "claude") return false;
     if (this.pendingMessages.length > 0 && procAlive(this.proc)) return true;
+    // T-758: fila serializada do stdin também é trabalho não terminado.
+    if ((this.claudeWriteQueue.length > 0 || this.claudeInflight) && procAlive(this.proc)) return true;
     return this.currentState === "thinking" || this.currentState === "sending" || this.currentState === "speaking";
   }
 
@@ -753,6 +773,10 @@ export class AgentRunner {
     for (const m of this.messageSession.takeAllForDrain()) out.push({ content: m.content, images: m.images });
     for (const m of this.pendingMessages) this.turnLatency.discard(m, "drained");
     out.push(...this.pendingMessages.splice(0));
+    // T-758: escrita serializada ainda não enviada também é drainável.
+    for (const m of this.claudeWriteQueue) this.turnLatency.discard(m.timingMessage, "drained");
+    out.push(...this.claudeWriteQueue.map((m) => ({ content: m.content, images: m.images })));
+    this.claudeWriteQueue = [];
     out.push(...dshTakeQueue(this as unknown as Record<string, unknown>));
     return out;
   }
@@ -794,6 +818,21 @@ export class AgentRunner {
     }
     const latencyInput = latencyMessage ?? { content, images };
     this.turnLatency.enqueue(latencyInput);
+    const item = { content, images, timingMessage: latencyInput };
+    // T-758: serializa — turno em voo segura a escrita (o CLI não lê stdin
+    // durante o turno e linhas no mesmo chunk se perdem).
+    if (this.claudeInflight || this.claudeTimings.length > 0) {
+      this.claudeWriteQueue.push(item);
+      this.opts.log("info", `[cli:${this.info.id}:claude] serializado (turno em voo; fila=${this.claudeWriteQueue.length})`);
+      return;
+    }
+    this.sendClaudeMessage(item);
+  }
+
+  /** T-758: escreve UMA mensagem no stdin do claude e arma a vigilância de
+   *  aceitação. Só chamar com CLI ocioso (sem claudeInflight). */
+  private sendClaudeMessage(item: { content: string; images?: ImageAttachment[]; timingMessage: object }): void {
+    const { content, images, timingMessage } = item;
     // Não-imagem não cabe no payload inline do claude — vai por arquivo.
     const anexos = this.attachNonImageFiles(content, images);
     const messageContent = buildClaudeUserContent(anexos.content, images);
@@ -803,17 +842,66 @@ export class AgentRunner {
       message: { role: "user", content: messageContent },
     });
     this.traceCli("claude", "stdin", line);
-    const timing = this.turnLatency.activate(latencyInput, this.info.sessionId ? "resume" : "cold");
+    const timing = this.turnLatency.activate(timingMessage, this.info.sessionId ? "resume" : "cold");
     timing.start();
     this.claudeTimings.push(timing);
-    this.proc.stdin.write(line + "\n");
+    this.claudeInflight = { ...item, timing };
+    this.claudeUnacceptedSince = Date.now();
+    this.claudeUnacceptedWarned = false;
+    this.proc?.stdin.write(line + "\n");
     this.setState("thinking");
+  }
+
+  /** T-758: próximo da fila serializada, assim que o turno anterior fecha. */
+  private drainClaudeWriteQueue(): void {
+    if (this.stopped || this.claudeInflight || this.claudeTimings.length > 0) return;
+    if (!this.proc || !this.proc.stdin.writable) return;
+    const next = this.claudeWriteQueue.shift();
+    if (next) this.sendClaudeMessage(next);
+  }
+
+  /** T-758: mensagem escrita e NÃO aceita pelo CLI (stdin parado) — evento
+   *  visível e, persistindo, restart com resume + re-envio. */
+  private tickClaudeAcceptWatch(): void {
+    if (this.opts.cliRunner !== "claude" || this.claudeUnacceptedSince == null) return;
+    const waited = Date.now() - this.claudeUnacceptedSince;
+    if (waited >= AgentRunner.CLAUDE_ACCEPT_WARN_MS && !this.claudeUnacceptedWarned) {
+      this.claudeUnacceptedWarned = true;
+      const msg = `[claude:${this.info.name}] mensagem não foi aceita pelo CLI há ${Math.round(waited / 1000)}s (stdin parado) — turno mudo; reinicia em ${Math.round((AgentRunner.CLAUDE_ACCEPT_RESTART_MS - waited) / 1000)}s se persistir`;
+      this.opts.log("warn", msg);
+      this.opts.onError(msg);
+    }
+    if (waited >= AgentRunner.CLAUDE_ACCEPT_RESTART_MS) this.restartClaudeUnaccepted();
+  }
+
+  private restartClaudeUnaccepted(): void {
+    const item = this.claudeInflight;
+    const waited = this.claudeUnacceptedSince == null ? 0 : Date.now() - this.claudeUnacceptedSince;
+    this.claudeUnacceptedSince = null;
+    this.claudeUnacceptedWarned = false;
+    if (!item) return;
+    this.claudeInflight = null;
+    item.timing.finish("retry", "watchdog");
+    this.claudeTimings = this.claudeTimings.filter((t) => t !== item.timing);
+    // Re-envio no flush do startClaude (pendingMessages) — mesma identidade de
+    // mensagem, sem duplicar: a linha antiga nunca foi aceita.
+    this.pendingMessages.unshift({ content: item.content, images: item.images });
+    const msg = `[claude:${this.info.name}] stdin não aceito por ${Math.round(waited / 1000)}s — reiniciando com resume e re-enviando a mensagem`;
+    this.opts.log("warn", msg);
+    this.opts.onError(msg);
+    void this.killClaudeForRestart().then(() => {
+      if (!this.stopped) this.startClaude();
+    });
   }
 
   stop() {
     this.turnLatency.finishAll("stopped", "stop");
     for (const timing of this.claudeTimings) timing.finish("stopped", "stop");
     this.claudeTimings = [];
+    this.claudeWriteQueue = [];
+    this.claudeInflight = null;
+    this.claudeUnacceptedSince = null;
+    this.claudeUnacceptedWarned = false;
     this.stopped = true;
     this.stopHangWatch();
     if (this.hangNudgeTimer) {
@@ -1010,6 +1098,8 @@ export class AgentRunner {
     this.turnLatency.finishAll("process-exit");
     for (const timing of this.claudeTimings) timing.finish("process-exit");
     this.claudeTimings = [];
+    this.claudeInflight = null;
+    this.claudeUnacceptedSince = null;
     this.exited = true;
     // Remove o token-file plaintext + tmpdir no fim de vida — sem isso o token
     // (válido até o server reiniciar, que re-arma todos) ficava em /tmp pra
@@ -1227,6 +1317,9 @@ export class AgentRunner {
       }
       return;
     }
+    // T-758: aceitação do stdin do claude (estado que soft/hard não pegam —
+// CLI ocioso com mensagem no pipe não gera evento nenhum).
+    this.tickClaudeAcceptWatch();
     if (!this.isInTurn()) {
       this.activityClock.deadSince = null;
       // Fora de turno: limpa contagem residual de tools.

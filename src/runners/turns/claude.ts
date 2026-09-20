@@ -132,6 +132,9 @@ export function handleStreamEvent(self: any, event: any) {
       // deste marco: write→init = espera na fila do CLI, que o firstEventMs
       // sozinho confundia com demora do modelo.
       self.claudeTimings?.[0]?.accept();
+      // T-758: aceite observado — desarma o watchdog de stdin parado.
+      self.claudeUnacceptedSince = null;
+      self.claudeUnacceptedWarned = false;
       if (!self.claudeSawInit) self.claudeTimings?.[0]?.setBootMs(performance.now() - self.claudeBootStartedAt);
       self.claudeSawInit = true;
       // CLI reporta o model realmente resolvido (alias→ID, default da conta).
@@ -238,6 +241,8 @@ export function handleStreamEvent(self: any, event: any) {
       return;
     }
     if (event.type === "result") {
+      // T-758: turno fechou — libera a fila serializada do stdin.
+      self.claudeInflight = null;
       self.claudeTimings?.shift()?.finish(event.is_error || String(event.subtype).startsWith("error") ? "error" : "completed");
       self.toolsInFlight = 0;
       self.toolsInFlightSince = null;
@@ -251,6 +256,7 @@ export function handleStreamEvent(self: any, event: any) {
           self.checkContextFullError(r);
         }
       }
+      self.drainClaudeWriteQueue?.();
       return;
     }
   }
