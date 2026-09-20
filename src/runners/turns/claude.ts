@@ -127,6 +127,11 @@ export function handleStreamEvent(self: any, event: any) {
       self.opts.onSessionId(event.session_id);
     }
     if (event.type === "system" && event.subtype === "init") {
+      // T-755: o claude contínuo emite um init POR mensagem consumida do stdin
+      // (medido no transcript/probe). O timing mais antigo (FIFO) é o dono
+      // deste marco: write→init = espera na fila do CLI, que o firstEventMs
+      // sozinho confundia com demora do modelo.
+      self.claudeTimings?.[0]?.accept();
       if (!self.claudeSawInit) self.claudeTimings?.[0]?.setBootMs(performance.now() - self.claudeBootStartedAt);
       self.claudeSawInit = true;
       // CLI reporta o model realmente resolvido (alias→ID, default da conta).

@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { TurnLatency, TurnTiming } from '../runners/turn-latency.js';
 import { AgentRunner } from '../agent-runner.js';
+import { handleStreamEvent } from '../runners/turns/claude.js';
 
 test('T-730: queue/gate/first-event/end are distinct, boot recorded once, one final line', () => {
   let now = 0;
@@ -26,6 +27,38 @@ test('T-730: queue/gate/first-event/end are distinct, boot recorded once, one fi
   assert.equal(lines[0].firstEventMs, 60);
   assert.equal(lines[0].durationMs, 110);
   assert.equal(lines[0].firstEventKind, 'thinking');
+});
+
+test('T-755: accept marca write→CLI começou a mensagem; uma vez, só depois do start', () => {
+  let now = 0; const lines: any[] = [];
+  const t = new TurnTiming(0, e => lines.push(e), () => now);
+  t.accept(); now = 10; t.start();
+  now = 4_000; t.accept();          // init do CLI: espera na fila do stdin
+  now = 9_000; t.accept();          // init tardio não sobrescreve
+  now = 10_000; t.semantic('tool'); // 1º evento (1s após o accept tardio)
+  now = 30_000; t.finish('completed');
+  assert.equal(lines[0].acceptMs, 3_990, 'write→init mede a espera na fila do CLI');
+  assert.equal(lines[0].firstEventMs, 9_990, 'firstEvent segue do write, como antes');
+  // Sem start (ex.: init antes de qualquer mensagem), accept fica null.
+  const semStart = new TurnTiming(0, e => lines.push(e), () => now);
+  semStart.accept(); semStart.finish('completed');
+  assert.equal(lines[1].acceptMs, null);
+});
+
+test('T-755: system/init do claude marca accept no timing FIFO mais antigo', () => {
+  const marks: number[] = [];
+  const timing: any = { accept: () => marks.push(1), setBootMs: () => marks.push(2) };
+  const self: any = {
+    claudeTimings: [timing], claudeBootStartedAt: performance.now(),
+    claudeSawInit: false, toolsInFlight: 0, toolsInFlightSince: Date.now(),
+    info: { id: 't755' }, buffer: '',
+    touchActivity: () => {}, setState: () => {}, opts: {},
+    contextTracker: { setResolvedModel: () => {} },
+  };
+  handleStreamEvent(self, { type: 'system', subtype: 'init', session_id: 's1', model: 'm' });
+  assert.deepEqual(marks, [1, 2], 'init marca accept e boot');
+  handleStreamEvent(self, { type: 'system', subtype: 'init', session_id: 's1', model: 'm' });
+  assert.deepEqual(marks, [1, 2, 1], 'init repetido chama accept de novo (once-only é do TurnTiming, c/ boot já setado)');
 });
 
 test('T-730: no semantic event is null; hard recover retains cause despite late close', () => {

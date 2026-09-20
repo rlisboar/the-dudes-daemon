@@ -22,6 +22,7 @@ export class TurnTiming {
   private bootAt: number | null = null;
   private bootMs: number | null = null;
   private lifetimeLimit: LifetimeLimit | null = null;
+  private acceptAt: number | null = null;
   private ended = false;
   sessionMode: SessionMode | null = null;
 
@@ -40,6 +41,12 @@ export class TurnTiming {
     if (this.ended || this.startedAt === null || this.firstAt !== null) return;
     this.firstAt = this.now(); this.firstKind = kind;
   }
+  /** T-755: o CLI aceitou/começou ESTA mensagem (marco por turno; ex.: o
+   *  `system/init` que o claude contínuo emite ao consumir cada input). Separa
+   *  a espera na fila do CLI do tempo até o 1º evento: `firstEventMs` inclui
+   *  esse trecho; `firstEventMs - acceptMs` é o resíduo (modelo/CLI). Uma vez
+   *  só — inits tardios de outra mensagem não sobrescrevem. */
+  accept(): void { if (!this.ended && this.startedAt !== null && this.acceptAt === null) this.acceptAt = this.now(); }
   finish(endReason: TurnEndReason, killedBy: KilledBy | null = null, recoverKind: RecoverKind | null = null): void {
     if (this.ended) return;
     this.ended = true;
@@ -52,6 +59,7 @@ export class TurnTiming {
       durationMs: ms(this.startedAt === null ? null : end - this.startedAt),
       firstEventKind: this.firstKind, endReason, killedBy, recoverKind,
       lifetimeLimit: this.lifetimeLimit,
+      acceptMs: ms(this.acceptAt === null || this.startedAt === null ? null : this.acceptAt - this.startedAt),
       sessionMode: this.sessionMode, bootMs: ms(this.bootMs) });
   }
 }
