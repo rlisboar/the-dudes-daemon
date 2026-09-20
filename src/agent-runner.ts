@@ -304,6 +304,11 @@ export class AgentRunner {
   private claudeInflight: { content: string; images?: ImageAttachment[]; timingMessage: object; timing: TurnTiming } | null = null;
   private claudeUnacceptedSince: number | null = null;
   private claudeUnacceptedWarned = false;
+  /** T-760: re-envio condicional — arma durante o kill do restart por não
+   *  aceitação; se um `result` chegar nessa janela, a mensagem já foi
+   *  respondida e não se re-envia (evita duplicar texto no chat). */
+  private claudeUnacceptedRestartPending = false;
+  private claudeUnacceptedReplied = false;
   private readonly runtimeFiles: RunnerRuntimeFiles;
   private readonly contextTracker: ContextTracker;
   private proc: ChildProcessWithoutNullStreams | null = null;
@@ -883,14 +888,27 @@ export class AgentRunner {
     this.claudeInflight = null;
     item.timing.finish("retry", "watchdog");
     this.claudeTimings = this.claudeTimings.filter((t) => t !== item.timing);
-    // Re-envio no flush do startClaude (pendingMessages) — mesma identidade de
-    // mensagem, sem duplicar: a linha antiga nunca foi aceita.
-    this.pendingMessages.unshift({ content: item.content, images: item.images });
-    const msg = `[claude:${this.info.name}] stdin não aceito por ${Math.round(waited / 1000)}s — reiniciando com resume e re-enviando a mensagem`;
+    // T-760: corrida com o kill — `stdin.end()` destrava a leitura e o CLI
+    // pode aceitar E responder a mensagem antiga dentro do grace do SIGTERM
+    // (~1,5s). Se um `result` chegar nessa janela, NÃO re-enviar (senão o
+    // usuário vê o texto duas vezes). Regra declarada: re-envio só sem result
+    // observado durante o kill.
+    this.claudeUnacceptedRestartPending = true;
+    this.claudeUnacceptedReplied = false;
+    const msg = `[claude:${this.info.name}] stdin não aceito por ${Math.round(waited / 1000)}s — reiniciando com resume (re-envio só se a mensagem não responder durante o kill)`;
     this.opts.log("warn", msg);
-    this.opts.onError(msg);
     void this.killClaudeForRestart().then(() => {
-      if (!this.stopped) this.startClaude();
+      const replied = this.claudeUnacceptedReplied;
+      this.claudeUnacceptedRestartPending = false;
+      this.claudeUnacceptedReplied = false;
+      if (this.stopped) return;
+      if (replied) {
+        this.opts.log("warn", `[claude:${this.info.name}] resposta da mensagem chegou durante o kill — sem re-envio (evita texto duplicado)`);
+      } else {
+        // Mesma identidade de mensagem; a linha antiga nunca foi aceita.
+        this.pendingMessages.unshift({ content: item.content, images: item.images });
+      }
+      this.startClaude();
     });
   }
 

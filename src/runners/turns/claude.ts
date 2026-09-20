@@ -241,6 +241,11 @@ export function handleStreamEvent(self: any, event: any) {
       return;
     }
     if (event.type === "result") {
+      // T-760: result durante o kill do restart por não-aceitação = a mensagem
+      // antiga foi respondida (o timing dela já foi finalizado) → sem re-envio.
+      if (self.claudeUnacceptedRestartPending && (self.claudeTimings?.length ?? 0) === 0) {
+        self.claudeUnacceptedReplied = true;
+      }
       // T-758: turno fechou — libera a fila serializada do stdin.
       self.claudeInflight = null;
       self.claudeTimings?.shift()?.finish(event.is_error || String(event.subtype).startsWith("error") ? "error" : "completed");
