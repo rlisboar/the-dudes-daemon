@@ -447,12 +447,49 @@ function dshMcpServers(self: any): DshMcpServer[] {
   return servers;
 }
 
+/** Keep runner errors visible in the local daemon log as well as the chat. */
+function dshReportError(self: any, message: string): void {
+  self.opts.log("warn", `[cli:${self.info.id}:dsh] ${message}`);
+  self.opts.onError(message);
+}
+
 /**
  * Sobe o servidor ACP, faz o handshake (initialize → session/new|resume →
  * set_config_option) e drena a fila. Espelha o startClaude: proc em `self.proc`
  * (o stop/kill do runner alcança), identidade `self.dsh` guarda chunks tardios.
  */
 export function startDsh(self: any): void {
+  let handshakePending = true;
+  let pendingExit: { code: number | null } | undefined;
+  const finishExit = (code: number | null) => {
+    if (self.dsh !== client) return;
+    self.dsh = null;
+    self.dshReady = false;
+    self.dshPromptInFlight = false;
+    self.toolsInFlight = 0;
+    self.toolsInFlightSince = null;
+    if (self.stopped || self.recoveringHung) return;
+    // T-726 (d): só o handshake conta para o backoff — saída normal pós-turno
+    // (dshHandshakeFails zerado no sucesso) segue com o restart rápido.
+    const falhas = Number(self.dshHandshakeFails ?? 0);
+    if (falhas >= DSH_HANDSHAKE_MAX_TRIES) {
+      dshReportError(self,
+        `[dsh] handshake falhou ${falhas}x seguidas — agente PARADO (sem restart). ` +
+        `Último motivo: ${String(self.dshLastHandshakeError ?? "desconhecido")}. Corrija e reinicie o agente.`,
+      );
+      self.opts.log("warn", `[cli:${self.info.id}:dsh] handshake falhou ${falhas}x — parado (sem loop)`);
+      self.emitExit(code ?? 1);
+      return;
+    }
+    const delay = falhas > 0
+      ? Math.min(DSH_RESTART_DELAY_MS * 2 ** falhas, DSH_BACKOFF_CAP_MS)
+      : DSH_RESTART_DELAY_MS;
+    self.opts.log("warn", `[cli:${self.info.id}:dsh] processo saiu (code=${code}) — restart com resume em ${delay}ms${falhas ? ` (falha ${falhas}/${DSH_HANDSHAKE_MAX_TRIES})` : ""}`);
+    self.dshRestartTimer = setTimeout(() => {
+      if (!self.stopped && !self.recoveringHung) startDsh(self);
+    }, delay);
+    self.dshRestartTimer?.unref?.();
+  };
   const client = new DshClient({
     onText: (t) => {
       if (self.dsh !== client) return;
@@ -484,40 +521,21 @@ export function startDsh(self: any): void {
       self.touchActivity();
       self.opts.onContextUsage?.(used, size);
     },
-    onConfig: (opts) => { self.dshConfig = opts; },
+    onConfig: (opts) => { if (self.dsh === client) self.dshConfig = opts; },
     onStderr: (line) => {
       if (self.dsh !== client) return;
       self.traceCli("dsh", "stderr", line);
-      self.opts.onError(line);
+      dshReportError(self, line);
     },
     onExit: (code) => {
       if (self.dsh !== client) return;
-      self.dsh = null;
-      self.dshReady = false;
-      self.dshPromptInFlight = false;
-      self.toolsInFlight = 0;
-      self.toolsInFlightSince = null;
-      if (self.stopped || self.recoveringHung) return;
-      // T-726 (d): só o handshake conta para o backoff — saída normal pós-turno
-      // (dshHandshakeFails zerado no sucesso) segue com o restart rápido.
-      const falhas = Number(self.dshHandshakeFails ?? 0);
-      if (falhas >= DSH_HANDSHAKE_MAX_TRIES) {
-        self.opts.onError(
-          `[dsh] handshake falhou ${falhas}x seguidas — agente PARADO (sem restart). ` +
-          `Último motivo: ${String(self.dshLastHandshakeError ?? "desconhecido")}. Corrija e reinicie o agente.`,
-        );
-        self.opts.log("warn", `[cli:${self.info.id}:dsh] handshake falhou ${falhas}x — parado (sem loop)`);
-        self.emitExit(code ?? 1);
+      // failAll rejects promises before this synchronous callback. Let the
+      // handshake catch record the cause before clearing the current identity.
+      if (handshakePending) {
+        pendingExit = { code };
         return;
       }
-      const delay = falhas > 0
-        ? Math.min(DSH_RESTART_DELAY_MS * 2 ** falhas, DSH_BACKOFF_CAP_MS)
-        : DSH_RESTART_DELAY_MS;
-      self.opts.log("warn", `[cli:${self.info.id}:dsh] processo saiu (code=${code}) — restart com resume em ${delay}ms${falhas ? ` (falha ${falhas}/${DSH_HANDSHAKE_MAX_TRIES})` : ""}`);
-      self.dshRestartTimer = setTimeout(() => {
-        if (!self.stopped && !self.recoveringHung) startDsh(self);
-      }, delay);
-      self.dshRestartTimer?.unref?.();
+      finishExit(code);
     },
   });
   self.dsh = client;
@@ -530,7 +548,7 @@ export function startDsh(self: any): void {
     client.start(self.runnerCommand("dsh"), args, { cwd: self.opts.workspaceRoot, env: self.buildEnv() },
       (cmd, a, o) => spawnDropped(cmd, a, o, self.opts.dropTo ?? null) as unknown as ChildProcess);
   } catch (e) {
-    self.opts.onError(`[dsh] spawn error: ${(e as Error).message}`);
+    dshReportError(self, `[dsh] spawn error: ${(e as Error).message}`);
     self.dsh = null;
     self.emitExit(1);
     return;
@@ -540,13 +558,14 @@ export function startDsh(self: any): void {
     const resumeId = compatibleSessionId("dsh", self.opts.resumeSessionId ?? self.info.sessionId);
     try {
       await client.initialize();
+      if (self.dsh !== client) return;
       const mcp = dshMcpServers(self);
       // T-726 (a)/(b): comando relativo é resolvido pelo PATH; o que não
       // resolve sai da lista. Bridge fora = fatal; MCP extra fora = aviso.
       const conv = toAcpMcpServers(mcp);
       for (const s2 of conv.skipped) {
         if (s2.name === BRIDGE_MCP_NAME) throw new DshAcpError(`bridge ${BRIDGE_MCP_NAME} indisponível: ${s2.reason}`);
-        self.opts.onError(`[dsh] MCP "${s2.name}" ficou de fora: ${s2.reason} — o agente sobe sem ele`);
+        dshReportError(self, `[dsh] MCP "${s2.name}" ficou de fora: ${s2.reason} — o agente sobe sem ele`);
         self.opts.log("warn", `[cli:${self.info.id}:dsh] MCP ${s2.name} ignorado: ${s2.reason}`);
       }
       for (const srv of conv.servers) {
@@ -563,10 +582,11 @@ export function startDsh(self: any): void {
         // T-726 (b)/(c): o dsh só descobre no session/new que um MCP não
         // conecta (-32603 mcp-client(<nome>), ~63s). Tira o culpado (se for
         // EXTRA) e sobe sem ele, em vez de matar a sessão.
+        if (self.dsh !== client) return;
         const msg = (e as Error).message;
         const culpado = mcpNameFromAcpError(msg);
         if (!culpado || culpado === BRIDGE_MCP_NAME) throw e;
-        self.opts.onError(`[dsh] MCP "${culpado}" não conectou (${msg}) — o agente sobe sem ele`);
+        dshReportError(self, `[dsh] MCP "${culpado}" não conectou (${msg}) — o agente sobe sem ele`);
         self.opts.log("warn", `[cli:${self.info.id}:dsh] MCP ${culpado} não conectou — retry sem ele`);
         sess = await abrir(usaveis.filter((m) => m.name !== culpado));
       }
@@ -591,13 +611,16 @@ export function startDsh(self: any): void {
       if (self.dsh !== client) return;
       self.dshHandshakeFails = Number(self.dshHandshakeFails ?? 0) + 1;
       self.dshLastHandshakeError = (e as Error).message;
-      self.opts.onError(`[dsh] handshake: ${(e as Error).message}`);
+      dshReportError(self, `[dsh] handshake: ${(e as Error).message}`);
       // Resume inválido: próxima subida faz session/new (não loopa no mesmo id).
       if (resumeId) {
         self.opts.resumeSessionId = undefined;
         self.info.sessionId = undefined;
       }
       client.kill();
+    } finally {
+      handshakePending = false;
+      if (pendingExit) finishExit(pendingExit.code);
     }
   })();
 }
@@ -658,7 +681,7 @@ function dshPump(self: any): void {
     } catch (e) {
       if (self.dsh !== client) return;
       self.dshPromptInFlight = false;
-      self.opts.onError(`[dsh] prompt: ${(e as Error).message}`);
+      dshReportError(self, `[dsh] prompt: ${(e as Error).message}`);
       // Prompt falhou com processo vivo (ex.: timeout de controle): devolve a
       // mensagem e tenta de novo no próximo pump.
       queue.unshift(next);
