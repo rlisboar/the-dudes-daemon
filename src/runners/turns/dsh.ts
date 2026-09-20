@@ -18,7 +18,8 @@
  * decide o que fazer com cada evento.
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { isAbsolute } from "node:path";
+import { isAbsolute, join } from "node:path";
+import { accessSync, constants as fsConstants } from "node:fs";
 import { spawnDropped } from "../../privileges.js";
 import { appendPathAttachmentPrompt } from "../attachments.js";
 import { compatibleSessionId } from "../index.js";
@@ -75,26 +76,62 @@ function recordToNameValues(rec?: Record<string, string>): AcpNameValue[] {
   return out;
 }
 
-function acpAbsoluteCommand(command: string | undefined, index: number): string {
-  if (!command) throw new DshAcpError(`mcpServers[${index}].command ausente`);
+/** T-726 (a): o ACP do dsh exige command ABSOLUTO. Antes um comando relativo
+ *  lançava e derrubava o handshake inteiro — o MCP playwright do projeto é
+ *  `npx -y @playwright/mcp` e nenhum agente dsh subia. Agora resolve pelo PATH
+ *  do processo do daemon (mesmo PATH que o dsh herdaria) e devolve null se não
+ *  achar; quem chama decide (extra some, bridge é fatal). */
+export function resolveAcpCommand(command: string | undefined): string | null {
+  if (!command) return null;
   if (isAbsolute(command)) return command;
   if (command === "node" || command === "nodejs") return process.execPath;
-  throw new DshAcpError(`mcpServers[${index}].command deve ser path absoluto (ACP); recebi ${JSON.stringify(command)}`);
+  if (command.includes("/")) return null; // relativo ao cwd: ambíguo no ACP
+  for (const dir of (process.env.PATH ?? "").split(":")) {
+    if (!dir) continue;
+    const cand = join(dir, command);
+    try {
+      accessSync(cand, fsConstants.X_OK);
+      return cand;
+    } catch { /* próximo dir */ }
+  }
+  return null;
 }
 
-/** Converte a forma interna (Record) para o wire ACP (arrays + command absoluto). */
-export function toAcpMcpServers(servers: DshMcpServer[]): AcpMcpServerWire[] {
-  return servers.map((s, i) => {
+export interface AcpMcpConversion {
+  servers: AcpMcpServerWire[];
+  /** MCPs deixados de fora (command não resolvido): nome + motivo, para o chat. */
+  skipped: Array<{ name: string; reason: string }>;
+}
+
+/** Converte a forma interna (Record) para o wire ACP (arrays + command absoluto).
+ *  T-726: comando relativo é resolvido pelo PATH; o que não resolve sai da lista
+ *  (o caller decide se é fatal) em vez de derrubar o handshake. */
+export function toAcpMcpServers(servers: DshMcpServer[]): AcpMcpConversion {
+  const out: AcpMcpServerWire[] = [];
+  const skipped: AcpMcpConversion["skipped"] = [];
+  for (const s of servers) {
     if (s.url) {
-      return { type: "http", name: s.name, url: s.url, headers: recordToNameValues(s.headers) };
+      out.push({ type: "http", name: s.name, url: s.url, headers: recordToNameValues(s.headers) });
+      continue;
     }
-    return {
+    const resolved = resolveAcpCommand(s.command);
+    if (!resolved) {
+      skipped.push({
+        name: s.name,
+        reason: s.command
+          ? `comando ${JSON.stringify(s.command)} não encontrado no PATH (o ACP do dsh exige path absoluto)`
+          : "sem command",
+      });
+      continue;
+    }
+    out.push({
       name: s.name,
-      command: acpAbsoluteCommand(s.command, i),
+      command: resolved,
       args: Array.isArray(s.args) ? s.args : [],
       env: recordToNameValues(s.env),
-    };
-  });
+    });
+  }
+  return { servers: out, skipped };
 }
 
 export interface DshSession {
@@ -120,6 +157,16 @@ interface Pending {
 
 /** Timeout de requests de controle (boot+compose mede ~13-19s; margem 3×). */
 const CONTROL_TIMEOUT_MS = 60_000;
+/** T-726 (c): o session/new espera os mcpServers conectarem e o próprio dsh
+ *  só desiste por volta dos 63s (medido: -32603 "mcp-client(X): initial
+ *  connection or tool synchronization failed" aos 63s). Com o teto de controle
+ *  em 60s o runner cortava ANTES e o chat mostrava "timeout 60s", escondendo
+ *  o nome do MCP culpado. 120s = ~2× o teto interno medido. */
+export const SESSION_TIMEOUT_MS = 120_000;
+/** T-726: nome do MCP culpado no erro do dsh (-32603 mcp-client(<nome>)). */
+export function mcpNameFromAcpError(message: string): string | null {
+  return /mcp-client\(([^)]+)\)/.exec(message)?.[1] ?? null;
+}
 /** Teto de segurança do prompt (o turno é longo; o watchdog do daemon cobre). */
 const PROMPT_TIMEOUT_MS = 60 * 60_000;
 
@@ -194,7 +241,7 @@ export class DshClient {
   }
 
   async newSession(cwd: string, mcpServers: DshMcpServer[]): Promise<DshSession> {
-    const res = (await this.request("session/new", { cwd, mcpServers: toAcpMcpServers(mcpServers) }, CONTROL_TIMEOUT_MS)) as DshSession;
+    const res = (await this.request("session/new", { cwd, mcpServers: toAcpMcpServers(mcpServers).servers }, SESSION_TIMEOUT_MS)) as DshSession;
     this.sessionId = res.sessionId;
     if (Array.isArray(res.configOptions)) this.handlers.onConfig(res.configOptions);
     return res;
@@ -202,7 +249,7 @@ export class DshClient {
 
   /** Resume pós-restart: mesmo sessionId, sem replay de updates. */
   async resumeSession(sessionId: string, cwd: string, mcpServers: DshMcpServer[]): Promise<DshSession> {
-    const res = (await this.request("session/resume", { sessionId, cwd, mcpServers: toAcpMcpServers(mcpServers) }, CONTROL_TIMEOUT_MS)) as DshSession;
+    const res = (await this.request("session/resume", { sessionId, cwd, mcpServers: toAcpMcpServers(mcpServers).servers }, SESSION_TIMEOUT_MS)) as DshSession;
     this.sessionId = res.sessionId ?? sessionId;
     if (Array.isArray(res.configOptions)) this.handlers.onConfig(res.configOptions);
     return { sessionId: this.sessionId!, configOptions: res.configOptions ?? [] };
@@ -269,8 +316,12 @@ export class DshClient {
       this.pending.delete(msg.id);
       clearTimeout(p.timer);
       if (msg.error) {
-        const err = msg.error as { code?: number; message?: string };
-        p.reject(new DshAcpError(`acp ${err.code ?? "?"}: ${err.message ?? "erro"}`));
+        // T-726: `data.details` é onde o dsh diz QUAL mcp-client falhou
+        // ("mcp-client(<nome>): initial connection…"). Sem ele o chat só via
+        // "Internal error" e ninguém sabia o culpado.
+        const err = msg.error as { code?: number; message?: string; data?: { details?: string } };
+        const detalhe = typeof err.data?.details === "string" ? ` — ${err.data.details}` : "";
+        p.reject(new DshAcpError(`acp ${err.code ?? "?"}: ${err.message ?? "erro"}${detalhe}`));
       } else {
         p.resolve(msg.result);
       }
@@ -370,6 +421,13 @@ export function dshEffortValue(effort: string | undefined): string | undefined {
 const MAX_DSH_QUEUE = 20;
 /** Backoff do restart pós-exit inesperado (resume da mesma sessão). */
 const DSH_RESTART_DELAY_MS = 500;
+/** T-726 (d): handshake que falha em série vira backoff (500ms → 30s) e PARA
+ *  em 5 tentativas, com motivo no chat. Antes era restart fixo de 500ms para
+ *  sempre: com um MCP quebrado o agente ficava em loop cego, sem mensagem útil. */
+export const DSH_HANDSHAKE_MAX_TRIES = 5;
+const DSH_BACKOFF_CAP_MS = 30_000;
+/** Nome do bridge do the-dudes: sem ele o agente não fala com o time (fatal). */
+const BRIDGE_MCP_NAME = "the-dudes";
 
 interface DshQueued { content: string }
 
@@ -440,10 +498,25 @@ export function startDsh(self: any): void {
       self.toolsInFlight = 0;
       self.toolsInFlightSince = null;
       if (self.stopped || self.recoveringHung) return;
-      self.opts.log("warn", `[cli:${self.info.id}:dsh] processo saiu (code=${code}) — restart com resume`);
+      // T-726 (d): só o handshake conta para o backoff — saída normal pós-turno
+      // (dshHandshakeFails zerado no sucesso) segue com o restart rápido.
+      const falhas = Number(self.dshHandshakeFails ?? 0);
+      if (falhas >= DSH_HANDSHAKE_MAX_TRIES) {
+        self.opts.onError(
+          `[dsh] handshake falhou ${falhas}x seguidas — agente PARADO (sem restart). ` +
+          `Último motivo: ${String(self.dshLastHandshakeError ?? "desconhecido")}. Corrija e reinicie o agente.`,
+        );
+        self.opts.log("warn", `[cli:${self.info.id}:dsh] handshake falhou ${falhas}x — parado (sem loop)`);
+        self.emitExit(code ?? 1);
+        return;
+      }
+      const delay = falhas > 0
+        ? Math.min(DSH_RESTART_DELAY_MS * 2 ** falhas, DSH_BACKOFF_CAP_MS)
+        : DSH_RESTART_DELAY_MS;
+      self.opts.log("warn", `[cli:${self.info.id}:dsh] processo saiu (code=${code}) — restart com resume em ${delay}ms${falhas ? ` (falha ${falhas}/${DSH_HANDSHAKE_MAX_TRIES})` : ""}`);
       self.dshRestartTimer = setTimeout(() => {
         if (!self.stopped && !self.recoveringHung) startDsh(self);
-      }, DSH_RESTART_DELAY_MS);
+      }, delay);
       self.dshRestartTimer?.unref?.();
     },
   });
@@ -468,9 +541,35 @@ export function startDsh(self: any): void {
     try {
       await client.initialize();
       const mcp = dshMcpServers(self);
-      const sess = resumeId
-        ? await client.resumeSession(resumeId, self.opts.workspaceRoot, mcp)
-        : await client.newSession(self.opts.workspaceRoot, mcp);
+      // T-726 (a)/(b): comando relativo é resolvido pelo PATH; o que não
+      // resolve sai da lista. Bridge fora = fatal; MCP extra fora = aviso.
+      const conv = toAcpMcpServers(mcp);
+      for (const s2 of conv.skipped) {
+        if (s2.name === BRIDGE_MCP_NAME) throw new DshAcpError(`bridge ${BRIDGE_MCP_NAME} indisponível: ${s2.reason}`);
+        self.opts.onError(`[dsh] MCP "${s2.name}" ficou de fora: ${s2.reason} — o agente sobe sem ele`);
+        self.opts.log("warn", `[cli:${self.info.id}:dsh] MCP ${s2.name} ignorado: ${s2.reason}`);
+      }
+      for (const srv of conv.servers) {
+        if ("command" in srv) self.opts.log("info", `[cli:${self.info.id}:dsh] MCP ${srv.name} → ${srv.command}`);
+      }
+      const usaveis = mcp.filter((m) => !conv.skipped.some((s2) => s2.name === m.name));
+      const abrir = (lista: typeof usaveis) => (resumeId
+        ? client.resumeSession(resumeId, self.opts.workspaceRoot, lista)
+        : client.newSession(self.opts.workspaceRoot, lista));
+      let sess: DshSession;
+      try {
+        sess = await abrir(usaveis);
+      } catch (e) {
+        // T-726 (b)/(c): o dsh só descobre no session/new que um MCP não
+        // conecta (-32603 mcp-client(<nome>), ~63s). Tira o culpado (se for
+        // EXTRA) e sobe sem ele, em vez de matar a sessão.
+        const msg = (e as Error).message;
+        const culpado = mcpNameFromAcpError(msg);
+        if (!culpado || culpado === BRIDGE_MCP_NAME) throw e;
+        self.opts.onError(`[dsh] MCP "${culpado}" não conectou (${msg}) — o agente sobe sem ele`);
+        self.opts.log("warn", `[cli:${self.info.id}:dsh] MCP ${culpado} não conectou — retry sem ele`);
+        sess = await abrir(usaveis.filter((m) => m.name !== culpado));
+      }
       if (self.dsh !== client) return;
       self.opts.onSessionId?.(sess.sessionId);
       self.info.sessionId = sess.sessionId;
@@ -484,10 +583,14 @@ export function startDsh(self: any): void {
       if (effort) await client.setConfigOption("reasoning_effort", effort);
       if (self.dsh !== client) return;
       self.dshReady = true;
+      self.dshHandshakeFails = 0; // T-726 (d): sucesso zera o backoff
+      self.dshLastHandshakeError = undefined;
       self.setState("idle");
       dshPump(self);
     } catch (e) {
       if (self.dsh !== client) return;
+      self.dshHandshakeFails = Number(self.dshHandshakeFails ?? 0) + 1;
+      self.dshLastHandshakeError = (e as Error).message;
       self.opts.onError(`[dsh] handshake: ${(e as Error).message}`);
       // Resume inválido: próxima subida faz session/new (não loopa no mesmo id).
       if (resumeId) {

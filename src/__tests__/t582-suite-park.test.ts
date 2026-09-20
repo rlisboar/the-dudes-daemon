@@ -314,7 +314,23 @@ test("T-582 C1: `--list-suites` lista a pendurada e declara o critério de corte
     assert.match(out.stdout, /criterio: raiz `node … --test` viva ha >= 0s/);
     assert.match(out.stdout, /PENDURADA/);
     assert.match(out.stdout, new RegExp(`PENDURADA\\s+${suite.rootPid}\\b`));
-    assert.match(out.stdout, /fake\.test\.mjs/, "a linha traz o comando da suite");
+    // T-731: a coluna CMD é truncada em 90 chars (suite-park.ts). No runner
+    // novo do CI o node vive em /home/gh-runner/actions-runner/_work/_tool/
+    // node/<versão>/x64/bin/node (66 chars), então `node --test <tmp>/
+    // fake.test.mjs` passa de 90 e o nome do ficheiro some no "...". Antes
+    // passava só porque o path do node era curto. A identidade da suite é
+    // afirmada pelo CWD (coluna própria, NÃO truncada) + o root ser um
+    // `--test`, que é o que o critério exige e não depende do comprimento
+    // do path do runner.
+    const linha = out.stdout.split("\n").find((l) => l.includes("PENDURADA") && l.includes(String(suite.rootPid)));
+    assert.ok(linha, `linha da pendurada:\n${out.stdout}`);
+    assert.ok(linha!.includes(path.basename(dir)), `a linha identifica a suite pelo CWD: ${linha}`);
+    // O comando COMPLETO (sem truncagem de exibição) vem do scan do ps: é ele
+    // que prova que a raiz listada é a nossa suite `node … --test fake.test.mjs`.
+    // Com path de node longo o suficiente, nem "--test" sobrevive aos 90 chars
+    // da coluna — medido aqui com execPath de 90 chars, pior que o do CI (66).
+    assert.match(suite.command, /--test/, "a raiz é um `node … --test`");
+    assert.match(suite.command, /fake\.test\.mjs/, "a raiz é a suite falsa deste teste");
     assert.match(out.stdout, /modo lista \(zero mutacao\)/);
     assert.equal(alive(suite.rootPid), true, "modo lista não mata");
   } finally {

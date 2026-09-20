@@ -60,6 +60,14 @@ function handle(msg) {
     });
   }
   if (msg.method === "session/new") {
+    // T-726: simula o MCP que não conecta (o dsh real devolve isto ~63s depois).
+    const quebrado = process.env.FAKE_ACP_FAIL_MCP;
+    if (quebrado && (msg.params?.mcpServers ?? []).some((m) => m?.name === quebrado)) {
+      return out({
+        jsonrpc: "2.0", id: msg.id,
+        error: { code: -32603, message: "Internal error", data: { details: `mcp-client(${quebrado}): initial connection or tool synchronization failed` } },
+      });
+    }
     sessionId = SESSION_ID;
     return result(msg.id, { sessionId, configOptions: configOptions() });
   }

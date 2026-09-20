@@ -114,12 +114,13 @@ test("T-690 ACP: kill encerra e request posterior rejeita", async () => {
 });
 
 test("T-690 ACP: toAcpMcpServers — command node vira execPath, env Record vira [{name,value}]", () => {
+  // T-726: toAcpMcpServers devolve { servers, skipped } (MCP que não resolve sai da lista).
   const wire = toAcpMcpServers([{
     name: "the-dudes",
     command: "node",
     args: ["/tmp/mcp-bridge.cjs"],
     env: { THE_DUDES_AGENT_ID: "agent_x", FOO: "bar" },
-  }]);
+  }]).servers;
   assert.equal(wire.length, 1);
   const s = wire[0] as { command: string; args: string[]; env: Array<{ name: string; value: string }> };
   assert.equal(s.command, process.execPath, "node relativo → process.execPath (ACP exige absoluto)");
@@ -136,7 +137,7 @@ test("T-690 ACP: toAcpMcpServers — HTTP leva type+headers array (campo require
     name: "extra",
     url: "https://example.test/mcp",
     headers: { Authorization: "Bearer x" },
-  }]);
+  }]).servers;
   assert.deepEqual(wire, [{
     type: "http",
     name: "extra",
