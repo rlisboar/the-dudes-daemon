@@ -10,6 +10,7 @@ import {isMissingSessionFailure as isMissingSessionMessage, classifyRunnerFailur
 import type {AgentUsage} from "../../types.js";
 
 export function startClaude(self: any) {
+    self.claudeBootStartedAt = performance.now();
     const args = self.buildClaudeArgs();
     const env = self.buildEnv();
     const appendPromptIndex = args.indexOf("--append-system-prompt");
@@ -39,7 +40,7 @@ export function startClaude(self: any) {
       const pending = self.pendingMessages.splice(0);
       self.opts.log("info", `[cli:${self.info.id}:claude] flushing ${pending.length} buffered message(s) after restart`);
       setTimeout(() => {
-        for (const m of pending) self.pushUserMessage(m.content, m.images);
+        for (const m of pending) self.pushUserMessage(m.content, m.images, m);
       }, 300);
     }
     proc.stdout.on("data", (chunk: string) => {
@@ -126,6 +127,7 @@ export function handleStreamEvent(self: any, event: any) {
       self.opts.onSessionId(event.session_id);
     }
     if (event.type === "system" && event.subtype === "init") {
+      if (!self.claudeSawInit) self.claudeTimings?.[0]?.setBootMs(performance.now() - self.claudeBootStartedAt);
       self.claudeSawInit = true;
       // CLI reporta o model realmente resolvido (alias→ID, default da conta).
       if (typeof event.model === "string" && event.model) self.contextTracker.setResolvedModel(event.model);
@@ -157,15 +159,18 @@ export function handleStreamEvent(self: any, event: any) {
         if (b.type === "thinking") {
           const t = typeof b.thinking === "string" ? b.thinking.trim() : "";
           self.traceInternalCli("info", `[cli:${self.info.id}:claude:thinking] block_received len=${t.length} collectFlag=${self.info.collectThinking}`);
+          if (t) self.claudeTimings?.[0]?.semantic("thinking");
           if (self.info.collectThinking && t) self.opts.onThinkingText?.(t);
         }
         if (b.type === "redacted_thinking") {
+          self.claudeTimings?.[0]?.semantic("thinking");
           self.traceInternalCli("info", `[cli:${self.info.id}:claude:thinking] redacted_block_received collectFlag=${self.info.collectThinking}`);
           if (self.info.collectThinking) {
             self.opts.onThinkingText?.("[raciocínio omitido pelo modelo]", { redacted: true });
           }
         }
         if (b.type === "tool_use") {
+          self.claudeTimings?.[0]?.semantic("tool");
           hasToolUse = true;
           if (self.toolsInFlight === 0) self.toolsInFlightSince = Date.now();
           self.toolsInFlight++;
@@ -205,6 +210,7 @@ export function handleStreamEvent(self: any, event: any) {
               return;
             }
           }
+          self.claudeTimings?.[0]?.semantic("text");
           self.setState("speaking");
           self.opts.onAssistantText(text);
         }
@@ -227,6 +233,7 @@ export function handleStreamEvent(self: any, event: any) {
       return;
     }
     if (event.type === "result") {
+      self.claudeTimings?.shift()?.finish(event.is_error || String(event.subtype).startsWith("error") ? "error" : "completed");
       self.toolsInFlight = 0;
       self.toolsInFlightSince = null;
       self.setState("idle");

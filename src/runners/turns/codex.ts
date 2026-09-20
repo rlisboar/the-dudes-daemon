@@ -31,6 +31,7 @@ export function writeCodexConfig(self: any, ): void {
     }
   }
 export async function runCodexMessage(self: any, content: string, images?: ImageAttachment[]) {
+    const timing = self.turnLatency?.current;
     if (self.stopped) return;
     if (!self.ensureRunnerAvailable("codex")) return;
     // T-251: gate de turno para todos os runners (antes só Grok).
@@ -79,8 +80,10 @@ export async function runCodexMessage(self: any, content: string, images?: Image
       self.failTurnSpawn("codex", e, self.messageSession.epoch, imgCleanup, firstTurnSnapshot);
       return;
     }
+    timing?.bootStart();
     self.ocActiveProc = proc;
     armHardTimeout(proc, PER_MSG_TURN_TIMEOUT_MS, () => {
+      timing?.finish("hard-recover", "hard-timeout", "lifetime");
       self.opts.log("warn", `[codex:${self.info.name}] turno excedeu ${PER_MSG_TURN_TIMEOUT_MS / 1000}s — SIGKILL`);
     });
     // Epoch do spawn: eventos deste turno só valem enquanto a sessão não foi
@@ -116,6 +119,7 @@ export async function runCodexMessage(self: any, content: string, images?: Image
         try { self.handleCodexEvent(JSON.parse(buf.trim()), epoch); } catch {}
       }
       // R7: fim de turno único/idempotente (T-417 + T-251 preservados dentro).
+      timing?.finish(code === 0 ? "completed" : "process-exit");
       endTurn(self, { epoch, code, imgCleanup });
       if (!self.stopped && self.messageSession.owns(epoch)) {
         // T-245: ocupação REAL pós-turno (último token_count do rollout). O
@@ -138,6 +142,10 @@ export function handleCodexEvent(self: any, event: any, epoch: number) {
     // T-416/A10: linha parseada = progresso mesmo se setState for no-op.
     self.touchActivity();
     for (const normalized of parseCodexTurnEvent(event)) {
+      if (normalized.type === "session") self.turnLatency?.current?.bootReady();
+      if (normalized.type === "text" && normalized.text) self.turnLatency?.current?.semantic("text");
+      if (normalized.type === "thought" && normalized.text) self.turnLatency?.current?.semantic("thinking");
+      if (normalized.type === "tool") self.turnLatency?.current?.semantic("tool");
       if (normalized.type === "session") {
         if (normalized.sessionId !== self.messageSession.sessionId) {
           self.messageSession.sessionId = normalized.sessionId;

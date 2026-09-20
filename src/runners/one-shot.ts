@@ -171,6 +171,8 @@ export async function runOneShotWithSession(self: any, prompt: string, sessionId
   /** Encaminha onExit pro orchestrator no máximo uma vez (guard idempotente
    *  contra stop() repetido ou close handler racing). */
 export async function killClaudeForRestart(self: any, ): Promise<void> {
+    for (const timing of self.claudeTimings ?? []) timing.finish("reset", "context-reset");
+    self.claudeTimings = [];
     // Teste de vida por exitCode/signalCode, NÃO por .killed: kill() marca
     // killed=true no ENVIO do sinal — early-return por .killed pulava a espera
     // quando outro caminho já tinha sinalizado (processo ainda vivo) e a

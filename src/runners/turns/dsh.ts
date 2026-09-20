@@ -459,10 +459,12 @@ function dshReportError(self: any, message: string): void {
  * (o stop/kill do runner alcança), identidade `self.dsh` guarda chunks tardios.
  */
 export function startDsh(self: any): void {
+  const bootStartedAt = performance.now();
   let handshakePending = true;
   let pendingExit: { code: number | null } | undefined;
   const finishExit = (code: number | null) => {
     if (self.dsh !== client) return;
+    if (self.dshReady) self.turnLatency?.current?.finish("process-exit");
     self.dsh = null;
     self.dshReady = false;
     self.dshPromptInFlight = false;
@@ -495,11 +497,13 @@ export function startDsh(self: any): void {
       if (self.dsh !== client) return;
       self.touchActivity();
       self.setState("speaking");
+      if (t) self.turnLatency?.current?.semantic("text");
       self.opts.onAssistantText(t);
     },
     onThought: (t) => {
       if (self.dsh !== client) return;
       self.touchActivity();
+      if (t) self.turnLatency?.current?.semantic("thinking");
       if (self.info.collectThinking && t) self.opts.onThinkingText?.(t);
       if (self.currentState !== "speaking") self.setState("thinking");
     },
@@ -507,6 +511,7 @@ export function startDsh(self: any): void {
       if (self.dsh !== client) return;
       self.touchActivity();
       if (ev.phase === "call") {
+        self.turnLatency?.current?.semantic("tool");
         if (self.toolsInFlight === 0) self.toolsInFlightSince = Date.now();
         self.toolsInFlight++;
         self.opts.onToolUse(ev.title ?? ev.id, {});
@@ -602,6 +607,7 @@ export function startDsh(self: any): void {
       const effort = dshEffortValue(self.info.effort);
       if (effort) await client.setConfigOption("reasoning_effort", effort);
       if (self.dsh !== client) return;
+      self.turnLatency?.bootReady(performance.now() - bootStartedAt);
       self.dshReady = true;
       self.dshHandshakeFails = 0; // T-726 (d): sucesso zera o backoff
       self.dshLastHandshakeError = undefined;
@@ -629,6 +635,7 @@ export function startDsh(self: any): void {
  *  NÃO enviados (o prompt em voo não está nela). Só leitura/limpeza. */
 export function dshTakeQueue(self: any): Array<{ content: string }> {
   const queue = (self.dshQueue as DshQueued[] | undefined) ?? [];
+  for (const q of queue) self.turnLatency?.discard(q, "drained");
   self.dshQueue = [];
   return queue.map((q) => ({ content: q.content }));
 }
@@ -646,7 +653,9 @@ export function dshPushUserMessage(self: any, content: string, images?: ImageAtt
     self.scheduleAttachmentCleanup(cleanup);
     message = appendPathAttachmentPrompt(message, files, "dsh");
   }
-  queue.push({ content: message });
+  const queued = { content: message };
+  self.turnLatency?.enqueue(queued);
+  queue.push(queued);
   self.dshQueue = queue;
   dshPump(self);
 }
@@ -658,6 +667,8 @@ function dshPump(self: any): void {
   const next = queue.shift();
   if (!next) return;
   self.dshQueue = queue;
+  const timing = self.turnLatency?.activate(next, self.dshFreshSession ? "cold" : "resume");
+  timing?.start();
   self.dshPromptInFlight = true;
   self.setState("thinking");
   void (async () => {
@@ -673,6 +684,7 @@ function dshPump(self: any): void {
       }
       const stop = await client.prompt(text);
       if (self.dsh !== client) return;
+      timing?.finish(stop === "cancelled" ? "cancelled" : "completed");
       self.dshFreshSession = false;
       self.dshPromptInFlight = false;
       if (stop !== "cancelled") self.setState("idle");
@@ -681,6 +693,8 @@ function dshPump(self: any): void {
     } catch (e) {
       if (self.dsh !== client) return;
       self.dshPromptInFlight = false;
+      timing?.finish("error");
+      self.turnLatency?.enqueue(next, true);
       dshReportError(self, `[dsh] prompt: ${(e as Error).message}`);
       // Prompt falhou com processo vivo (ex.: timeout de controle): devolve a
       // mensagem e tenta de novo no próximo pump.
@@ -713,6 +727,7 @@ export function dshStop(self: any): void {
 
 /** clearContext/compact: mata e ressobe com sessão nova (caller zera ids). */
 export async function dshKillForRestart(self: any): Promise<void> {
+  self.turnLatency?.current?.finish("reset", "context-reset");
   if (self.dshRestartTimer) {
     clearTimeout(self.dshRestartTimer);
     self.dshRestartTimer = null;

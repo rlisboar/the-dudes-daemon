@@ -12,6 +12,7 @@ import {spawnDropped} from "../../privileges.js";
 
 
 export async function runQwenMessage(self: any, content: string, images?: ImageAttachment[]) {
+    const timing = self.turnLatency?.current;
     if (self.stopped) return;
     if (!self.ensureRunnerAvailable("qwen")) return;
     // T-251: gate de turno para todos os runners per-message.
@@ -87,6 +88,7 @@ export async function runQwenMessage(self: any, content: string, images?: ImageA
     }
     proc.stdin?.on("error", () => { /* EPIPE: o CLI morreu cedo — o close cuida */ });
     proc.stdin?.end(message);
+    timing?.bootStart();
     self.ocActiveProc = proc;
     // T-598: backstop do processo ACIMA do teto de lifetime do watchdog — o
     // watchdog corta primeiro, com re-fila + sessão preservada. Se este
@@ -103,6 +105,7 @@ export async function runQwenMessage(self: any, content: string, images?: ImageA
     let buf = "";
     let pendingText = "";
     let sawResult = false;
+    let resultError = false;
     let loopAborted = false;
     let errOut = "";
     const flush = () => {
@@ -126,11 +129,16 @@ export async function runQwenMessage(self: any, content: string, images?: ImageA
         if (!line.startsWith("{")) continue;
         if (!self.messageSession.owns(epoch)) continue;
         try {
-          for (const event of parseQwenTurnEvent(JSON.parse(line))) {
+          const raw = JSON.parse(line);
+          for (const event of parseQwenTurnEvent(raw)) {
             // T-371 (e): TODO evento semântico do stream é uma rodada de API
             // concluída ou progresso real — repõe o clock de ociosidade.
             // O complementar do teto absoluto de lifetime (d): thinking
             // profundo com rodadas de ~85s deixa de ser "stalled" falso.
+            if (event.type === "session") timing?.bootReady();
+            if (event.type === "text" && event.text) timing?.semantic("text");
+            if (event.type === "thought" && event.text) timing?.semantic("thinking");
+            if (event.type === "tool") timing?.semantic("tool");
             self.touchActivity();
             if (event.type === "session") {
               // uuid ecoado = o que já registramos; adota se divergir (CLI
@@ -158,6 +166,7 @@ export async function runQwenMessage(self: any, content: string, images?: ImageA
               self.opts.onToolUse(event.name, event.input);
               self.setState(event.name.includes("send_message") ? "sending" : "thinking");
             } else if (event.type === "result") {
+              resultError = raw.is_error === true || String(raw.subtype).startsWith("error");
               sawResult = true;
               flush();
             } else if (event.type === "usage") {
@@ -208,6 +217,7 @@ export async function runQwenMessage(self: any, content: string, images?: ImageA
         );
         return;
       }
+      timing?.finish(sawResult ? resultError ? "error" : "completed" : code === 0 ? "error" : "process-exit");
       if (sawResult) self.inflightPerMessage = null; // T-371 (b): turno completo
       // Resume apontando pra sessão que sumiu do disco (reboot limpou o
       // QWEN_HOME efêmero antigo, delete manual): "No saved session found".

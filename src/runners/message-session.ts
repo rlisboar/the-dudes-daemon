@@ -13,6 +13,11 @@ export interface FirstTurnSnapshot {
 }
 
 export class PerMessageSessionState {
+  constructor(private readonly observe?: {
+    reset(): void;
+    queued(message: QueuedMessage, retry: boolean): void;
+    discarded(message: QueuedMessage, reason: "queue-cleared" | "drained"): void;
+  }) {}
   sessionId?: string;
   needsPrime = false;
   busy = false;
@@ -28,6 +33,7 @@ export class PerMessageSessionState {
   }
 
   reset(summary?: string): void {
+    this.observe?.reset();
     this.epoch++;
     this.sessionId = undefined;
     this.needsPrime = false;
@@ -47,16 +53,18 @@ export class PerMessageSessionState {
    * agente fica mudo até restart manual (sintoma: Claude→Grok “para”).
    */
   bumpEpoch(): void {
+    this.observe?.reset();
     this.epoch++;
   }
 
   enqueue(message: QueuedMessage, maxSize: number): boolean {
     if (this.queue.length >= maxSize) return false;
+    this.observe?.queued(message, false);
     this.queue.push(message);
     return true;
   }
 
-  prepend(message: QueuedMessage): void { this.queue.unshift(message); }
+  prepend(message: QueuedMessage): void { this.observe?.queued(message, true); this.queue.unshift(message); }
   dequeue(): QueuedMessage | undefined { return this.queue.shift(); }
   queuedCount(): number { return this.queue.length; }
 
@@ -65,12 +73,14 @@ export class PerMessageSessionState {
    *  (ex.: hang-recover) não são do usuário e ficam de fora. */
   takeAllForDrain(): QueuedMessage[] {
     const out = this.queue.filter((m) => !m.synthetic);
+    for (const m of this.queue) this.observe?.discarded(m, "drained");
     this.queue = [];
     return out;
   }
 
   clearQueue(): number {
     const count = this.queue.length;
+    for (const m of this.queue) this.observe?.discarded(m, "queue-cleared");
     this.queue = [];
     return count;
   }

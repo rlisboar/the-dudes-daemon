@@ -62,6 +62,7 @@ export function ocUsageSemantics(self: any, ): UsageSemantics {
     return providerID.startsWith("anthropic") ? "anthropic" : "auto";
   }
 export async function runOpenCodeMessage(self: any, content: string, images?: ImageAttachment[], retry = 0) {
+    const timing = self.turnLatency?.current;
     if (self.stopped) return;
     if (!self.ensureRunnerAvailable("opencode")) return;
     // T-251: gate de turno também para o opencode — o processo serve é
@@ -70,11 +71,13 @@ export async function runOpenCodeMessage(self: any, content: string, images?: Im
     // (idle = gate vazio, T-088) matava o serve no meio.
     if (!(await self.gateTurn())) { self.messageSession.busy = false; return; }
     self.setState("thinking");
+    timing?.bootStart();
     self.ensureOcServer().then(
-      () => void self.runOpenCodeMessageAttached(content, images, retry)
-        .catch((e: any) => self.opts.log("warn", `[cli:${self.info.id}:opencode] attached threw: ${(e as Error).message}`))
-        .finally(() => self.releaseActiveTurnSlot()),
+      () => { timing?.bootReady(); return void self.runOpenCodeMessageAttached(content, images, retry)
+        .catch((e: any) => { timing?.finish("error"); self.opts.log("warn", `[cli:${self.info.id}:opencode] attached threw: ${(e as Error).message}`); })
+        .finally(() => { timing?.finish("completed"); self.releaseActiveTurnSlot(); }); },
       (err: any) => {
+        timing?.finish("spawn-error");
         self.releaseActiveTurnSlot();
         self.opts.onError(`opencode serve falhou: ${err?.message ?? err}`);
         self.messageSession.busy = false;
@@ -88,6 +91,7 @@ export async function runOpenCodeMessage(self: any, content: string, images?: Im
    *  conexão TLS cai no meio → opencode sai sem emitir text/step_finish).
    *  1 retry cobre o flap intermitente (ex.: Z.AI) sem loop infinito. */
 export async function runOpenCodeMessageAttached(self: any, content: string, images?: ImageAttachment[], retry = 0) {
+    const timing = self.turnLatency?.current;
     // Descarte silencioso: sem este log não dá pra distinguir "mensagem nunca
     // chegou" de "chegou e morreu aqui" — que é o sintoma de ficar mudo.
     if (self.stopped || !self.openCodeTransport.ready()) {
@@ -112,6 +116,7 @@ export async function runOpenCodeMessageAttached(self: any, content: string, ima
         self.messageSession.sessionId = sess.id;
         if (self.opts.onSessionId) self.opts.onSessionId(sess.id);
       } catch (e) {
+        timing?.finish("error");
         self.opts.onError(`opencode: falha criando sessão no serve: ${(e as Error).message}`);
         self.messageSession.busy = false; self.setState("idle"); self.drainOcQueue(); return;
       }
@@ -161,11 +166,14 @@ export async function runOpenCodeMessageAttached(self: any, content: string, ima
       // falso-idle e o compact rodaria em paralelo com o turno novo).
       if (!self.messageSession.owns(turnEpoch, turnSession)) return;
       self.messageSession.busy = false;
+      timing?.finish("error");
       const emsg = (e as Error).message;
       if (retry < AgentRunner.OC_EMPTY_RETRIES) {
         self.opts.onError(`opencode: turno falhou (${emsg}) — retry ${retry + 1}/${AgentRunner.OC_EMPTY_RETRIES}`);
         self.messageSession.restoreFirstTurn(firstTurnSnapshot);
         self.messageSession.busy = true;
+        const retryMessage = {};
+        self.turnLatency?.enqueue(retryMessage, true);
         setTimeout(() => {
           if (self.stopped) { self.messageSession.busy = false; return; }
           // Clear na janela de 1,2s descartou a mensagem — re-postá-la numa
@@ -173,6 +181,7 @@ export async function runOpenCodeMessageAttached(self: any, content: string, ima
           // side effects de tools). Não toca busy: o clear já zerou e um
           // turno novo pode ser o dono agora.
           if (!self.messageSession.owns(turnEpoch, turnSession)) return;
+          self.turnLatency?.activate(retryMessage, self.messageSession.sessionId ? "resume" : "cold");
           void self.runOpenCodeMessage(content, images, retry + 1);
         }, 1200);
         return;
@@ -222,9 +231,13 @@ export async function runOpenCodeMessageAttached(self: any, content: string, ima
       self.opts.onError(`opencode: resposta vazia (provável flap do provider) — retry ${retry + 1}/${AgentRunner.OC_EMPTY_RETRIES}`);
       self.messageSession.restoreFirstTurn(firstTurnSnapshot);
       self.messageSession.busy = true;
+      timing?.finish("retry");
+      const retryMessage = {};
+      self.turnLatency?.enqueue(retryMessage, true);
       setTimeout(() => {
         if (self.stopped) { self.messageSession.busy = false; return; }
         if (!self.messageSession.owns(turnEpoch, turnSession)) return; // clear descartou a mensagem (ver retry do catch)
+        self.turnLatency?.activate(retryMessage, self.messageSession.sessionId ? "resume" : "cold");
         void self.runOpenCodeMessage(content, images, retry + 1);
       }, 1200);
       return;
@@ -232,6 +245,7 @@ export async function runOpenCodeMessageAttached(self: any, content: string, ima
     if (!self.ocRunSawOutput) {
       self.opts.onError(`opencode: turno terminou sem texto — o modelo "${self.info.model ?? "?"}" pode não retornar resposta. Troque o modelo.`);
     }
+    timing?.finish(infoErr || !self.ocRunSawOutput ? "error" : "completed");
     self.setState("idle");
     self.drainOcQueue();
   }
@@ -324,6 +338,9 @@ export function ocHandleStreamPart(self: any, props: any): void {
     // sem nenhum toque de atividade e batia no limiar de hang.
     self.touchActivity();
     const type = String(part.type ?? "");
+    if (type === "text" && part.text) self.turnLatency?.current?.semantic("text");
+    if (type === "reasoning" && part.text) self.turnLatency?.current?.semantic("thinking");
+    if (type.startsWith("tool") && part.state?.status === "running") self.turnLatency?.current?.semantic("tool");
     if ((type === "text" || type === "reasoning") && !part.time?.end) return;
     // Tool começa em `pending` (sem input resolvido): o parser não emite nada
     // aí, e marcar o id como visto agora enterraria o `running` que vem logo
@@ -338,6 +355,9 @@ export function ocHandleStreamPart(self: any, props: any): void {
   }
 export function applyOpenCodeEvents(self: any, raw: unknown): void {
     for (const event of parseOpenCodeTurnEvent(raw)) {
+      if (event.type === "text" && event.text) self.turnLatency?.current?.semantic("text");
+      if (event.type === "thought" && event.text) self.turnLatency?.current?.semantic("thinking");
+      if (event.type === "tool") self.turnLatency?.current?.semantic("tool");
       if (event.type === "session") {
         if (event.sessionId !== self.messageSession.sessionId) {
           self.messageSession.sessionId = event.sessionId;

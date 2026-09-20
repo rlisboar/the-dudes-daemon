@@ -1,3 +1,4 @@
+import { TurnLatency, type TurnTiming } from "./runners/turn-latency.js";
 import {type ChildProcess, type ChildProcessWithoutNullStreams} from "node:child_process";
 
 import {readdirSync, realpathSync, existsSync, statSync, openSync, readSync, closeSync} from "node:fs";
@@ -283,6 +284,8 @@ export function sweepGrokChatToolCallsFromPath(
 
 export class AgentRunner {
   readonly info: AgentInfo;
+  private readonly turnLatency: TurnLatency;
+  private claudeTimings: TurnTiming[] = [];
   private readonly runtimeFiles: RunnerRuntimeFiles;
   private readonly contextTracker: ContextTracker;
   private proc: ChildProcessWithoutNullStreams | null = null;
@@ -474,7 +477,12 @@ export class AgentRunner {
 
   constructor(info: AgentInfo, private opts: AgentRunnerOptions) {
     this.info = info;
-    this.messageSession = new PerMessageSessionState();
+    this.turnLatency = new TurnLatency(info.id, opts.cliRunner, opts.log);
+    this.messageSession = new PerMessageSessionState({
+      reset: () => this.turnLatency.current?.finish("reset", "context-reset"),
+      queued: (m, retry) => this.turnLatency.enqueue(m, retry),
+      discarded: (m, reason) => this.turnLatency.discard(m, reason),
+    });
     this.runtimeFiles = new RunnerRuntimeFiles({
       workspaceRoot: opts.workspaceRoot,
       agentId: info.id,
@@ -702,6 +710,7 @@ export class AgentRunner {
     this.touchActivity();
     const next = this.messageSession.dequeue();
     if (!next) { this.messageSession.busy = false; return; }
+    this.turnLatency.activate(next, this.messageSession.sessionId ? "resume" : "cold");
     const { content, images } = next;
     if (this.opts.cliRunner === "gemini") {
       void this.runGeminiMessage(content, images);
@@ -735,12 +744,13 @@ export class AgentRunner {
   takeQueuedForDrain(): Array<{ content: string; images?: ImageAttachment[] }> {
     const out: Array<{ content: string; images?: ImageAttachment[] }> = [];
     for (const m of this.messageSession.takeAllForDrain()) out.push({ content: m.content, images: m.images });
+    for (const m of this.pendingMessages) this.turnLatency.discard(m, "drained");
     out.push(...this.pendingMessages.splice(0));
     out.push(...dshTakeQueue(this as unknown as Record<string, unknown>));
     return out;
   }
 
-  pushUserMessage(content: string, images?: ImageAttachment[]) {
+  pushUserMessage(content: string, images?: ImageAttachment[], latencyMessage?: { content: string; images?: ImageAttachment[] }) {
     if (isLoopStopMessage(content)) {
       const dropped = this.messageSession.clearQueue();
       if (dropped > 0) {
@@ -769,10 +779,14 @@ export class AgentRunner {
         this.opts.log("warn", `[cli:${this.info.id}:claude] pendingMessages cheia (${this.pendingMessages.length}) — drop mensagem durante restart`);
         return;
       }
-      this.pendingMessages.push({ content, images });
+      const pending = latencyMessage ?? { content, images };
+      this.turnLatency.enqueue(pending);
+      this.pendingMessages.push(pending);
       this.opts.log("info", `[cli:${this.info.id}:claude] buffered message during restart (queued=${this.pendingMessages.length})`);
       return;
     }
+    const latencyInput = latencyMessage ?? { content, images };
+    this.turnLatency.enqueue(latencyInput);
     // Não-imagem não cabe no payload inline do claude — vai por arquivo.
     const anexos = this.attachNonImageFiles(content, images);
     const messageContent = buildClaudeUserContent(anexos.content, images);
@@ -782,11 +796,17 @@ export class AgentRunner {
       message: { role: "user", content: messageContent },
     });
     this.traceCli("claude", "stdin", line);
+    const timing = this.turnLatency.activate(latencyInput, this.info.sessionId ? "resume" : "cold");
+    timing.start();
+    this.claudeTimings.push(timing);
     this.proc.stdin.write(line + "\n");
     this.setState("thinking");
   }
 
   stop() {
+    this.turnLatency.finishAll("stopped", "stop");
+    for (const timing of this.claudeTimings) timing.finish("stopped", "stop");
+    this.claudeTimings = [];
     this.stopped = true;
     this.stopHangWatch();
     if (this.hangNudgeTimer) {
@@ -980,6 +1000,9 @@ export class AgentRunner {
   /** Parse tolerante de EPISODE_JSON (mesma robustez do MEMORY_JSON). */
   private emitExit(code: number | null) {
     if (this.exited) return;
+    this.turnLatency.finishAll("process-exit");
+    for (const timing of this.claudeTimings) timing.finish("process-exit");
+    this.claudeTimings = [];
     this.exited = true;
     // Remove o token-file plaintext + tmpdir no fim de vida — sem isso o token
     // (válido até o server reiniciar, que re-arma todos) ficava em /tmp pra
@@ -1058,10 +1081,14 @@ export class AgentRunner {
    */
   private async gateTurn(): Promise<boolean> {
     if (this.stopped) return false;
+    const timing = this.turnLatency.current;
+    timing?.gateStart();
     this.waitingTurnGate = true;
     this.setState("queued");
     const pool = this.info.ephemeral ? "bg" as const : "main" as const;
     const release = await acquireTurnSlot(`${this.opts.cliRunner}:${this.info.name}`, this.opts.log, pool);
+    timing?.gateEnd();
+    timing?.start();
     this.waitingTurnGate = false;
     if (this.stopped) { release(); return false; }
     this.activeTurnRelease = release;
@@ -1080,6 +1107,7 @@ export class AgentRunner {
     imgCleanup: () => void,
     firstTurnSnapshot: FirstTurnSnapshot,
   ): void {
+    this.turnLatency.current?.finish("spawn-error");
     imgCleanup();
     this.opts.onError(`${runner} spawn falhou: ${(error as Error).message}`);
     if (this.messageSession.owns(epoch) || this.stopped) {
@@ -1328,6 +1356,7 @@ export class AgentRunner {
    *  do hang clássico (semântica T-240/T-371 intacta). */
   private recoverHungTurn(reason: string, idleMs: number, kind: HardRecoverKind = "hang"): void {
     if (this.recoveringHung || this.stopped) return;
+    this.turnLatency.current?.finish("hard-recover", reason.startsWith("hard timeout") ? "hard-timeout" : reason.startsWith("token loop") ? "token-loop" : "watchdog", kind);
     this.recoveringHung = true;
     recordHardRecover(this.opts.cliRunner);
     const label = kind === "lifetime" ? "lifetime" : "hang";
@@ -1535,6 +1564,9 @@ export class AgentRunner {
   private async recoverClaudeContinuousHang(reason: string, idleMs: number): Promise<void> {
     if (this.recoveringHung || this.stopped) return;
     if (this.opts.cliRunner !== "claude") return;
+    this.turnLatency.current?.finish("hard-recover", "watchdog", "hang");
+    for (const timing of this.claudeTimings) timing.finish("hard-recover", "watchdog", "hang");
+    this.claudeTimings = [];
     this.recoveringHung = true;
     try {
       this.opts.log(
@@ -1570,6 +1602,9 @@ export class AgentRunner {
   private async recoverDshContinuousHang(reason: string, idleMs: number): Promise<void> {
     if (this.recoveringHung || this.stopped) return;
     if (this.opts.cliRunner !== "dsh") return;
+    this.turnLatency.current?.finish("hard-recover", "watchdog", "hang");
+    for (const timing of this.claudeTimings) timing.finish("hard-recover", "watchdog", "hang");
+    this.claudeTimings = [];
     this.recoveringHung = true;
     try {
       this.opts.log(

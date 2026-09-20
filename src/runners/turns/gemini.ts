@@ -18,6 +18,10 @@ export function ingestGeminiLine(self: any,
     if (!self.messageSession.owns(epoch)) return;
     self.touchActivity();
     for (const event of parseGeminiTurnEvent(obj)) {
+      if (event.type === "session") self.turnLatency?.current?.bootReady();
+      if (event.type === "text" && event.text) self.turnLatency?.current?.semantic("text");
+      if (event.type === "thought" && event.text) self.turnLatency?.current?.semantic("thinking");
+      if (event.type === "tool") self.turnLatency?.current?.semantic("tool");
       if (event.type === "text") acc.addText(event.text);
       else if (event.type === "tool") {
         acc.flush();
@@ -43,6 +47,7 @@ export function ingestGeminiLine(self: any,
     }
   }
 export async function runGeminiMessage(self: any, content: string, images?: ImageAttachment[]) {
+    const timing = self.turnLatency?.current;
     if (self.stopped) return;
     if (!self.ensureRunnerAvailable("gemini")) return;
     // T-251: gate de turno para TODOS os runners (antes só Grok) — sem isto
@@ -106,8 +111,10 @@ export async function runGeminiMessage(self: any, content: string, images?: Imag
       self.failTurnSpawn("gemini", e, epoch, imgCleanup, firstTurnSnapshot);
       return;
     }
+    timing?.bootStart();
     self.ocActiveProc = proc;
     armHardTimeout(proc, PER_MSG_TURN_TIMEOUT_MS, () => {
+      timing?.finish("hard-recover", "hard-timeout", "lifetime");
       self.opts.log("warn", `[gemini:${self.info.name}] turno excedeu ${PER_MSG_TURN_TIMEOUT_MS / 1000}s — SIGKILL`);
     });
     let buf = "";
@@ -153,6 +160,7 @@ export async function runGeminiMessage(self: any, content: string, images?: Imag
     });
     proc.on("close", (code) => {
       // R7: fim de turno único/idempotente (T-417 + T-251 preservados dentro).
+      timing?.finish(sawResult ? "completed" : code === 0 ? "error" : "process-exit");
       endTurn(self, { epoch, code, sawResult, firstTurnSnapshot, beforeCleanup: flush, imgCleanup });
     });
   }

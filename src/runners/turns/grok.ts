@@ -111,6 +111,7 @@ export function grokTurnEnv(self: any, ): NodeJS.ProcessEnv {
     });
   }
 export async function runGrokMessage(self: any, content: string, images?: ImageAttachment[]) {
+    const timing = self.turnLatency?.current;
     if (self.stopped) { self.messageSession.busy = false; return; }
     if (!self.ensureRunnerAvailable(self.opts.cliRunner)) { self.messageSession.busy = false; return; }
     // Nunca manda ciphertext pro CLI — hang/resposta lixo. Decryption falhou
@@ -133,6 +134,7 @@ export async function runGrokMessage(self: any, content: string, images?: ImageA
     self.inflightPerMessage = { content, images, attempt: prevAttempt };
     // T-055: fila do turn-gate NÃO é hang. Estado "queued" + flag interna
     // suspendem o watchdog até o slot ser concedido e o CLI spawnar.
+    timing?.gateStart();
     self.waitingTurnGate = true;
     self.setState("queued");
     // Mesmo semáforo do runOneShot: turnos grok de resume são o caso medido
@@ -141,6 +143,8 @@ export async function runGrokMessage(self: any, content: string, images?: ImageA
     // T-055: ephemeral (Brain subagent) compete no pool `bg`, não no main.
     const pool = self.info.ephemeral ? "bg" as const : "main" as const;
     const releaseSlot = await acquireTurnSlot(`${self.opts.cliRunner}:${self.info.name}`, self.opts.log, pool);
+    timing?.gateEnd();
+    timing?.start();
     self.waitingTurnGate = false;
     if (self.stopped || !self.messageSession.owns(epoch0)) { releaseSlot(); return; }
     // Guarda o release pro hard recover: close pós-SIGKILL não é garantido
@@ -189,6 +193,7 @@ export async function runGrokMessage(self: any, content: string, images?: ImageA
         stdio: ["ignore", "pipe", "pipe"],
       }, self.opts.dropTo ?? null);
     } catch (e) {
+      timing?.finish("spawn-error");
       self.releaseActiveTurnSlot();
       imgCleanup();
       self.messageSession.busy = false;
@@ -205,6 +210,7 @@ export async function runGrokMessage(self: any, content: string, images?: ImageA
       if (self.messageSession.owns(epoch) || self.stopped) self.releaseActiveTurnSlot();
       recordTurnEnd(self.opts.cliRunner, Date.now() - grokTurnT0, code === 0);
     });
+    timing?.bootStart();
     self.ocActiveProc = proc;
     // T-593: o pid é rastreado para o hard recover matar por PID mesmo quando
     // `ocActiveProc` já tiver sido anulado por um close tardio do turno
@@ -235,6 +241,7 @@ export async function runGrokMessage(self: any, content: string, images?: ImageA
     const grokHang = hangThresholds(self.opts.cliRunner);
     const grokRearmMs = grokHang.postEventMs ?? grokHang.hardMs;
     armHardTimeout(proc, GROK_TURN_TIMEOUT_MS, () => {
+      timing?.finish("hard-recover", "hard-timeout", "hang");
       self.opts.log("warn", `[grok:${self.info.name}] turno excedeu ${GROK_TURN_TIMEOUT_MS / 1000}s — SIGKILL (session=${self.messageSession.sessionId?.slice(0, 8) ?? "nova"})`);
       setTimeout(() => {
         if (self.stopped || !self.messageSession.owns(epoch)) return;
@@ -303,6 +310,10 @@ export async function runGrokMessage(self: any, content: string, images?: ImageA
       try {
         let sawSemantic = false;
         for (const event of parseGrokStreamEvent(JSON.parse(line))) {
+          if (event.type === "session") timing?.bootReady();
+          if (event.type === "text" && event.text) timing?.semantic("text");
+          if (event.type === "thought" && event.text) timing?.semantic("thinking");
+          if (event.type === "tool") timing?.semantic("tool");
           sawSemantic = true;
           // Fim do segmento de thought: sai ANTES do text/tool (T-705 + T-712).
           if (event.type === "text" || event.type === "tool" || event.type === "result" || event.type === "error") {
@@ -428,6 +439,7 @@ export async function runGrokMessage(self: any, content: string, images?: ImageA
       // (T-417) / qwen (T-371).
       if (self.messageSession.owns(epoch) || self.stopped) self.ocActiveProc = null;
       if (self.stopped) { self.messageSession.busy = false; self.emitExit(code); return; }
+      timing?.finish(sawEnd && !errFromJson ? "completed" : code === 0 ? "error" : "process-exit");
       void self.finishGrokTurn({
         code, epoch, firstTurn, pendingSummary, content, images,
         sawEnd, endSessionId, errOut, errFromJson, emittedAny,

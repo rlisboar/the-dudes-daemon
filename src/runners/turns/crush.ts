@@ -72,6 +72,7 @@ export function crushSessionJson(self: any, argv: string[]): Promise<any> {
     });
   }
 export async function runCrushMessage(self: any, content: string, images?: ImageAttachment[]) {
+    const timing = self.turnLatency?.current;
     if (self.stopped) { self.messageSession.busy = false; return; }
     if (!self.ensureRunnerAvailable("crush")) { self.messageSession.busy = false; return; }
     // T-251: gate de turno para todos os runners (antes só Grok).
@@ -128,8 +129,10 @@ export async function runCrushMessage(self: any, content: string, images?: Image
       self.failTurnSpawn("crush", e, epoch, imgCleanup, firstTurnSnapshot);
       return;
     }
+    timing?.bootStart();
     self.ocActiveProc = proc;
     armHardTimeout(proc, PER_MSG_TURN_TIMEOUT_MS, () => {
+      timing?.finish("hard-recover", "hard-timeout", "lifetime");
       self.opts.log("warn", `[crush:${self.info.name}] turno excedeu ${PER_MSG_TURN_TIMEOUT_MS / 1000}s — SIGKILL`);
     });
     let out = "";
@@ -137,6 +140,7 @@ export async function runCrushMessage(self: any, content: string, images?: Image
     proc.stdout!.setEncoding("utf8");
     proc.stderr!.setEncoding("utf8");
     proc.stdout!.on("data", (chunk: string) => {
+      if (self.messageSession.owns(epoch) && chunk.trim()) timing?.semantic("text");
       self.ingestCrushChunk(chunk);
       self.traceCli("crush", "stdout", chunk);
       out = self.capAccum("crush", out, chunk);
@@ -160,6 +164,7 @@ export async function runCrushMessage(self: any, content: string, images?: Image
         self.ocActiveProc = null;
       }
       if (self.stopped) { self.messageSession.busy = false; self.emitExit(code); return; }
+      timing?.finish(code === 0 ? "completed" : "process-exit");
       void self.finishCrushTurn({ out, errOut, code, epoch, firstTurn, pendingSummary, content, images });
     });
   }
