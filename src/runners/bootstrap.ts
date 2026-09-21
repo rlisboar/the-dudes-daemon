@@ -6,7 +6,7 @@ import {RUNNER_OUTPUT_CAP_BYTES, appendCapped} from "./process-lifecycle.js";
 import {buildAgentContext, buildInitialMessage, buildSystemPromptHeader, buildWorkspacePrompt} from "./prompts.js";
 import {buildBaseRunnerEnv} from "./env.js";
 import {buildBridgeEnv, buildClaudeMcpConfig, buildGeminiMcpServers, buildOpenCodeMcpConfig, buildQwenMcpServers} from "./mcp-config.js";
-import {buildGraph, graphExists, graphMtime, graphPath, hasSemanticMarker, needsSemanticUpdate} from "../graph-indexer.js";
+import {buildGraph, checkoutLagWarning, graphExists, graphMtime, graphPath, hasSemanticMarker, needsSemanticUpdate} from "../graph-indexer.js";
 import {buildOpenCodeAgentConfig} from "./opencode-effort.js";
 
 import {claudeThinkingEffort, qwenConfigContextLimit, qwenReasoningEffort} from "./model-policy.js";
@@ -381,6 +381,10 @@ export async function prepareGraphify(self: any) {
         hasSemantic: hasSemanticMarker(root),
       });
       if (gbin?.available) {
+        // T-764: checkout de indexação atrás do origin = grafo velho mesmo com
+        // refresh ok (indexa a ÁRVORE). Aviso declarado, uma vez por spawn.
+        const lagWarn = checkoutLagWarning(root);
+        if (lagWarn) self.opts.log("warn", `[graph:${self.info.name}] ${lagWarn}`);
         self.opts.log("info", `[graph:${self.info.name}] índice presente — refresh code-only em background (preserva docs).`);
         void buildGraph(root, gbin.command).then((r) => {
           if (self.stopped) return;

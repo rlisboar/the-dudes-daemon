@@ -1,7 +1,7 @@
 import path from "node:path";
 import { homedir } from "node:os";
 import { statSync, readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import type { ResolvedCliCommands } from "./cli-config.js";
 import { spawnDropped, type DropTarget } from "./privileges.js";
 import { buildSummarizerEnv } from "./runners/env.js";
@@ -169,6 +169,31 @@ export function graphExists(workspaceRoot: string): boolean {
 }
 
 /** mtime do graph.json em ms epoch, ou undefined se ausente. */
+/** T-764: o graphify indexa a ÁRVORE do workspace — se o checkout de indexação
+ *  ficou para trás do origin, o grafo envelhece em silêncio (foi o que
+ *  aconteceu: HEAD detached de 18/09 indexado até o sync manual). Read-only;
+ *  null quando não é repo ou a ref origin/main não existe. */
+export function indexCheckoutLagMs(workspaceRoot: string): { headMs: number; mainMs: number; lagMs: number } | null {
+  try {
+    const read = (rev: string) =>
+      Number(execFileSync("git", ["-C", workspaceRoot, "log", "-1", "--format=%ct", rev], { encoding: "utf8", timeout: 5_000 }).trim()) * 1000;
+    const headMs = read("HEAD");
+    const mainMs = read("origin/main");
+    if (!Number.isFinite(headMs) || !Number.isFinite(mainMs) || headMs <= 0 || mainMs <= 0) return null;
+    return { headMs, mainMs, lagMs: Math.max(0, mainMs - headMs) };
+  } catch {
+    return null;
+  }
+}
+
+/** T-764: aviso DECLARADO de checkout de indexação atrasado (null = ok). */
+export function checkoutLagWarning(workspaceRoot: string, minLagMs = 24 * 3600_000): string | null {
+  const lag = indexCheckoutLagMs(workspaceRoot);
+  if (!lag || lag.lagMs < minLagMs) return null;
+  const dias = Math.round((lag.lagMs / 86_400_000) * 10) / 10;
+  return `CHECKOUT DE INDEXAÇÃO atrasado ${dias}d: HEAD de ${new Date(lag.headMs).toISOString()} vs origin/main de ${new Date(lag.mainMs).toISOString()} — o grafo indexa a árvore do HEAD; sincronize o workspace`;
+}
+
 export function graphMtime(workspaceRoot: string): number | undefined {
   try {
     return statSync(graphPath(workspaceRoot)).mtimeMs;
@@ -421,9 +446,10 @@ async function runBuild(
   opts: BuildOpts,
 ): Promise<GraphBuildResult> {
   // semântico é mais lento (LLM sequencial via claude-cli) → timeout maior.
-  // T-762: code-only medido NESTE repo (978 arquivos, cache parcial): 165–170s
-  // numa execução SOLO — o teto antigo de 180s dava 6–9% de margem e qualquer
-  // contenção/load estourava (38% de falhas no log). 600s = 3,5× o medido;
+  // T-762: code-only medido NESTE repo: 165–170s solo (árvore antiga) e 332s no
+  // rebuild real completo (987 arquivos, pós-sync); o teto antigo de 180s dava
+  // 6–9% de margem e qualquer load estourava (38% de falhas no log).
+  // GRAPHIFY_UPDATE_TIMEOUT_MS = 900s = ~2,7× o PIOR medido (332s).
   // single-flight por root já impede N agentes = N runs (ver buildGraph).
   const timeoutMs = opts.timeoutMs ?? (opts.semantic ? 900_000 : GRAPHIFY_UPDATE_TIMEOUT_MS);
   // Descobre o CLAUDE_CONFIG_DIR autenticado (probe + cache) p/ o claude-cli do
