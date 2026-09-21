@@ -54,7 +54,18 @@ export function freeLoopbackPort(): Promise<number> {
   });
 }
 
-export function requestJson(baseUrl: string, requestPath: string, method: string, body?: unknown, timeoutMs = 20_000): Promise<unknown> {
+/** T-776: teto PROGRESS-AWARE para o POST síncrono do turno. O socket do POST
+ *  fica mudo enquanto o run roda (quem streama é o /event), então o timeout
+ *  ocioso do socket media o turno inteiro. Aqui a ociosidade é medida pela
+ *  ATIVIDADE do agente (último evento observado) e há um cap absoluto. */
+export interface ProgressTimeout {
+  idleTimeoutMs: number;
+  totalTimeoutMs: number;
+  /** Último instante de atividade real (ms epoch). Renovada pelo stream. */
+  activity: () => number;
+}
+
+export function requestJson(baseUrl: string, requestPath: string, method: string, body?: unknown, timeoutMs = 20_000, progress?: ProgressTimeout): Promise<unknown> {
   return new Promise((resolve, reject) => {
     let url: URL;
     try { url = new URL(baseUrl + requestPath); } catch (error) { reject(error as Error); return; }
@@ -68,7 +79,7 @@ export function requestJson(baseUrl: string, requestPath: string, method: string
         "Content-Type": "application/json",
         ...(data ? { "Content-Length": Buffer.byteLength(data) } : {}),
       },
-      timeout: timeoutMs,
+      ...(progress ? {} : { timeout: timeoutMs }),
     }, (response) => {
       const chunks: Buffer[] = [];
       response.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -81,6 +92,24 @@ export function requestJson(baseUrl: string, requestPath: string, method: string
     });
     request.on("error", reject);
     request.on("timeout", () => request.destroy(new Error(`timeout ${timeoutMs}ms`)));
+    if (progress) {
+      const started = Date.now();
+      const timer = setInterval(() => {
+        const agora = Date.now();
+        const semEvento = agora - progress.activity();
+        if (semEvento >= progress.idleTimeoutMs) {
+          clearInterval(timer);
+          request.destroy(new Error(`timeout ${progress.idleTimeoutMs}ms (sem evento do agente; run parado)`));
+          return;
+        }
+        if (agora - started >= progress.totalTimeoutMs) {
+          clearInterval(timer);
+          request.destroy(new Error(`timeout ${progress.totalTimeoutMs}ms (cap absoluto do turno)`));
+        }
+      }, 250);
+      timer.unref?.();
+      request.on("close", () => clearInterval(timer));
+    }
     if (data) request.write(data);
     request.end();
   });
@@ -193,9 +222,9 @@ export class OpenCodeTransport {
     return boot;
   }
 
-  fetch(path: string, method: string, body?: unknown, timeoutMs?: number): Promise<unknown> {
+  fetch(path: string, method: string, body?: unknown, timeoutMs?: number, progress?: import("./opencode-transport.js").ProgressTimeout): Promise<unknown> {
     if (!this.serverUrl) return Promise.reject(new Error("serve não está pronto"));
-    return requestJson(this.serverUrl, path, method, body, timeoutMs);
+    return requestJson(this.serverUrl, path, method, body, timeoutMs, progress);
   }
 
   /** M19 (T-442): cancela o turno em voo NO SERVE. Matar o cliente/POST não

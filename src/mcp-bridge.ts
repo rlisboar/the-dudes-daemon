@@ -1,4 +1,5 @@
 import http from "node:http";
+import { runToolProxy, type ProxySpec } from "./mcp-tool-proxy.js";
 import { readFileSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -54,8 +55,13 @@ const AGENT_TOKEN = loadAgentToken();
 // (`mcp-bridge.{cjs,js,ts}`). `import.meta.url` não serve: o bundle CJS do
 // esbuild (0.28) o deixa `undefined`.
 const IS_BRIDGE_ENTRYPOINT = /[/\\]mcp-bridge\.(?:cjs|js|ts)$/.test(process.argv[1] ?? "");
+// T-768: modo PROXY de ferramentas — o cliente MCP e apontado para este
+// mesmo binario com "--mcp-proxy <json>": conecta no servidor real e
+// filtra tools/list (os CLIs nao filtram visibilidade sozinhos).
+const PROXY_ARG_IDX = process.argv.indexOf("--mcp-proxy");
+const IS_MCP_PROXY = IS_BRIDGE_ENTRYPOINT && PROXY_ARG_IDX >= 0;
 
-if (!AGENT_ID && IS_BRIDGE_ENTRYPOINT) {
+if (!AGENT_ID && IS_BRIDGE_ENTRYPOINT && !IS_MCP_PROXY) {
   console.error("[mcp-bridge] THE_DUDES_AGENT_ID not set");
   process.exit(1);
 }
@@ -1642,7 +1648,9 @@ export const transport = new StdioServerTransport();
 // T-577: só liga o stdio quando é o entrypoint. Importado (teste), o módulo
 // deixa o stdin do host em paz — o registry já está montado e ninguém pendura
 // o event loop de quem importou.
-if (IS_BRIDGE_ENTRYPOINT) {
+if (IS_MCP_PROXY) {
+  void runToolProxy(JSON.parse(process.argv[PROXY_ARG_IDX + 1] ?? "{}") as ProxySpec);
+} else if (IS_BRIDGE_ENTRYPOINT) {
   server.connect(transport).catch((e: unknown) => {
     console.error("[mcp-bridge] failed to connect:", e);
     process.exit(1);

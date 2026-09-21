@@ -17,7 +17,7 @@ export function writeCrushConfig(self: any) {
     // Bridge the-dudes: os valores POR AGENTE (id/name/token-file) via $VAR —
     // o token file path não é secreto (o conteúdo é, mode 0600) e o env do
     // processo crush já carrega tudo (buildEnv + crushTurnEnv).
-    const built = buildCrushMcpConfig(self.opts.extraMcpServers, {
+    const built = buildCrushMcpConfig(self.mcpServersForSpawn(), {
       command: self.opts.bridgeCommand,
       args: self.opts.bridgeArgs,
       env: {

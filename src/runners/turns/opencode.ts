@@ -1,5 +1,5 @@
 /* R7 (T-462): turno extraído do agent-runner — `self` é o AgentRunner. */
-import {AgentRunner, OPENCODE_TURN_TIMEOUT_MS} from "../../agent-runner.js";
+import {AgentRunner, OPENCODE_TURN_TIMEOUT_MS, OPENCODE_POST_CAP_MS} from "../../agent-runner.js";
 import {AgentUsage, ImageAttachment} from "../../types.js";
 import {OPENCODE_MANAGED_AGENT} from "../opencode-effort.js";
 import {UsageSemantics} from "../context-tracker.js";
@@ -174,6 +174,8 @@ export async function runOpenCodeMessageAttached(self: any, content: string, ima
         "POST",
         { ...(providerID && modelID ? { model: { providerID, modelID }, agent: OPENCODE_MANAGED_AGENT } : {}), parts },
         OPENCODE_TURN_TIMEOUT_MS,
+        // T-776: renova enquanto o agente dá sinal de vida (SSE), com cap.
+        { idleTimeoutMs: OPENCODE_TURN_TIMEOUT_MS, totalTimeoutMs: OPENCODE_POST_CAP_MS, activity: () => self.activityClock.lastActivityAt },
       );
     } catch (e) {
       if (self.stopped) { self.messageSession.busy = false; return; }
@@ -272,8 +274,8 @@ export async function runOpenCodeMessageAttached(self: any, content: string, ima
   /** HTTP ao opencode serve (loopback). Resolve com JSON parseado; rejeita
    *  em status !2xx ou erro de rede/timeout. Usado pelo transporte por API
    *  (POST /session, POST /session/:id/message). */
-export function ocServeFetch(self: any, path: string, method: string, body?: unknown, timeoutMs = 20_000): Promise<any> {
-    return self.openCodeTransport.fetch(path, method, body, timeoutMs);
+export function ocServeFetch(self: any, path: string, method: string, body?: unknown, timeoutMs = 20_000, progress?: any): Promise<any> {
+    return self.openCodeTransport.fetch(path, method, body, timeoutMs, progress);
   }
   /* ---------- OpenCode permission (auto-approve OFF) ---------- */
   /** Abre o stream SSE /event do serve p/ receber `permission.asked`. Só roda

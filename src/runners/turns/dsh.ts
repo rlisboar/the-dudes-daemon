@@ -439,7 +439,8 @@ function dshMcpServers(self: any): DshMcpServer[] {
     args: self.opts.bridgeArgs,
     env: self.bridgeEnv(),
   }];
-  for (const [name, def] of Object.entries(self.opts.extraMcpServers ?? {})) {
+  // harness antigo chama startDsh com self FAKE (sem o metodo) — fallback defensivo.
+  for (const [name, def] of Object.entries(self.mcpServersForSpawn?.() ?? self.opts.extraMcpServers ?? {})) {
     const d = def as { command?: string; args?: string[]; env?: Record<string, string>; url?: string; headers?: Record<string, string> };
     if (d?.command) servers.push({ name, command: d.command, args: d.args ?? [], env: d.env });
     else if (d?.url) servers.push({ name, url: d.url, headers: d.headers });

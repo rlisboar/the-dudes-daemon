@@ -14,7 +14,7 @@ import os from "node:os";
 import path from "node:path";
 export function writeCodexConfig(self: any, ): void {
     const home = self.runtimeFiles.codexHomeDir();
-    const built = buildCodexMcpToml(self.opts.extraMcpServers, {
+    const built = buildCodexMcpToml(self.mcpServersForSpawn(), {
       command: self.opts.bridgeCommand,
       args: self.opts.bridgeArgs,
       env: self.bridgeEnv(),

@@ -6,6 +6,10 @@ export interface McpServerConfig {
   url?: string;
   headers?: Record<string, string>;
   description?: string;
+  /** T-768: ferramentas visíveis deste servidor para ESTE agente. Ausente/null
+   *  = todas (compat); [] = nenhuma. O daemon troca o servidor por um proxy
+   *  que filtra tools/list — os CLIs não filtram visibilidade sozinhos. */
+  tools?: string[];
 }
 
 export interface BridgeConfig {
@@ -304,4 +308,41 @@ export function buildCodexMcpArgs(extras: Record<string, McpServerConfig> | unde
     "-c", `mcp_servers.the-dudes.env=${tomlEnv(bridge.env)}`,
   );
   return { args, warnings };
+}
+
+/** T-768: troca cada servidor com `tools` declaradas por um proxy stdio nosso
+ *  (mcp-bridge --mcp-proxy) que filtra tools/list no ponto de injeção. Sem
+ *  `tools`, devolve o MESMO objeto (compat total: config antiga passa igual). */
+export function wrapToolFilteredServers(
+  extras: Record<string, McpServerConfig> | undefined,
+  bridge: BridgeConfig,
+): Record<string, McpServerConfig> | undefined {
+  if (!extras) return extras;
+  let changed = false;
+  const out: Record<string, McpServerConfig> = {};
+  for (const [name, cfg] of Object.entries(extras)) {
+    if (name !== "the-dudes" && Array.isArray(cfg.tools)) {
+      changed = true;
+      const isRemote = (cfg.type === "http" || cfg.type === "sse") && cfg.url;
+      const upstream = isRemote
+        ? { transport: cfg.type as "http" | "sse", url: cfg.url as string, ...(cfg.headers && Object.keys(cfg.headers).length ? { headers: cfg.headers } : {}) }
+        : { transport: "stdio" as const, command: cfg.command ?? "", ...(cfg.args ? { args: cfg.args } : {}), ...(cfg.env ? { env: cfg.env } : {}) };
+      out[name] = {
+        type: "stdio",
+        command: bridge.command,
+        args: [...bridge.args, "--mcp-proxy", JSON.stringify({ tools: cfg.tools, upstream })],
+        ...(cfg.description ? { description: cfg.description } : {}),
+      };
+      continue;
+    }
+    if (cfg.tools !== undefined) {
+      changed = true;
+      const rest: McpServerConfig = { ...cfg };
+      delete rest.tools;
+      out[name] = rest;
+      continue;
+    }
+    out[name] = cfg;
+  }
+  return changed ? out : extras;
 }

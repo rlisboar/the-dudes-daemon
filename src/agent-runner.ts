@@ -17,7 +17,7 @@ import {isGrokFamily, isPerMessageRunner, runnerAdapter} from "./runners/index.j
 
 import {grokSignalsPath, parseGrokChatToolCalls, type GrokChatToolCall} from "./runners/parsers.js";
 
-import {summarizeMcpServers} from "./runners/mcp-config.js";
+import {summarizeMcpServers, wrapToolFilteredServers} from "./runners/mcp-config.js";
 import {RunnerRuntimeFiles} from "./runners/runtime-files.js";
 import {ContextTracker, CumulativeUsageTracker} from "./runners/context-tracker.js";
 import {killGrokLeader, killPidTree, killProcess, pidAlive, processAlive as procAlive, terminateWithEscalation} from "./runners/process-lifecycle.js";
@@ -79,6 +79,14 @@ export const ONE_SHOT_TIMEOUT_MS = 300_000;
  *  precisa cobrir o pior toolsHardMs do watchdog (~20min) com folga: quem
  *  apanha run travado é o watchdog (idle 10min / tool 20min), não este POST. */
 export const OPENCODE_TURN_TIMEOUT_MS = 30 * 60_000;
+
+/** T-776: cap ABSOLUTO do turno opencode (POST + stream). Medido em prod
+ *  21/09 pós-T-750: 6/28 turnos morreram cravados no teto de 30min, p90 dos
+ *  completed 888s, máx 1509s — e UM run abortado seguiu no serve por 81min
+ *  até concluir (134 steps). O teto de 30min vira OCIOSIDADE (sem evento),
+ *  e o turno pode viver até este cap com progresso: 120min cobre o pior
+ *  observado (81min) com folga. */
+export const OPENCODE_POST_CAP_MS = 120 * 60_000;
 /** Timeout do turno headless Grok (`grok -p …`). Sem isso, um resume + system
  *  prompt gigante (skills) deixa o processo zumbi por horas com busy=true e
  *  a fila enche (`ocQueue cheia`). 12 min cobre turnos longos com tools. */
@@ -625,6 +633,16 @@ export class AgentRunner {
     // T-758: fila serializada do stdin também é trabalho não terminado.
     if ((this.claudeWriteQueue.length > 0 || this.claudeInflight) && procAlive(this.proc)) return true;
     return this.currentState === "thinking" || this.currentState === "sending" || this.currentState === "speaking";
+  }
+
+  /** T-768: extras de MCP PARA SPAWN — servidor com `tools` declaradas vira
+   *  proxy filtrado (mcp-bridge --mcp-proxy); sem declaração passa igual. */
+  mcpServersForSpawn(): Record<string, unknown> | undefined {
+    return wrapToolFilteredServers(this.opts.extraMcpServers, {
+      command: this.opts.bridgeCommand,
+      args: this.opts.bridgeArgs,
+      env: this.bridgeEnv(),
+    }) as Record<string, unknown> | undefined;
   }
 
   async start() {

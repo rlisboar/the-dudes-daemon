@@ -90,7 +90,7 @@ export function writeGeminiConfig(self: any) {
     // Gemini settings.json aceita `mcpServers` no mesmo shape do Claude
     // (command/args/env pra stdio; url/headers pra http). Apenas o campo
     // `type` é específico do Claude e deve ficar fora aqui.
-    const mcpServers = buildGeminiMcpServers(self.opts.extraMcpServers, {
+    const mcpServers = buildGeminiMcpServers(self.mcpServersForSpawn(), {
       command: self.opts.bridgeCommand,
       args: self.opts.bridgeArgs,
       env: self.bridgeEnv(),
@@ -107,7 +107,7 @@ export function writeGeminiConfig(self: any) {
    *  próximo turno). */
 export function writeQwenConfig(self: any) {
     const dir = self.runtimeFiles.qwenHomeDir();
-    const mcpServers = buildQwenMcpServers(self.opts.extraMcpServers, {
+    const mcpServers = buildQwenMcpServers(self.mcpServersForSpawn(), {
       command: self.opts.bridgeCommand,
       args: self.opts.bridgeArgs,
       env: self.bridgeEnv(),
@@ -174,7 +174,7 @@ export function writeOpenCodeConfig(self: any) {
     // ocConfigPath), então identidade aqui é segura — e JSON.stringify escapa
     // nome com aspas/backslash. featuresEnv via spread: chave AUSENTE segue
     // significando "registra tudo (inclusive grupos futuros)" no bridge.
-    const built = buildOpenCodeMcpConfig(self.opts.extraMcpServers, {
+    const built = buildOpenCodeMcpConfig(self.mcpServersForSpawn(), {
       command: self.opts.bridgeCommand,
       args: self.opts.bridgeArgs,
       env: self.bridgeEnv(),
@@ -325,7 +325,7 @@ export function buildClaudeArgs(self: any, ): string[] {
 export function writeMcpConfig(self: any, ): string {
     const dir = self.runtimeFiles.tempDir();
     const configPath = path.join(dir, "mcp.json");
-    const config = buildClaudeMcpConfig(self.opts.extraMcpServers, {
+    const config = buildClaudeMcpConfig(self.mcpServersForSpawn(), {
       command: self.opts.bridgeCommand, args: self.opts.bridgeArgs, env: self.bridgeEnv(),
     });
     // mode 0o600: contém THE_DUDES_AGENT_TOKEN; tmpdir 0o700 protege parent.

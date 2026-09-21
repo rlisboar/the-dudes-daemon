@@ -85,7 +85,7 @@ export function writeGrokConfig(self: any) {
     for (const k of Object.keys(self.featuresEnv())) {
       bridgeEnv[k] = `\${${k}}`;
     }
-    const built = buildGrokMcpToml(self.opts.extraMcpServers, {
+    const built = buildGrokMcpToml(self.mcpServersForSpawn(), {
       command: self.opts.bridgeCommand, args: self.opts.bridgeArgs, env: bridgeEnv,
     });
     for (const warning of built.warnings) self.opts.log("warn", `[grok:${self.info.name}] ${warning}`);
