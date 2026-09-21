@@ -517,6 +517,45 @@ export const commandSchemas = {
   gitlab_comment_issue: cmd({ issueIid: num, body: text }),
   gitlab_comment_mr: cmd({ mergeRequestIid: num, body: text }),
 
+  /* ---------- T-772: GitHub (espelho) + genéricos repo_* ---------- */
+  github_save_config: cmd({
+    config: z.object({
+      baseUrl: text.optional(),
+      projectRef: text,
+      token: text.optional(),
+      defaultBranch: text.optional(),
+      webhookSecret: text.optional(),
+    }),
+  }),
+  github_test: cmd({}),
+  github_import_issues: cmd({ state: z.enum(["open", "closed", "all"]).optional(), labels: text.optional() }),
+  github_export_task: cmd({ taskId: id, labels: text.optional() }),
+  github_export_all_tasks: cmd({ labels: text.optional(), deleteMissing: flag.optional() }),
+  github_create_webhook: cmd({ publicUrl: text }),
+  github_create_branch: cmd({ branch: text, ref: text.optional() }),
+  github_create_change_request: cmd({ title: text, sourceBranch: text, targetBranch: text.optional(), description: text.optional(), taskId: id.optional() }),
+  github_comment_issue: cmd({ issueNumber: num, body: text }),
+  github_comment_change_request: cmd({ pullNumber: num, body: text }),
+  repo_save_config: cmd({
+    provider: z.enum(["gitlab", "github"]),
+    config: z.object({
+      baseUrl: text.optional(),
+      projectRef: text,
+      token: text.optional(),
+      defaultBranch: text.optional(),
+      webhookSecret: text.optional(),
+    }),
+  }),
+  repo_test: cmd({ provider: z.enum(["gitlab", "github"]) }),
+  repo_import_issues: cmd({ provider: z.enum(["gitlab", "github"]), state: text.optional(), labels: text.optional() }),
+  repo_export_task: cmd({ provider: z.enum(["gitlab", "github"]), taskId: id, labels: text.optional() }),
+  repo_export_all_tasks: cmd({ provider: z.enum(["gitlab", "github"]), labels: text.optional(), deleteMissing: flag.optional() }),
+  repo_create_webhook: cmd({ provider: z.enum(["gitlab", "github"]), publicUrl: text }),
+  repo_create_change_request: cmd({ provider: z.enum(["gitlab", "github"]), title: text, sourceBranch: text, targetBranch: text.optional(), description: text.optional(), taskId: id.optional() }),
+  repo_comment_change_request: cmd({ provider: z.enum(["gitlab", "github"]), number: num, body: text }),
+  repo_create_branch: cmd({ provider: z.enum(["gitlab", "github"]), branch: text, ref: text.optional() }),
+  repo_comment_issue: cmd({ provider: z.enum(["gitlab", "github"]), number: num, body: text }),
+
   /* ---------- tts / runs ---------- */
   save_tts_summary: cmd({
     entry: z.object({
@@ -716,6 +755,8 @@ export const DB_WRITE_COMMANDS = Object.freeze([
   "start_plan", "pause_plan", "cancel_plan", "reset_plan",
   "validate_plan_task", "report_plan_task_sentinel",
   "gitlab_save_config", "gitlab_import_issues", "gitlab_export_task",
+  "github_save_config", "github_import_issues", "github_export_task", "github_export_all_tasks", "github_create_webhook",
+  "repo_save_config", "repo_import_issues", "repo_export_task", "repo_export_all_tasks", "repo_create_webhook",
   "gitlab_export_all_tasks", "gitlab_create_webhook", "gitlab_create_branch",
   "gitlab_create_mr", "gitlab_comment_issue", "gitlab_comment_mr",
   "save_tts_summary", "clear_tts_summaries", "clear_runs",

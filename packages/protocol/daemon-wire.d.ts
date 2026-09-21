@@ -919,6 +919,9 @@ export interface GitlabApiRequest {
   url: string;
   token: string;
   body?: string;
+  /** T-772: headers extras (GitHub: Authorization/X-GitHub-Api-Version). Quando
+   *  ausente o daemon usa PRIVATE-TOKEN (compat GitLab). */
+  headers?: Record<string, string>;
 }
 export interface GitlabApiResult {
   type: "gitlab:request_result";
@@ -927,6 +930,8 @@ export interface GitlabApiResult {
   status: number;
   statusText?: string;
   text?: string;
+  /** T-772: headers da resposta (Link de paginação, rate limit). */
+  headers?: Record<string, string>;
   /** Falha de transporte (DNS/conexão/timeout) — distinto de um HTTP !ok. */
   error?: string;
 }

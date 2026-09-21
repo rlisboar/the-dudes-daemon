@@ -1418,7 +1418,7 @@ export class DaemonClient {
         msg.url,
         {
           method: msg.method,
-          headers: { "PRIVATE-TOKEN": msg.token, "Content-Type": "application/json" },
+          headers: msg.headers ?? { "PRIVATE-TOKEN": msg.token, "Content-Type": "application/json" },
           body: msg.body,
           signal: ctrl.signal,
         },
@@ -1448,7 +1448,9 @@ export class DaemonClient {
           text = raw.length > CAP ? raw.slice(0, CAP) : raw;
         }
       }
-      send({ ok: res.ok, status: res.status, statusText: res.statusText, text });
+      const headers: Record<string, string> = {};
+      res.headers.forEach((v, k) => { headers[k.toLowerCase()] = v; });
+      send({ ok: res.ok, status: res.status, statusText: res.statusText, text, headers });
     } catch (e) {
       const reason = (e as Error).name === "AbortError" ? "timeout (25s)" : (e as Error).message;
       send({ error: `${msg.method}: ${reason}` });

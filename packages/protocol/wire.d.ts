@@ -564,7 +564,7 @@ export interface Task {
   updatedAt?: string;
   /** sequential per-project number (1-indexed) for human reference */
   taskNumber?: number;
-  externalProvider?: "gitlab";
+  externalProvider?: "gitlab" | "github";
   externalId?: string;
   externalUrl?: string;
   /** Labels sincronizadas com a issue do GitLab (sev::P3, type::data,
@@ -1476,6 +1476,29 @@ export type ClientCommand =
   | { type: "gitlab_create_mr"; title: string; sourceBranch: string; targetBranch?: string; description?: string; taskId?: string }
   | { type: "gitlab_comment_issue"; issueIid: number; body: string }
   | { type: "gitlab_comment_mr"; mergeRequestIid: number; body: string }
+  // T-772: GitHub espelha a superfície do GitLab (mesmos payloads; PR no lugar de MR).
+  | { type: "github_save_config"; config: { baseUrl?: string; projectRef: string; token?: string; defaultBranch?: string; webhookSecret?: string } }
+  | { type: "github_test" }
+  | { type: "github_import_issues"; state?: "open" | "closed" | "all"; labels?: string }
+  | { type: "github_export_task"; taskId: string; labels?: string }
+  | { type: "github_export_all_tasks"; labels?: string; deleteMissing?: boolean }
+  | { type: "github_create_webhook"; publicUrl: string }
+  | { type: "github_create_branch"; branch: string; ref?: string }
+  | { type: "github_create_change_request"; title: string; sourceBranch: string; targetBranch?: string; description?: string; taskId?: string }
+  | { type: "github_comment_issue"; issueNumber: number; body: string }
+  | { type: "github_comment_change_request"; pullNumber: number; body: string }
+  // T-772: comandos GENÉRICOS repo_* (provider no payload) — canônicos do contrato;
+  // gitlab_*/github_* seguem como aliases compatíveis.
+  | { type: "repo_save_config"; provider: "gitlab" | "github"; config: { baseUrl?: string; projectRef: string; token?: string; defaultBranch?: string; webhookSecret?: string } }
+  | { type: "repo_test"; provider: "gitlab" | "github" }
+  | { type: "repo_import_issues"; provider: "gitlab" | "github"; state?: string; labels?: string }
+  | { type: "repo_export_task"; provider: "gitlab" | "github"; taskId: string; labels?: string }
+  | { type: "repo_export_all_tasks"; provider: "gitlab" | "github"; labels?: string; deleteMissing?: boolean }
+  | { type: "repo_create_webhook"; provider: "gitlab" | "github"; publicUrl: string }
+  | { type: "repo_create_change_request"; provider: "gitlab" | "github"; title: string; sourceBranch: string; targetBranch?: string; description?: string; taskId?: string }
+  | { type: "repo_comment_change_request"; provider: "gitlab" | "github"; number: number; body: string }
+  | { type: "repo_create_branch"; provider: "gitlab" | "github"; branch: string; ref?: string }
+  | { type: "repo_comment_issue"; provider: "gitlab" | "github"; number: number; body: string }
   | { type: "add_credential"; credential: { name: string; value?: string; note?: string; expiresAt?: string | null; agentAccess?: boolean } }
   | { type: "remove_credential"; id: string }
   | { type: "reveal_credential"; id: string }
