@@ -102,6 +102,7 @@ export interface SkillDefinition {
 export type MCPSource =
   | "workspace"
   | "claude-project"
+  | "gemini-project"
   | "claude-global"
   | "codex"
   | "opencode"

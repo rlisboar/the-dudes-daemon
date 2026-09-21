@@ -4,6 +4,7 @@
  * Scans 7 config locations in precedence order (later wins on name collision):
  *   1. workspace          — <ws>/.mcp.json | <ws>/.claude/mcp.json
  *   2. claude-project     — <ws>/.claude/settings.json [.mcpServers]
+ *   2b. gemini-project    — <ws>/.gemini/settings.json [.mcpServers]
  *   3. claude-global      — ~/.claude/mcp_servers.json | ~/.claude/settings.json
  *   4. codex              — ~/.codex/mcp.json
  *   5. opencode           — ~/.config/opencode/mcp.json
@@ -23,6 +24,7 @@
  * skipped and reported via scannedSources for UI introspection.
  */
 
+import { statSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -67,9 +69,15 @@ function buildSources(workspaceRoot?: string): ConfigSource[] {
   const wsClaudeSettings = workspaceRoot
     ? [path.join(workspaceRoot, ".claude", "settings.json")]
     : [];
+  // T-770: o Gemini CLI lê <ws>/.gemini/settings.json — era invisível pra nós
+  // (MCP morto de lá subia quebrado e em silêncio).
+  const wsGeminiSettings = workspaceRoot
+    ? [path.join(workspaceRoot, ".gemini", "settings.json")]
+    : [];
   return [
     { source: "workspace",      candidates: wsCandidates },
     { source: "claude-project", candidates: wsClaudeSettings },
+    { source: "gemini-project", candidates: wsGeminiSettings },
     {
       source: "claude-global",
       candidates: [
@@ -87,6 +95,22 @@ function buildSources(workspaceRoot?: string): ConfigSource[] {
 }
 
 const MAX_MCP_CONFIG_BYTES = 1 * 1024 * 1024; // 1MB — configs reais <10KB
+
+/** T-770: o comando stdio existe no disco/PATH? Só o nome — nunca args/env.
+ *  Absoluto: stat direto. Com barra relativa: resolve no workspace. Sem barra:
+ *  varre o PATH. Diretório não conta. */
+export function mcpCommandExists(command: string, workspaceRoot?: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  const exists = (p: string): boolean => {
+    try { return statSync(p).isFile(); } catch { return false; }
+  };
+  if (!command) return false;
+  if (path.isAbsolute(command)) return exists(command);
+  if (command.includes("/")) return exists(path.resolve(workspaceRoot ?? process.cwd(), command));
+  for (const dir of (env.PATH ?? "").split(path.delimiter)) {
+    if (dir && exists(path.join(dir, command))) return true;
+  }
+  return false;
+}
 
 async function readFirstExisting(paths: string[], warnings: ScanWarning[]): Promise<{ data: any; path: string } | null> {
   for (const p of paths) {
@@ -192,6 +216,12 @@ export async function scanMCPs(input: ScanInput): Promise<ScanResult> {
     const hit = await readFirstExisting(src.candidates, warnings);
     if (!hit) continue;
     const defs = parseServers(hit.data, src.source, hit.path, warnings);
+    // T-770: servidor stdio com comando morto aparece — antes falhava calado.
+    for (const def of defs) {
+      if ((def.transport ?? "stdio") === "stdio" && def.command && !mcpCommandExists(def.command, input.workspaceRoot)) {
+        warnings.push({ path: hit.path, reason: `MCP "${def.name}" (${src.source}): comando não encontrado no disco/PATH: "${def.command}"` });
+      }
+    }
     // T-308: warning acionável sem poluir — settings.json do claude SEM
     // mcpServers é arquivo normal; o que o dono precisa saber é (a) o
     // override do The Dudes ilegível/sem shape ou (b) mcpServers presente

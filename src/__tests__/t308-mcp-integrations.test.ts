@@ -83,7 +83,7 @@ test("T-308 (1): cadeia scan → extraMcpServers → config/args de cada runner 
   mkdirSync(path.join(xdg, "the-dudes"), { recursive: true });
   writeFileSync(path.join(xdg, "the-dudes", "mcp-servers.json"), JSON.stringify({
     mcpServers: {
-      "integra-stdio": { type: "stdio", command: "/usr/local/bin/integra-mcp", args: ["serve"], env: { INTEGRA_TOKEN: "s3cr3t" } },
+      "integra-stdio": { type: "stdio", command: process.execPath, args: ["serve"], env: { INTEGRA_TOKEN: "s3cr3t" } },
     },
   }));
   const ws = mkdtempSync(path.join(tmpdir(), "t308-ws-"));
@@ -121,7 +121,7 @@ test("T-308 (1): cadeia scan → extraMcpServers → config/args de cada runner 
   assert.ok(claude["ws-http"], "claude: http presente");
   // gemini
   const gemini = buildGeminiMcpServers(extras, bridge) as Record<string, any>;
-  assert.equal(gemini["integra-stdio"].command, "/usr/local/bin/integra-mcp", "gemini: stdio presente");
+  assert.equal(gemini["integra-stdio"].command, process.execPath, "gemini: stdio presente");
   assert.equal(gemini["ws-http"].httpUrl, "https://mcp.example/u", "gemini: http vira httpUrl");
   assert.deepEqual(gemini["ws-http"].headers, { Authorization: "Bearer ws-token" });
   // codex
@@ -137,7 +137,7 @@ test("T-308 (1): cadeia scan → extraMcpServers → config/args de cada runner 
   const opencode = buildOpenCodeMcpConfig(extras, bridge, true);
   assert.equal(opencode.warnings.length, 0, "opencode: nada é descartado");
   const ocMcp = opencode.config.mcp as Record<string, any>;
-  assert.deepEqual(ocMcp["integra-stdio"].command, ["/usr/local/bin/integra-mcp", "serve"], "opencode: stdio presente");
+  assert.deepEqual(ocMcp["integra-stdio"].command, [process.execPath, "serve"], "opencode: stdio presente");
   assert.equal(ocMcp["ws-http"].type, "remote", "opencode: http vira remote");
   assert.equal(ocMcp["ws-http"].url, "https://mcp.example/u");
   // grok
@@ -182,7 +182,7 @@ test("T-308 (5a): override com JSON quebrado → warning acionável, demais font
   writeFileSync(path.join(xdg, "the-dudes", "mcp-servers.json"), "{ isto não é json");
   mkdirSync(path.join(home, ".claude"), { recursive: true });
   writeFileSync(path.join(home, ".claude", "mcp_servers.json"), JSON.stringify({
-    mcpServers: { "gl-stdio": { command: "gl-mcp" } },
+    mcpServers: { "gl-stdio": { command: process.execPath } },
   }));
 
   const scan = await scanMCPs({});
@@ -201,7 +201,7 @@ test("T-308 (5b): entrada sem command nem url → descartada COM motivo; mcpServ
   writeFileSync(path.join(xdg, "the-dudes", "mcp-servers.json"), JSON.stringify({
     mcpServers: {
       "quebrado": { description: "sem command nem url" },
-      "ok": { command: "mcp-ok" },
+      "ok": { command: process.execPath },
     },
   }));
 
