@@ -88,7 +88,10 @@ async function runUpdate(entry: WatchEntry): Promise<void> {
       stale: true,
       phase: "watch",
     });
-    entry.handlers.log?.("warn", `[graph-watch] falhou: ${r.error}`);
+    // T-762: dizer que o índice servido está velho e desde quando.
+    const mt = graphMtime(entry.root);
+    const idade = mt == null ? "sem mtime" : `${Math.round((Date.now() - mt) / 60_000)}min atrás (${new Date(mt).toISOString()})`;
+    entry.handlers.log?.("warn", `[graph-watch] falhou — GRAFO DESATUALIZADO desde ${idade}: ${r.error}`);
   }
 }
 

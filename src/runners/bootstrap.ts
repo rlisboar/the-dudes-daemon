@@ -397,7 +397,11 @@ export async function prepareGraphify(self: any) {
               ...avail,
             });
           } else {
-            self.opts.log("warn", `[graph:${self.info.name}] refresh falhou (mantém índice antigo): ${r.error}`);
+            // T-762: o aviso tem de dizer que o grafo está VELHO e desde quando —
+// "refresh falhou" sozinho não denuncia índice de ontem servindo resposta.
+            const mt = graphMtime(root);
+            const idade = mt == null ? "sem mtime" : `${Math.round((Date.now() - mt) / 60_000)}min atrás (${new Date(mt).toISOString()})`;
+            self.opts.log("warn", `[graph:${self.info.name}] refresh falhou — GRAFO DESATUALIZADO desde ${idade} (mantém índice antigo): ${r.error}`);
           }
         }).catch((e) => {
           self.opts.log("warn", `[graph:${self.info.name}] refresh exceção: ${(e as Error).message}`);

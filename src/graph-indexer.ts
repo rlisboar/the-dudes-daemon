@@ -398,6 +398,9 @@ function ensureGitignored(workspaceRoot: string): void {
  *   egress (chamadas ao modelo). Single-flight por (root, modo).
  * Parseia "Rebuilt: N nodes, M edges" (fallback: conta do JSON).
  */
+/** T-762: teto do `graphify update` code-only, DERIVADO do medido (ver runBuild). */
+export const GRAPHIFY_UPDATE_TIMEOUT_MS = 900_000;
+
 export function buildGraph(
   workspaceRoot: string,
   graphifyBin: string,
@@ -418,7 +421,11 @@ async function runBuild(
   opts: BuildOpts,
 ): Promise<GraphBuildResult> {
   // semântico é mais lento (LLM sequencial via claude-cli) → timeout maior.
-  const timeoutMs = opts.timeoutMs ?? (opts.semantic ? 900_000 : 180_000);
+  // T-762: code-only medido NESTE repo (978 arquivos, cache parcial): 165–170s
+  // numa execução SOLO — o teto antigo de 180s dava 6–9% de margem e qualquer
+  // contenção/load estourava (38% de falhas no log). 600s = 3,5× o medido;
+  // single-flight por root já impede N agentes = N runs (ver buildGraph).
+  const timeoutMs = opts.timeoutMs ?? (opts.semantic ? 900_000 : GRAPHIFY_UPDATE_TIMEOUT_MS);
   // Descobre o CLAUDE_CONFIG_DIR autenticado (probe + cache) p/ o claude-cli do
   // graphify não cair no default ~/.claude desautenticado (401 → exit 1).
   let claudeCfgDir: string | undefined;
