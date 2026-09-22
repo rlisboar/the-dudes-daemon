@@ -178,13 +178,64 @@ export function isTestRoot(command: string): boolean {
   return BARE_TEST_RE.test(command);
 }
 
+/**
+ * Resultado cru de um `ps`. Amostra falhada (timeout, buffer estourado,
+ * stdout vazio) NÃO é um host sem processos: tratá-la como lista vazia faz
+ * toda raiz já viva cair em "sem amostra anterior" (T-761, C2 com outra
+ * suíte `node --test` no ar).
+ */
+export interface PsSpawnResult {
+  status: number | null;
+  stdout?: string | null;
+  error?: (Error & { code?: string }) | null;
+}
+
+const PS_TENTATIVAS = 3;
+const PS_TIMEOUT_MS = 15_000;
+const PS_MAX_BUFFER = 32 * 1024 * 1024;
+
+export function describePsFailure(r: PsSpawnResult): string {
+  const code = r.error?.code ?? "";
+  if (code === "ETIMEDOUT") return "timeout";
+  if (code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") return "maxbuffer";
+  if (r.error) return "erro";
+  if (r.status !== 0 && r.status !== null) return `status_${r.status}`;
+  if (!(r.stdout ?? "").trim()) return "stdout_vazio";
+  return "sem_processo";
+}
+
+/** null = esta tentativa não serve (não parsear como host vazio). */
+export function rowsFromPsAttempt(r: PsSpawnResult): ProcRow[] | null {
+  if (r.error || r.status !== 0) return null;
+  if (!(r.stdout ?? "").trim()) return null;
+  const rows = parsePsOutput(r.stdout ?? "");
+  return rows.length > 0 ? rows : null;
+}
+
+export function primeiraAmostraUtil(tentativas: PsSpawnResult[]): ProcRow[] {
+  let last: PsSpawnResult = { status: null, stdout: "", error: null };
+  for (const t of tentativas) {
+    last = t;
+    const rows = rowsFromPsAttempt(t);
+    if (rows) return rows;
+  }
+  throw new Error(`ps indisponível (${describePsFailure(last)}) — amostra descartada`);
+}
+
 export function runPs(): ProcRow[] {
-  const r = spawnSync("ps", ["-axo", "pid=,ppid=,pgid=,stat=,etime=,time=,command="], {
-    encoding: "utf8",
-    timeout: 5_000,
-    maxBuffer: 8 * 1024 * 1024,
-  });
-  return parsePsOutput(r.stdout ?? "");
+  const tentativas: PsSpawnResult[] = [];
+  for (let i = 0; i < PS_TENTATIVAS; i++) {
+    const r = spawnSync("ps", ["-axo", "pid=,ppid=,pgid=,stat=,etime=,time=,command="], {
+      encoding: "utf8",
+      timeout: PS_TIMEOUT_MS,
+      maxBuffer: PS_MAX_BUFFER,
+    });
+    tentativas.push({ status: r.status, stdout: r.stdout, error: r.error ?? null });
+    const rows = rowsFromPsAttempt(tentativas[tentativas.length - 1]!);
+    if (rows) return rows;
+    if (i + 1 < PS_TENTATIVAS) sleepSync(200 * (i + 1));
+  }
+  return primeiraAmostraUtil(tentativas);
 }
 
 // ──────────────────────────── modelagem da árvore ───────────────────────────
@@ -559,11 +610,22 @@ export interface SuiteParkCliOpts {
   maxCpuDeltaMs: number;
 }
 
+/**
+ * Raiz mais velha que a janela e ausente da 1ª amostra: o `ps` anterior não
+ * viu um processo que já existia (timeout, buffer, linha cortada). Não é
+ * suite nova — a medição não serve.
+ */
+function baselineIncompleta(suites: Suite[], baseline: Sample, windowMs: number): boolean {
+  const minimo = windowMs + 1_000;
+  return suites.some((s) => s.ageMs > minimo && !baseline.cpu.has(s.rootPid));
+}
+
 /** Duas amostras separadas pela janela + classificação + (opcional) morte.
- *  Tudo síncrono de propósito: roda antes do bootstrap do daemon e sai. */
+ *  Tudo síncrono de propósito: roda antes do bootstrap do daemon e sai.
+ *  `sleep` é injetável para o teste não esperar a janela real. */
 export function runSuiteParkCli(
   opts: SuiteParkCliOpts,
-  io: { out: (s: string) => void; ps: () => ProcRow[]; deps?: ReapDeps } = {
+  io: { out: (s: string) => void; ps: () => ProcRow[]; deps?: ReapDeps; sleep?: (ms: number) => void } = {
     out: (s) => { process.stdout.write(s); },
     ps: runPs,
   },
@@ -573,13 +635,23 @@ export function runSuiteParkCli(
     maxCpuDeltaMs: opts.maxCpuDeltaMs,
     windowMs: opts.windowMs,
   };
-  const first = io.ps();
-  const baseline = sampleOf(first);
-  io.out(`amostra 1/2 colhida — aguardando ${fmtDuration(opts.windowMs)} para medir a CPU da janela...\n`);
-  sleepSync(opts.windowMs);
-  const rows = io.ps();
-  const suites = collectSuites(rows);
-  const assessments = assessSuites(suites, baseline, assessOpts);
+  const dormir = io.sleep ?? sleepSync;
+  let baselineRows = io.ps();
+  let assessments: Assessment[] = [];
+  // No máximo uma repetição: a 2ª amostra boa vira a baseline da medição
+  // seguinte. Duas furadas seguidas reportam indeterminada em vez de laçar.
+  for (let tentativa = 0; tentativa < 2; tentativa++) {
+    const baseline = sampleOf(baselineRows);
+    io.out(`amostra 1/2 colhida — aguardando ${fmtDuration(opts.windowMs)} para medir a CPU da janela...\n`);
+    dormir(opts.windowMs);
+    const rows = io.ps();
+    const suites = collectSuites(rows);
+    assessments = assessSuites(suites, baseline, assessOpts);
+    const furada = baselineIncompleta(suites, baseline, opts.windowMs);
+    if (!furada || tentativa === 1) break;
+    io.out("amostra 1 incompleta (raiz mais velha que a janela sem baseline) — repetindo a medição\n");
+    baselineRows = rows;
+  }
   io.out(formatReport(assessments, assessOpts));
 
   const penduradas = assessments.filter((a) => a.state === "pendurada");

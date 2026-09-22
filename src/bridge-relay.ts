@@ -17,6 +17,7 @@ import {
 } from "@the-dudes/protocol/e2ee-fields";
 import { DELEGATION_CONTEXT_MAX, delegationMissionTitle, delegationStepTitle, delegationTaskPrompt } from "@the-dudes/protocol/delegation";
 import { decryptForProject, encryptForProject, E2eeRequiredError, isE2eEncrypted, isE2eeRequired, rememberCredentialPlaintext } from "./daemon-crypto.js";
+import { scheduleDelegateShadow } from "./typesafe-delegate-shadow.js";
 
 /**
  * Local Unix-socket HTTP relay. The MCP bridge child process talks to this
@@ -767,6 +768,12 @@ export class BridgeRelay {
       try {
         const json = JSON.parse(buf.toString("utf8"));
         if (json && typeof json === "object") {
+          // T-758: plaintext do goal só existe aqui, entre o parse e a cifra.
+          // Sem await — o veredito não muda a rota nem o corpo. O try evita
+          // que um throw da sombra caia no catch externo e suba o body em claro.
+          if (kind === "delegate" && !Array.isArray(json)) {
+            try { scheduleDelegateShadow(json); } catch { /* sombra não falha o delegate */ }
+          }
           body = Buffer.from(JSON.stringify(encryptBridgePayload(kind, json, projectId, opts)), "utf8");
         }
         return true;

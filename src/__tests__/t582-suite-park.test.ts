@@ -25,10 +25,14 @@ import {
   isTestRoot,
   parsePsDuration,
   parsePsOutput,
+  primeiraAmostraUtil,
   reapSuites,
+  rowsFromPsAttempt,
   runPs,
+  runSuiteParkCli,
   suiteParkCliArgs,
   type ProcRow,
+  type PsSpawnResult,
 } from "../suite-park.js";
 
 const DAEMON_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -82,6 +86,74 @@ test("T-582: assinatura da raiz — `node … --test` nu, não o worker nem o `s
   // wrapper: a string contém `--test` mas o argv[0] é o shell
   assert.equal(isTestRoot("sh -c node --import tsx --test \"src/**/*.test.ts\""), false);
   assert.equal(isTestRoot("node /path/vite --port 30474 --strictPort"), false);
+});
+
+test("T-761: ps morto ou vazio não vira host sem processos", () => {
+  const sentinela = "SENTINELA_STDOUT_NAO_ENTRA_NO_ERRO";
+  const timeout: PsSpawnResult = {
+    status: null,
+    stdout: sentinela,
+    error: Object.assign(new Error("spawnSync ps ETIMEDOUT"), { code: "ETIMEDOUT" }),
+  };
+  assert.equal(rowsFromPsAttempt(timeout), null);
+  const bom: PsSpawnResult = {
+    status: 0,
+    stdout: "  101   100   100 S  1:23  0:12.50 node --test a.test.mjs\n",
+    error: null,
+  };
+  const rows = primeiraAmostraUtil([timeout, bom]);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]!.pid, 101);
+  assert.throws(
+    () => primeiraAmostraUtil([timeout, { status: 0, stdout: `lixo ${sentinela}`, error: null }]),
+    (e: Error) => {
+      assert.equal(e.message.includes(sentinela), false);
+      assert.match(e.message, /ps indisponível \(sem_processo\)/);
+      return true;
+    },
+  );
+  assert.throws(
+    () => primeiraAmostraUtil([{ status: null, stdout: "", error: Object.assign(new Error("x"), { code: "ETIMEDOUT" }) }]),
+    /ps indisponível \(timeout\)/,
+  );
+  assert.ok(runPs().length > 0, "ps real ainda devolve processo");
+});
+
+test("T-761: raiz mais velha que a janela e ausente da 1ª amostra repete a medição", () => {
+  const velha = row(10, 1, 10, "1:10", "0:08.00", "node --test fake.test.mjs");
+  const depois = row(10, 1, 10, "1:13", "0:11.00", "node --test fake.test.mjs");
+  const seq: ProcRow[][] = [[], [velha], [depois]];
+  let i = 0;
+  const out: string[] = [];
+  const code = runSuiteParkCli(
+    { reap: false, windowMs: 3_000, minAgeMs: 0, graceMs: 0, maxCpuDeltaMs: 50 },
+    {
+      out: (s) => out.push(s),
+      ps: () => seq[i++] ?? [],
+      sleep: () => {},
+    },
+  );
+  const texto = out.join("");
+  assert.equal(code, 0);
+  assert.equal(i, 3, "baseline furada + uma repetição, sem laço");
+  assert.match(texto, /amostra 1 incompleta/);
+  assert.match(texto, /VIVA\s+10\b/);
+  assert.match(texto, /cresceu 3000ms >= 50ms/);
+  assert.equal(/INDETERMINADA\s+10\b/.test(texto), false);
+});
+
+test("T-761: processo nascido dentro da janela não força outra medição", () => {
+  const jovem = row(7, 1, 7, "0:01", "0:00.10", "node --test novo.test.mjs");
+  const seq: ProcRow[][] = [[], [jovem]];
+  let i = 0;
+  const out: string[] = [];
+  runSuiteParkCli(
+    { reap: false, windowMs: 3_000, minAgeMs: 0, graceMs: 0, maxCpuDeltaMs: 50 },
+    { out: (s) => out.push(s), ps: () => seq[i++] ?? [], sleep: () => {} },
+  );
+  assert.equal(i, 2);
+  assert.equal(out.join("").includes("amostra 1 incompleta"), false);
+  assert.match(out.join(""), /INDETERMINADA\s+7\b/);
 });
 
 test("T-582: parse do ps ignora cabeçalho/ruído e preserva o comando inteiro", () => {

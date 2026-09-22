@@ -1208,6 +1208,8 @@ export type ServerEvent =
       explanationBoards?: BoardSummary[];
       activeBoardId?: string;
       gitlab: GitLabIntegrationPublic;
+      /** Ausente em servidores antigos: a UI trata como não configurado. */
+      github?: GitLabIntegrationPublic;
       autoApprove: boolean;
       comments: TaskComment[];
       toolExecutions: ToolExecutionEvent[];
@@ -1286,6 +1288,7 @@ export type ServerEvent =
       activeBoardId?: string;
     }
   | { type: "gitlab:updated"; integration: GitLabIntegrationPublic }
+  | { type: "github:updated"; integration: GitLabIntegrationPublic }
   | { type: "messages:cleared" }
   /** AgentSkills v2 — set scaneado pelo daemon do owner do projeto. */
   | { type: "workspace_skills"; list: SkillDefinition[] }
