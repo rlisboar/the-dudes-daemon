@@ -28,7 +28,7 @@ import { MAX_DAEMON_WIRE_MESSAGE_BYTES, WireMessageTooLargeError, parseWireMessa
 import { AgentHost, agentErrorKind, sealAgentErrorMessage } from "./agent-host.js";
 import { assertWorkspaceScoped, autoWorkspaceCwd, describeGitRoots, ensureWritableDir, expandBasePath, isInsideRoot, validateBasePath, validateGitHash, validateGitRef } from "./workspace.js";
 import { buildGraph, graphMtime, graphPath, hasSemanticMarker, loadGraphJsonForUi, needsSemanticUpdate } from "./graph-indexer.js";
-import { apagarArquivoOd, apagarProjetoOd, cancelarRunOd, criarProjetoOd, gravarArquivoOd, iniciarRunOd, lerArquivoOd, lerRunOd, listarArquivosOd, listarProjetosOd } from "./open-design-client.js";
+import { apagarArquivoOd, apagarProjetoOd, buscarArquivosOd, cancelarRunOd, copiarDesignSystemOd, criarProjetoOd, duplicarProjetoOd, gravarArquivoOd, guiarRunOd, iniciarRunOd, lerArquivoOd, lerArtefatoOd, lerRunOd, listarAgentsOd, listarArquivosOd, listarPluginsOd, listarProjetosOd, listarSkillsCatalogoOd, listarVersoesOd, restaurarVersaoOd } from "./open-design-client.js";
 import { ensureGraphWatch, stopAllGraphWatches } from "./graph-watcher.js";
 import { detectDropTarget, spawnDropped, type DropTarget } from "./privileges.js";
 import { BridgeRelay, type PeerPidMode } from "./bridge-relay.js";
@@ -191,6 +191,46 @@ Diagnóstico (roda sem --orch/--token, não abre WS):
 
 /** Exportado p/ teste unitário (T-252) — o bootstrap real continua privado
  *  ao módulo via SELF_BOOTSTRAP (abaixo). */
+function kindOpenDesign(type: Extract<FromOrch, { type: `open_design:${string}` }>["type"]): "projects" | "files" | "file" | "run" | "notice" | "search" | "artifact" | "skills" | "plugins" | "agents" | "versions" | "design_system" {
+  switch (type) {
+    case "open_design:list":
+    case "open_design:create_project":
+    case "open_design:delete_project":
+    case "open_design:duplicate":
+      return "projects";
+    case "open_design:files":
+    case "open_design:write":
+    case "open_design:delete_file":
+      return "files";
+    case "open_design:file":
+    case "open_design:restore_version":
+      return "file";
+    case "open_design:start_run":
+    case "open_design:run":
+    case "open_design:cancel_run":
+    case "open_design:steer":
+      return "run";
+    case "open_design:search":
+      return "search";
+    case "open_design:artifact":
+      return "artifact";
+    case "open_design:skills":
+      return "skills";
+    case "open_design:plugins":
+      return "plugins";
+    case "open_design:agents":
+      return "agents";
+    case "open_design:versions":
+      return "versions";
+    case "open_design:copy_design_system":
+      return "design_system";
+    default: {
+      const _nunca: never = type;
+      return _nunca;
+    }
+  }
+}
+
 export class DaemonClient {
   /** M35 (T-475): welcome do server declarou protocolo diferente do local. */
   protocolMismatch = false;
@@ -1156,6 +1196,16 @@ export class DaemonClient {
       case "open_design:start_run":
       case "open_design:run":
       case "open_design:cancel_run":
+      case "open_design:search":
+      case "open_design:artifact":
+      case "open_design:skills":
+      case "open_design:plugins":
+      case "open_design:agents":
+      case "open_design:duplicate":
+      case "open_design:copy_design_system":
+      case "open_design:versions":
+      case "open_design:restore_version":
+      case "open_design:steer":
         await this.handleOpenDesign(msg);
         return;
       case "git:blame":
@@ -1761,17 +1811,9 @@ export class DaemonClient {
     }
   }
 
-  /** Aba Open Design: só GET no daemon local. Erro volta no mesmo correlationId. */
-  private async handleOpenDesign(msg: Extract<FromOrch, { type: "open_design:list" | "open_design:files" | "open_design:file" | "open_design:create_project" | "open_design:delete_project" | "open_design:write" | "open_design:delete_file" | "open_design:start_run" | "open_design:run" | "open_design:cancel_run" }>): Promise<void> {
-    const kind = msg.type === "open_design:list" || msg.type === "open_design:create_project" || msg.type === "open_design:delete_project"
-      ? "projects"
-      : msg.type === "open_design:files" || msg.type === "open_design:write" || msg.type === "open_design:delete_file"
-        ? "files"
-        : msg.type === "open_design:file"
-          ? "file"
-          : msg.type === "open_design:start_run" || msg.type === "open_design:run" || msg.type === "open_design:cancel_run"
-            ? "run"
-            : "notice";
+  /** Aba Open Design: HTTP só no daemon local. Erro curto no mesmo correlationId. */
+  private async handleOpenDesign(msg: Extract<FromOrch, { type: `open_design:${string}` }>): Promise<void> {
+    const kind = kindOpenDesign(msg.type);
     try {
       if (msg.type === "open_design:list") {
         this.send({ type: "open_design:result", correlationId: msg.correlationId, kind: "projects", projects: await listarProjetosOd() });
@@ -1815,17 +1857,103 @@ export class DaemonClient {
         this.send({ type: "open_design:result", correlationId: msg.correlationId, kind: "run", runId: run.runId, status: run.status, previewUrl: run.previewUrl, message: run.message });
         return;
       }
-      await cancelarRunOd(msg.runId);
-      this.send({ type: "open_design:result", correlationId: msg.correlationId, kind: "run", runId: msg.runId, status: "canceled" });
+      if (msg.type === "open_design:cancel_run") {
+        await cancelarRunOd(msg.runId);
+        this.send({ type: "open_design:result", correlationId: msg.correlationId, kind: "run", runId: msg.runId, status: "canceled" });
+        return;
+      }
+      if (msg.type === "open_design:search") {
+        this.send({
+          type: "open_design:result",
+          correlationId: msg.correlationId,
+          kind: "search",
+          odProjectId: msg.odProjectId,
+          query: msg.query,
+          hits: await buscarArquivosOd(msg.odProjectId, msg.query),
+        });
+        return;
+      }
+      if (msg.type === "open_design:artifact") {
+        this.send({
+          type: "open_design:result",
+          correlationId: msg.correlationId,
+          kind: "artifact",
+          odProjectId: msg.odProjectId,
+          path: msg.path,
+          content: await lerArtefatoOd(msg.odProjectId, msg.path),
+        });
+        return;
+      }
+      if (msg.type === "open_design:skills") {
+        this.send({ type: "open_design:result", correlationId: msg.correlationId, kind: "skills", skills: await listarSkillsCatalogoOd() });
+        return;
+      }
+      if (msg.type === "open_design:plugins") {
+        this.send({ type: "open_design:result", correlationId: msg.correlationId, kind: "plugins", plugins: await listarPluginsOd() });
+        return;
+      }
+      if (msg.type === "open_design:agents") {
+        this.send({ type: "open_design:result", correlationId: msg.correlationId, kind: "agents", agents: await listarAgentsOd() });
+        return;
+      }
+      if (msg.type === "open_design:duplicate") {
+        this.send({ type: "open_design:result", correlationId: msg.correlationId, kind: "projects", projects: await duplicarProjetoOd(msg.odProjectId, msg.name) });
+        return;
+      }
+      if (msg.type === "open_design:copy_design_system") {
+        const ds = await copiarDesignSystemOd(msg.odProjectId, msg.name);
+        this.send({
+          type: "open_design:result",
+          correlationId: msg.correlationId,
+          kind: "design_system",
+          odProjectId: ds.odProjectId,
+          designSystem: { id: ds.id, name: ds.name },
+        });
+        return;
+      }
+      if (msg.type === "open_design:versions") {
+        this.send({
+          type: "open_design:result",
+          correlationId: msg.correlationId,
+          kind: "versions",
+          odProjectId: msg.odProjectId,
+          path: msg.path,
+          versions: await listarVersoesOd(msg.odProjectId, msg.path),
+        });
+        return;
+      }
+      if (msg.type === "open_design:restore_version") {
+        this.send({
+          type: "open_design:result",
+          correlationId: msg.correlationId,
+          kind: "file",
+          odProjectId: msg.odProjectId,
+          path: msg.path,
+          content: await restaurarVersaoOd(msg.odProjectId, msg.path, msg.versionId),
+        });
+        return;
+      }
+      const run = await guiarRunOd(msg.runId, msg.message);
+      this.send({
+        type: "open_design:result",
+        correlationId: msg.correlationId,
+        kind: "run",
+        runId: run.runId,
+        status: run.status,
+        previewUrl: run.previewUrl,
+        message: run.message,
+      });
     } catch (e) {
+      const bruto = e instanceof Error ? e.message : "falha";
       this.send({
         type: "open_design:result",
         correlationId: msg.correlationId,
         kind,
         odProjectId: "odProjectId" in msg ? msg.odProjectId : undefined,
         path: "path" in msg ? msg.path : undefined,
+        query: "query" in msg ? msg.query : undefined,
         runId: "runId" in msg ? msg.runId : undefined,
-        error: (e as Error).message,
+        error: bruto.replace(/\s+/g, " ").slice(0, 160),
       });
     }
   }

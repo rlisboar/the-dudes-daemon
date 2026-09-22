@@ -1269,6 +1269,13 @@ export type ServerEvent =
   | { type: "open_design:file"; odProjectId: string; path: string; content?: string; error?: string }
   | { type: "open_design:notice"; text?: string; error?: string }
   | { type: "open_design:run"; runId: string; status?: string; previewUrl?: string; message?: string; error?: string }
+  | { type: "open_design:search"; odProjectId: string; query?: string; hits: Array<{ path: string; name: string; snippet?: string }>; error?: string }
+  | { type: "open_design:artifact"; odProjectId: string; path: string; content?: string; error?: string }
+  | { type: "open_design:skills"; skills: Array<{ id: string; name?: string }>; error?: string }
+  | { type: "open_design:plugins"; plugins: Array<{ id: string; name?: string }>; error?: string }
+  | { type: "open_design:agents"; agents: Array<{ id: string; name?: string }>; error?: string }
+  | { type: "open_design:versions"; odProjectId: string; path: string; versions: Array<{ id: string; label?: string; createdAt?: string }>; error?: string }
+  | { type: "open_design:design_system"; odProjectId?: string; designSystem?: { id: string; name: string }; error?: string }
   | { type: "graph:data"; json?: string; error?: string }
   | { type: "usage_breakdown"; byUser: { userId: string; input: number; output: number }[]; byModel: { model: string; input: number; output: number }[]; from?: string; to?: string }
   | { type: "pong" }
@@ -1482,6 +1489,16 @@ export type ClientCommand =
   | { type: "open_design:start_run"; odProjectId: string; prompt: string; skillId?: string }
   | { type: "open_design:run"; runId: string }
   | { type: "open_design:cancel_run"; runId: string }
+  | { type: "open_design:search"; odProjectId: string; query: string }
+  | { type: "open_design:artifact"; odProjectId: string; path: string }
+  | { type: "open_design:skills" }
+  | { type: "open_design:plugins" }
+  | { type: "open_design:agents" }
+  | { type: "open_design:duplicate"; odProjectId: string; name: string }
+  | { type: "open_design:copy_design_system"; odProjectId: string; name: string }
+  | { type: "open_design:versions"; odProjectId: string; path: string }
+  | { type: "open_design:restore_version"; odProjectId: string; path: string; versionId: string }
+  | { type: "open_design:steer"; runId: string; message: string }
   | { type: "graph:reindex"; semantic?: boolean; backend?: string; model?: string }
   | { type: "graph:get" }
   | { type: "get_usage"; from?: string; to?: string }

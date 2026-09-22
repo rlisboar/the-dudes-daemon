@@ -661,6 +661,16 @@ export const commandSchemas = {
   "open_design:start_run": cmd({ odProjectId: text, prompt: text, skillId: text.optional() }),
   "open_design:run": cmd({ runId: text }),
   "open_design:cancel_run": cmd({ runId: text }),
+  "open_design:search": cmd({ odProjectId: text, query: text }),
+  "open_design:artifact": cmd({ odProjectId: text, path: text }),
+  "open_design:skills": cmd({}),
+  "open_design:plugins": cmd({}),
+  "open_design:agents": cmd({}),
+  "open_design:duplicate": cmd({ odProjectId: text, name: text }),
+  "open_design:copy_design_system": cmd({ odProjectId: text, name: text }),
+  "open_design:versions": cmd({ odProjectId: text, path: text }),
+  "open_design:restore_version": cmd({ odProjectId: text, path: text, versionId: text }),
+  "open_design:steer": cmd({ runId: text, message: text }),
 
   summarize: cmd({
     correlationId: text,

@@ -629,20 +629,38 @@ export interface OpenDesignDeleteFileRequest { type: "open_design:delete_file"; 
 export interface OpenDesignStartRunRequest { type: "open_design:start_run"; correlationId: string; odProjectId: string; prompt: string; skillId?: string; }
 export interface OpenDesignRunRequest { type: "open_design:run"; correlationId: string; runId: string; }
 export interface OpenDesignCancelRunRequest { type: "open_design:cancel_run"; correlationId: string; runId: string; }
+export interface OpenDesignSearchRequest { type: "open_design:search"; correlationId: string; odProjectId: string; query: string; }
+export interface OpenDesignArtifactRequest { type: "open_design:artifact"; correlationId: string; odProjectId: string; path: string; }
+export interface OpenDesignSkillsRequest { type: "open_design:skills"; correlationId: string; }
+export interface OpenDesignPluginsRequest { type: "open_design:plugins"; correlationId: string; }
+export interface OpenDesignAgentsRequest { type: "open_design:agents"; correlationId: string; }
+export interface OpenDesignDuplicateRequest { type: "open_design:duplicate"; correlationId: string; odProjectId: string; name: string; }
+export interface OpenDesignCopyDesignSystemRequest { type: "open_design:copy_design_system"; correlationId: string; odProjectId: string; name: string; }
+export interface OpenDesignVersionsRequest { type: "open_design:versions"; correlationId: string; odProjectId: string; path: string; }
+export interface OpenDesignRestoreVersionRequest { type: "open_design:restore_version"; correlationId: string; odProjectId: string; path: string; versionId: string; }
+export interface OpenDesignSteerRequest { type: "open_design:steer"; correlationId: string; runId: string; message: string; }
 export interface OpenDesignResult {
   type: "open_design:result";
   correlationId: string;
-  kind: "projects" | "files" | "file" | "run" | "notice";
+  kind: "projects" | "files" | "file" | "run" | "notice" | "search" | "artifact" | "skills" | "plugins" | "agents" | "versions" | "design_system";
   projects?: Array<{ id: string; name: string; designSystemId?: string | null }>;
   files?: Array<{ path: string; name: string; size?: number }>;
+  hits?: Array<{ path: string; name: string; snippet?: string }>;
+  skills?: Array<{ id: string; name?: string }>;
+  plugins?: Array<{ id: string; name?: string }>;
+  agents?: Array<{ id: string; name?: string }>;
+  versions?: Array<{ id: string; label?: string; createdAt?: string }>;
+  designSystem?: { id: string; name: string };
   odProjectId?: string;
   path?: string;
+  query?: string;
   content?: string;
   runId?: string;
   status?: string;
   previewUrl?: string;
   message?: string;
   text?: string;
+  versionId?: string;
   error?: string;
 }
 /** graph.json (string) devolvido pelo daemon pro mapa. */
@@ -1101,4 +1119,14 @@ export type FromOrch =
   | OpenDesignStartRunRequest
   | OpenDesignRunRequest
   | OpenDesignCancelRunRequest
+  | OpenDesignSearchRequest
+  | OpenDesignArtifactRequest
+  | OpenDesignSkillsRequest
+  | OpenDesignPluginsRequest
+  | OpenDesignAgentsRequest
+  | OpenDesignDuplicateRequest
+  | OpenDesignCopyDesignSystemRequest
+  | OpenDesignVersionsRequest
+  | OpenDesignRestoreVersionRequest
+  | OpenDesignSteerRequest
   | ModelsDiscoverRequest;
