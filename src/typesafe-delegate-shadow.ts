@@ -14,6 +14,7 @@
  */
 import { createHash } from "node:crypto";
 import { isE2eEncrypted } from "./daemon-crypto.js";
+import type { TypesafeShadow } from "./protocol.js";
 import { safeFetch, type SafeFetchOpts } from "./ssrf-guard.js";
 
 /** Endpoint pinado. Sem override por env. */
@@ -46,6 +47,7 @@ interface Pedido {
   declaredTaskType: string;
   declaredComplexity: string;
   goalSha256: string;
+  projectId: string;
 }
 
 interface ChoiceLido {
@@ -135,6 +137,25 @@ const PERGUNTAS = {
 
 let fetchInjetado: DelegateShadowFetch | null = null;
 const emVoo = new Set<Promise<void>>();
+/** Projetos cujo spawn veio com ContextFeatures.jev === true. Ausente = desligado. */
+const jevPorProjeto = new Map<string, true>();
+let emissorSombra: ((msg: TypesafeShadow) => void) | null = null;
+
+/** Chamado no agent:spawn. Sem hot-update: o próximo spawn substitui. */
+export function registrarJevDoProjeto(projectId: string, ligado: boolean): void {
+  if (!projectId) return;
+  if (ligado) jevPorProjeto.set(projectId, true);
+  else jevPorProjeto.delete(projectId);
+}
+
+/** O daemon entrega o veredito no socket. A sombra não espera essa entrega. */
+export function definirEmissorSombra(fn: ((msg: TypesafeShadow) => void) | null): void {
+  emissorSombra = fn;
+}
+
+function jevLigado(projectId: string): boolean {
+  return jevPorProjeto.get(projectId) === true;
+}
 
 /** Opts da chamada de produção. `maxRedirects: 0` é obrigatório. */
 export interface DelegateShadowSafeFetchOpts {
@@ -229,6 +250,7 @@ function copiarPedido(json: unknown): Pedido | null {
     declaredTaskType: declarado(rec.taskType),
     declaredComplexity: declarado(rec.complexity),
     goalSha256: hashGoal(cru),
+    projectId: "",
   };
 }
 
@@ -245,13 +267,39 @@ function montarCorpo(snap: Pedido): string {
   });
 }
 
-function logar(evento: LogSombra): void {
+function emitirVeredito(evento: LogSombra, projectId: string): void {
+  const fn = emissorSombra;
+  if (!fn || !projectId) return;
+  const conf = evento.confidence;
+  const msg: TypesafeShadow = {
+    type: "typesafe:shadow",
+    projectId,
+    at: Date.now(),
+    ok: evento.ok,
+    error: evento.error,
+    model: evento.model,
+    latencyMs: evento.latencyMs,
+    declaredTaskType: evento.declaredTaskType,
+    declaredComplexity: evento.declaredComplexity,
+    taskType: evento.choices?.task_type ?? "",
+    complexity: evento.choices?.complexity ?? "",
+    domain: evento.choices?.domain ?? "",
+    confidence: conf,
+    destructiveNoul: evento.destructiveNoul,
+    disagreeTaskType: evento.disagreeTaskType,
+    disagreeComplexity: evento.disagreeComplexity,
+  };
+  try { fn(msg); } catch { /* a emissão não falha o delegate */ }
+}
+
+function logar(evento: LogSombra, projectId: string): void {
   try {
     // Uma linha. Sem goal, context, chave ou corpo cru — só o veredito.
     console.error(`${PREFIXO_LOG} ${JSON.stringify(evento)}`);
   } catch {
     /* o log não pode derrubar o delegate */
   }
+  emitirVeredito(evento, projectId);
 }
 
 function ehTimeout(e: unknown): boolean {
@@ -373,7 +421,7 @@ async function executar(snap: Pedido): Promise<void> {
       latencyMs: Date.now() - inicio,
       ok: false,
       error,
-    });
+    }, snap.projectId);
   };
   try {
     const signal = AbortSignal.timeout(TIMEOUT_MS);
@@ -421,7 +469,7 @@ async function executar(snap: Pedido): Promise<void> {
       latencyMs: Date.now() - inicio,
       ok: true,
       error: null,
-    });
+    }, snap.projectId);
   } catch (e) {
     falha(erroCurto(e));
   }
@@ -431,11 +479,14 @@ async function executar(snap: Pedido): Promise<void> {
  * Copia o pedido e devolve já. A rede corre depois, sem o caller esperar.
  * Não escreve em `json`. Goal vazio ou já cifrado (`e2e:` / `e2e:v2:`) não sai.
  */
-export function scheduleDelegateShadow(json: unknown): void {
+export function scheduleDelegateShadow(json: unknown, projectId?: string): void {
   try {
     if (!sombraLigada()) return;
+    // Feature do projeto vem só do agent:spawn. Ausente ou false: zero rede.
+    if (!projectId || !jevLigado(projectId)) return;
     const snap = copiarPedido(json);
     if (!snap) return;
+    snap.projectId = projectId;
     const job = executar(snap).catch(() => {});
     emVoo.add(job);
     void job.finally(() => { emVoo.delete(job); });

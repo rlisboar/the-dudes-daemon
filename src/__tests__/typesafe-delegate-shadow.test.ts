@@ -10,6 +10,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   TYPESAFE_SYSTEMONE_URL,
+  definirEmissorSombra,
+  registrarJevDoProjeto,
   scheduleDelegateShadow,
   setDelegateShadowFetch,
   setDelegateShadowSafeFetch,
@@ -89,6 +91,14 @@ function mockFetch(fn: DelegateShadowFetch): void {
   });
 }
 
+const PROJETO = "projeto-jev";
+
+/** Os testes que esperam POST ligam a feature e passam o projectId. */
+function disparar(json: unknown): void {
+  registrarJevDoProjeto(PROJETO, true);
+  scheduleDelegateShadow(json, PROJETO);
+}
+
 describe("typesafe-delegate-shadow", { concurrency: 1 }, () => {
   beforeEach(() => {
     chamadasRede = 0;
@@ -102,6 +112,8 @@ describe("typesafe-delegate-shadow", { concurrency: 1 }, () => {
     await settleDelegateShadowForTests();
     setDelegateShadowFetch(null);
     setDelegateShadowSafeFetch(null);
+    registrarJevDoProjeto(PROJETO, false);
+    definirEmissorSombra(null);
     restaurarEnvOriginal();
   });
 
@@ -111,7 +123,7 @@ describe("typesafe-delegate-shadow", { concurrency: 1 }, () => {
       definirEnv(undefined, "chave-que-nao-sai");
       const json = { goal: "faz um teste", taskType: "coding", complexity: "simple" };
       const antes = { ...json };
-      const ret = scheduleDelegateShadow(json);
+      const ret = disparar(json);
       await settleDelegateShadowForTests();
       assert.equal(ret, undefined);
       assert.deepEqual(json, antes);
@@ -127,12 +139,12 @@ describe("typesafe-delegate-shadow", { concurrency: 1 }, () => {
     try {
       for (const flag of ["1", "true", " TRUE "]) {
         definirEnv(flag, undefined);
-        scheduleDelegateShadow({ goal: "faz um teste", taskType: "coding", complexity: "simple" });
+        disparar({ goal: "faz um teste", taskType: "coding", complexity: "simple" });
         definirEnv(flag, "   ");
-        scheduleDelegateShadow({ goal: "faz um teste", taskType: "coding", complexity: "simple" });
+        disparar({ goal: "faz um teste", taskType: "coding", complexity: "simple" });
       }
       definirEnv("yes", "chave-presente");
-      scheduleDelegateShadow({ goal: "faz um teste", taskType: "coding", complexity: "simple" });
+      disparar({ goal: "faz um teste", taskType: "coding", complexity: "simple" });
       await settleDelegateShadowForTests();
       assert.equal(chamadasRede, 0);
       assert.deepEqual(log.linhas(), []);
@@ -148,7 +160,7 @@ describe("typesafe-delegate-shadow", { concurrency: 1 }, () => {
       mockFetch(async () => ({ status: 200, text: async () => resposta() }));
       for (const flag of ["1", "true", " TRUE "]) {
         definirEnv(flag, "k");
-        const ret = scheduleDelegateShadow({ goal: "faz um teste", taskType: "coding", complexity: "simple" });
+        const ret = disparar({ goal: "faz um teste", taskType: "coding", complexity: "simple" });
         assert.equal(ret, undefined);
         vistos += 1;
       }
@@ -182,7 +194,7 @@ describe("typesafe-delegate-shadow", { concurrency: 1 }, () => {
         repo: "REPO_SENTINELA",
         diff: "DIFF_SENTINELA",
       };
-      scheduleDelegateShadow(json);
+      disparar(json);
       await settleDelegateShadowForTests();
       assert.ok(initVisto);
       assert.equal(urlVista, "https://api.typesafe.ai/v1/systemone");
@@ -236,8 +248,8 @@ describe("typesafe-delegate-shadow", { concurrency: 1 }, () => {
       mockFetch(async () => ({ status: 200, text: async () => fila.shift()! }));
       definirEnv("true", "k");
       const pedido = { goal: "explica o relay", context: "só leitura", taskType: "coding", complexity: "simple" };
-      scheduleDelegateShadow(pedido);
-      scheduleDelegateShadow(pedido);
+      disparar(pedido);
+      disparar(pedido);
       await settleDelegateShadowForTests();
       const eventos = log.linhas().map((l) => JSON.parse(l.slice(PREFIXO.length)) as {
         choices: { task_type: string; complexity: string; domain: string };
@@ -285,7 +297,7 @@ describe("typesafe-delegate-shadow", { concurrency: 1 }, () => {
         };
       });
       definirEnv("1", chave);
-      scheduleDelegateShadow({
+      disparar({
         goal: `altera o daemon ${sentinelaGoal}`,
         context: `notas ${sentinelaCtx}`,
         taskType: "coding",
@@ -320,7 +332,7 @@ describe("typesafe-delegate-shadow", { concurrency: 1 }, () => {
       const sentinela = "SENTINELA_THROW_nao_sai";
       mockFetch(async () => { throw new Error(sentinela); });
       definirEnv("1", "k");
-      assert.doesNotThrow(() => scheduleDelegateShadow({ goal: "faz X", taskType: "coding", complexity: "simple" }));
+      assert.doesNotThrow(() => disparar({ goal: "faz X", taskType: "coding", complexity: "simple" }));
       await settleDelegateShadowForTests();
       await new Promise((r) => setImmediate(r));
       assert.equal(rejeicoes.length, 0);
@@ -348,7 +360,7 @@ describe("typesafe-delegate-shadow", { concurrency: 1 }, () => {
     };
     const antes = { ...json };
     definirEnv(undefined, "k");
-    const ret = scheduleDelegateShadow(json);
+    const ret = disparar(json);
     json.goal = "mudou-depois";
     await settleDelegateShadowForTests();
     assert.equal(ret, undefined);
@@ -364,7 +376,7 @@ describe("typesafe-delegate-shadow", { concurrency: 1 }, () => {
     const vivo = { goal: "objetivo-original", context: "ctx", taskType: "coding", complexity: "simple" };
     const foto = { ...vivo };
     definirEnv("1", "k");
-    scheduleDelegateShadow(vivo);
+    disparar(vivo);
     assert.deepEqual(vivo, foto);
     vivo.goal = "MUTADO_DEPOIS";
     await settleDelegateShadowForTests();
@@ -386,7 +398,7 @@ describe("typesafe-delegate-shadow", { concurrency: 1 }, () => {
         return { status: 200, text: async () => resposta() };
       });
       definirEnv("1", "k");
-      scheduleDelegateShadow({ goal: "mede a url", taskType: "general", complexity: "simple" });
+      disparar({ goal: "mede a url", taskType: "general", complexity: "simple" });
       await settleDelegateShadowForTests();
       assert.equal(urlVista, "https://api.typesafe.ai/v1/systemone");
       assert.equal(log.linhas().some((l) => l.includes("mede a url")), false);
@@ -415,9 +427,9 @@ describe("typesafe-delegate-shadow", { concurrency: 1 }, () => {
       });
       definirEnv("1", "k");
       for (const goal of ["", "   ", "e2e:v2:blob", "e2e:legado", "  e2e:v2:blob", "e2e:v1:xx"]) {
-        scheduleDelegateShadow({ goal, context: "ainda em claro", taskType: "coding", complexity: "simple" });
+        disparar({ goal, context: "ainda em claro", taskType: "coding", complexity: "simple" });
       }
-      scheduleDelegateShadow({ goal: "plaintext ok", context: "e2e:v2:ctx", taskType: "coding", complexity: "simple" });
+      disparar({ goal: "plaintext ok", context: "e2e:v2:ctx", taskType: "coding", complexity: "simple" });
       await settleDelegateShadowForTests();
       assert.equal(chamadasRede, 1);
       assert.equal(log.linhas().length, 1);
@@ -443,7 +455,7 @@ describe("typesafe-delegate-shadow", { concurrency: 1 }, () => {
       const erros: string[] = [];
       for (const passo of passos) {
         mockFetch(passo);
-        scheduleDelegateShadow({ goal: "um", taskType: "coding", complexity: "simple" });
+        disparar({ goal: "um", taskType: "coding", complexity: "simple" });
         await settleDelegateShadowForTests();
         const linha = log.linhas().at(-1);
         assert.ok(linha);
@@ -493,7 +505,7 @@ describe("typesafe-delegate-shadow", { concurrency: 1 }, () => {
         throw new Error(`SSRF bloqueado: redirects demais (> ${opts.maxRedirects})`);
       });
       definirEnv("1", chave);
-      scheduleDelegateShadow({ goal: "nao seguir redirect", taskType: "coding", complexity: "simple" });
+      disparar({ goal: "nao seguir redirect", taskType: "coding", complexity: "simple" });
       await settleDelegateShadowForTests();
       assert.deepEqual(hops, [TYPESAFE_SYSTEMONE_URL]);
       assert.equal(chamadasRede, 0, "o atalho do fetch não pode mascarar o seam");
@@ -512,15 +524,67 @@ describe("typesafe-delegate-shadow", { concurrency: 1 }, () => {
     }
   });
 
+  test("feature ausente não posta", async () => {
+    const log = instalarLog();
+    try {
+      registrarJevDoProjeto(PROJETO, false);
+      definirEnv("1", "chave-presente");
+      scheduleDelegateShadow({ goal: "faz um teste", taskType: "coding", complexity: "simple" }, PROJETO);
+      scheduleDelegateShadow({ goal: "faz um teste", taskType: "coding", complexity: "simple" });
+      await settleDelegateShadowForTests();
+      assert.equal(chamadasRede, 0);
+      assert.deepEqual(log.linhas(), []);
+    } finally {
+      log.parar();
+    }
+  });
+
+  test("veredito emitido não contém goal nem context", async () => {
+    const log = instalarLog();
+    try {
+      const sentinela = "SENTINELA_VEREDITO_9c1e";
+      const enviados: unknown[] = [];
+      definirEmissorSombra((msg) => { enviados.push(msg); });
+      mockFetch(async () => ({ status: 200, text: async () => resposta() }));
+      definirEnv("1", "chave-que-nao-sobe");
+      registrarJevDoProjeto(PROJETO, true);
+      scheduleDelegateShadow({
+        goal: `altera ${sentinela}`,
+        context: sentinela,
+        taskType: "coding",
+        complexity: "simple",
+      }, PROJETO);
+      await settleDelegateShadowForTests();
+      assert.equal(enviados.length, 1);
+      const msg = enviados[0] as Record<string, unknown>;
+      const cru = JSON.stringify(msg);
+      assert.equal(cru.includes(sentinela), false);
+      assert.equal(cru.includes("chave-que-nao-sobe"), false);
+      assert.equal("goal" in msg, false);
+      assert.equal("context" in msg, false);
+      assert.equal("probabilities" in msg, false);
+      assert.equal("prompt" in msg, false);
+      assert.equal(msg.type, "typesafe:shadow");
+      assert.equal(msg.projectId, PROJETO);
+      assert.equal(msg.ok, true);
+      assert.equal(msg.taskType, "coding");
+      assert.equal(msg.error, null);
+      const conf = msg.confidence as { task_type: number } | null;
+      assert.equal(conf?.task_type, 0.8);
+    } finally {
+      log.parar();
+    }
+  });
+
   test("relay chama scheduleDelegateShadow no delegate, antes de encryptBridgePayload, sem await", () => {
     const i0 = RELAY.indexOf("const encryptOr409");
     const i1 = RELAY.indexOf("if (body && body.length > 0", i0);
     assert.ok(i0 !== -1 && i1 > i0);
     const trecho = RELAY.slice(i0, i1);
-    assert.match(trecho, /if \(kind === "delegate" && !Array\.isArray\(json\)\) \{\s*try \{ scheduleDelegateShadow\(json\); \} catch \{/);
+    assert.match(trecho, /if \(kind === "delegate" && !Array\.isArray\(json\)\) \{\s*try \{ scheduleDelegateShadow\(json, projectId\); \} catch \{/);
     assert.equal(trecho.includes("await scheduleDelegateShadow"), false);
     assert.equal(/await\s+scheduleDelegateShadow/.test(trecho), false);
-    const posSombra = trecho.indexOf("scheduleDelegateShadow(json)");
+    const posSombra = trecho.indexOf("scheduleDelegateShadow(json, projectId)");
     const posCifra = trecho.indexOf("encryptBridgePayload(");
     assert.ok(posSombra !== -1 && posCifra !== -1 && posSombra < posCifra);
     assert.match(RELAY, /import \{ scheduleDelegateShadow \} from "\.\/typesafe-delegate-shadow\.js"/);

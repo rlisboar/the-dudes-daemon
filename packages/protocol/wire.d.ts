@@ -299,6 +299,37 @@ export interface Project {
   boardHtmlLevel?: BoardHtmlLevel;
   /** Largura útil do quadro (default `small`). */
   boardWidth?: BoardWidth;
+  /** Aba Jev. Lean: novos nascem off. O server só retransmite o veredito podado. */
+  jevEnabled?: boolean;
+}
+
+/** Confiança já resumida do Jev. Não é o mapa cru de probabilidades. */
+export interface JevConfidence {
+  task_type: number;
+  complexity: number;
+  domain: number;
+}
+
+/**
+ * Veredito do Jev que o cliente pode ver. Sem goal, context, prompt, chave,
+ * body ou distribuição crua — só o julgamento e o quanto divergiu do declarado.
+ */
+export interface JevVerdict {
+  projectId: string;
+  at: number;
+  ok: boolean;
+  error: string | null;
+  model: string;
+  latencyMs: number;
+  declaredTaskType: string;
+  declaredComplexity: string;
+  taskType: string;
+  complexity: string;
+  domain: string;
+  confidence: JevConfidence | null;
+  destructiveNoul: number | null;
+  disagreeTaskType: boolean;
+  disagreeComplexity: boolean;
 }
 
 export interface ProjectMember {
@@ -1215,6 +1246,8 @@ export type ServerEvent =
       autoApprove: boolean;
       comments: TaskComment[];
       toolExecutions: ToolExecutionEvent[];
+      /** Anel em memória dos vereditos Jev (até 50). Ausente em servidores antigos. */
+      jevVerdicts?: JevVerdict[];
     }
   | { type: "members"; list: ProjectMember[] }
   | { type: "workspace"; workspace: UserWorkspace | null }
@@ -1262,7 +1295,8 @@ export type ServerEvent =
   | { type: "credential:revealed"; id: string; value: string }
   | { type: "permission:request"; req: PermissionRequest }
   | { type: "permission:resolved"; requestId: string; allow: boolean }
-  | { type: "config"; autoApprove: boolean; loopProtection: "reactive" | "preventive"; loopLimitEnabled?: boolean; loopLimit?: number; loopPairLimit?: number; loopPairWindowMs?: number; memoryEnabled?: boolean; memoryMaxPinned?: number; e2eeRequired?: boolean; tasksEnabled?: boolean; teammatesEnabled?: boolean; goalsEnabled?: boolean; credentialsEnabled?: boolean; webhooksEnabled?: boolean; graphEnabled?: boolean; openDesignEnabled?: boolean; boardEnabled?: boolean; diagramLanguage?: DiagramLanguage; boardMode?: BoardMode; boardHtmlLevel?: BoardHtmlLevel; boardWidth?: BoardWidth; autoRetryEnabled?: boolean; autoRetrySeconds?: number }
+  | { type: "config"; autoApprove: boolean; loopProtection: "reactive" | "preventive"; loopLimitEnabled?: boolean; loopLimit?: number; loopPairLimit?: number; loopPairWindowMs?: number; memoryEnabled?: boolean; memoryMaxPinned?: number; e2eeRequired?: boolean; tasksEnabled?: boolean; teammatesEnabled?: boolean; goalsEnabled?: boolean; credentialsEnabled?: boolean; webhooksEnabled?: boolean; graphEnabled?: boolean; openDesignEnabled?: boolean; boardEnabled?: boolean; diagramLanguage?: DiagramLanguage; boardMode?: BoardMode; boardHtmlLevel?: BoardHtmlLevel; boardWidth?: BoardWidth; autoRetryEnabled?: boolean; autoRetrySeconds?: number; jevEnabled?: boolean; jevVerdicts?: JevVerdict[] }
+  | { type: "jev:verdict"; verdict: JevVerdict }
   | { type: "graph:status"; status: "idle" | "building" | "ready" | "error"; nodeCount?: number; edgeCount?: number; error?: string; inputTokens?: number; outputTokens?: number; lastIndexedAt?: number; progress?: number; phase?: string; indexMtime?: number; stale?: boolean; graphifyAvailable?: boolean; graphifyMcpAvailable?: boolean; docsPending?: boolean; hasSemantic?: boolean }
   | { type: "open_design:projects"; projects: Array<{ id: string; name: string; designSystemId?: string | null }>; error?: string }
   | { type: "open_design:files"; odProjectId: string; files: Array<{ path: string; name: string; size?: number }>; error?: string }
@@ -1478,7 +1512,7 @@ export type ClientCommand =
   | { type: "set_memory_enabled"; value: boolean }
   | { type: "set_memory_max_pinned"; value: number }
   | { type: "set_e2ee_required"; value: boolean }
-  | { type: "set_context_feature"; feature: "tasks" | "teammates" | "goals" | "credentials" | "webhooks" | "graph" | "board" | "openDesign"; value: boolean }
+  | { type: "set_context_feature"; feature: "tasks" | "teammates" | "goals" | "credentials" | "webhooks" | "graph" | "board" | "openDesign" | "jev"; value: boolean }
   | { type: "open_design:list" }
   | { type: "open_design:files"; odProjectId: string }
   | { type: "open_design:file"; odProjectId: string; path: string }

@@ -21,6 +21,7 @@ import type {
   ImageAttachment,
   MCPDefinition,
   RunnerModelCatalog,
+  JevVerdict,
   SkillDefinition,
   SkillFrontmatter,
 } from "./wire";
@@ -213,6 +214,8 @@ export interface ContextFeatures {
   boardMode?: "blocks" | "html";
   /** Requinte da página no modo html: basic | normal | quality. */
   boardHtmlLevel?: "basic" | "normal" | "quality";
+  /** Jev no projeto. Opt-in. O daemon só chama a API quando isto é true. */
+  jev?: boolean;
 }
 
 export interface MemoryInjectionEntry {
@@ -618,6 +621,9 @@ export interface GraphStatusEvent {
 }
 /** Orch pede o graph.json do workspace pra renderizar o mapa na UI. */
 export interface GraphFetchRequest { type: "graph:fetch"; correlationId?: string; projectId?: string; workspaceRoot?: string; }
+
+/** Shadow do Jev já podado. O daemon não manda goal, context, prompt nem o mapa cru. */
+export interface TypesafeShadow extends JevVerdict { type: "typesafe:shadow"; }
 
 export interface OpenDesignListRequest { type: "open_design:list"; correlationId: string; }
 export interface OpenDesignFilesRequest { type: "open_design:files"; correlationId: string; odProjectId: string; }
@@ -1077,7 +1083,8 @@ export type FromDaemon =
   | GraphStatusEvent
   | GraphDataEvent
   | OpenDesignResult
-  | ModelsCatalogResult;
+  | ModelsCatalogResult
+  | TypesafeShadow;
 
 export type FromOrch =
   | DaemonLogsGetRequest

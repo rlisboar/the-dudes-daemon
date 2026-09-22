@@ -32,6 +32,7 @@ import { apagarArquivoOd, apagarProjetoOd, buscarArquivosOd, cancelarRunOd, copi
 import { ensureGraphWatch, stopAllGraphWatches } from "./graph-watcher.js";
 import { detectDropTarget, spawnDropped, type DropTarget } from "./privileges.js";
 import { BridgeRelay, type PeerPidMode } from "./bridge-relay.js";
+import { definirEmissorSombra, registrarJevDoProjeto } from "./typesafe-delegate-shadow.js";
 import { defaultDaemonConfigPath, formatCliStatus, loadDaemonCliConfig, mergeCliConfig, resolveCliCommands, type DaemonCliConfig, type ResolvedCliCommands } from "./cli-config.js";
 import { applyRunnerPolicy, buildInstalledRunnerAvailability, helloRunnerLists, POLICY_GATED_RUNNERS, type InstalledRunnerAvailability } from "./runner-policy.js";
 import { assembleAgentSendParts, contentAadChain, openWithAnyHeldProject, type FromDaemon, type FromOrch, type TaskUpdatedEv } from "./protocol.js";
@@ -375,6 +376,9 @@ export class DaemonClient {
     // Start the local Unix-socket relay so MCP bridges spawned by agents
     // (which run as the dropped user) can reach the orchestrator without
     // hitting an outbound firewall app.
+    definirEmissorSombra((veredito) => {
+      try { this.send(veredito); } catch { /* a emissão não falha o delegate */ }
+    });
     this.relay = new BridgeRelay(this.orchUrl, this.dropTo, (agentId) => this.host.getAgentProjectId(agentId), {
       // T-581: o prompt de delegação cifrado cita o nome do pai (o subagente
       // responde por send_message pra ele). Closures lazy — `host` nasce abaixo.
@@ -668,6 +672,7 @@ export class DaemonClient {
         return;
       }
       case "agent:spawn": {
+        if (msg.projectId) registrarJevDoProjeto(msg.projectId, msg.features?.jev === true);
         let resolvedCwd: string;
         if (msg.agentRepo && msg.cwdOverride) {
           resolvedCwd = `${msg.cwdOverride}/${msg.agentRepo.name} (agent repo)`;

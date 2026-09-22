@@ -258,7 +258,7 @@ export const commandSchemas = {
   }),
   set_auto_retry: cmd({ enabled: flag, seconds: num }),
   set_context_feature: cmd({
-    feature: z.enum(["tasks", "teammates", "goals", "credentials", "webhooks", "graph", "board", "openDesign"]),
+    feature: z.enum(["tasks", "teammates", "goals", "credentials", "webhooks", "graph", "board", "openDesign", "jev"]),
     value: flag,
   }),
   set_project_planner: cmd({ agentId: id.nullable() }),

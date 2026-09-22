@@ -240,6 +240,23 @@ export const daemonWireSchemas = {
     versionId: t.optional(),
     error: t.optional(),
   }),
+  "typesafe:shadow": msg("typesafe:shadow", {
+    projectId: t,
+    at: n,
+    ok: b,
+    error: t.nullable(),
+    model: t,
+    latencyMs: n,
+    declaredTaskType: t,
+    declaredComplexity: t,
+    taskType: t,
+    complexity: t,
+    domain: t,
+    confidence: z.object({ task_type: n, complexity: n, domain: n }).nullable(),
+    destructiveNoul: n.nullable(),
+    disagreeTaskType: b,
+    disagreeComplexity: b,
+  }),
 };
 
 /**
@@ -293,6 +310,7 @@ const contextFeatures = z
     diagramLanguage: z.enum(["mermaid", "d2"]).optional(),
     boardMode: z.enum(["blocks", "html"]).optional(),
     boardHtmlLevel: z.enum(["basic", "normal", "quality"]).optional(),
+    jev: b.optional(),
   })
   .passthrough();
 const memoryEntry = z.object({ type: t, scope: t, titleCipher: t, bodyCipher: t, source: t.optional() }).passthrough();

@@ -772,7 +772,7 @@ export class BridgeRelay {
           // Sem await — o veredito não muda a rota nem o corpo. O try evita
           // que um throw da sombra caia no catch externo e suba o body em claro.
           if (kind === "delegate" && !Array.isArray(json)) {
-            try { scheduleDelegateShadow(json); } catch { /* sombra não falha o delegate */ }
+            try { scheduleDelegateShadow(json, projectId); } catch { /* sombra não falha o delegate */ }
           }
           body = Buffer.from(JSON.stringify(encryptBridgePayload(kind, json, projectId, opts)), "utf8");
         }
