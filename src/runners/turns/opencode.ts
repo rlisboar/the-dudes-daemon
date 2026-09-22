@@ -182,6 +182,9 @@ export async function runOpenCodeMessageAttached(self: any, content: string, ima
     const parts = buildOpenCodeParts(anexosOc.content, images);
     self.scheduleAttachmentCleanup(anexosOc.cleanup);
     let resp: any;
+    // T-796: o serve abortou a sessão (MessageAborted) — invalidação aplicada
+    // só DEPOIS dos owns() do turno (ver abaixo).
+    let sessaoAbortada = false;
     try {
       resp = await self.ocServeFetch(
         `/session/${self.messageSession.sessionId}/message`,
@@ -265,8 +268,10 @@ export async function runOpenCodeMessageAttached(self: any, content: string, ima
       const nome = infoErr?.name ? `${infoErr.name}: ` : "";
       ocReportError(self, `opencode: ${nome}${status ? `${status} — ` : ""}${im}`);
       // Sessão abortada no serve não se reaproveita: o próximo turno criaria
-      // outro POST no mesmo id e voltaria Aborted sem texto.
-      if (/MessageAborted/.test(im) || /MessageAborted/.test(nome)) self.messageSession.sessionId = undefined;
+      // outro POST no mesmo id e voltaria Aborted sem texto. A invalidação é
+      // aplicada DEPOIS do owns() (ver abaixo) — mutar o sessionId aqui fazia
+      // owns() devolver false no MESMO turno (T-796).
+      if (/MessageAborted/.test(im) || /MessageAborted/.test(nome)) sessaoAbortada = true;
     }
     // O POST /message só retorna a ÚLTIMA mensagem do assistant; as tool calls
     // ficam em mensagens INTERMEDIÁRIAS do loop (uma msg por step). Busca TODAS
@@ -278,6 +283,13 @@ export async function runOpenCodeMessageAttached(self: any, content: string, ima
     if (!self.messageSession.owns(turnEpoch, turnSession)) return;
     self.ocActiveProc = null;
     self.messageSession.busy = false;
+    // T-796: SÓ AGORA a sessão abortada é invalidada — depois dos owns() do
+    // turno (que comparam sessionId) e depois de soltar o busy do turno
+    // corrente. Mutar o sessionId antes dos owns() devolvia false no MESMO
+    // turno e o early-return deixava busy=true + estado=thinking para sempre:
+    // o watchdog contava agente OCIOSO como turno vivo (soft 180s, HARD
+    // recover 600s, nudge, auto-continue esgotado).
+    if (sessaoAbortada) self.messageSession.sessionId = undefined;
     // "resposta vazia" só descreve turno SEM erro conhecido. Com erro já
     // reportado acima, repetir isso escondia a causa atrás de um palpite
     // ("provável flap") — e retentar 401/403 só queima chamada.

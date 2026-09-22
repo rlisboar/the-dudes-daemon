@@ -31,6 +31,35 @@ export const DSH_ACP_ARGS = ["--profile", "acp"] as const;
 /** Default do runner: a rota `deepseek-official` falha sem API key (-32603). */
 export const DSH_DEFAULT_MODEL = '["dsflash","deepseek-flash-41"]';
 
+/** T-796: rota SEM chave neste host. A credencial presente é DSFLASH_API_KEY
+ *  (docs/DAEMON.md) — `deepseek-official` responde `-32603: no API key for
+ *  provider route "deepseek-official"` no prompt. */
+export const DSH_KEYLESS_ROUTE = "deepseek-official";
+
+/** Rota (1º elemento do par opaco `["rota","modelo"]`) ou null se o value não
+ *  segue o formato de par. */
+export function dshModelRoute(value: string): string | null {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (Array.isArray(parsed) && typeof parsed[0] === "string") return parsed[0];
+  } catch { /* value opaco fora do formato par */ }
+  return null;
+}
+
+/**
+ * T-796: modelo que o TURNO usa. O catálogo ACP do dsh marca o par
+ * `["deepseek-official","deepseek-v4-flash"]` como default (medido no host
+ * 2026-09-22) — um agente criado a partir do catálogo chega com esse model
+ * preenchido e o prompt ia para a rota sem chave, falhando em ~180ms com
+ * `-32603` (os 8 agentes de 15:07:23Z). Sem model OU em rota sem chave →
+ * dsflash; model explícito de rota com chave é preservado.
+ */
+export function dshModelForTurn(model?: string): string {
+  const m = typeof model === "string" ? model.trim() : "";
+  if (!m) return DSH_DEFAULT_MODEL;
+  return dshModelRoute(m) === DSH_KEYLESS_ROUTE ? DSH_DEFAULT_MODEL : m;
+}
+
 export interface DshConfigOption {
   id: string;
   name?: string;
@@ -603,8 +632,25 @@ export function startDsh(self: any): void {
       // system+contexto; resume NÃO re-injeta — o log é durável).
       self.messageSession.sessionId = sess.sessionId;
       self.dshFreshSession = !resumeId;
-      const model = (typeof self.info.model === "string" ? self.info.model.trim() : "") || DSH_DEFAULT_MODEL;
-      await client.setConfigOption("model", model);
+      // T-796: rota sem chave (default do catálogo = par official) cai no
+      // dsflash; só model explícito de rota COM chave é preservado.
+      const model = dshModelForTurn(self.info.model);
+      const aplicados = await client.setConfigOption("model", model);
+      // O value é opaco: confere o que o servidor APLICOU. Se a sessão ficou
+      // em rota sem chave o prompt falha em ~180ms com -32603 sem UMA linha
+      // explicando o set — repete uma vez e loga o desfecho.
+      const efetivo = aplicados.find((o) => o?.id === "model")?.currentValue;
+      if (efetivo && efetivo !== model) {
+        self.opts.log(
+          "warn",
+          `[cli:${self.info.id}:dsh] set_config_option model=${model} não pegou (sessão em ${efetivo}) — repetindo`,
+        );
+        const repetido = await client.setConfigOption("model", model);
+        const ficou = repetido.find((o) => o?.id === "model")?.currentValue;
+        if (ficou && dshModelRoute(ficou) === DSH_KEYLESS_ROUTE) {
+          self.opts.log("warn", `[cli:${self.info.id}:dsh] sessão segue na rota sem chave (${ficou}) — prompt deve falhar com -32603`);
+        }
+      }
       const effort = dshEffortValue(self.info.effort);
       if (effort) await client.setConfigOption("reasoning_effort", effort);
       if (self.dsh !== client) return;

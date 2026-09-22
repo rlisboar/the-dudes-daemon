@@ -91,7 +91,17 @@ export function requestJson(baseUrl: string, requestPath: string, method: string
       response.on("error", (error) => reject(new Error(`resposta interrompida: ${error.message}`)));
     });
     request.on("error", reject);
-    request.on("timeout", () => request.destroy(new Error(`timeout ${timeoutMs}ms`)));
+    // T-796: o timeout do SOCKET não é o nosso quando há modo progress. O
+    // agente global do Node arma 5s de keep-alive no socket e o POST síncrono
+    // do opencode fica MUDO o turno inteiro (quem streama é o /event) — 5s
+    // depois o socket emite `timeout` e o handler matava um turno saudável
+    // com a mensagem ERRADA ("timeout 1800000ms" num POST de 5s), abortava a
+    // sessão no serve e o retry morria com MessageAborted. Aqui quem decide é
+    // a atividade do agente (idle) e o cap absoluto do turno.
+    request.on("timeout", () => {
+      if (progress) return;
+      request.destroy(new Error(`timeout ${timeoutMs}ms`));
+    });
     if (progress) {
       const started = Date.now();
       const timer = setInterval(() => {

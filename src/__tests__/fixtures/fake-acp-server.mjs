@@ -17,6 +17,8 @@ const result = (id, res) => out({ jsonrpc: "2.0", id, result: res });
 const notify = (method, params) => out({ jsonrpc: "2.0", method, params });
 
 const SESSION_ID = "57eb3eca-0a64-411f-890d-8478bef47e71";
+/** Par dsflash (rota COM chave) — o default do catálogo real é o official. */
+const DSFLASH_VALUE = '["dsflash","deepseek-flash-41"]';
 let sessionId = null;
 let modelValue = '["deepseek-official","deepseek-v4-flash"]';
 let effortValue = "high";
@@ -82,6 +84,15 @@ function handle(msg) {
   }
   if (msg.method === "session/prompt") {
     const text = msg.params?.prompt?.[0]?.text ?? "";
+    // T-796: no host do dono a rota `deepseek-official` NÃO tem chave e o
+    // prompt morre em ~180ms com -32603. Com esta flag o fake reproduz isso —
+    // o prompt só passa se a sessão tiver sido configurada para dsflash.
+    if (process.env.FAKE_ACP_REQUIRE_DSFLASH && modelValue !== DSFLASH_VALUE) {
+      return out({
+        jsonrpc: "2.0", id: msg.id,
+        error: { code: -32603, message: "Internal error: turn failed: llm-deepseek: no API key for provider route \"deepseek-official\"" },
+      });
+    }
     promptInFlight = { id: msg.id, text };
     // Updates na ordem do contrato: thought → tool (call+update) → texto → usage.
     notify("session/update", { sessionId, update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "pensando…" } } });

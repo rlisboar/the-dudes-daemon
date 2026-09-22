@@ -51,7 +51,11 @@ test("T-776: com progresso o POST renova e só morre no CAP absoluto", async () 
 });
 
 test("T-776: relógio anterior ao POST não conta como ociosidade deste turno", async () => {
-  const s = await slowServer(80);
+  // T-796: o tick do detector é 250ms. Com servidor de 80ms a resposta chegava
+  // ANTES do 1º tick e o caso era vacamente verde (passava até com
+  // `marco = activity()`, sem o Math.max). 600ms garante >= 2 ticks: no código
+  // antigo o POST morria em ~273ms por causa do relógio de 31min.
+  const s = await slowServer(600);
   try {
     const velho = Date.now() - 31 * 60_000;
     const out = await requestJson(s.base, "/x", "POST", {}, 30_000, {

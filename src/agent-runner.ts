@@ -1375,6 +1375,20 @@ export class AgentRunner {
       return;
     }
 
+    // T-796: em runner per-message "stalled" é só o RÓTULO VISUAL que o soft
+    // anterior deixou — não é prova de turno vivo (isInTurn conta stalled).
+    // Sem busy não há turno: o relógio não pode continuar acumulando, senão
+    // um agente OCIOSO esperando mensagem vira HARD recover aos 600s e o
+    // auto-continue queima o nudge até esgotar ("agente parado").
+    if (isPerMessageRunner(this.opts.cliRunner) && !this.messageSession.busy) {
+      if (this.currentState === "stalled" || this.currentState === "thinking" || this.currentState === "speaking") {
+        this.setState("idle");
+      }
+      this.activityClock.softReported = false;
+      this.activityClock.deadSince = null;
+      return;
+    }
+
     const runner = this.opts.cliRunner;
     const t = hangThresholds(runner);
     const now = Date.now();
