@@ -10,11 +10,42 @@ export function processAlive(process: ChildProcess | null | undefined): process 
  *
  * O SIGKILL do cliente headless NÃO atinge o leader (processo separado no
  * socket). Leader zumbi = próximos turnos pendem sem CPU/log até restart.
- * Best-effort: lsof → kill; unlink do sock. Falha silenciosa se sem lsof.
+ * Best-effort: lsof → kill; se o lsof não achar NINGUÉM (0 pids desde 18/09
+ * em prod: o socket de filesystem não aparece no lsof), varre o argv dos
+ * processos por `--leader-socket <path>` e mata o GRUPO (`kill(-pid)`) —
+ * o líder zumbi sobrevive ao cliente e trava o próximo turno. Falha
+ * silenciosa se sem lsof/ps.
  */
-export function killGrokLeader(leaderSocketPath: string | undefined | null): number {
+export type GrokLeaderFinder = (socketPath: string) => number[];
+
+/** Finder padrão: `ps -axo pid=,args=` e match de `--leader-socket` + path. */
+export function findGrokLeaderProcsByArgv(socketPath: string): number[] {
+  let out = "";
+  try {
+    const r = spawnSync("ps", ["-axo", "pid=,args="], { encoding: "utf8", timeout: 3_000 });
+    out = r.stdout ?? "";
+  } catch { /* ps ausente / timeout */ }
+  const pids: number[] = [];
+  for (const line of out.split("\n")) {
+    if (!line.includes("--leader-socket") || !line.includes(socketPath)) continue;
+    const pid = parseInt(line.trimStart().split(/\s+/)[0] ?? "", 10);
+    if (Number.isFinite(pid) && pid > 1) pids.push(pid);
+  }
+  return pids;
+}
+
+export function killGrokLeader(
+  leaderSocketPath: string | undefined | null,
+  finder: GrokLeaderFinder = findGrokLeaderProcsByArgv,
+  onKilled?: (pid: number, via: "lsof" | "argv") => void,
+): number {
   if (!leaderSocketPath) return 0;
   let killed = 0;
+  const killGroup = (pid: number): boolean => {
+    if (!Number.isFinite(pid) || pid <= 1) return false;
+    try { process.kill(-pid, "SIGKILL"); return true; } catch { /* sem grupo → individual */ }
+    try { process.kill(pid, "SIGKILL"); return true; } catch { return false; }
+  };
   try {
     const r = spawnSync("lsof", ["-t", leaderSocketPath], {
       encoding: "utf8",
@@ -28,9 +59,18 @@ export function killGrokLeader(leaderSocketPath: string | undefined | null): num
       try {
         process.kill(pid, "SIGKILL");
         killed += 1;
+        onKilled?.(pid, "lsof");
       } catch { /* ESRCH */ }
     }
   } catch { /* lsof ausente / timeout */ }
+  if (killed === 0) {
+    for (const pid of finder(leaderSocketPath)) {
+      if (killGroup(pid)) {
+        killed += 1;
+        onKilled?.(pid, "argv");
+      }
+    }
+  }
   try {
     if (existsSync(leaderSocketPath)) unlinkSync(leaderSocketPath);
   } catch { /* best-effort */ }

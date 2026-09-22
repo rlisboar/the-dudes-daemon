@@ -70,12 +70,13 @@ export function ocReportError(self: any, message: string): void {
   }
 
 /** T-750: distingue o timeout do NOSSO POST (cliente) de erro do provider e
- *  devolve texto útil — o run pode seguir no serve após o abort do POST. */
+ *  devolve texto útil — no timeout a sessão é ABORTADA no serve antes do
+ *  retry (T-784: a run não pode seguir no serve). */
 export function ocTurnFailureReason(errorMessage: string): { timedOut: boolean; detail: string } {
     const m = /^timeout (\d+)ms/.exec(errorMessage);
     if (!m) return { timedOut: false, detail: errorMessage };
     const min = Math.round(Number(m[1]) / 60_000);
-    return { timedOut: true, detail: `teto de ${min}min do POST excedido (run pode seguir no serve) — ${errorMessage}` };
+    return { timedOut: true, detail: `teto de ${min}min do POST excedido (sessão abortada no serve) — ${errorMessage}` };
   }
 
 export async function runOpenCodeMessage(self: any, content: string, images?: ImageAttachment[], retry = 0) {
@@ -121,6 +122,10 @@ export async function runOpenCodeMessageAttached(self: any, content: string, ima
     // Coleta a janela real do catálogo em paralelo ao turno (idempotente).
     void self.fetchOcCatalogLimit();
     self.ocRunSawOutput = false;
+    // T-788: turno novo começa com a contagem por part zerada (sem herança
+    // de partIds do turno anterior).
+    self.ocToolRunningPartIds?.clear();
+    self.ocPendingPermissionIds?.clear();
     // provider/modelID + reasoning effort (sufixo ":high"/":max" ou effort do agente).
     const { providerID, modelID } = providerModelParts(self.info.model);
     // Garante sessão no serve (POST /session). Reusa sessionId se já existe.
@@ -187,9 +192,21 @@ export async function runOpenCodeMessageAttached(self: any, content: string, ima
       self.messageSession.busy = false;
       timing?.finish("error");
       const emsg = (e as Error).message;
-      // T-750: timeout do POST ganha texto próprio (run pode seguir no serve).
+      // T-750: timeout do POST ganha texto próprio.
       const fail = ocTurnFailureReason(emsg);
       if (fail.timedOut) self.traceCli("opencode", "stderr", `[turn-timeout] ${fail.detail}`);
+      // T-784: timeout do POST NÃO mata a run no serve — sem abortSession o
+      // run continuava lá (38 timeouts de 30min no log) e o retry disparava
+      // um turno PARALELO na mesma sessão (side effects de tools duplicados).
+      // Aborta ANTES de re-enfileirar; best-effort.
+      if (fail.timedOut && turnSession) {
+        try {
+          await self.openCodeTransport.abortSession(turnSession);
+          self.opts.log("warn", `[cli:${self.info.id}:opencode] timeout do POST: sessão ${turnSession.slice(0, 8)}… abortada no serve antes do retry`);
+        } catch (e) {
+          self.opts.log("warn", `[cli:${self.info.id}:opencode] abort pós-timeout falhou: ${(e as Error).message}`);
+        }
+      }
       if (retry < AgentRunner.OC_EMPTY_RETRIES) {
         ocReportError(self, `opencode: turno falhou (${fail.detail}) — retry ${retry + 1}/${AgentRunner.OC_EMPTY_RETRIES}`);
         self.messageSession.restoreFirstTurn(firstTurnSnapshot);
@@ -288,21 +305,39 @@ export async function ocHandlePermissionAsked(self: any, props: any): Promise<vo
     const sessionID = props?.sessionID as string | undefined;
     const tool = String(props?.permission ?? "");
     if (!permId || !sessionID) return;
-    // input p/ exibir na UI: metadata (ex bash {command, description}) + patterns
-    const input = { ...(props?.metadata ?? {}), patterns: props?.patterns };
-    let allow = false;
+    // T-784: um ask pendente é turno VIVO — o agente está esperando o dono
+    // aprovar (pode levar minutos). Sem touch, o relógio de ociosidade
+    // estourava o soft e o agente aparecia stalled no meio da espera.
+    self.touchActivity();
+    // T-788 (F2): o touch na CHEGADA não cobre a espera — o bridge espera até
+    // 5min e o soft é 3min. Enquanto o ask estiver pendente, o tickHangWatch
+    // renova o relógio (ver ocPendingPermissionDue). Removido ao responder
+    // (ou falhar) — finally garante que não gruda.
+    if (!self.ocPendingPermissionIds) self.ocPendingPermissionIds = new Set<string>();
+    self.ocPendingPermissionIds.add(permId);
     try {
-      const r = await self.bridgePost("permission", { tool, input });
-      allow = !!r?.allow;
-    } catch (e) {
-      // fail-closed: nega se a política não respondeu (igual approve_action)
-      self.opts.log("warn", `[cli:${self.info.id}:opencode] permission '${tool}' negada (erro política): ${(e as Error).message}`);
+      // input p/ exibir na UI: metadata (ex bash {command, description}) + patterns
+      const input = { ...(props?.metadata ?? {}), patterns: props?.patterns };
+      let allow = false;
+      try {
+        const r = await self.bridgePost("permission", { tool, input });
+        allow = !!r?.allow;
+      } catch (e) {
+        // fail-closed: nega se a política não respondeu (igual approve_action)
+        self.opts.log("warn", `[cli:${self.info.id}:opencode] permission '${tool}' negada (erro política): ${(e as Error).message}`);
+      }
+      try {
+        await self.ocServeFetch(`/session/${sessionID}/permissions/${permId}`, "POST", { response: allow ? "once" : "reject" });
+      } catch (e) {
+        self.opts.log("warn", `[cli:${self.info.id}:opencode] falha respondendo permission: ${(e as Error).message}`);
+      }
+    } finally {
+      self.ocPendingPermissionIds.delete(permId);
     }
-    try {
-      await self.ocServeFetch(`/session/${sessionID}/permissions/${permId}`, "POST", { response: allow ? "once" : "reject" });
-    } catch (e) {
-      self.opts.log("warn", `[cli:${self.info.id}:opencode] falha respondendo permission: ${(e as Error).message}`);
-    }
+  }
+  /** T-788 (F2): há permission.asked pendente de aprovação humana? */
+export function ocPendingPermissionDue(self: any): boolean {
+    return (self.ocPendingPermissionIds?.size ?? 0) > 0;
   }
   /** POST ao orquestrador /api/bridge/<agentId>/<route> (via socket se houver,
    *  senão HTTP). Bearer = agentToken. Timeout longo: aprovação humana pode
@@ -362,6 +397,37 @@ export function ocHandleStreamPart(self: any, props: any): void {
     const type = String(part.type ?? "");
     if (type === "text" && part.text) self.turnLatency?.current?.semantic("text");
     if (type === "reasoning" && part.text) self.turnLatency?.current?.semantic("thinking");
+    // T-784/T-788: tool longa (build/suíte/MCP) fica minutos sem evento — sem
+    // toolsInFlight o relógio estourava o soft de 3min e o agente aparecia
+    // stalled no meio do trabalho. Com tool em voo o soft não acende
+    // (o teto segue toolsHardMs no tick).
+    // T-788 (F1): o serve REEMITE o mesmo part a cada chunk (ctx.metadata) —
+    // contar por evento incrementava N vezes e descia 1 no completed (contador
+    // grudava >0 e adiava o hard até toolsHardMs). Contagem POR TRANSIÇÃO:
+    // o partId entra no set uma vez; completed/error o remove.
+    if (type.startsWith("tool")) {
+      const status = String(part.state?.status ?? "");
+      const partId = typeof part.id === "string" ? part.id : undefined;
+      if (!self.ocToolRunningPartIds) self.ocToolRunningPartIds = new Set<string>();
+      if (status === "running") {
+        if (partId != null) {
+          if (self.ocToolRunningPartIds.has(partId)) return;
+          self.ocToolRunningPartIds.add(partId);
+        }
+        if (self.toolsInFlight === 0) self.toolsInFlightSince = Date.now();
+        self.toolsInFlight++;
+      } else if (status === "completed" || status === "error") {
+        if (partId != null) {
+          if (!self.ocToolRunningPartIds.has(partId)) return;
+          self.ocToolRunningPartIds.delete(partId);
+        }
+        self.toolsInFlight = Math.max(0, (self.toolsInFlight ?? 0) - 1);
+        if (self.toolsInFlight === 0) {
+          self.ocToolRunningPartIds.clear();
+          self.toolsInFlightSince = null;
+        }
+      }
+    }
     if (type.startsWith("tool") && part.state?.status === "running") self.turnLatency?.current?.semantic("tool");
     if ((type === "text" || type === "reasoning") && !part.time?.end) return;
     // Tool começa em `pending` (sem input resolvido): o parser não emite nada

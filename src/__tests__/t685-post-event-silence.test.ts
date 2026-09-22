@@ -186,17 +186,21 @@ test("T-685 unidade: postEventMs declarado (grok 5min); cold start T-593 intacto
   const g = hangThresholds("grok-custom");
   assert.equal(g.postEventMs, 5 * 60_000, "teto pós-evento declarado");
   assert.equal(g.firstEventMs, 5 * 60_000, "cold start (T-593) intacto");
-  assert.ok(g.softMs < g.hardMs, "soft < hard");
-  assert.ok(g.hardMs < g.postEventMs!, "teto pós-evento acima do piso");
+  // T-784: soft subiu para 3min (era 60s) — o piso seco de 120s ficou ABAIXO
+  // do soft; quem ordena agora é soft(180s) < teto pós-evento(300s).
+  assert.equal(g.softMs, 3 * 60_000, "T-784: soft pós-evento 3min");
+  assert.ok(g.hardMs < g.softMs, "piso seco abaixo do soft (nunca aciona)");
+  assert.ok(g.softMs < g.postEventMs!, "soft abaixo do teto pós-evento");
   assert.ok(g.postEventMs! < g.toolsHardMs, "teto de tool segue acima do pós-evento");
 
-  // pós-evento: 121s vira soft; hard só no teto
-  assert.equal(hangPhase(121_000, g, false), "soft");
+  // pós-evento: 121s nem soft é (T-784); soft aos 180s; hard só no teto
+  assert.equal(hangPhase(121_000, g, false), "ok");
+  assert.equal(hangPhase(g.softMs, g, false), "soft");
   assert.equal(hangPhase(g.postEventMs!, g, false), "hard");
   assert.equal(effectiveHardMs(g, false), 300_000);
 
-  // cold start inalterado (T-593)
-  assert.equal(hangPhase(121_000, g, true), "soft");
+  // cold start (T-784): nenhum soft antes de firstEventMs
+  assert.equal(hangPhase(121_000, g, true), "ok");
   assert.equal(hangPhase(g.firstEventMs!, g, true), "hard");
   assert.equal(effectiveHardMs(g, true), 300_000);
 

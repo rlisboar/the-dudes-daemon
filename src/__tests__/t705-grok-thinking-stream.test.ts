@@ -246,7 +246,7 @@ test("T-705: thought periódico < softMs NÃO dispara HARD recover aos ~304s", (
   a.ocActiveProc = child;
   a.activityClock.firstEventAt = Date.now() - 30_000;
   const soft = hangThresholds("grok").softMs;
-  assert.equal(soft, 60_000);
+  assert.equal(soft, 3 * 60_000, "T-784: soft pós-evento é 3min");
   // 50s < softMs; 7 ciclos = 350s > 304s medidos em prod
   const ciclos = 7;
   for (let i = 0; i < ciclos; i++) {

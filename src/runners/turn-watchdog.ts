@@ -104,8 +104,13 @@ export function hangThresholds(runner?: string): HangThresholds {
     // em 2026-09-18, todos com turno vivo e 0 tool em voo. O teto pós-evento
     // ganha o mesmo orçamento de 5min (postEventMs): trava real segue
     // recolhida, aos 5min em vez de 2min (custo aceito pela direção).
+    // T-784: soft aos 60s era FALSO stalled — o log real cai em 60–65s com o
+    // turno VIVO. Cold start (firstEventAt null) não pode virar stalled antes
+    // da janela firstEventMs (5min); pós-1º evento, soft sobe para 3min.
+    // Hard segue no teto pós-evento (postEventMs, 5min). Stderr bruto segue
+    // sem contar (touch é só semântico).
     return {
-      softMs: 60_000,
+      softMs: 3 * 60_000,
       hardMs: 120_000,
       deadProcMs: 12_000,
       toolsHardMs: 10 * 60_000,
@@ -171,10 +176,13 @@ export function effectiveHardMs(t: HangThresholds, coldStart: boolean): number {
 
 /** `coldStart` (T-593) = o turno ainda não emitiu nenhum evento semântico.
  *  Default false = regime pós-evento (T-685: postEventMs quando declarado);
- *  para runners sem janelas declaradas preserva os call sites anteriores. */
+ *  para runners sem janelas declaradas preserva os call sites anteriores.
+ *  T-784: em cold start o soft não acende antes de firstEventMs — "stalled"
+ *  aos 60s com o CLI ainda carregando era falso. */
 export function hangPhase(idleMs: number, t: HangThresholds, coldStart = false): HangPhase {
   if (idleMs >= effectiveHardMs(t, coldStart)) return "hard";
-  if (idleMs >= t.softMs) return "soft";
+  const softMs = coldStart && t.firstEventMs != null ? Math.max(t.softMs, t.firstEventMs) : t.softMs;
+  if (idleMs >= softMs) return "soft";
   return "ok";
 }
 

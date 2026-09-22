@@ -17,12 +17,20 @@ describe("turn-watchdog", () => {
     assert.ok(c.softMs >= 10 * 60_000);
   });
 
-  it("hangPhase transitions ok → soft → hard (teto pós-evento, T-685)", () => {
+  it("hangPhase: soft 3min pós-evento; cold start não vira stalled antes de 5min (T-784)", () => {
     const t = hangThresholds("grok");
+    // Regime pós-evento (coldStart=false, default)
     assert.equal(hangPhase(0, t), "ok");
+    assert.equal(hangPhase(t.softMs - 1, t), "ok");
     assert.equal(hangPhase(t.softMs, t), "soft");
-    assert.equal(hangPhase(t.hardMs, t), "soft", "pós-evento: o limiar seco de 120s é soft (T-685)");
+    assert.equal(hangPhase(t.postEventMs! - 1, t), "soft");
     assert.equal(hangPhase(t.postEventMs!, t), "hard");
+    // Cold start (firstEventAt null): 60s/3min NÃO é stalled (T-784);
+    // recolhimento direto no hard em firstEventMs (5min).
+    assert.equal(hangPhase(60_000, t, true), "ok", "cold start aos 60s não é stalled");
+    assert.equal(hangPhase(t.softMs, t, true), "ok", "cold start aos 3min não é stalled");
+    assert.equal(hangPhase(t.firstEventMs! - 1, t, true), "ok");
+    assert.equal(hangPhase(t.firstEventMs!, t, true), "hard");
   });
 
   it("touchActivityClock resets soft flag", () => {

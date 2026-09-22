@@ -341,17 +341,20 @@ test("T-593/T-685: janelas condicionais (cold start e pós-evento); demais runne
   assert.ok(t.firstEventMs && t.firstEventMs > t.hardMs, "família grok tem janela de cold start");
 
   // cold start: 121s ainda não mata (é o que os 121/124 hard recovers de prod
-// mediam), e o aviso soft continua saindo aos 60s
-  assert.equal(hangPhase(t.hardMs + 1_000, t, true), "soft");
-  assert.equal(hangPhase(t.softMs, t, true), "soft");
-  assert.equal(hangPhase(t.softMs - 1_000, t, true), "ok");
+// mediam); T-784: em cold start NENHUM soft acende antes de firstEventMs
+  assert.equal(hangPhase(t.hardMs + 1_000, t, true), "ok");
+  assert.equal(hangPhase(t.softMs, t, true), "ok");
+  assert.equal(hangPhase(t.firstEventMs - 1_000, t, true), "ok");
   assert.equal(hangPhase(t.firstEventMs, t, true), "hard");
-  // já emitiu (T-685): 121s também não mata — o teto pós-evento é que recolhe
+  // já emitiu (T-685): 121s também não mata — T-784: nem soft é mais (3min);
+  // o teto pós-evento é que recolhe
   assert.ok(t.postEventMs && t.postEventMs > t.hardMs, "família grok tem teto pós-evento");
-  assert.equal(hangPhase(t.hardMs + 1_000, t, false), "soft");
+  assert.equal(hangPhase(t.hardMs + 1_000, t, false), "ok");
+  assert.equal(hangPhase(t.softMs, t, false), "soft");
   assert.equal(hangPhase(t.postEventMs, t, false), "hard");
   // default (3º arg omitido) = regime pós-evento
-  assert.equal(hangPhase(t.hardMs + 1_000, t), "soft");
+  assert.equal(hangPhase(t.hardMs + 1_000, t), "ok");
+  assert.equal(hangPhase(t.softMs, t), "soft");
   assert.equal(hangPhase(t.postEventMs, t), "hard");
 
   // runners sem janelas não mudam de comportamento

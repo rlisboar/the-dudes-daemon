@@ -58,7 +58,9 @@ describe("hang detection scenario (Grok)", () => {
     const t = hangThresholds("grok");
     assert.ok(t.hardMs <= 120_000, `hardMs=${t.hardMs} > 120s`);
     assert.equal(t.postEventMs, 300_000, "teto pós-evento declarado");
-    assert.ok(t.hardMs > t.softMs);
-    assert.ok(t.softMs <= 90_000);
+    // T-784: soft 3min; o piso seco (120s) ficou abaixo do soft e nunca aciona;
+    // a ordem relevante é soft < teto pós-evento.
+    assert.equal(t.softMs, 3 * 60_000);
+    assert.ok(t.softMs < t.postEventMs!);
   });
 });

@@ -153,6 +153,48 @@ test("T-055 aceite: HARD recover → killGrokLeader (mock sock)", () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+test("T-784: lsof vazio → fallback por argv --leader-socket mata o grupo e remove o sock", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "td-leader-"));
+  const sock = path.join(dir, "leader.sock");
+  writeFileSync(sock, "");
+  const alvo = path.join(dir, "outro.sock");
+  writeFileSync(alvo, "");
+  const pidsRecebidos: number[] = [];
+  const sinais: string[] = [];
+  const origKill = process.kill;
+  (process as any).kill = (pid: number, signal?: string) => {
+    sinais.push(`${pid}:${signal}`);
+    return true;
+  };
+  try {
+    const mortos: number[] = [];
+    const vias: string[] = [];
+    const n = killGrokLeader(
+      sock,
+      // finder injetado: um leader deste sock + um de OUTRO sock (não pode morrer)
+      (p) => (p === sock ? [42_000] : [42_001]),
+      (pid, via) => { mortos.push(pid); vias.push(via); },
+    );
+    assert.equal(n, 1, "só o leader do sock pedido morre");
+    assert.deepEqual(mortos, [42_000], "pid morto reportado via callback");
+    assert.deepEqual(vias, ["argv"], "T-788 F3: fallback por argv é declarado no log");
+    // kill de GRUPO (-pid), não individual
+    assert.ok(sinais.includes("-42000:SIGKILL"), `esperava kill(-42000), tive ${sinais.join(",")}`);
+    assert.ok(!sinais.some((s) => s.includes("42001")), "leader de outro sock não pode ser morto");
+    assert.equal(existsSync(sock), false, "sock removido mesmo com lsof vazio");
+    assert.equal(existsSync(alvo), true, "arquivo alheio intacto");
+    // finder vazio: nenhum kill, sock ainda removido
+    sinais.length = 0;
+    const n2 = killGrokLeader(sock, () => []);
+    assert.equal(n2, 0);
+    assert.equal(sinais.length, 0);
+    assert.equal(existsSync(sock), false);
+  } finally {
+    (process as any).kill = origKill;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("T-055 aceite: BridgeRelay timeout = 25s", () => {
   assert.equal(BridgeRelay.UPSTREAM_FETCH_TIMEOUT_MS, 25_000);
 });

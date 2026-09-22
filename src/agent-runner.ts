@@ -435,6 +435,12 @@ export class AgentRunner {
   private toolsInFlight = 0;
   /** Quando toolsInFlight passou de 0 → >0 (ms). */
   private toolsInFlightSince: number | null = null;
+  /** T-788 (F1): partIds de tool em `running` — dedup da REEMISSÃO do serve
+   *  (cada chunk reenvia o part; contar por evento gruda o contador >0). */
+  private ocToolRunningPartIds = new Set<string>();
+  /** T-788 (F2): permission.asked pendentes de aprovação humana — turno vivo
+   *  enquanto existirem (o tick renova o relógio). */
+  private ocPendingPermissionIds = new Set<string>();
   /** T-240 (d): janela de agregação de notificações de hard recover (1h,
    *  por agente). 1º attempt não notifica individualmente; ≥3 na janela
    *  vira 1 resumo. attempt≥2 notifica individualmente. */
@@ -963,7 +969,10 @@ export class AgentRunner {
     // Grok: mata também o leader persistente (não é o ocActiveProc). Sem isto
     // o leader fica zumbi entre restarts — só era morto no HARD recover.
     if (isGrokFamily(this.opts.cliRunner)) {
-      try { killGrokLeader(this.runtimeFiles.grokLeaderSocket()); } catch { /* best-effort */ }
+      try {
+        killGrokLeader(this.runtimeFiles.grokLeaderSocket(), undefined, (pid, via) =>
+          this.opts.log("warn", `[cli:${this.info.id}:${this.opts.cliRunner}] matou leader grok pid=${pid} (stop, via ${via})`));
+      } catch { /* best-effort */ }
     }
     if (isPerMessageRunner(this.opts.cliRunner)) {
       // T-593: turno abandonado por hard recover não está em `ocActiveProc` —
@@ -1442,6 +1451,14 @@ export class AgentRunner {
       }
     }
 
+    // T-788 (F2): aprovação humana pendente (permission.asked) — o bridge
+    // espera até 5min e o soft é 3min; sem renovação a espera virava stalled.
+    if (runner === "opencode" && this.ocPendingPermissionIds.size > 0) {
+      this.touchActivity();
+      if (this.currentState === "stalled") this.setState("thinking");
+      return;
+    }
+
     // Grok: NÃO resetar idle por mtime de signals/updates/chat_history.
     // O poll de tools + o CLI escrevem nesses arquivos a cada poucos
     // segundos MESMO quando o turno está zumbi sem resposta pro user —
@@ -1520,7 +1537,8 @@ export class AgentRunner {
       // --leader-socket deste agente e limpa o sock.
       if (isGrokFamily(this.opts.cliRunner)) {
         const sock = this.runtimeFiles.grokLeaderSocket();
-        const n = killGrokLeader(sock);
+        const n = killGrokLeader(sock, undefined, (pid, via) =>
+          this.opts.log("warn", `[hang:${this.info.name}] matou leader grok pid=${pid} (via ${via})`));
         if (n > 0) {
           this.opts.log("warn", `[hang:${this.info.name}] matou leader grok (${n} pid) sock=${sock}`);
         }
@@ -1532,6 +1550,10 @@ export class AgentRunner {
       this.waitingTurnGate = false;
       this.toolsInFlight = 0;
       this.toolsInFlightSince = null;
+      // T-788: estado de contagem por part/permission do turno morto não
+      // pode vazar para o retry.
+      this.ocToolRunningPartIds.clear();
+      this.ocPendingPermissionIds.clear();
       this.activityClock.softReported = false;
       this.activityClock.deadSince = null;
       // Slot do gate ANTES de drain: senão a re-fila espera em si mesma.

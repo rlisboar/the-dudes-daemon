@@ -73,22 +73,25 @@ function simulateHardRecover(input: {
   return { requeued, busy: false };
 }
 
-test("thresholds grok: soft aos 60s; hard no teto pós-evento (T-009 reescopado pela T-685)", () => {
+test("thresholds grok: soft 3min pós-evento; cold start isento até 5min (T-009 reescopado por T-685/T-784)", () => {
   const t = hangThresholds("grok");
+  // Pós-evento: soft aos 3min, hard no teto declarado (postEventMs, 5min).
   assert.equal(hangPhase(t.softMs - 1, t), "ok");
   assert.equal(hangPhase(t.softMs, t), "soft");
-  // T-685: pós-evento o limiar seco de 120s virou soft; o recolhimento é no
-  // teto declarado (postEventMs) — sem tool em voo e processo vivo.
-  assert.equal(hangPhase(t.hardMs, t), "soft");
+  assert.equal(hangPhase(t.hardMs, t), "ok", "120s seco nem soft é mais (T-784: falso stalled)");
   assert.equal(hangPhase(t.postEventMs!, t), "hard");
+  // Cold start (firstEventAt null): nenhum soft antes de firstEventMs (5min).
+  assert.equal(hangPhase(60_000, t, true), "ok", "T-784: cold start aos 60s NÃO é stalled");
+  assert.equal(hangPhase(t.firstEventMs!, t, true), "hard");
   assert.ok(t.hardMs <= 120_000);
 });
 
 test("bytes brutos NÃO contam: só touchActivity semântico avança o relógio", () => {
   // Repro da causa-raiz: se cada stderr reseta idle, hard nunca chega.
   const clock = createActivityClock(0);
-  // "ruído" de thrash — NÃO chamar touchActivityClock
-  const idleAfterNoise = 100_000;
+  // "ruído" de thrash — NÃO chamar touchActivityClock. T-784: pós-evento o
+  // soft agora é 3min (o teste antigo esperava soft aos 60s).
+  const idleAfterNoise = 200_000;
   assert.equal(hangPhase(idleAfterNoise, hangThresholds("grok")), "soft");
   // progresso semântico (text/tool) reseta
   touchActivityClock(clock, 100_000);
