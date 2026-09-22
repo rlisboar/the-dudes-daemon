@@ -124,8 +124,13 @@ export async function runOpenCodeMessageAttached(self: any, content: string, ima
     self.ocRunSawOutput = false;
     // T-788: turno novo começa com a contagem por part zerada (sem herança
     // de partIds do turno anterior).
+    // T-790 (G1): e o CONTADOR junto — se um running do turno anterior não
+    // recebeu terminal, o error tardio cai no return de "não está no set" e
+    // o toolsInFlight gruda >0: soft some e o hard espera toolsHardMs (20min).
     self.ocToolRunningPartIds?.clear();
     self.ocPendingPermissionIds?.clear();
+    self.toolsInFlight = 0;
+    self.toolsInFlightSince = null;
     // provider/modelID + reasoning effort (sufixo ":high"/":max" ou effort do agente).
     const { providerID, modelID } = providerModelParts(self.info.model);
     // Garante sessão no serve (POST /session). Reusa sessionId se já existe.

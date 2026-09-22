@@ -159,7 +159,6 @@ test("T-784: lsof vazio → fallback por argv --leader-socket mata o grupo e rem
   writeFileSync(sock, "");
   const alvo = path.join(dir, "outro.sock");
   writeFileSync(alvo, "");
-  const pidsRecebidos: number[] = [];
   const sinais: string[] = [];
   const origKill = process.kill;
   (process as any).kill = (pid: number, signal?: string) => {

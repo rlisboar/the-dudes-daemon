@@ -14,7 +14,7 @@ import os from "node:os";
 import { AgentRunner } from "../agent-runner.js";
 import { resolveCliCommands } from "../cli-config.js";
 import { hangPhase, hangThresholds } from "../runners/turn-watchdog.js";
-import { ocHandlePermissionAsked, ocHandleStreamPart } from "../runners/turns/opencode.js";
+import { ocHandlePermissionAsked, ocHandleStreamPart, runOpenCodeMessageAttached } from "../runners/turns/opencode.js";
 
 function makeRunner(): { runner: AgentRunner; a: any; hung: Array<{ soft: boolean }> } {
   const hung: Array<{ soft: boolean }> = [];
@@ -206,6 +206,45 @@ test("T-788 F2: erro na política/serve também remove a pendência (finally)", 
     a.ocServeFetch = async () => { throw new Error("serve fora"); };
     await ocHandlePermissionAsked(runner, { id: "perm-2", sessionID: "sess-perm3", permission: "bash" });
     assert.equal((a.ocPendingPermissionIds as Set<string>).has("perm-2"), false, "falha não gruda pendência");
+  } finally {
+    runner.stop();
+  }
+});
+
+test("T-790 G1: início do turno REAL zera toolsInFlight residual (running sem terminal)", async () => {
+  const { runner, a } = makeRunner();
+  try {
+    a.stopped = false;
+    a.info.model = undefined;
+    a.messageSession.busy = true;
+    a.messageSession.epoch = 11;
+    a.messageSession.sessionId = "sess-g1";
+    a.messageSession.needsPrime = false;
+    a.messageSession.consumeFirstTurnIfNeeded = () => ({ firstTurn: false, pendingSummary: undefined });
+    a.messageSession.owns = () => true;
+    a.openCodeTransport = { ready: () => true, abortSession: async () => {}, stop: () => {} };
+    a.fetchOcCatalogLimit = () => {};
+    a.traceCli = () => {};
+    a.attachNonImageFiles = (content: string) => ({ content, cleanup: () => {} });
+    a.scheduleAttachmentCleanup = () => {};
+    a.turnLatency.enqueue = () => {};
+    a.turnLatency.activate = () => {};
+    a.ensureRunnerAvailable = () => true;
+    a.runOpenCodeMessage = async () => {};
+    a.ocHandlePermissionAsked = () => {};
+    // Residual do turno anterior: running que NUNCA recebeu terminal — o
+    // error tardio caiu no return de "não está no set" e o contador grudou.
+    a.ocToolRunningPartIds = new Set(["fantasma"]);
+    a.toolsInFlight = 1;
+    a.toolsInFlightSince = Date.now() - 25 * 60_000;
+    // O turno REAL (POST rejeita logo) — o reset do início é o que estamos
+    // provando; nada é setado à mão depois.
+    a.ocServeFetch = async () => { throw new Error("timeout 600000ms"); };
+    await runOpenCodeMessageAttached(runner, "msg", undefined, 2); // retry esgotado: sem re-agendar
+    a.stopped = true;
+    assert.equal(a.toolsInFlight, 0, "início do turno zera o contador residual");
+    assert.equal(a.toolsInFlightSince, null, "início do turno zera o since");
+    assert.equal((a.ocToolRunningPartIds as Set<string>).size, 0, "início do turno zera o set de partIds");
   } finally {
     runner.stop();
   }
