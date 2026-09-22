@@ -219,12 +219,17 @@ export const daemonWireSchemas = {
   "graph:data": msg("graph:data", { projectId: t.optional(), json: t.optional(), error: t.optional(), correlationId: t.optional() }),
   "open_design:result": msg("open_design:result", {
     correlationId: t,
-    kind: z.enum(["projects", "files", "file"]),
+    kind: z.enum(["projects", "files", "file", "run", "notice"]),
     projects: z.array(z.object({ id: t, name: t, designSystemId: t.nullable().optional() })).optional(),
     files: z.array(z.object({ path: t, name: t, size: n.optional() })).optional(),
     odProjectId: t.optional(),
     path: t.optional(),
     content: t.optional(),
+    runId: t.optional(),
+    status: t.optional(),
+    previewUrl: t.optional(),
+    message: t.optional(),
+    text: t.optional(),
     error: t.optional(),
   }),
 };
@@ -450,6 +455,13 @@ export const fromOrchSchemas = {
   "open_design:list": msg("open_design:list", { correlationId: t }),
   "open_design:files": msg("open_design:files", { correlationId: t, odProjectId: t }),
   "open_design:file": msg("open_design:file", { correlationId: t, odProjectId: t, path: t }),
+  "open_design:create_project": msg("open_design:create_project", { correlationId: t, name: t }),
+  "open_design:delete_project": msg("open_design:delete_project", { correlationId: t, odProjectId: t }),
+  "open_design:write": msg("open_design:write", { correlationId: t, odProjectId: t, path: t, content: t }),
+  "open_design:delete_file": msg("open_design:delete_file", { correlationId: t, odProjectId: t, path: t }),
+  "open_design:start_run": msg("open_design:start_run", { correlationId: t, odProjectId: t, prompt: t, skillId: t.optional() }),
+  "open_design:run": msg("open_design:run", { correlationId: t, runId: t }),
+  "open_design:cancel_run": msg("open_design:cancel_run", { correlationId: t, runId: t }),
 
   "models:discover": msg("models:discover", { correlationId: t, runner: t.optional(), force: b.optional() }),
 };

@@ -1267,6 +1267,8 @@ export type ServerEvent =
   | { type: "open_design:projects"; projects: Array<{ id: string; name: string; designSystemId?: string | null }>; error?: string }
   | { type: "open_design:files"; odProjectId: string; files: Array<{ path: string; name: string; size?: number }>; error?: string }
   | { type: "open_design:file"; odProjectId: string; path: string; content?: string; error?: string }
+  | { type: "open_design:notice"; text?: string; error?: string }
+  | { type: "open_design:run"; runId: string; status?: string; previewUrl?: string; message?: string; error?: string }
   | { type: "graph:data"; json?: string; error?: string }
   | { type: "usage_breakdown"; byUser: { userId: string; input: number; output: number }[]; byModel: { model: string; input: number; output: number }[]; from?: string; to?: string }
   | { type: "pong" }
@@ -1473,6 +1475,13 @@ export type ClientCommand =
   | { type: "open_design:list" }
   | { type: "open_design:files"; odProjectId: string }
   | { type: "open_design:file"; odProjectId: string; path: string }
+  | { type: "open_design:create_project"; name: string }
+  | { type: "open_design:delete_project"; odProjectId: string }
+  | { type: "open_design:write"; odProjectId: string; path: string; content: string }
+  | { type: "open_design:delete_file"; odProjectId: string; path: string }
+  | { type: "open_design:start_run"; odProjectId: string; prompt: string; skillId?: string }
+  | { type: "open_design:run"; runId: string }
+  | { type: "open_design:cancel_run"; runId: string }
   | { type: "graph:reindex"; semantic?: boolean; backend?: string; model?: string }
   | { type: "graph:get" }
   | { type: "get_usage"; from?: string; to?: string }

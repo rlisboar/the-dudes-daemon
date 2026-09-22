@@ -622,15 +622,27 @@ export interface GraphFetchRequest { type: "graph:fetch"; correlationId?: string
 export interface OpenDesignListRequest { type: "open_design:list"; correlationId: string; }
 export interface OpenDesignFilesRequest { type: "open_design:files"; correlationId: string; odProjectId: string; }
 export interface OpenDesignFileRequest { type: "open_design:file"; correlationId: string; odProjectId: string; path: string; }
+export interface OpenDesignCreateProjectRequest { type: "open_design:create_project"; correlationId: string; name: string; }
+export interface OpenDesignDeleteProjectRequest { type: "open_design:delete_project"; correlationId: string; odProjectId: string; }
+export interface OpenDesignWriteRequest { type: "open_design:write"; correlationId: string; odProjectId: string; path: string; content: string; }
+export interface OpenDesignDeleteFileRequest { type: "open_design:delete_file"; correlationId: string; odProjectId: string; path: string; }
+export interface OpenDesignStartRunRequest { type: "open_design:start_run"; correlationId: string; odProjectId: string; prompt: string; skillId?: string; }
+export interface OpenDesignRunRequest { type: "open_design:run"; correlationId: string; runId: string; }
+export interface OpenDesignCancelRunRequest { type: "open_design:cancel_run"; correlationId: string; runId: string; }
 export interface OpenDesignResult {
   type: "open_design:result";
   correlationId: string;
-  kind: "projects" | "files" | "file";
+  kind: "projects" | "files" | "file" | "run" | "notice";
   projects?: Array<{ id: string; name: string; designSystemId?: string | null }>;
   files?: Array<{ path: string; name: string; size?: number }>;
   odProjectId?: string;
   path?: string;
   content?: string;
+  runId?: string;
+  status?: string;
+  previewUrl?: string;
+  message?: string;
+  text?: string;
   error?: string;
 }
 /** graph.json (string) devolvido pelo daemon pro mapa. */
@@ -1082,4 +1094,11 @@ export type FromOrch =
   | OpenDesignListRequest
   | OpenDesignFilesRequest
   | OpenDesignFileRequest
+  | OpenDesignCreateProjectRequest
+  | OpenDesignDeleteProjectRequest
+  | OpenDesignWriteRequest
+  | OpenDesignDeleteFileRequest
+  | OpenDesignStartRunRequest
+  | OpenDesignRunRequest
+  | OpenDesignCancelRunRequest
   | ModelsDiscoverRequest;

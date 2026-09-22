@@ -654,6 +654,13 @@ export const commandSchemas = {
   "open_design:list": cmd({}),
   "open_design:files": cmd({ odProjectId: text }),
   "open_design:file": cmd({ odProjectId: text, path: text }),
+  "open_design:create_project": cmd({ name: text }),
+  "open_design:delete_project": cmd({ odProjectId: text }),
+  "open_design:write": cmd({ odProjectId: text, path: text, content: text }),
+  "open_design:delete_file": cmd({ odProjectId: text, path: text }),
+  "open_design:start_run": cmd({ odProjectId: text, prompt: text, skillId: text.optional() }),
+  "open_design:run": cmd({ runId: text }),
+  "open_design:cancel_run": cmd({ runId: text }),
 
   summarize: cmd({
     correlationId: text,

@@ -1,6 +1,6 @@
 /**
- * Cliente HTTP só de leitura do daemon local do Open Design.
- * Só loopback. Sem POST, sem path com `..`.
+ * Cliente HTTP do daemon local do Open Design.
+ * Só loopback. Path sem `..`. Escrita é POST/DELETE na API local.
  */
 
 const PADRAO = "http://127.0.0.1:7456";
@@ -42,10 +42,35 @@ function idSeguro(id: string): string {
   return id;
 }
 
+async function pedir(url: string, init?: RequestInit): Promise<Response> {
+  const res = await fetch(url, { ...init, signal: AbortSignal.timeout(8000) });
+  return res;
+}
+
 async function lerJson(url: string): Promise<unknown> {
-  const res = await fetch(url, { method: "GET", signal: AbortSignal.timeout(4000) });
+  const res = await pedir(url);
   if (!res.ok) throw new Error(`Open Design HTTP ${res.status}`);
   return res.json();
+}
+
+async function enviarJson(url: string, method: "POST" | "DELETE", body?: unknown): Promise<unknown> {
+  const res = await pedir(url, {
+    method,
+    headers: body === undefined ? undefined : { "content-type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg = data && typeof data === "object" && data && "error" in data ? JSON.stringify((data as { error: unknown }).error) : "";
+    throw new Error(`Open Design HTTP ${res.status}${msg ? ` ${msg}` : ""}`);
+  }
+  return data;
+}
+
+function nomeSeguro(nome: string): string {
+  const n = nome.trim();
+  if (!n || n.length > 120 || /[\u0000-\u001f]/.test(n)) throw new Error("nome recusado");
+  return n;
 }
 
 export async function listarProjetosOd(): Promise<ProjetoOd[]> {
@@ -81,4 +106,81 @@ export async function lerArquivoOd(odProjectId: string, path: string): Promise<s
   const buf = Buffer.from(await res.arrayBuffer());
   if (buf.length > TETO_ARQUIVO) throw new Error("arquivo grande demais para a aba");
   return buf.toString("utf8");
+}
+
+export async function criarProjetoOd(name: string): Promise<{ id: string; name: string }> {
+  const data = await enviarJson(`${baseUrl()}/api/projects`, "POST", {
+    id: crypto.randomUUID(),
+    name: nomeSeguro(name),
+  }) as { project?: { id?: string; name?: string } };
+  const id = data.project?.id;
+  const nome = data.project?.name ?? name;
+  if (!id) throw new Error("Open Design não devolveu o id do projeto");
+  return { id, name: nome };
+}
+
+export async function apagarProjetoOd(odProjectId: string): Promise<void> {
+  await enviarJson(`${baseUrl()}/api/projects/${encodeURIComponent(idSeguro(odProjectId))}`, "DELETE");
+}
+
+export async function gravarArquivoOd(odProjectId: string, path: string, content: string): Promise<void> {
+  if (content.length > TETO_ARQUIVO) throw new Error("arquivo grande demais para a aba");
+  await enviarJson(`${baseUrl()}/api/projects/${encodeURIComponent(idSeguro(odProjectId))}/files`, "POST", {
+    name: caminhoSeguro(path),
+    content,
+    encoding: "utf8",
+  });
+}
+
+export async function apagarArquivoOd(odProjectId: string, path: string): Promise<void> {
+  const rel = caminhoSeguro(path);
+  await enviarJson(`${baseUrl()}/api/projects/${encodeURIComponent(idSeguro(odProjectId))}/files/${encodeURIComponent(rel)}`, "DELETE");
+}
+
+export async function listarSkillsOd(): Promise<string[]> {
+  const body = await lerJson(`${baseUrl()}/api/skills`) as { skills?: unknown };
+  const lista = Array.isArray(body?.skills) ? body.skills : [];
+  return lista.flatMap((item) => {
+    if (typeof item === "string") return [item];
+    if (item && typeof item === "object" && typeof (item as { id?: string }).id === "string") return [(item as { id: string }).id];
+    return [];
+  });
+}
+
+export interface RunOd {
+  runId: string;
+  status?: string;
+  previewUrl?: string;
+  message?: string;
+}
+
+export async function iniciarRunOd(odProjectId: string, prompt: string, skillId?: string): Promise<RunOd> {
+  const texto = prompt.trim();
+  if (!texto || texto.length > 8000) throw new Error("pedido recusado");
+  const body: Record<string, string> = { projectId: idSeguro(odProjectId), message: texto };
+  if (skillId?.trim()) body.skillId = skillId.trim().slice(0, 120);
+  const data = await enviarJson(`${baseUrl()}/api/runs`, "POST", body) as { runId?: string; run?: { id?: string; status?: string } };
+  const runId = data.runId ?? data.run?.id;
+  if (!runId) throw new Error("Open Design não devolveu o run");
+  return { runId, status: data.run?.status ?? "queued" };
+}
+
+export async function lerRunOd(runId: string): Promise<RunOd> {
+  if (!/^[A-Za-z0-9_.:-]{8,120}$/.test(runId)) throw new Error("run recusado");
+  const data = await lerJson(`${baseUrl()}/api/runs/${encodeURIComponent(runId)}`) as {
+    runId?: string; id?: string; status?: string; previewUrl?: string; agentMessage?: string;
+    run?: { id?: string; status?: string; previewUrl?: string; agentMessage?: string };
+  };
+  const run = data.run ?? data;
+  return {
+    runId: run.id ?? data.runId ?? runId,
+    status: run.status,
+    previewUrl: run.previewUrl,
+    message: run.agentMessage,
+  };
+}
+
+export async function cancelarRunOd(runId: string): Promise<void> {
+  if (!/^[A-Za-z0-9_.:-]{8,120}$/.test(runId)) throw new Error("run recusado");
+  await enviarJson(`${baseUrl()}/api/runs/${encodeURIComponent(runId)}/cancel`, "POST");
 }
