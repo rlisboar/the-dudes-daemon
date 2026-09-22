@@ -28,6 +28,7 @@ import { MAX_DAEMON_WIRE_MESSAGE_BYTES, WireMessageTooLargeError, parseWireMessa
 import { AgentHost, agentErrorKind, sealAgentErrorMessage } from "./agent-host.js";
 import { assertWorkspaceScoped, autoWorkspaceCwd, describeGitRoots, ensureWritableDir, expandBasePath, isInsideRoot, validateBasePath, validateGitHash, validateGitRef } from "./workspace.js";
 import { buildGraph, graphMtime, graphPath, hasSemanticMarker, loadGraphJsonForUi, needsSemanticUpdate } from "./graph-indexer.js";
+import { lerArquivoOd, listarArquivosOd, listarProjetosOd } from "./open-design-client.js";
 import { ensureGraphWatch, stopAllGraphWatches } from "./graph-watcher.js";
 import { detectDropTarget, spawnDropped, type DropTarget } from "./privileges.js";
 import { BridgeRelay, type PeerPidMode } from "./bridge-relay.js";
@@ -1145,6 +1146,11 @@ export class DaemonClient {
       case "graph:fetch":
         await this.handleGraphFetch(msg);
         return;
+      case "open_design:list":
+      case "open_design:files":
+      case "open_design:file":
+        await this.handleOpenDesign(msg);
+        return;
       case "git:blame":
         await this.handleGitOp(msg.correlationId, "blame", ["blame", "--", msg.path]);
         return;
@@ -1745,6 +1751,38 @@ export class DaemonClient {
       }
     } catch (e) {
       this.send({ type: "graph:data", projectId: msg.projectId, error: (e as Error).message, correlationId: msg.correlationId });
+    }
+  }
+
+  /** Aba Open Design: só GET no daemon local. Erro volta no mesmo correlationId. */
+  private async handleOpenDesign(msg: Extract<FromOrch, { type: "open_design:list" | "open_design:files" | "open_design:file" }>): Promise<void> {
+    const kind = msg.type === "open_design:list" ? "projects" : msg.type === "open_design:files" ? "files" : "file";
+    try {
+      if (msg.type === "open_design:list") {
+        this.send({ type: "open_design:result", correlationId: msg.correlationId, kind, projects: await listarProjetosOd() });
+        return;
+      }
+      if (msg.type === "open_design:files") {
+        this.send({ type: "open_design:result", correlationId: msg.correlationId, kind, odProjectId: msg.odProjectId, files: await listarArquivosOd(msg.odProjectId) });
+        return;
+      }
+      this.send({
+        type: "open_design:result",
+        correlationId: msg.correlationId,
+        kind,
+        odProjectId: msg.odProjectId,
+        path: msg.path,
+        content: await lerArquivoOd(msg.odProjectId, msg.path),
+      });
+    } catch (e) {
+      this.send({
+        type: "open_design:result",
+        correlationId: msg.correlationId,
+        kind,
+        odProjectId: msg.type === "open_design:list" ? undefined : msg.odProjectId,
+        path: msg.type === "open_design:file" ? msg.path : undefined,
+        error: (e as Error).message,
+      });
     }
   }
 

@@ -618,6 +618,21 @@ export interface GraphStatusEvent {
 }
 /** Orch pede o graph.json do workspace pra renderizar o mapa na UI. */
 export interface GraphFetchRequest { type: "graph:fetch"; correlationId?: string; projectId?: string; workspaceRoot?: string; }
+
+export interface OpenDesignListRequest { type: "open_design:list"; correlationId: string; }
+export interface OpenDesignFilesRequest { type: "open_design:files"; correlationId: string; odProjectId: string; }
+export interface OpenDesignFileRequest { type: "open_design:file"; correlationId: string; odProjectId: string; path: string; }
+export interface OpenDesignResult {
+  type: "open_design:result";
+  correlationId: string;
+  kind: "projects" | "files" | "file";
+  projects?: Array<{ id: string; name: string; designSystemId?: string | null }>;
+  files?: Array<{ path: string; name: string; size?: number }>;
+  odProjectId?: string;
+  path?: string;
+  content?: string;
+  error?: string;
+}
 /** graph.json (string) devolvido pelo daemon pro mapa. */
 export interface GraphDataEvent { type: "graph:data"; projectId?: string; json?: string; error?: string; correlationId?: string; }
 
@@ -1031,6 +1046,7 @@ export type FromDaemon =
   | MCPDeleteResult
   | GraphStatusEvent
   | GraphDataEvent
+  | OpenDesignResult
   | ModelsCatalogResult;
 
 export type FromOrch =
@@ -1063,4 +1079,7 @@ export type FromOrch =
   | MCPDeleteRequest
   | GraphBuildRequest
   | GraphFetchRequest
+  | OpenDesignListRequest
+  | OpenDesignFilesRequest
+  | OpenDesignFileRequest
   | ModelsDiscoverRequest;

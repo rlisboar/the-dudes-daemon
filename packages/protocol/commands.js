@@ -258,7 +258,7 @@ export const commandSchemas = {
   }),
   set_auto_retry: cmd({ enabled: flag, seconds: num }),
   set_context_feature: cmd({
-    feature: z.enum(["tasks", "teammates", "goals", "credentials", "webhooks", "graph", "board"]),
+    feature: z.enum(["tasks", "teammates", "goals", "credentials", "webhooks", "graph", "board", "openDesign"]),
     value: flag,
   }),
   set_project_planner: cmd({ agentId: id.nullable() }),
@@ -651,6 +651,9 @@ export const commandSchemas = {
   "skill:delete": cmd({ correlationId: text, skillName: text }),
   "graph:reindex": cmd({ semantic: flag.optional(), backend: text.optional(), model: text.optional() }),
   "graph:get": cmd({}),
+  "open_design:list": cmd({}),
+  "open_design:files": cmd({ odProjectId: text }),
+  "open_design:file": cmd({ odProjectId: text, path: text }),
 
   summarize: cmd({
     correlationId: text,

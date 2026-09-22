@@ -217,6 +217,16 @@ export const daemonWireSchemas = {
     correlationId: t.optional(),
   }),
   "graph:data": msg("graph:data", { projectId: t.optional(), json: t.optional(), error: t.optional(), correlationId: t.optional() }),
+  "open_design:result": msg("open_design:result", {
+    correlationId: t,
+    kind: z.enum(["projects", "files", "file"]),
+    projects: z.array(z.object({ id: t, name: t, designSystemId: t.nullable().optional() })).optional(),
+    files: z.array(z.object({ path: t, name: t, size: n.optional() })).optional(),
+    odProjectId: t.optional(),
+    path: t.optional(),
+    content: t.optional(),
+    error: t.optional(),
+  }),
 };
 
 /**
@@ -437,6 +447,9 @@ export const fromOrchSchemas = {
     apiKeyCipher: t.optional(),
   }),
   "graph:fetch": msg("graph:fetch", { correlationId: t.optional(), projectId: t.optional(), workspaceRoot: t.optional() }),
+  "open_design:list": msg("open_design:list", { correlationId: t }),
+  "open_design:files": msg("open_design:files", { correlationId: t, odProjectId: t }),
+  "open_design:file": msg("open_design:file", { correlationId: t, odProjectId: t, path: t }),
 
   "models:discover": msg("models:discover", { correlationId: t, runner: t.optional(), force: b.optional() }),
 };

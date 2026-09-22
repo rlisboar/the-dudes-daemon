@@ -276,6 +276,8 @@ export interface Project {
   /** Knowledge graph (graphify) ligado p/ os agentes — injeta o MCP graphify
    *  e indexa o workspace. Lean: novos nascem off. */
   graphEnabled?: boolean;
+  /** Aba Open Design. Lean: novos nascem off. Só leitura via daemon local. */
+  openDesignEnabled?: boolean;
   /** Explanation Board — tools board_* + aba Quadro. Lean: novos nascem off. */
   boardEnabled?: boolean;
   /** Linguagem de diagrama do quadro (default mermaid). */
@@ -1260,8 +1262,11 @@ export type ServerEvent =
   | { type: "credential:revealed"; id: string; value: string }
   | { type: "permission:request"; req: PermissionRequest }
   | { type: "permission:resolved"; requestId: string; allow: boolean }
-  | { type: "config"; autoApprove: boolean; loopProtection: "reactive" | "preventive"; loopLimitEnabled?: boolean; loopLimit?: number; loopPairLimit?: number; loopPairWindowMs?: number; memoryEnabled?: boolean; memoryMaxPinned?: number; e2eeRequired?: boolean; tasksEnabled?: boolean; teammatesEnabled?: boolean; goalsEnabled?: boolean; credentialsEnabled?: boolean; webhooksEnabled?: boolean; graphEnabled?: boolean; boardEnabled?: boolean; diagramLanguage?: DiagramLanguage; boardMode?: BoardMode; boardHtmlLevel?: BoardHtmlLevel; boardWidth?: BoardWidth; autoRetryEnabled?: boolean; autoRetrySeconds?: number }
+  | { type: "config"; autoApprove: boolean; loopProtection: "reactive" | "preventive"; loopLimitEnabled?: boolean; loopLimit?: number; loopPairLimit?: number; loopPairWindowMs?: number; memoryEnabled?: boolean; memoryMaxPinned?: number; e2eeRequired?: boolean; tasksEnabled?: boolean; teammatesEnabled?: boolean; goalsEnabled?: boolean; credentialsEnabled?: boolean; webhooksEnabled?: boolean; graphEnabled?: boolean; openDesignEnabled?: boolean; boardEnabled?: boolean; diagramLanguage?: DiagramLanguage; boardMode?: BoardMode; boardHtmlLevel?: BoardHtmlLevel; boardWidth?: BoardWidth; autoRetryEnabled?: boolean; autoRetrySeconds?: number }
   | { type: "graph:status"; status: "idle" | "building" | "ready" | "error"; nodeCount?: number; edgeCount?: number; error?: string; inputTokens?: number; outputTokens?: number; lastIndexedAt?: number; progress?: number; phase?: string; indexMtime?: number; stale?: boolean; graphifyAvailable?: boolean; graphifyMcpAvailable?: boolean; docsPending?: boolean; hasSemantic?: boolean }
+  | { type: "open_design:projects"; projects: Array<{ id: string; name: string; designSystemId?: string | null }>; error?: string }
+  | { type: "open_design:files"; odProjectId: string; files: Array<{ path: string; name: string; size?: number }>; error?: string }
+  | { type: "open_design:file"; odProjectId: string; path: string; content?: string; error?: string }
   | { type: "graph:data"; json?: string; error?: string }
   | { type: "usage_breakdown"; byUser: { userId: string; input: number; output: number }[]; byModel: { model: string; input: number; output: number }[]; from?: string; to?: string }
   | { type: "pong" }
@@ -1464,7 +1469,10 @@ export type ClientCommand =
   | { type: "set_memory_enabled"; value: boolean }
   | { type: "set_memory_max_pinned"; value: number }
   | { type: "set_e2ee_required"; value: boolean }
-  | { type: "set_context_feature"; feature: "tasks" | "teammates" | "goals" | "credentials" | "webhooks" | "graph" | "board"; value: boolean }
+  | { type: "set_context_feature"; feature: "tasks" | "teammates" | "goals" | "credentials" | "webhooks" | "graph" | "board" | "openDesign"; value: boolean }
+  | { type: "open_design:list" }
+  | { type: "open_design:files"; odProjectId: string }
+  | { type: "open_design:file"; odProjectId: string; path: string }
   | { type: "graph:reindex"; semantic?: boolean; backend?: string; model?: string }
   | { type: "graph:get" }
   | { type: "get_usage"; from?: string; to?: string }
