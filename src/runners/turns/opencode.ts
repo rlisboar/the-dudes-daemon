@@ -121,6 +121,10 @@ export async function runOpenCodeMessageAttached(self: any, content: string, ima
     }
     // Coleta a janela real do catálogo em paralelo ao turno (idempotente).
     void self.fetchOcCatalogLimit();
+    // O idle do POST lê activityClock. Sem este toque, um agente parado há
+    // mais de 30 min faz o primeiro tick abortar o POST novo (o log mostra
+    // "timeout 1800000ms" num turno de ~30s) e o abort da sessão mata o retry.
+    self.touchActivity?.();
     self.ocRunSawOutput = false;
     // T-788: turno novo começa com a contagem por part zerada (sem herança
     // de partIds do turno anterior).
@@ -225,6 +229,9 @@ export async function runOpenCodeMessageAttached(self: any, content: string, ima
           // side effects de tools). Não toca busy: o clear já zerou e um
           // turno novo pode ser o dono agora.
           if (!self.messageSession.owns(turnEpoch, turnSession)) return;
+          // A sessão abortada no serve responde MessageAborted no mesmo id.
+          // O retry precisa de uma sessão nova; owns() já passou.
+          if (fail.timedOut || /MessageAborted/.test(emsg)) self.messageSession.sessionId = undefined;
           self.turnLatency?.activate(retryMessage, self.messageSession.sessionId ? "resume" : "cold");
           void self.runOpenCodeMessage(content, images, retry + 1);
         }, 1200);
@@ -257,6 +264,9 @@ export async function runOpenCodeMessageAttached(self: any, content: string, ima
       const status = infoErr?.data?.statusCode;
       const nome = infoErr?.name ? `${infoErr.name}: ` : "";
       ocReportError(self, `opencode: ${nome}${status ? `${status} — ` : ""}${im}`);
+      // Sessão abortada no serve não se reaproveita: o próximo turno criaria
+      // outro POST no mesmo id e voltaria Aborted sem texto.
+      if (/MessageAborted/.test(im) || /MessageAborted/.test(nome)) self.messageSession.sessionId = undefined;
     }
     // O POST /message só retorna a ÚLTIMA mensagem do assistant; as tool calls
     // ficam em mensagens INTERMEDIÁRIAS do loop (uma msg por step). Busca TODAS

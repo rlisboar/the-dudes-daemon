@@ -96,7 +96,11 @@ export function requestJson(baseUrl: string, requestPath: string, method: string
       const started = Date.now();
       const timer = setInterval(() => {
         const agora = Date.now();
-        const semEvento = agora - progress.activity();
+        // Relógio antigo (agente ocioso há horas) não pode matar um POST que
+        // acabou de começar. O silêncio conta do início do request, ou do
+        // último evento se ele for mais novo.
+        const marco = Math.max(progress.activity(), started);
+        const semEvento = agora - marco;
         if (semEvento >= progress.idleTimeoutMs) {
           clearInterval(timer);
           request.destroy(new Error(`timeout ${progress.idleTimeoutMs}ms (sem evento do agente; run parado)`));

@@ -50,6 +50,19 @@ test("T-776: com progresso o POST renova e só morre no CAP absoluto", async () 
   } finally { await s.close(); }
 });
 
+test("T-776: relógio anterior ao POST não conta como ociosidade deste turno", async () => {
+  const s = await slowServer(80);
+  try {
+    const velho = Date.now() - 31 * 60_000;
+    const out = await requestJson(s.base, "/x", "POST", {}, 30_000, {
+      idleTimeoutMs: 30 * 60_000,
+      totalTimeoutMs: 60_000,
+      activity: () => velho,
+    });
+    assert.deepEqual(out, {});
+  } finally { await s.close(); }
+});
+
 test("T-776: resposta normal resolve antes de qualquer corte", async () => {
   const s = await slowServer(120);
   try {
