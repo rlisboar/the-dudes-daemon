@@ -1201,13 +1201,16 @@ export class AgentHost {
    *  chave do projeto; sem chave (ou projeto desconhecido) a mensagem NÃO vai
    *  para o disco — perda declarada no log, nunca plaintext. Arquivo 0600 em
    *  diretório 0700, escrita atômica (tmp + rename). */
-  writeReexecSpool(dir: string = reexecSpoolDir()): { spooled: number; lost: number; path: string | null } {
+  writeReexecSpool(dir: string = reexecSpoolDir()): { spooled: number; lost: number; lostDeliveryIds: string[]; path: string | null } {
     for (const agentId of this.inboundAgentIds) {
       for (const m of this.inboundBuffer.drain(agentId)) this.holdForDrain(agentId, { ...m, images: m.images as ImageAttachment[] | undefined });
     }
     this.inboundAgentIds.clear();
     const records: SpoolRecord[] = [];
     let lost = 0;
+    // T-824 (prova): id da mensagem que NÃO entrou no spool não pode ir para os
+    // vistos — o replay do server é a única chance dela no processo novo.
+    const lostDeliveryIds: string[] = [];
     for (const [agentId, items] of this.drainHeld) {
       const projectId = this.entries.get(agentId)?.projectId;
       for (const item of items) {
@@ -1216,6 +1219,7 @@ export class AgentHost {
           : null;
         if (!projectId || !blob || !blob.startsWith("e2e:v2:")) {
           lost++;
+          if (item.deliveryId) lostDeliveryIds.push(item.deliveryId);
           this.log("warn", `[self-update] spool: msg para ${agentId} (project=${projectId ?? "?"}) sem chave do projeto — NÃO gravada em claro; perdida no re-exec`);
           continue;
         }
@@ -1229,7 +1233,7 @@ export class AgentHost {
     records.push(...pendentes);
     if (records.length === 0) {
       this.drainHeld.clear();
-      return { spooled: 0, lost, path: null };
+      return { spooled: 0, lost, lostDeliveryIds, path: null };
     }
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     fs.chmodSync(dir, 0o700);
@@ -1239,7 +1243,7 @@ export class AgentHost {
     fs.renameSync(tmp, file);
     this.drainHeld.clear();
     this.spooled.clear();
-    return { spooled: records.length, lost, path: file };
+    return { spooled: records.length, lost, lostDeliveryIds, path: file };
   }
 
   /** T-720: boot do processo novo — carrega o spool (entregue no spawn de

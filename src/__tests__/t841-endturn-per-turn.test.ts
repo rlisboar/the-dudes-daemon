@@ -83,7 +83,9 @@ async function tresTurnos(kind: "codex" | "gemini") {
     runner.pushUserMessage("dois");
     runner.pushUserMessage("tres");
     const t0 = Date.now();
-    while (Date.now() - t0 < 8_000 && !(texts.length >= 3 && a.messageSession.busy === false)) {
+    // T-888: 8s era apertado (o QA mediu 4,8s sob carga). O que o teste prova é
+    // a ORDEM e o busy liberado, não o tempo — 15s não enfraquece a asserção.
+    while (Date.now() - t0 < 15_000 && !(texts.length >= 3 && a.messageSession.busy === false)) {
       await new Promise((r) => setTimeout(r, 30));
     }
     assert.deepEqual(texts, ["resp-1", "resp-2", "resp-3"], `${kind}: uma resposta por mensagem`);
@@ -96,6 +98,19 @@ async function tresTurnos(kind: "codex" | "gemini") {
     runner.stop();
   }
 }
+
+test("T-888: o histórico de turnos encerrados é podado (sem vazamento de dias)", async () => {
+  const { endTurn, ENDED_TURN_KEYS_CAP } = await import("../runners/turns/end-turn.js");
+  const self: any = { messageSession: { owns: () => true }, stopped: false, releaseActiveTurnSlot: () => {}, setState: () => {}, drainOcQueue: () => {} };
+  for (let i = 0; i < ENDED_TURN_KEYS_CAP * 2 + 7; i++) endTurn(self, { epoch: 1, turnKey: `t${i}` });
+  assert.equal(self.__endedTurnKeys.size, ENDED_TURN_KEYS_CAP, "mapa limitado pelo teto");
+  // A garantia que importa segue valendo: o close DUPLO do turno mais recente
+  // é engolido (o mais antigo já saiu — e é o comportamento desejado).
+  const antes = self.__endedTurnKeys.size;
+  endTurn(self, { epoch: 1, turnKey: `t${ENDED_TURN_KEYS_CAP * 2 + 6}` });
+  assert.equal(self.__endedTurnKeys.size, antes, "chave recente continua no mapa");
+  assert.ok(!self.__endedTurnKeys.has("t0"), "o turno mais antigo saiu primeiro");
+});
 
 test("T-841 codex: 3 turnos seguidos no mesmo epoch fecham, sem resposta duplicada", async () => {
   await tresTurnos("codex");

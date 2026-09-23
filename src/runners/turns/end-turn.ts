@@ -14,6 +14,13 @@
  */
 import type { FirstTurnSnapshot } from "../message-session.js";
 
+/**
+ * T-888: teto do histórico de turnos encerrados por runner. 512 turnos cobrem
+ * folgado a janela do close tardio (o dobro do pior visto: um turno inteiro);
+ * acima disso o custo de memória por agente fica limitado a alguns KB.
+ */
+export const ENDED_TURN_KEYS_CAP = 512;
+
 export interface EndTurnOpts {
   epoch: number;
   /** T-841: identidade deste turno. Dois turnos do mesmo epoch são chaves distintas. */
@@ -38,6 +45,19 @@ export function endTurn(self: any, o: EndTurnOpts): void {
   const ended: Set<string> = (self.__endedTurnKeys ??= new Set());
   if (ended.has(o.turnKey) && !self.stopped) return;
   ended.add(o.turnKey);
+  // T-888: o mapa crescia UM por turno e nunca era podado — num daemon que
+  // fica dias no ar isso é vazamento lento (um agente tagarela faz ~4,3 mil
+  // turnos/dia; 100 mil chaves ≈ 8 MB por runner, ~120 MB com 15 agentes em 3
+  // semanas). O que a chave protege é o close DUPLO/tardio do MESMO turno, que
+  // aterra em segundos — não precisa de histórico infinito. Set preserva a
+  // ordem de inserção, então podar a frente descarta o turno mais antigo.
+  if (ended.size > ENDED_TURN_KEYS_CAP) {
+    let sobra = ended.size - ENDED_TURN_KEYS_CAP;
+    for (const k of ended) {
+      if (sobra-- <= 0) break;
+      ended.delete(k);
+    }
+  }
   try { o.beforeCleanup?.(); } catch { /* flush best-effort */ }
   try { o.imgCleanup?.(); } catch { /* cleanup best-effort */ }
   if (owns || self.stopped) {

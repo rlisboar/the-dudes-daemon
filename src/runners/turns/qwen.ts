@@ -198,14 +198,22 @@ export async function runQwenMessage(self: any, content: string, images?: ImageA
       }
     });
     proc.on("close", (code) => {
-      self.releaseActiveTurnSlot(); // T-251
+      // T-886: o guarda do T-371 cobria só PROC/BUSY. O `releaseActiveTurnSlot`
+      // era incondicional, então o close TARDIO de um turno morto pelo hard
+      // recover consumia o handle do gate do turno NOVO que o drain pôs em voo
+      // (contador do gate subconta → pool admite um turno extra e /health
+      // subnotifica), e o `setState("idle")`/`drainOcQueue()` do fim voltavam o
+      // runner a idle com turno vivo. Mesmo guard dos irmãos (gemini/codex/
+      // crush em endTurn, grok T-593): quem manda é a POSSE do epoch.
+      const dono = self.messageSession.owns(epoch) || self.stopped;
+      if (dono) self.releaseActiveTurnSlot(); // T-251
       flush();
       imgCleanup();
       // T-371: close TARDIO de um turno já recuperado (SIGKILL do hard
       // recover) não pode zerar busy/proc do turno NOVO que o drain do
       // recover pôs em voo — o guarda que o caminho grok aprendeu na T-240.
       // Em stop(), o teardown completo é do stop(), não daqui.
-      if (self.messageSession.owns(epoch) || self.stopped) {
+      if (dono) {
         self.ocActiveProc = null;
         self.messageSession.busy = false;
       }
@@ -252,8 +260,12 @@ export async function runQwenMessage(self: any, content: string, images?: ImageA
           self.opts.onError(`qwen: ${errOut.trim().slice(0, 500)}`);
         }
       }
-      self.setState("idle");
-      self.drainOcQueue();
+      // T-886: sem posse do epoch o turno NOVO segue em voo — voltar a idle
+      // aqui mentia no estado e o drain podia despachar por cima dele.
+      if (dono) {
+        self.setState("idle");
+        self.drainOcQueue();
+      }
     });
   }
   /* ---------- Codex per-message model ---------- */

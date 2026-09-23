@@ -2795,7 +2795,10 @@ export class DaemonClient {
     commitReexecSnapshot({
       tag,
       writeSpool: () => this.host.writeReexecSpool(),
-      saveSeen: () => saveDeliverySeen(profileHome(), this.deliveryDedup.snapshot()),
+      saveSeen: (excluir) => {
+        const fora = new Set(excluir);
+        saveDeliverySeen(profileHome(), this.deliveryDedup.snapshot().filter((id) => !fora.has(id)));
+      },
       log: (level, msg) => log(level, msg),
     });
   }
