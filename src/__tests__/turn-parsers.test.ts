@@ -4,7 +4,17 @@ import { parseCodexTurnEvent, parseCrushSessionMeta, parseGeminiTurnEvent, parse
 
 test("Codex normalizes session, tool, text, usage and failures", () => {
   assert.deepEqual(parseCodexTurnEvent({ type: "thread.started", thread_id: "t1" }), [{ type: "session", sessionId: "t1" }]);
-  assert.deepEqual(parseCodexTurnEvent({ type: "item.started", item: { type: "mcp_tool_call", tool: "send_message", arguments: { to: "B" } } }), [{ type: "tool", name: "send_message", input: { to: "B" } }]);
+  // T-829: tool iniciada ganha id (o do item, ou sintético "anon-N" se faltar)
+  // para o completed descontar o in-flight.
+  const [tool] = parseCodexTurnEvent({ type: "item.started", item: { type: "mcp_tool_call", tool: "send_message", arguments: { to: "B" } } }) as Array<{ type: string; name: string; input: unknown; id?: string }>;
+  assert.equal(tool!.type, "tool");
+  assert.equal(tool!.name, "send_message");
+  assert.deepEqual(tool!.input, { to: "B" });
+  assert.match(String(tool!.id), /^anon-\d+$/);
+  assert.deepEqual(
+    parseCodexTurnEvent({ type: "item.started", item: { id: "item_7", type: "mcp_tool_call", tool: "send_message", arguments: { to: "B" } } }),
+    [{ type: "tool", name: "send_message", input: { to: "B" }, id: "item_7" }],
+  );
   assert.deepEqual(parseCodexTurnEvent({ type: "item.completed", item: { type: "agent_message", text: " ok " } }), [{ type: "text", text: "ok" }]);
   assert.deepEqual(parseCodexTurnEvent({ type: "turn.completed", usage: { input_tokens: 10, output_tokens: 2, cached_input_tokens: 4 } }), [{ type: "usage", input: 10, output: 2, cacheCreate: 0, cacheRead: 4, cumulative: false }]);
   assert.deepEqual(parseCodexTurnEvent({ type: "turn.failed", error: { message: "context full" } }), [{ type: "error", message: "context full" }]);
