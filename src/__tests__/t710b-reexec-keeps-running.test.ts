@@ -5,7 +5,9 @@
  * processo novo não tinha o que religar (replay só religa running=true).
  *
  * Agora: re-exec do self-update (shutdown({reexec:true})) mata os CLIs mas NÃO
- * anuncia exit/running false. O shutdown normal (SIGTERM) segue anunciando.
+ * anuncia exit/running false. T-824: o shutdown por SIGTERM/SIGINT do daemon
+ * também passa a flag (antes anunciava e o server deixava todo agente parado
+ * depois de qualquer reinício). `host.shutdown()` sem flag segue anunciando.
  * AgentHost real + CLI stub (claude), sem mock do onExit.
  */
 import "./scratch-home.js";
@@ -80,7 +82,7 @@ test("T-710b (1): re-exec do self-update mata os CLIs e NÃO emite agent:exit / 
   assert.deepEqual(outbound.filter(anunciaParada), [], `emitiu: ${JSON.stringify(outbound.filter(anunciaParada))}`);
 });
 
-test("T-710b (3) regressão: shutdown normal (SIGTERM/stop) CONTINUA emitindo agent:exit + running false", async () => {
+test("T-710b (3) regressão: host.shutdown() sem flag (parada definitiva do uninstall, T-824) CONTINUA emitindo agent:exit + running false", async () => {
   const { host, outbound, runners } = await hostCom2Agentes();
   outbound.length = 0;
   await host.shutdown();
@@ -92,12 +94,16 @@ test("T-710b (3) regressão: shutdown normal (SIGTERM/stop) CONTINUA emitindo ag
   assert.deepEqual(parados, ["agent_t710b_a", "agent_t710b_b"]);
 });
 
-test("T-710b (5) wiring: self-update chama prepareReexec({keepRunning:true}) e loga a contagem; SIGTERM não passa a flag", () => {
+test("T-710b (5) wiring: self-update chama prepareReexec({keepRunning:true}) e loga a contagem; T-824: SIGTERM também passa a flag", () => {
   const src = readFileSync(new URL("../main.ts", import.meta.url), "utf8");
   assert.match(src, /prepareReexec: \(\) => this\.prepareReexec\(\{ keepRunning: true \}\)/, "gate do self-update mantém running");
   assert.match(src, /\[self-update\] reexec: \$\{n\} agent\(s\) mantidos running/);
   const shutdownAt = src.indexOf("private async shutdown()");
-  const bloco = src.slice(shutdownAt, shutdownAt + 1200);
-  assert.match(bloco, /await this\.prepareReexec\(\);/, "shutdown normal chama SEM keepRunning");
+  const bloco = src.slice(shutdownAt, src.indexOf("\n  }\n}", shutdownAt));
+  assert.match(bloco, /await this\.prepareReexec\(\{ keepRunning: true, porSinal: true \}\);/, "T-824: shutdown por sinal mantém os agentes running");
+  // O único anúncio de exit é a parada definitiva pedida pelo uninstall.
+  const semFlag = bloco.split("await this.prepareReexec();").length - 1;
+  assert.equal(semFlag, 1, "só um caminho anuncia exit");
+  assert.match(bloco, /if \(pararDeVez\) \{[\s\S]*?await this\.prepareReexec\(\);/, "e ele só vale com o marcador de parar de vez");
   assert.match(src, /this\.host\.shutdown\(\{ reexec: !!opts\.keepRunning \}\)/);
 });

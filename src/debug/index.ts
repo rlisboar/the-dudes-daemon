@@ -16,6 +16,7 @@ import v8 from "node:v8";
 import inspector from "node:inspector";
 import { performance } from "node:perf_hooks";
 import { dashboardHtml } from "./dashboard-html.js";
+import { profileHome } from "../profile-home.js";
 import { lastHostMemory, ProcSampler, refreshHostMemory, type ProcSample } from "./proc-sampler.js";
 import { readLoopStats, type LoopStats } from "./probes.js";
 import { analyzeHistory, historyLogFiles, type HistorySummary } from "./history.js";
@@ -50,11 +51,7 @@ export interface DashboardHandle {
 
 /* ───────────────────────────── perfil / config ───────────────────────────── */
 
-export function profileHome(): string {
-  const bin = process.env.THE_DUDES_DAEMON_BIN || process.argv[1] || "";
-  if (bin.endsWith(".cjs")) return path.dirname(path.resolve(bin));
-  return path.join(os.homedir(), ".the-dudes");
-}
+export { profileHome } from "../profile-home.js";
 
 interface DashboardConfig { token: string; port: number }
 

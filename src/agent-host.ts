@@ -1,6 +1,6 @@
+import { profileHome } from "./profile-home.js";
 import path from "node:path";
 import fs from "node:fs";
-import os from "node:os";
 import {AgentRunner, type AgentRunnerOptions} from "./agent-runner.js";
 import {breadcrumb, captureWarn} from "./sentry.js";
 import {assertWorkspaceScoped, autoWorkspaceCwd, cloneRepoIfMissing, expandBasePath, findGitRoot, getWorkspaceRoot, isInsideRoot, repoCwd} from "./workspace.js";
@@ -162,8 +162,12 @@ const SPOOL_TTL_MS = 60 * 60_000;
 function spoolAad(projectId: string): string {
   return aadV2({ projectId, table: "daemon_reexec_spool", field: "message" });
 }
+/** T-824 (revisão): por PERFIL. Com os dois perfis desta máquina no mesmo
+ *  HOME, o spool era um arquivo só: no logout/reboot os dois daemons faziam
+ *  rename no mesmo caminho (o último vencia) e, no boot, um regravava as
+ *  mensagens do outro. */
 export function reexecSpoolDir(): string {
-  return process.env.THE_DUDES_REEXEC_SPOOL_DIR || path.join(os.homedir(), ".the-dudes", "reexec-spool");
+  return process.env.THE_DUDES_REEXEC_SPOOL_DIR || path.join(profileHome(), "reexec-spool");
 }
 
 export class AgentHost {
@@ -177,6 +181,10 @@ export class AgentHost {
    *  (e nas filas tiradas dos runners) até o spool do re-exec. */
   private draining = false;
   private drainHeld = new Map<string, SpoolItem[]>();
+  /** T-824: por que o dreno está ligado — muda o aviso no chat. */
+  private drainReason: "update" | "shutdown" = "update";
+  /** T-824: agentes que já receberam o aviso de dreno (1× por dreno). */
+  private drainNotified = new Set<string>();
   /** T-720: spool carregado no boot do processo novo, entregue no spawn. */
   private spooled = new Map<string, SpoolRecord[]>();
   private spoolPath: string | null = null;
@@ -850,7 +858,16 @@ export class AgentHost {
       // T-720: dreno — não alimenta o runner (turno novo atrasaria o re-exec);
       // a mensagem vai no spool cifrado e é entregue pelo processo novo.
       this.holdForDrain(agentId, { content, images, deliveryId, enqueuedAt: Date.now() });
-      this.log("info", `[self-update] dreno: send_message para ${agentId} retido para o re-exec (${this.drainHeld.get(agentId)?.length ?? 0} retidas)`);
+      this.log("info", `${this.drainReason === "update" ? "[self-update] dreno" : "[shutdown] dreno"}: send_message para ${agentId} retido para o próximo processo (${this.drainHeld.get(agentId)?.length ?? 0} retidas)`);
+      // T-824: no dreno do update o agente parece travado na UI (a mensagem
+      // não vira turno até os turnos em curso terminarem) e o dono reiniciava
+      // o daemon. Avisa no chat do agente, uma vez por dreno.
+      if (this.entries.has(agentId) && !this.drainNotified.has(agentId)) {
+        this.drainNotified.add(agentId);
+        this.emitAgentError(agentId, this.drainReason === "update"
+          ? "[daemon] atualização do daemon pendente: esta mensagem e as próximas ficam retidas até os turnos em curso terminarem e são entregues logo depois da troca. Não precisa reiniciar."
+          : "[daemon] daemon reiniciando: esta mensagem fica retida e é entregue quando o processo novo subir.");
+      }
       return;
     }
     const e = this.entries.get(agentId);
@@ -930,8 +947,9 @@ export class AgentHost {
   /** T-720: liga o dreno. Tira dos runners as mensagens enfileiradas e ainda
    *  NÃO iniciadas (o turno em curso segue e termina normalmente) e passa a
    *  reter todo send_message novo. @returns mensagens retiradas das filas. */
-  startDrain(): number {
+  startDrain(reason: "update" | "shutdown" = "update"): number {
     this.draining = true;
+    this.drainReason = reason;
     let moved = 0;
     for (const [agentId, e] of this.entries) {
       const take = (e.runner as unknown as { takeQueuedForDrain?: () => Array<{ content: string; images?: ImageAttachment[] }> } | null)?.takeQueuedForDrain;
@@ -946,6 +964,10 @@ export class AgentHost {
   }
 
   isDraining(): boolean { return this.draining; }
+
+  /** Revisão T-824: SIGTERM no meio do dreno do update — o aviso passa a ser
+   *  o de reinício (o de "não precisa reiniciar" viraria mentira). */
+  setDrainReason(reason: "update" | "shutdown"): void { this.drainReason = reason; }
 
   /** T-720: grava o spool ANTES do re-exec. Só blob e2e:v2 re-cifrado com a
    *  chave do projeto; sem chave (ou projeto desconhecido) a mensagem NÃO vai
@@ -973,6 +995,12 @@ export class AgentHost {
       }
     }
     this.drainHeld.clear();
+    // Revisão T-824: o spool do boot anterior que ainda não foi entregue
+    // (agente que não subiu a tempo) entra junto — antes o rename o
+    // sobrescrevia e dois reinícios seguidos perdiam as retidas mais antigas.
+    const pendentes = [...this.spooled.values()].flat();
+    records.push(...pendentes);
+    this.spooled.clear();
     if (records.length === 0) return { spooled: 0, lost, path: null };
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     fs.chmodSync(dir, 0o700);
@@ -1068,8 +1096,8 @@ export class AgentHost {
     return [...this.spooled.values()].reduce((n, l) => n + l.length, 0);
   }
 
-  /** T-710b: re-exec do self-update em curso — os CLIs morrem, mas o agente
-   *  NÃO parou para o time. onExit não anuncia exit/running false ao server
+  /** T-710b: re-exec do self-update em curso (T-824: e shutdown por sinal) —
+   *  os CLIs morrem, mas o agente NÃO parou para o time. onExit não anuncia exit/running false ao server
    *  (ele seguiria marcando parada normal, e o hello do processo novo não
    *  teria o que religar). O server mantém running=true, a graça de offline
    *  cobre o gap e o replay do hello re-spawna. Processo novo que não volta:

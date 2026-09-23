@@ -13,7 +13,7 @@ import {
 import { captureBootBinaryHash, checkAndApplyUpdate, runningReleaseInfo } from "./self-update.js";
 import { DAEMON_BUILD_TS } from "./daemon-build-ts.js";
 import { createSelfUpdateGate } from "./self-update-gate.js";
-import { createDeliveryDeduper } from "./inbound-dedup.js";
+import { createDeliveryDeduper, loadDeliverySeen, saveDeliverySeen } from "./inbound-dedup.js";
 import {
   resolveGrokSessionRoots,
   scheduleGrokSessionCleanup,
@@ -401,6 +401,18 @@ export class DaemonClient {
     try { this.host.loadReexecSpool(); } catch (e) {
       log("warn", `[self-update] spool: leitura falhou (${(e as Error).message})`);
     }
+    // T-824 (revisão): ids de entrega vistos pelo processo anterior — o replay
+    // do server (resumeFromSeq=0) não reentrega o que já foi processado/retido.
+    try {
+      const vistos = loadDeliverySeen(profileHome());
+      for (const id of vistos) this.deliveryDedup.markSeen(id);
+      if (vistos.length) log("info", `[boot] ${vistos.length} id(s) de entrega do processo anterior carregados (dedup do replay)`);
+    } catch (e) {
+      log("warn", `[boot] ids de entrega vistos: leitura falhou (${(e as Error).message})`);
+    }
+    // Marcador de "parar de vez" que sobrou de um uninstall sem daemon vivo
+    // não pode valer para o próximo shutdown.
+    try { fs.rmSync(path.join(profileHome(), STOP_AGENTS_MARKER), { force: true }); } catch { /* noop */ }
     POLICY_GATED_RUNNERS.forEach((runner) => {
       const status = this.cliCommands[runner];
       log(status.available ? "info" : "warn", formatCliStatus(runner, status));
@@ -2613,28 +2625,51 @@ export class DaemonClient {
   private shuttingDown = false;
 
   /** T-100: só os filhos/CLIs — NÃO process.exit. O caller decide 0 vs 42. */
-  /** T-710b: keepRunning=true só no re-exec do self-update (exit 42): os
-   *  agentes seguem running no server e o hello do processo novo os religa.
-   *  O shutdown normal (SIGTERM) chama sem flag e anuncia o exit. */
-  private async prepareReexec(opts: { keepRunning?: boolean } = {}): Promise<void> {
-    log("info", "[self-update] parando CLIs filhos antes do re-exec");
+  /** T-710b: keepRunning=true: os CLIs morrem, mas os agentes seguem running
+   *  no server e o hello do processo novo os religa (replay; passada a graça
+   *  de 90s do server, auto-resume).
+   *  T-824: o shutdown por sinal (SIGTERM/SIGINT) também mantém — reinício
+   *  manual, bootout/reinstalação do LaunchAgent, logout/reboot. Antes ele
+   *  anunciava exit de cada agente e o server os deixava parados até alguém
+   *  dar Start (23/09: o time inteiro do alertai parou num reinício manual).
+   *  Parar agente de propósito continua sendo pela UI (agent:stop). */
+  private async prepareReexec(opts: { keepRunning?: boolean; porSinal?: boolean } = {}): Promise<void> {
+    if (opts.porSinal) log("info", "[shutdown] parando CLIs filhos; os agentes seguem running no server e voltam no próximo hello (T-824)");
+    else log("info", "[self-update] parando CLIs filhos antes do re-exec");
     try { stopAllGraphWatches(); } catch { /* noop */ }
     // T-720: no re-exec, retém tudo que chegar daqui em diante (idle natural
     // não passou pelo dreno) e tira o que ainda estiver nas filas.
-    if (opts.keepRunning && !this.host.isDraining()) this.host.startDrain();
-    const n = await this.host.shutdown({ reexec: !!opts.keepRunning });
-    if (opts.keepRunning) log("info", `[self-update] reexec: ${n} agent(s) mantidos running`);
     if (opts.keepRunning) {
-      // Depois do shutdown: menor janela para mensagem chegar e ficar de fora.
-      try {
-        const sp = this.host.writeReexecSpool();
-        log("info", `[self-update] spool: ${sp.spooled} msg(s) gravadas cifradas${sp.lost ? `, ${sp.lost} perdida(s) sem chave (não gravadas em claro)` : ""}`);
-      } catch (e) {
-        log("warn", `[self-update] spool falhou: ${(e as Error).message} — mensagens retidas perdidas no re-exec`);
-      }
+      if (!this.host.isDraining()) this.host.startDrain(opts.porSinal ? "shutdown" : "update");
+      else if (opts.porSinal) this.host.setDrainReason("shutdown");
     }
+    // Revisão T-824: no sinal o WS já fechou (nada novo chega). Grava spool e
+    // ids vistos ANTES de matar os CLIs: um daemon novo que suba em paralelo
+    // (bootout+bootstrap, Ctrl-C+rerun) já acha os arquivos no boot.
+    if (opts.keepRunning && opts.porSinal) this.gravarSpoolEVistos("[shutdown]");
+    const n = await this.host.shutdown({ reexec: !!opts.keepRunning });
+    if (opts.keepRunning && opts.porSinal) log("info", `[shutdown] ${n} agent(s) mantidos running`);
+    else if (opts.keepRunning) log("info", `[self-update] reexec: ${n} agent(s) mantidos running`);
+    // Re-exec do update: o WS segue aberto até aqui — grava depois do
+    // shutdown, menor janela para mensagem chegar e ficar de fora.
+    if (opts.keepRunning && !opts.porSinal) this.gravarSpoolEVistos("[self-update]");
     // terminateWithEscalation agenda SIGKILL em ~1.5s; espera o timer.
     await new Promise((r) => setTimeout(r, 2_500));
+  }
+
+  /** Revisão T-824: spool das retidas + ids de entrega vistos, por perfil. */
+  private gravarSpoolEVistos(tag: string): void {
+    try {
+      const sp = this.host.writeReexecSpool();
+      log("info", `${tag} spool: ${sp.spooled} msg(s) gravadas cifradas${sp.lost ? `, ${sp.lost} perdida(s) sem chave (não gravadas em claro)` : ""}`);
+    } catch (e) {
+      log("warn", `${tag} spool falhou: ${(e as Error).message} — mensagens retidas perdidas na saída`);
+    }
+    try {
+      saveDeliverySeen(profileHome(), this.deliveryDedup.snapshot());
+    } catch (e) {
+      log("warn", `${tag} ids de entrega vistos: gravação falhou (${(e as Error).message}) — o replay pode reentregar`);
+    }
   }
 
   private async shutdown() {
@@ -2646,7 +2681,23 @@ export class DaemonClient {
     // relay.stop()/forgetAllProjectKeys() viraria unhandled rejection e pularia
     // o process.exit(0). O finally garante que o daemon sempre encerra.
     try {
-      await this.prepareReexec();
+      // T-824: sinal = o daemon vai embora, não os agentes (ver prepareReexec),
+      // salvo "parar de vez" pedido pelo uninstall (marcador no perfil).
+      const marcador = path.join(profileHome(), STOP_AGENTS_MARKER);
+      const pararDeVez = fs.existsSync(marcador);
+      if (pararDeVez) {
+        try { fs.rmSync(marcador, { force: true }); } catch { /* noop */ }
+        log("info", "[shutdown] parada definitiva pedida (uninstall) — anunciando exit dos agentes");
+        await this.prepareReexec();
+      } else {
+        // Revisão T-824: fecha o WS PRIMEIRO. Sem agent:exit, a conexão velha
+        // seguia no registry do server com os agentes "ativos" até o fim do
+        // shutdown, e um daemon novo que subisse antes tinha o replay pulado.
+        this.stopPing();
+        this.stopHeartbeat();
+        try { this.ws?.close(1000, "shutdown"); } catch { /* noop */ }
+        await this.prepareReexec({ keepRunning: true, porSinal: true });
+      }
       if (this.relay) this.relay.stop();
       this.stopPing();
       this.stopHeartbeat();
@@ -2665,6 +2716,10 @@ export class DaemonClient {
     }
   }
 }
+
+/** T-824: o uninstall cria este arquivo no perfil antes do bootout: o SIGTERM
+ *  seguinte usa o shutdown que anuncia exit (agentes param de verdade). */
+const STOP_AGENTS_MARKER = "stop-agents-on-exit";
 
 /** PID vivo? kill(pid,0) não envia sinal — só testa existência. EPERM = existe
  *  mas não é nosso (ainda vivo); ESRCH = morto. */

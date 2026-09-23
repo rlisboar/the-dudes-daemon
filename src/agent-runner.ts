@@ -474,6 +474,8 @@ export class AgentRunner {
   private ocCatalogLimitFetch?: Promise<void>;
   static readonly OC_EMPTY_RETRIES = 1;
   private codexTurnBilling: { epoch: number; delta: AgentUsage } | null = null;
+  /** T-829: ids dos itens de tool do codex em voo (started sem completed). */
+  private codexToolItems: Set<string> | null = null;
   private grokSeenToolCallIds = new Set<string>();
   private grokToolsPrimed = false;
   private grokChatSweepState: { path: string; offset: number } | null = null;

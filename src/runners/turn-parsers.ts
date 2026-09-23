@@ -2,6 +2,8 @@ export type NormalizedTurnEvent =
   | { type: "session"; sessionId: string }
   | { type: "text"; text: string }
   | { type: "tool"; name: string; input: unknown; id?: string }
+  /** T-829: tool (com id) concluída — desconta o in-flight. */
+  | { type: "tool_done"; id: string }
   | { type: "usage"; input: number; output: number; cacheCreate: number; cacheRead: number; cumulative: boolean }
   | { type: "plan" }
   | { type: "result" }
@@ -11,6 +13,10 @@ export type NormalizedTurnEvent =
 const record = (value: unknown): Record<string, unknown> | null =>
   value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 
+/** T-829: tool iniciada SEM id (formato antigo/incompleto) ainda conta em voo —
+ *  id sintético que nenhum completed desconta; o turn.completed zera, como antes. */
+let codexAnonToolSeq = 0;
+
 export function parseCodexTurnEvent(raw: unknown): NormalizedTurnEvent[] {
   const event = record(raw);
   if (!event || typeof event.type !== "string") return [];
@@ -18,8 +24,30 @@ export function parseCodexTurnEvent(raw: unknown): NormalizedTurnEvent[] {
   if (event.type === "thread.started" && typeof event.thread_id === "string" && event.thread_id) {
     return [{ type: "session", sessionId: event.thread_id }];
   }
+  // T-829: id do item liga o started ao completed (in-flight por tool).
+  const itemId = typeof item?.id === "string" && item.id ? item.id : undefined;
   if (event.type === "item.started" && item?.type === "mcp_tool_call") {
-    return [{ type: "tool", name: typeof item.tool === "string" ? item.tool : "", input: item.arguments ?? {} }];
+    return [{ type: "tool", name: typeof item.tool === "string" ? item.tool : "", input: item.arguments ?? {}, id: itemId ?? `anon-${++codexAnonToolSeq}` }];
+  }
+  // T-829: shell, build e testes são o grosso do trabalho do codex e não viravam
+  // tool (sumiam da RUNS, da "última tool" e do turn-latency). codex-cli 0.156:
+  // item.started/completed {type:"command_execution", command, aggregated_output, exit_code, status}.
+  if (event.type === "item.started" && item?.type === "command_execution") {
+    return [{ type: "tool", name: "shell", input: { command: typeof item.command === "string" ? item.command : "" }, id: itemId ?? `anon-${++codexAnonToolSeq}` }];
+  }
+  if (event.type === "item.completed" && itemId && (item?.type === "command_execution" || item?.type === "mcp_tool_call")) {
+    return [{ type: "tool_done", id: itemId }];
+  }
+  // Edição de arquivo e busca chegam como item concluído: tool instantânea,
+  // sem in-flight (não há par started para descontar).
+  if (event.type === "item.completed" && item?.type === "file_change") {
+    return [{ type: "tool", name: "file_change", input: { changes: Array.isArray(item.changes) ? item.changes : [] } }];
+  }
+  if (event.type === "item.completed" && item?.type === "web_search") {
+    return [{ type: "tool", name: "web_search", input: { query: typeof item.query === "string" ? item.query : "" } }];
+  }
+  if (event.type === "item.completed" && item?.type === "reasoning" && typeof item.text === "string" && item.text.trim()) {
+    return [{ type: "thought", text: item.text.trim() }];
   }
   if (event.type === "item.completed" && item?.type === "agent_message" && typeof item.text === "string" && item.text.trim()) {
     return [{ type: "text", text: item.text.trim() }];

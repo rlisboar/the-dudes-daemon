@@ -30,12 +30,21 @@ export function writeCodexConfig(self: any, ): void {
       try { chownSync(file, self.opts.dropTo.uid, self.opts.dropTo.gid); } catch {}
     }
   }
+/** T-829: espera do `close` depois do `exit`. O close só vem quando TODOS os
+ *  pipes fecham; neto que herdou stdout/stderr (MCP do codex, comando em
+ *  background) segura o pipe e o turno ficava busy até o watchdog dar HARD
+ *  recover ("process dead for 20s while busy", 41× no log de 21/09). */
+export const CODEX_CLOSE_GRACE_MS = 2_000;
+
 export async function runCodexMessage(self: any, content: string, images?: ImageAttachment[]) {
     const timing = self.turnLatency?.current;
     if (self.stopped) return;
     if (!self.ensureRunnerAvailable("codex")) return;
     // T-251: gate de turno para todos os runners (antes só Grok).
     if (!(await self.gateTurn())) { self.messageSession.busy = false; return; }
+    // T-829: contador de tools é por turno; resto de turno anterior não vale.
+    self.codexToolItems?.clear();
+    self.clearGrokToolsInFlight();
     self.setState("thinking");
     let message = content;
     const firstTurnSnapshot = self.messageSession.consumeFirstTurnIfNeeded();
@@ -114,10 +123,16 @@ export async function runCodexMessage(self: any, content: string, images?: Image
         self.opts.onError(msg);
       }
     });
-    proc.on("close", (code) => {
+    // T-829: o turno fecha UMA vez — no close ou, se ele não vier, no exit +
+    // CODEX_CLOSE_GRACE_MS (ver a constante).
+    let fechado = false;
+    const fecharTurno = (code: number | null) => {
+      if (fechado) return;
+      fechado = true;
       if (buf.trim().startsWith("{")) {
         try { self.handleCodexEvent(JSON.parse(buf.trim()), epoch); } catch {}
       }
+      buf = "";
       // R7: fim de turno único/idempotente (T-417 + T-251 preservados dentro).
       timing?.finish(code === 0 ? "completed" : "process-exit");
       endTurn(self, { epoch, code, imgCleanup });
@@ -129,6 +144,19 @@ export async function runCodexMessage(self: any, content: string, images?: Image
         void self.pollCodexContextOccupancy(epoch);
         self.drainOcQueue();
       }
+    };
+    proc.on("close", (code) => fecharTurno(code));
+    proc.on("exit", (code, signal) => {
+      const t = setTimeout(() => {
+        if (fechado) return;
+        self.opts.log("warn", `[codex:${self.info.name}] close não veio ${CODEX_CLOSE_GRACE_MS}ms após o exit (code=${code} signal=${signal ?? "-"}) — fechando o turno (neto segurando o pipe)`);
+        try { proc.stdout?.destroy(); } catch { /* já fechado */ }
+        try { proc.stderr?.destroy(); } catch { /* já fechado */ }
+        // Colhe os netos que ficaram no grupo do codex (spawnDropped é detached).
+        try { if (proc.pid) process.kill(-proc.pid, "SIGTERM"); } catch { /* grupo vazio */ }
+        fecharTurno(code ?? (signal ? null : 0));
+      }, CODEX_CLOSE_GRACE_MS);
+      t.unref?.();
     });
   }
 export function handleCodexEvent(self: any, event: any, epoch: number) {
@@ -152,9 +180,27 @@ export function handleCodexEvent(self: any, event: any, epoch: number) {
           self.opts.onSessionId?.(normalized.sessionId);
         }
       } else if (normalized.type === "tool") {
-        self.noteGrokToolInFlight();
+        // T-829: in-flight por item (id): o item.completed desconta. Antes só o
+        // turn.completed zerava e o contador inflava (11 "em voo" no WEB),
+        // deixando o watchdog no teto de tools de 20min em vez do soft.
+        if (normalized.id) {
+          const itens: Set<string> = self.codexToolItems ?? (self.codexToolItems = new Set<string>());
+          if (!itens.has(normalized.id)) {
+            itens.add(normalized.id);
+            self.noteGrokToolInFlight();
+          }
+        }
         self.opts.onToolUse(normalized.name, normalized.input);
         self.setState(normalized.name.includes("send_message") ? "sending" : "thinking");
+      } else if (normalized.type === "tool_done") {
+        if (self.codexToolItems?.delete(normalized.id)) {
+          self.toolsInFlight = Math.max(0, self.toolsInFlight - 1);
+          if (self.toolsInFlight === 0) self.toolsInFlightSince = null;
+        }
+      } else if (normalized.type === "thought") {
+        // T-829: raciocínio do codex (item reasoning) não chegava à UI.
+        if (self.info.collectThinking) self.opts.onThinkingText?.(normalized.text);
+        if (self.currentState !== "speaking") self.setState("thinking");
       } else if (normalized.type === "text") {
         self.setState("speaking");
         self.opts.onAssistantText(normalized.text);
@@ -173,6 +219,7 @@ export function handleCodexEvent(self: any, event: any, epoch: number) {
           // usar como fallback (rollout ausente).
           self.codexTurnBilling = { epoch, delta };
           self.clearGrokToolsInFlight();
+          self.codexToolItems?.clear();
       } else if (normalized.type === "error") {
         self.checkContextFullError(normalized.message);
         self.opts.onError(`codex: ${normalized.message}`);

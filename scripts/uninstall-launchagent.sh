@@ -75,9 +75,17 @@ if [ "$ASSUME_YES" -ne 1 ]; then
 fi
 
 if agent_loaded; then
-  log "bootout $DOMAIN/$LABEL"
+  # T-824: desinstalar é parar DE VEZ. Sem o marcador, o SIGTERM do bootout
+  # mantém os agentes running no server (reinício) e eles viram auto-resume
+  # dias depois. Com ele, o daemon anuncia o exit de cada agente.
+  touch "$TD_DIR/stop-agents-on-exit" 2>/dev/null || true
+  log "bootout $DOMAIN/$LABEL (parada definitiva: o daemon anuncia o exit dos agentes)"
   launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || \
     launchctl unload "$PLIST_PATH" 2>/dev/null || true
+  # O daemon consome o marcador no shutdown; se ele não estava vivo, não
+  # pode sobrar para o próximo (o boot também apaga, por garantia).
+  sleep 5
+  rm -f "$TD_DIR/stop-agents-on-exit" 2>/dev/null || true
 else
   log "agent não estava carregado"
 fi

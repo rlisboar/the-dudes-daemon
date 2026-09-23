@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 /**
  * T-037: dedup de agent:send por deliveryId + fila local se runner ausente.
  *
@@ -24,6 +26,8 @@ export function createDeliveryDeduper(maxSeen = 500): {
   markSeen: (deliveryId: string | undefined) => void;
   size: () => number;
   clear: () => void;
+  /** T-824: ids vistos, do mais antigo ao mais novo (persistidos no reinício). */
+  snapshot: () => string[];
 } {
   const seen = new Set<string>();
   const order: string[] = [];
@@ -52,6 +56,7 @@ export function createDeliveryDeduper(maxSeen = 500): {
       seen.clear();
       order.length = 0;
     },
+    snapshot: () => [...order],
   };
 }
 
@@ -106,4 +111,33 @@ export function createAgentInboundBuffer(opts: {
     },
     clear: () => byAgent.clear(),
   };
+}
+
+/**
+ * T-824 (revisão): o processo novo manda resumeFromSeq=0 e o server reenvia o
+ * buffer inteiro (até 200 msgs dos últimos 5 min). Sem os ids vistos pelo
+ * processo anterior, mensagem já processada voltava ao agente e a retida
+ * chegava 2× (spool + replay). O processo que sai grava; o novo carrega antes
+ * de conectar. Ids não são segredo (identificam entrega, não conteúdo).
+ */
+export const DELIVERY_SEEN_FILE = "delivery-seen.json";
+export const DELIVERY_SEEN_TTL_MS = 15 * 60_000;
+
+export function saveDeliverySeen(dir: string, ids: string[], now = Date.now()): void {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const file = path.join(dir, DELIVERY_SEEN_FILE);
+  const tmp = `${file}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify({ v: 1, savedAt: now, ids }), { mode: 0o600 });
+  fs.renameSync(tmp, file);
+}
+
+export function loadDeliverySeen(dir: string, now = Date.now()): string[] {
+  const file = path.join(dir, DELIVERY_SEEN_FILE);
+  try {
+    const d = JSON.parse(fs.readFileSync(file, "utf8")) as { savedAt?: number; ids?: unknown };
+    if (!Array.isArray(d.ids) || now - Number(d.savedAt || 0) > DELIVERY_SEEN_TTL_MS) return [];
+    return d.ids.filter((x): x is string => typeof x === "string" && x.length > 0);
+  } catch {
+    return [];
+  }
 }

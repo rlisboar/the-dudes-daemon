@@ -241,6 +241,58 @@ pid_still_ours() {
   cmd_belongs_to_td_dir "$cmd"
 }
 
+# T-824: descendentes do daemon do perfil (os runners são detached, com grupo
+# próprio: o bootout não os leva). pid|lstart ANTES de parar, para nunca matar
+# um pid reciclado depois.
+snapshot_descendants() {
+  local roots="$1" p
+  [ -n "${roots// }" ] || return 0
+  # Revisão T-824: o próprio instalador (e a cadeia de pais dele) fica fora.
+  # Rodado por um agente, ele É descendente do daemon: sem isto se matava
+  # antes do bootstrap e o daemon ficava fora do ar.
+  ps -axo pid=,ppid= 2>/dev/null | awk -v roots=" $roots " -v self="$$" '
+    { par[$1] = $2 }
+    END {
+      x = self; n = 0
+      while (x != "" && n < 64) { anc[x] = 1; if (!(x in par)) break; x = par[x]; n++ }
+      for (k in par) {
+        if (k in anc) continue
+        x = k; n = 0; out = 0
+        while ((x in par) && n < 64) {
+          if (x == self) break                  # subárvore do próprio instalador
+          if (index(roots, " " par[x] " ")) { out = 1; break }
+          x = par[x]; n++
+        }
+        if (out) print k
+      }
+    }' | while read -r p; do
+    printf '%s|%s\n' "$p" "$(ps -o lstart= -p "$p" 2>/dev/null || true)"
+  done
+}
+
+kill_leftover_descendants() {
+  local snap="$1" p st cur sobra=""
+  [ -n "$snap" ] || return 0
+  while IFS='|' read -r p st; do
+    [ -n "$p" ] || continue
+    cur="$(ps -o lstart= -p "$p" 2>/dev/null || true)"
+    if [ -n "$cur" ] && [ "$cur" = "$st" ]; then sobra="$sobra $p"; fi
+  done <<< "$snap"
+  if [ -z "${sobra// }" ]; then
+    log "nenhum runner do daemon antigo sobrou"
+    return 0
+  fi
+  log "runners do daemon antigo ainda vivos (órfãos):$sobra — SIGTERM"
+  for p in $sobra; do kill -TERM "$p" 2>/dev/null || true; done
+  sleep 2
+  for p in $sobra; do
+    if kill -0 "$p" 2>/dev/null; then
+      log "SIGKILL $p"
+      kill -KILL "$p" 2>/dev/null || true
+    fi
+  done
+}
+
 safe_stop_loose() {
   local pids pid
   pids="$(list_loose_pids | tr '\n' ' ')"
@@ -259,7 +311,18 @@ safe_stop_loose() {
     log "SIGTERM PID $pid (perfil $PROFILE_DISP)"
     kill -TERM "$pid" 2>/dev/null || true
   done
-  sleep 1
+  # T-824: o shutdown do daemon leva ~3-4s (para os CLIs com escalonamento e
+  # grava o spool das mensagens retidas). O SIGKILL fixo em 1s cortava isso e
+  # deixava runners órfãos. Espera até 15s.
+  local i vivo
+  for i in $(seq 1 30); do
+    vivo=0
+    for pid in $pids; do
+      if pid_still_ours "$pid"; then vivo=1; fi
+    done
+    [ "$vivo" -eq 0 ] && break
+    sleep 0.5
+  done
   for pid in $pids; do
     if pid_still_ours "$pid"; then
       log "SIGKILL PID $pid (perfil $PROFILE_DISP)"
@@ -509,12 +572,19 @@ EOF
   # Copiar o script enquanto o bash do launchd ainda o executa corrompe o
   # fluxo (leituras parciais) e deixa o job em estado estranho.
   if [ "$NO_LOAD" -eq 0 ]; then
+    local pre_snap
+    pre_snap="$(snapshot_descendants "$(list_loose_pids | tr '\n' ' ')")"
     if agent_loaded; then
       log "bootout $DOMAIN/$LABEL (antes de atualizar arquivos)"
       launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || \
         launchctl unload "$PLIST_PATH" 2>/dev/null || true
     fi
     safe_stop_loose
+    if [ "$NO_KILL" -eq 0 ]; then
+      kill_leftover_descendants "$pre_snap"
+    else
+      warn "--no-kill: runners do daemon antigo não são tocados"
+    fi
   else
     log "--no-load: skip kill/bootout"
   fi
