@@ -717,6 +717,22 @@ export interface GitLabIntegrationPublic {
   lastSyncAt?: string;
 }
 
+/** T-782: capabilities por provider — o cliente NÃO hardcoda regra de provider. */
+export interface RepoCapabilitiesPublic {
+  /** GitHub não apaga issue (fecha); UI deve dizer "fechar". */
+  deleteIssueIsClose: boolean;
+}
+
+/** T-782: estado PÚBLICO por provider (sem segredo; webhookSecretSet só sinaliza). */
+export type RepoIntegrationPublic = GitLabIntegrationPublic;
+
+/** T-782: snapshot do caminho de volta — os DOIS providers separados. */
+export interface RepoStatePublic {
+  gitlab: RepoIntegrationPublic;
+  github: RepoIntegrationPublic;
+  capabilities: { gitlab: RepoCapabilitiesPublic; github: RepoCapabilitiesPublic };
+}
+
 export interface PermissionRequest {
   requestId: string;
   agentId: string;
@@ -1243,6 +1259,9 @@ export type ServerEvent =
       gitlab: GitLabIntegrationPublic;
       /** Ausente em servidores antigos: a UI trata como não configurado. */
       github?: GitLabIntegrationPublic;
+      /** T-782: estado dos dois providers + capabilities (aditivo; servidor
+       *  antigo não manda). O slot legado `gitlab`/`github` segue para compat. */
+      repo?: RepoStatePublic;
       autoApprove: boolean;
       comments: TaskComment[];
       toolExecutions: ToolExecutionEvent[];
@@ -1337,6 +1356,9 @@ export type ServerEvent =
     }
   | { type: "gitlab:updated"; integration: GitLabIntegrationPublic }
   | { type: "github:updated"; integration: GitLabIntegrationPublic }
+  /** T-782: evento discriminado — cliente nunca adivinha o provider. Cliente
+   *  antigo (web da main de hoje) segue lendo os eventos legados. */
+  | { type: "repo:updated"; provider: "gitlab" | "github"; integration: RepoIntegrationPublic; capabilities: RepoCapabilitiesPublic }
   | { type: "messages:cleared" }
   /** AgentSkills v2 — set scaneado pelo daemon do owner do projeto. */
   | { type: "workspace_skills"; list: SkillDefinition[] }
