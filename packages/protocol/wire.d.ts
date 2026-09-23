@@ -491,7 +491,12 @@ export interface AgentInfo {
    */
   contextWindow?: { used: number; limit: number } | null;
   /** T-096: presença derivada no READ (nunca persistida). */
-  derived?: AgentDerived;
+  derived?: AgentDerived;  /**
+   * T-898: quantas mensagens estão RETIDAS na fila de espera deste agente
+   * (inclui o que ficou quando ele foi parado). Vem no estado do agente para o
+   * card mostrar a contagem sem fetch por card; ausente = 0.
+   */
+  queuePending?: number;
 }
 
 export type MessageKind =
@@ -1202,8 +1207,25 @@ export interface ReleaseAvailableToDaemon {
   sha256: string;
 }
 
+/** T-898: item da fila de espera retida de um agente (conteúdo OPAQUE). */
+export interface AgentQueueItemPublic {
+  id: string;
+  agentId: string;
+  seq: number;
+  content: string;
+  /** true = `content` cifrado; o cliente decifra com a chave do projeto. */
+  e2ee: boolean;
+  images?: unknown[] | null;
+  deliveryId: string | null;
+  source: "stop" | "inbound-ttl" | "manual";
+  createdAt: number;
+  deliveredAt: number | null;
+}
+
 export type ServerEvent =
   | { type: "prefs_updated"; prefs: Record<string, unknown> }
+  /** T-898: a fila retida de um agente mudou (retain/clear/move/entrega/flag). */
+  | { type: "agent:queue"; agentId: string; motivo: string; pending: number }
   | { type: "auth"; user: UserPublic | null }
   | { type: "daemon:status"; status: DaemonStatus }
   | {

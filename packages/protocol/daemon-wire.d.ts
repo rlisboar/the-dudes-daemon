@@ -94,6 +94,20 @@ export interface ProjectE2eeRequired {
   value: boolean;
 }
 
+/**
+ * T-878 (Jev nas tasks): o admin liga/desliga a feature do projeto e o daemon
+ * precisa parar de mandar texto antes do próximo spawn — o `config` só chega no
+ * web. Sem veredito e sem texto no payload: só a flag.
+ *
+ * Mensagem desconhecida é ignorada pelo daemon (o switch não tem default), então
+ * daemon antigo segue funcionando e só perde o hot-update até o próximo spawn.
+ */
+export interface ProjectFeatures {
+  type: "project:features";
+  projectId: string;
+  jev: boolean;
+}
+
 export interface ProjectKeyForDaemon {
   type: "project_key:for_daemon";
   projectId: string;
@@ -622,8 +636,53 @@ export interface GraphStatusEvent {
 /** Orch pede o graph.json do workspace pra renderizar o mapa na UI. */
 export interface GraphFetchRequest { type: "graph:fetch"; correlationId?: string; projectId?: string; workspaceRoot?: string; }
 
-/** Shadow do Jev já podado. O daemon não manda goal, context, prompt nem o mapa cru. */
-export interface TypesafeShadow extends JevVerdict { type: "typesafe:shadow"; }
+/**
+ * Shadow do Jev já podado. O daemon não manda goal, context, prompt nem o mapa cru.
+ *
+ * T-878 (Jev nas tasks): os campos abaixo são OPCIONAIS e aditivos — o daemon
+ * antigo (só delegate) continua válido, e o server só grava o que vier. Sem
+ * texto: `textSha256`/`goalSha256` são hash de 12 hex do texto cru, com
+ * `hashKind` etiquetando o algoritmo (HMAC local do daemon desliga o oráculo de
+ * dicionário para o server, que não tem a chave).
+ */
+export interface TypesafeShadow extends JevVerdict {
+  type: "typesafe:shadow";
+  /** Ausente = `task` quando há `taskId` (daemon antigo não manda o campo). */
+  source?: "task" | "delegate";
+  /** Task dona do veredito. O server só liga se a task for do projeto. */
+  taskId?: string;
+  /** `create` | `edit` | `shadow` (delegate). */
+  event?: string;
+  /** Responsável declarado; com `domain` alimenta a concordância do painel. */
+  declaredAssignee?: string;
+  /** Distribuição completa por faceta (teto de chaves/tamanho no server). */
+  probabilities?: {
+    domain?: Record<string, number>;
+    complexity?: Record<string, number>;
+  };
+  securityNoul?: number | null;
+  acceptanceNoul?: number | null;
+  /** Tri-estado: `null` = não comparável (elenco de outro daemon). */
+  disagreeDomain?: boolean | null;
+  textSha256?: string;
+  goalSha256?: string;
+  hashKind?: "sha256" | "hmac1";
+}
+
+/**
+ * T-898/security A: o daemon retém na fila de espera do agente quando ele está
+ * PARADO (stop) ou quando o inbound venceu o TTL. Sem este frame o server
+ * dropava (validateDaemonMessage é fail-closed) e a tabela ficava vazia.
+ *
+ * `content` vem como o daemon já tem (cifrado se o projeto cifra); o server não
+ * decifra. `deliveryId` é a chave de idempotência do retry.
+ */
+export interface AgentQueueRetainEv {
+  type: "agent:queue_retain";
+  agentId: string;
+  source: "stop" | "inbound-ttl" | "manual";
+  items: Array<{ content: string; images?: unknown[]; deliveryId?: string }>;
+}
 
 export interface OpenDesignListRequest { type: "open_design:list"; correlationId: string; }
 export interface OpenDesignFilesRequest { type: "open_design:files"; correlationId: string; odProjectId: string; }
@@ -1084,7 +1143,8 @@ export type FromDaemon =
   | GraphDataEvent
   | OpenDesignResult
   | ModelsCatalogResult
-  | TypesafeShadow;
+  | TypesafeShadow
+  | AgentQueueRetainEv;
 
 export type FromOrch =
   | DaemonLogsGetRequest
@@ -1105,6 +1165,7 @@ export type FromOrch =
   | TranscriptRequest
   | ProjectKeyForDaemon
   | ProjectE2eeRequired
+  | ProjectFeatures
   | TaskUpdatedEv
   | WebhookDispatchRequest
   | SkillsRescanRequest

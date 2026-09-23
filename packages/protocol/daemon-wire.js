@@ -240,6 +240,17 @@ export const daemonWireSchemas = {
     versionId: t.optional(),
     error: t.optional(),
   }),
+  // T-898/security A: retenção vinda do daemon (stop/inbound-ttl) — server não
+  // decifra, só persiste o que chegou.
+  "agent:queue_retain": msg("agent:queue_retain", {
+    agentId: t,
+    source: z.enum(["stop", "inbound-ttl", "manual"]),
+    items: z.array(z.object({
+      content: t,
+      images: z.array(z.unknown()).optional(),
+      deliveryId: t.optional(),
+    })).max(200),
+  }),
   "typesafe:shadow": msg("typesafe:shadow", {
     projectId: t,
     at: n,
@@ -256,6 +267,24 @@ export const daemonWireSchemas = {
     destructiveNoul: n.nullable(),
     disagreeTaskType: b,
     disagreeComplexity: b,
+    // T-878 (Jev nas tasks): opcionais e aditivos. O daemon antigo (só
+    // delegate) segue válido; campo fora do tipo declarado derruba a mensagem
+    // no fail-closed, como qualquer outro campo do schema.
+    source: z.enum(["task", "delegate"]).optional(),
+    taskId: t.optional(),
+    event: t.optional(),
+    declaredAssignee: t.optional(),
+    probabilities: z.object({
+      domain: z.record(t, n).optional(),
+      complexity: z.record(t, n).optional(),
+    }).optional(),
+    securityNoul: n.nullable().optional(),
+    acceptanceNoul: n.nullable().optional(),
+    // Tri-estado: `null` = não comparável (elenco de outro daemon).
+    disagreeDomain: b.nullable().optional(),
+    textSha256: t.optional(),
+    goalSha256: t.optional(),
+    hashKind: z.enum(["sha256", "hmac1"]).optional(),
   }),
 };
 
@@ -338,6 +367,8 @@ export const fromOrchSchemas = {
   "release:available": msg("release:available", { sha256: t }),
   "runner-policy:set": msg("runner-policy:set", { allowedRunners: z.array(t) }),
   "project:e2ee_required": msg("project:e2ee_required", { projectId: t, value: b }),
+  // T-878: só a flag da feature — o daemon para de mandar texto sem esperar spawn.
+  "project:features": msg("project:features", { projectId: t, jev: b }),
   "project_key:for_daemon": msg("project_key:for_daemon", { projectId: t, wrappedProjectKey: t, keyRing: z.array(t).optional() }),
   "task:updated": msg("task:updated", { task: z.object({ id: t, status: t.optional(), assigneeAgentId: t.nullable().optional(), titleCipher: t.optional() }) }),
 

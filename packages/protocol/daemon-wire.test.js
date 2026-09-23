@@ -108,3 +108,93 @@ test("T-423: scanner aninhado tolera campo novo (passthrough) mas exige o núcle
     false,
   );
 });
+/**
+ * T-878 (Jev nas tasks): o contrato novo é ADITIVO. O daemon antigo (só
+ * delegate, sem os campos) tem de continuar válido — e um campo declarado com
+ * tipo errado continua derrubando a mensagem no fail-closed.
+ */
+test("T-878: typesafe:shadow aceita o contrato novo e o daemon antigo", () => {
+  const legado = {
+    type: "typesafe:shadow", projectId: "p1", at: 1, ok: true, error: null, model: "jev", latencyMs: 40,
+    declaredTaskType: "coding", declaredComplexity: "simple", taskType: "review", complexity: "moderate",
+    domain: "server", confidence: { task_type: 0.9, complexity: 0.4, domain: 0.8 },
+    destructiveNoul: 0.1, disagreeTaskType: false, disagreeComplexity: false,
+  };
+  assert.equal(validateDaemonMessage(legado).ok, true, "daemon antigo segue válido");
+
+  const novo = {
+    ...legado,
+    source: "task", taskId: "task_1", event: "create", declaredAssignee: "ag-server",
+    probabilities: { domain: { server: 0.8, web: 0.2 }, complexity: { moderate: 0.6 } },
+    securityNoul: 0.8, acceptanceNoul: 0.2, disagreeDomain: null,
+    textSha256: "abc123abc123", goalSha256: "def456def456", hashKind: "hmac1",
+  };
+  assert.equal(validateDaemonMessage(novo).ok, true, "campos novos aceitos");
+  assert.equal(validateDaemonMessage({ ...novo, disagreeDomain: true }).ok, true, "tri-estado aceita false/true");
+  assert.equal(validateDaemonMessage({ ...novo, disagreeDomain: "sim" }).ok, false, "disagreeDomain não-nulo é boolean");
+  assert.equal(validateDaemonMessage({ ...novo, hashKind: "md5" }).ok, false, "hashKind fora do enum");
+  assert.equal(validateDaemonMessage({ ...novo, probabilities: { domain: { a: "x" } } }).ok, false, "probabilidade não-numérica");
+  assert.equal(validateDaemonMessage({ ...novo, textSha256: 7 }).ok, false);
+});
+
+test("T-878: project:features existe nos dois lados do contrato e exige a flag", () => {
+  assert.match(dts, /export interface ProjectFeatures\b/, "interface ausente do .d.ts");
+  assert.match(dts, /type: "project:features"/);
+  assert.match(dts, /\|\s*ProjectFeatures\b/, "ProjectFeatures fora do union FromOrch");
+  const schema = fromOrchSchemas["project:features"];
+  assert.ok(schema, "sem schema, o guard estrutural e o parse falham");
+  assert.equal(schema.safeParse({ type: "project:features", projectId: "p1", jev: true }).success, true);
+  assert.equal(schema.safeParse({ type: "project:features", projectId: "p1" }).success, false, "flag obrigatória");
+  assert.equal(schema.safeParse({ type: "project:features", projectId: "p1", jev: "on" }).success, false);
+});
+
+/**
+ * T-878 (aceite do card): o contrato novo é opcional E o schema NÃO é estrito.
+ *
+ * Não ser estrito é o que garante que um DAEMON NOVO falando com um SERVER ANTIGO
+ * não seja rejeitado (o server antigo não declara os campos novos → eles são
+ * "chave extra" → `strip`, não erro) e que o inverso também funcione. Sem isso o
+ * deploy teria ordem obrigatória. `validateDaemonMessage` só olha `success` e o
+ * handler usa o objeto CRU, então `strip` não perde nada.
+ */
+test("T-878: schema de typesafe:shadow é não-estrito (chave extra passa) e os novos campos são opcionais", () => {
+  const schema = daemonWireSchemas["typesafe:shadow"];
+  const modo = schema._def?.unknownKeys ?? schema.def?.unknownKeys;
+  assert.equal(modo, "strip", "esquema ficou estrito: daemon novo x server antigo passaria a exigir ordem de deploy");
+
+  // o que um SERVER ANTIGO vê de um daemon novo: campos que o schema dele não
+  // declara. Tem de passar.
+  const legadoComCampoFuturo = {
+    type: "typesafe:shadow", projectId: "p1", at: 1, ok: true, error: null, model: "jev", latencyMs: 40,
+    declaredTaskType: "coding", declaredComplexity: "simple", taskType: "review", complexity: "moderate",
+    domain: "server", confidence: null, destructiveNoul: 0.1, disagreeTaskType: false, disagreeComplexity: false,
+    source: "task", taskId: "task_1", hashKind: "hmac1", probabilidadesDoFuturo: { a: 1 },
+  };
+  assert.equal(validateDaemonMessage(legadoComCampoFuturo).ok, true, "chave extra foi rejeitada");
+});
+
+test("T-878: vocabulário do hashKind bate com o CHECK da v22 (sha256|hmac1)", () => {
+  // Fonte da verdade no server: migrations v22 (T-853),
+  // CHECK (hash_kind IS NULL OR hash_kind IN ('sha256', 'hmac1')).
+  // Um terceiro valor aqui (ex.: md5) passaria no pacote e morreria no INSERT.
+  const hk = daemonWireSchemas["typesafe:shadow"].shape.hashKind;
+  const valores = hk._def.innerType._def.values;
+  assert.deepEqual([...valores], ["sha256", "hmac1"], "vocabulário divergiu do CHECK da v22");
+  assert.equal(validateDaemonMessage({ ...shadowBase(), hashKind: "md5" }).ok, false);
+});
+
+test("T-878: project:features é não-estrito e exige só (projectId, jev)", () => {
+  const schema = fromOrchSchemas["project:features"];
+  assert.equal(schema._def?.unknownKeys ?? schema.def?.unknownKeys, "strip", "esquema ficou estrito");
+  assert.equal(schema.safeParse({ type: "project:features", projectId: "p1", jev: false, futuro: 1 }).success, true);
+  assert.equal(schema.safeParse({ projectId: "p1", jev: true }).success, false, "type obrigatório");
+});
+
+/** Payload mínimo do shadow do daemon (só os campos obrigatórios do contrato). */
+function shadowBase() {
+  return {
+    type: "typesafe:shadow", projectId: "p1", at: 1, ok: true, error: null, model: "jev", latencyMs: 40,
+    declaredTaskType: "coding", declaredComplexity: "simple", taskType: "review", complexity: "moderate",
+    domain: "server", confidence: null, destructiveNoul: 0.1, disagreeTaskType: false, disagreeComplexity: false,
+  };
+}

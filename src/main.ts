@@ -252,6 +252,8 @@ export class DaemonClient {
   // (hot loop). Escala 200ms→5s e reseta ao conectar.
   private transientBackoff = 200;
   private stableConnTimer: NodeJS.Timeout | null = null;
+  /** T-970: próxima tentativa de conexão agendada (normal ou passiva). */
+  private reconnectTimer: NodeJS.Timeout | null = null;
   /** T-846: hello `passive: true` — retomada depois de 4000/4001. */
   private helloPassivo = false;
   /** T-846: cooldown corrente do passivo (30s → 5min). */
@@ -554,7 +556,34 @@ export class DaemonClient {
       log("info", `token ocupado por outro processo (close 4001) — nova tentativa passiva em ${Math.round(delay / 1000)}s`);
     }
     breadcrumb("ws", "handoff", { decisao, delayMs: delay, passivo: true });
-    setTimeout(() => this.connect(), delay);
+    this.agendarConnect(delay);
+  }
+
+  /** T-970: um connect agendado por vez, cancelável por `pararConexao`. */
+  private agendarConnect(delayMs: number, antes?: () => void): void {
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      antes?.();
+      this.connect();
+    }, delayMs);
+  }
+
+  /**
+   * T-970: encerra a conexão SEM sair do processo e sem reconectar — timers de
+   * ping/heartbeat/estabilidade/self-update e connect agendado limpos, ws
+   * terminado. É o teardown dos testes ao vivo (o `shutdown` real faz exit).
+   */
+  pararConexao(): void {
+    this.stopped = true;
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+    if (this.stableConnTimer) { clearTimeout(this.stableConnTimer); this.stableConnTimer = null; }
+    if (this.selfUpdateTimer) { clearInterval(this.selfUpdateTimer); this.selfUpdateTimer = null; }
+    this.stopPing();
+    this.stopHeartbeat();
+    const ws = this.ws;
+    this.ws = null;
+    try { ws?.terminate(); } catch { /* noop */ }
   }
 
   private connect() {
@@ -759,7 +788,7 @@ export class DaemonClient {
       if (code !== 1000 && code !== 1001 && !isTransient) {
         captureWarn(`ws disconnected code=${code}`, { code, reason: reasonStr });
       }
-      setTimeout(() => {
+      this.agendarConnect(jittered, () => {
         // Backoff só pra non-transient. Transient sempre tenta rápido.
         if (!isTransient) {
           this.reconnectDelay = Math.min(this.reconnectDelay * 2, DaemonClient.RECONNECT_CAP_MS);
@@ -768,8 +797,7 @@ export class DaemonClient {
           // Escala o backoff transient — outage persistente não vira hot loop.
           this.transientBackoff = Math.min(this.transientBackoff * 2, DaemonClient.TRANSIENT_BACKOFF_CAP_MS);
         }
-        this.connect();
-      }, jittered);
+      });
     });
 
     ws.on("error", (err) => {

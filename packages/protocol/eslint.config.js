@@ -1,7 +1,7 @@
 export default [
   {
     files: ["*.js"],
-    languageOptions: { ecmaVersion: "latest", sourceType: "module", globals: { TextEncoder: "readonly", TextDecoder: "readonly" } },
+    languageOptions: { ecmaVersion: "latest", sourceType: "module", globals: { TextEncoder: "readonly", TextDecoder: "readonly", URL: "readonly" } },
     rules: {
       "no-unused-vars": ["error", { argsIgnorePattern: "^_" }],
       "no-undef": "error",

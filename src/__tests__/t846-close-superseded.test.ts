@@ -54,10 +54,10 @@ test("T-846: no close de handoff não há connect imediato; o passivo sai com ba
 
   const iMet = src.indexOf("private agendarRetomadaPassiva(");
   assert.ok(iMet > 0, "método existe");
-  const metodo = src.slice(iMet, src.indexOf("\n  private connect()", iMet));
+  const metodo = src.slice(iMet, src.indexOf("\n  /** T-970", iMet));
   assert.match(metodo, /proximoDelayPassivo\(this\.passivoDelayMs\)/);
   assert.match(metodo, /this\.helloPassivo = true/);
-  assert.match(metodo, /setTimeout\(\(\) => this\.connect\(\), delay\)/);
+  assert.match(metodo, /this\.agendarConnect\(delay\)/);
   assert.match(metodo, /this\.host\.stopLocalClis\(/, "os CLIs locais param no 4000");
   assert.match(metodo, /log\(\s*"warn"/, "warn uma vez no handoff");
   assert.match(metodo, /this\.handoffLogado/, "flag de log único");
