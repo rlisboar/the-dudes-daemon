@@ -1,0 +1,36 @@
+{
+  "projects": [
+    {
+      "id": "a5471b78-77fe-4288-b50c-e1d1324e92e2",
+      "name": "Melhorar design system",
+      "skillId": null,
+      "designSystemId": null,
+      "metadata": {
+        "kind": "prototype",
+        "nameSource": "agent"
+      },
+      "createdAt": 1790145724895,
+      "updatedAt": 1790146729621,
+      "status": {
+        "value": "succeeded",
+        "updatedAt": 1790146729154
+      }
+    },
+    {
+      "id": "afcd86cd-b8c5-4cdc-b537-84ac76155b7e",
+      "name": "Melhorar design system",
+      "skillId": null,
+      "designSystemId": null,
+      "metadata": {
+        "kind": "prototype",
+        "nameSource": "agent"
+      },
+      "createdAt": 1790145682708,
+      "updatedAt": 1790145707957,
+      "status": {
+        "value": "awaiting_input",
+        "updatedAt": 1790145707497
+      }
+    }
+  ]
+}

@@ -1,0 +1,308 @@
+{
+  "plugins": [
+    {
+      "id": "video-template-3d-animated-boy-building-lego",
+      "title": "3D Animated Boy Building Lego",
+      "version": "0.1.0",
+      "sourceKind": "bundled",
+      "source": "/Applications/Open Design.app/Contents/Resources/open-design/plugins/_official/video-templates/3d-animated-boy-building-lego",
+      "sourceMarketplaceId": "official",
+      "sourceMarketplaceEntryName": "open-design/video-template-3d-animated-boy-building-lego",
+      "sourceMarketplaceEntryVersion": "0.1.0",
+      "marketplaceTrust": "official",
+      "resolvedSource": "/Applications/Open Design.app/Contents/Resources/open-design/plugins/_official/video-templates/3d-animated-boy-building-lego",
+      "trust": "bundled",
+      "capabilitiesGranted": [
+        "prompt:inject"
+      ],
+      "fsPath": "/Applications/Open Design.app/Contents/Resources/open-design/plugins/_official/video-templates/3d-animated-boy-building-lego",
+      "installedAt": 1789420398347,
+      "updatedAt": 1789420398347,
+      "manifest": {
+        "specVersion": "1.0.0",
+        "$schema": "https://open-design.ai/schemas/plugin.v1.json",
+        "name": "video-template-3d-animated-boy-building-lego",
+        "title": "3D Animated Boy Building Lego",
+        "version": "0.1.0",
+        "description": "A multi-shot video prompt in 3D animation style describing a boy carefully assembling Lego pieces in a room, featuring time-lapse effects.",
+        "author": {
+          "name": "Alex Zhang",
+          "url": "https://x.com/jojogh_007/status/2049123558102810714"
+        },
+        "license": "CC-BY-4.0",
+        "homepage": "https://github.com/YouMind-OpenLab/awesome-seedance-2-prompts",
+        "publishedAt": "2026-05-12T07:18:16Z",
+        "tags": [
+          "video-template",
+          "first-party",
+          "video",
+          "general"
+        ],
+        "od": {
+          "kind": "scenario",
+          "taskKind": "new-generation",
+          "mode": "video",
+          "scenario": "video",
+          "preview": {
+            "type": "video",
+            "poster": "https://customer-qs6wnyfuv0gcybzj.cloudflarestream.com/2dba80d5da706c3ea078ed69096c67d3/thumbnails/thumbnail.jpg",
+            "video": "https://customer-qs6wnyfuv0gcybzj.cloudflarestream.com/2dba80d5da706c3ea078ed69096c67d3/downloads/default.mp4"
+          },
+          "useCase": {
+            "query": {
+              "en": "Scene: A boy in a room seriously assembling Lego blocks. The visual style is 3D animation with vibrant colors, smooth lines, full of childlike fun and vitality. A time-lapse effect is added to show the assembly process.\nScene: Wide shot of the room, sunlight spilling onto the desk through the window. The boy sits at the desk focused on assembling Lego, with a serious expression. The camera slowly zooms in.\nScene: Time-lapse effect showing the boy quickly snapping Lego pieces together, the blocks gradually taking shape in his hands. The camera switches to different angles.\nScene: Close-up of hands, showing details of the boy skillfully assembling Lego, fingers moving nimbly. The camera follows the hand movements.\nScene: Time-lapse effect continues showing the assembly process. The Lego creation becomes complete, and the boy's expression changes from focused to satisfied.\nScene: The boy looks up with a satisfied smile. The camera pulls back to reveal the finished Lego masterpiece.\n\nDuration: 00:20",
+              "zh-CN": "使用这个插件完成以下任务：Scene: A boy in a room seriously assembling Lego blocks. The visual style is 3D animation with vibrant colors, smooth lines, full of childlike fun and vitality. A time-lapse effect is added to show the assembly process.\nScene: Wide shot of the room, sunlight spilling onto the desk through the window. The boy sits at the desk focused on assembling Lego, with a serious expression. The camera slowly zooms in.\nScene: Time-lapse effect showing the boy quickly snapping Lego pieces together, the blocks gradually taking shape in his hands. The camera switches to different angles.\nScene: Close-up of hands, showing details of the boy skillfully assembling Lego, fingers moving nimbly. The camera follows the hand movements.\nScene: Time-lapse effect continues showing the assembly process. The Lego creation becomes complete, and the boy's expression changes from focused to satisfied.\nScene: The boy looks up with a satisfied smile. The camera pulls back to reveal the finished Lego masterpiece.\n\nDuration: 00:20"
+            }
+          },
+          "context": {
+            "assets": [
+              "./template.json"
+            ]
+          },
+          "pipeline": {
+            "stages": [
+              {
+                "id": "generate",
+                "atoms": [
+                  "video-generate"
+                ]
+              }
+            ]
+          },
+          "inputs": [
+            {
+              "name": "model",
+              "label": "Model",
+              "type": "select",
+              "options": [
+                "seedance-2.0"
+              ],
+              "default": "seedance-2.0"
+            },
+            {
+              "name": "aspect",
+              "label": "Aspect ratio",
+              "type": "select",
+              "options": [
+                "16:9",
+                "9:16",
+                "1:1",
+                "4:5"
+              ],
+              "default": "16:9"
+            }
+          ],
+          "capabilities": [
+            "prompt:inject",
+            "media:video-generate"
+          ],
+          "surface": "video"
+        }
+      }
+    },
+    {
+      "id": "image-template-3d-stone-staircase-evolution-infographic",
+      "title": "3D Stone Staircase Evolution Infographic",
+      "version": "0.1.0",
+      "sourceKind": "bundled",
+      "source": "/Applications/Open Design.app/Contents/Resources/open-design/plugins/_official/image-templates/3d-stone-staircase-evolution-infographic",
+      "sourceMarketplaceId": "official",
+      "sourceMarketplaceEntryName": "open-design/image-template-3d-stone-staircase-evolution-infographic",
+      "sourceMarketplaceEntryVersion": "0.1.0",
+      "marketplaceTrust": "official",
+      "resolvedSource": "/Applications/Open Design.app/Contents/Resources/open-design/plugins/_official/image-templates/3d-stone-staircase-evolution-infographic",
+      "trust": "bundled",
+      "capabilitiesGranted": [
+        "prompt:inject"
+      ],
+      "fsPath": "/Applications/Open Design.app/Contents/Resources/open-design/plugins/_official/image-templates/3d-stone-staircase-evolution-infographic",
+      "installedAt": 1789420398296,
+      "updatedAt": 1789420398296,
+      "manifest": {
+        "specVersion": "1.0.0",
+        "$schema": "https://open-design.ai/schemas/plugin.v1.json",
+        "name": "image-template-3d-stone-staircase-evolution-infographic",
+        "title": "3D Stone Staircase Evolution Infographic",
+        "version": "0.1.0",
+        "description": "Transforms a flat evolutionary timeline into a realistic 3D stone staircase infographic with detailed organism renders and structured side panels.",
+        "author": {
+          "name": "知识猫图解",
+          "url": "https://x.com/GeekCatX/status/2045792240044511277#reversed-1"
+        },
+        "license": "CC-BY-4.0",
+        "homepage": "https://github.com/YouMind-OpenLab/awesome-gpt-image-2",
+        "publishedAt": "2026-05-12T07:18:16Z",
+        "tags": [
+          "image-template",
+          "first-party",
+          "image",
+          "infographic",
+          "3d-render"
+        ],
+        "od": {
+          "kind": "scenario",
+          "taskKind": "new-generation",
+          "mode": "image",
+          "scenario": "image",
+          "preview": {
+            "type": "image",
+            "poster": "https://cms-assets.youmind.com/media/1776661968404_8a5flm_HGQc_KOaMAA2vt0.jpg"
+          },
+          "useCase": {
+            "query": {
+              "en": "{\n  \"type\": \"evolutionary timeline infographic\",\n  \"instruction\": \"Using REFERENCE_0 as a structural base, transform the flat vector design into a highly realistic 3D infographic. Replace the smooth ramps with distinct stone steps and upgrade all organisms to photorealistic 3D models.\",\n  \"style\": {\n    \"background\": \"{argument name=\\\"background style\\\" default=\\\"vintage textured parchment paper\\\"}\",\n    \"staircase\": \"{argument name=\\\"staircase material\\\" default=\\\"realistic textured stone blocks\\\"}\",\n    \"subjects\": \"{argument name=\\\"organism style\\\" default=\\\"highly detailed photorealistic 3D renders\\\"}\"\n  },\n  \"layout\": {\n    \"main_title\": \"{argument name=\\\"main title\\\" default=\\\"人类演化\\\"}\",\n    \"sections\": [\n      {\n        \"position\": \"left sidebar\",\n        \"count\": 8,\n        \"labels\": [\"L0: 单细胞生命\", \"L1: 多细胞生物\", \"L2: 动物界\", \"L3: 脊索动物\", \"L4: 上陆革命\", \"L5: 哺乳纲\", \"L6: 人科演化\", \"L7: 智人纪元\"]\n      },\n      {\n        \"position\": \"top right\",\n        \"title\": \"获得的功能 / 失去的功能\",\n        \"description\": \"Legend with plus and minus icons\"\n      },\n      {\n        \"position\": \"bottom center\",\n        \"title\": \"演化关键里程碑\",\n        \"count\": 6,\n        \"description\": \"Timeline with a silhouette graphic of 6 figures showing ape-to-human evolution\"\n      }\n    ],\n    \"centerpiece\": {\n      \"description\": \"Winding stone staircase with 25 numbered steps featuring specific organisms.\",\n      \"count\": 25,\n      \"notable_elements\": [\n        \"Step 07: Jellyfish\",\n        \"Step 09: Ammonite\",\n        \"Step 10: Trilobite\",\n        \"Step 24: Walking human\",\n        \"Step 25: {argument name=\\\"future evolution concept\\\" default=\\\"glowing cosmic silhouette with a question mark\\\"}\"\n      ]\n    }\n  }\n}",
+              "zh-CN": "{\n  \"type\": \"evolutionary timeline infographic\",\n  \"instruction\": \"Using REFERENCE_0 as a structural base, transform the flat vector design into a highly realistic 3D infographic. Replace the smooth ramps with distinct stone steps and upgrade all organisms to photorealistic 3D models.\",\n  \"style\": {\n    \"background\": \"{argument name=\\\"background style\\\" default=\\\"vintage textured parchment paper\\\"}\",\n    \"staircase\": \"{argument name=\\\"staircase material\\\" default=\\\"realistic textured stone blocks\\\"}\",\n    \"subjects\": \"{argument name=\\\"organism style\\\" default=\\\"highly detailed photorealistic 3D renders\\\"}\"\n  },\n  \"layout\": {\n    \"main_title\": \"{argument name=\\\"main title\\\" default=\\\"人类演化\\\"}\",\n    \"sections\": [\n      {\n        \"position\": \"left sidebar\",\n        \"count\": 8,\n        \"labels\": [\"L0: 单细胞生命\", \"L1: 多细胞生物\", \"L2: 动物界\", \"L3: 脊索动物\", \"L4: 上陆革命\", \"L5: 哺乳纲\", \"L6: 人科演化\", \"L7: 智人纪元\"]\n      },\n      {\n        \"position\": \"top right\",\n        \"title\": \"获得的功能 / 失去的功能\",\n        \"description\": \"Legend with plus and minus icons\"\n      },\n      {\n        \"position\": \"bottom center\",\n        \"title\": \"演化关键里程碑\",\n        \"count\": 6,\n        \"description\": \"Timeline with a silhouette graphic of 6 figures showing ape-to-human evolution\"\n      }\n    ],\n    \"centerpiece\": {\n      \"description\": \"Winding stone staircase with 25 numbered steps featuring specific organisms.\",\n      \"count\": 25,\n      \"notable_elements\": [\n        \"Step 07: Jellyfish\",\n        \"Step 09: Ammonite\",\n        \"Step 10: Trilobite\",\n        \"Step 24: Walking human\",\n        \"Step 25: {argument name=\\\"future evolution concept\\\" default=\\\"glowing cosmic silhouette with a question mark\\\"}\"\n      ]\n    }\n  }\n}"
+            }
+          },
+          "context": {
+            "assets": [
+              "./template.json"
+            ]
+          },
+          "pipeline": {
+            "stages": [
+              {
+                "id": "generate",
+                "atoms": [
+                  "image-generate"
+                ]
+              }
+            ]
+          },
+          "inputs": [
+            {
+              "name": "model",
+              "label": "Model",
+              "type": "select",
+              "options": [
+                "gpt-image-2"
+              ],
+              "default": "gpt-image-2"
+            },
+            {
+              "name": "aspect",
+              "label": "Aspect ratio",
+              "type": "select",
+              "options": [
+                "1:1",
+                "16:9",
+                "9:16",
+                "4:5",
+                "3:2"
+              ],
+              "default": "1:1"
+            }
+          ],
+          "capabilities": [
+            "prompt:inject",
+            "media:image-generate"
+          ],
+          "surface": "image"
+        }
+      }
+    },
+    {
+      "id": "video-template-a-decade-of-refinement-glow-up",
+      "title": "A Decade of Refinement Glow-Up",
+      "version": "0.1.0",
+      "sourceKind": "bundled",
+      "source": "/Applications/Open Design.app/Contents/Resources/open-design/plugins/_official/video-templates/a-decade-of-refinement-glow-up",
+      "sourceMarketplaceId": "official",
+      "sourceMarketplaceEntryName": "open-design/video-template-a-decade-of-refinement-glow-up",
+      "sourceMarketplaceEntryVersion": "0.1.0",
+      "marketplaceTrust": "official",
+      "resolvedSource": "/Applications/Open Design.app/Contents/Resources/open-design/plugins/_official/video-templates/a-decade-of-refinement-glow-up",
+      "trust": "bundled",
+      "capabilitiesGranted": [
+        "prompt:inject"
+      ],
+      "fsPath": "/Applications/Open Design.app/Contents/Resources/open-design/plugins/_official/video-templates/a-decade-of-refinement-glow-up",
+      "installedAt": 1789420398348,
+      "updatedAt": 1789420398348,
+      "manifest": {
+        "specVersion": "1.0.0",
+        "$schema": "https://open-design.ai/schemas/plugin.v1.json",
+        "name": "video-template-a-decade-of-refinement-glow-up",
+        "title": "A Decade of Refinement Glow-Up",
+        "version": "0.1.0",
+        "description": "A transformation prompt for Seedance 2.0 showing a man's transition from a casual 2016 setting to a luxurious 2026 Dubai lifestyle while maintaining character consistency.",
+        "author": {
+          "name": "Maverick | AI",
+          "url": "https://x.com/RizwanAly07/status/2048948726623056366"
+        },
+        "license": "CC-BY-4.0",
+        "homepage": "https://github.com/YouMind-OpenLab/awesome-seedance-2-prompts",
+        "publishedAt": "2026-05-12T05:25:44Z",
+        "tags": [
+          "video-template",
+          "first-party",
+          "video",
+          "advertising",
+          "cinematic",
+          "fantasy",
+          "product"
+        ],
+        "od": {
+          "kind": "scenario",
+          "taskKind": "new-generation",
+          "mode": "video",
+          "scenario": "video",
+          "preview": {
+            "type": "video",
+            "poster": "https://customer-qs6wnyfuv0gcybzj.cloudflarestream.com/d2d6d15cbc6ef4d4d4c8c9a7de7007d7/thumbnails/thumbnail.jpg",
+            "video": "https://customer-qs6wnyfuv0gcybzj.cloudflarestream.com/d2d6d15cbc6ef4d4d4c8c9a7de7007d7/downloads/default.mp4"
+          },
+          "useCase": {
+            "query": {
+              "en": "Create a 15-second ultra-realistic cinematic transformation video using the exact same man from the uploaded reference image. Maintain perfect face consistency, same hairstyle, facial features, identity, and body proportions throughout. No face change. Concept: “2026 is the new 2016” nostalgia-to-luxury glow-up. Scene 1: 2016 version — simple casual clothes, basic hairstyle, walking alone on a normal street, warm nostalgic colors, old Instagram aesthetic, simple life, no luxury. Scene 2: Flashback cuts — old bike ride, cheap café alone, late-night dreams, city lights, silent ambition in his eyes. Scene 3: Strong transition — speed-ramp effect, screen crack cinematic transition, time shifts from 2016 to 2026, luxury watch appears, black suit transformation begins. Scene 4: 2026 version — walking confidently in Dubai downtown, luxury black suit, sunglasses, expensive watch, black luxury car behind him, people turn and stare. Scene 5: Hero shot — rooftop skyline at sunset, slow motion, wind moving, camera rotating around him, strong eye contact, main character energy. Final scene: cinematic ending with the feeling “Same Man. Different Era.” Style: hyper-realistic, Netflix-level production, luxury transformation, dramatic lighting, viral Instagram reel style, strong masculine aura, editorial fashion visuals, 4K ultra realism, emotional and powerful storytelling.",
+              "zh-CN": "使用这个插件完成以下任务：Create a 15-second ultra-realistic cinematic transformation video using the exact same man from the uploaded reference image. Maintain perfect face consistency, same hairstyle, facial features, identity, and body proportions throughout. No face change. Concept: “2026 is the new 2016” nostalgia-to-luxury glow-up. Scene 1: 2016 version — simple casual clothes, basic hairstyle, walking alone on a normal street, warm nostalgic colors, old Instagram aesthetic, simple life, no luxury. Scene 2: Flashback cuts — old bike ride, cheap café alone, late-night dreams, city lights, silent ambition in his eyes. Scene 3: Strong transition — speed-ramp effect, screen crack cinematic transition, time shifts from 2016 to 2026, luxury watch appears, black suit transformation begins. Scene 4: 2026 version — walking confidently in Dubai downtown, luxury black suit, sunglasses, expensive watch, black luxury car behind him, people turn and stare. Scene 5: Hero shot — rooftop skyline at sunset, slow motion, wind moving, camera rotating around him, strong eye contact, main character energy. Final scene: cinematic ending with the feeling “Same Man. Different Era.” Style: hyper-realistic, Netflix-level production, luxury transformation, dramatic lighting, viral Instagram reel style, strong masculine aura, editorial fashion visuals, 4K ultra realism, emotional and powerful storytelling."
+            }
+          },
+          "context": {
+            "assets": [
+              "./template.json"
+            ]
+          },
+          "pipeline": {
+            "stages": [
+              {
+                "id": "generate",
+                "atoms": [
+                  "video-generate"
+                ]
+              }
+            ]
+          },
+          "inputs": [
+            {
+              "name": "model",
+              "label": "Model",
+              "type": "select",
+              "options": [
+                "seedance-2.0"
+              ],
+              "default": "seedance-2.0"
+            },
+            {
+              "name": "aspect",
+              "label": "Aspect ratio",
+              "type": "select",
+              "options": [
+                "16:9",
+                "9:16",
+                "1:1",
+                "4:5"
+              ],
+              "default": "16:9"
+            }
+          ],
+          "capabilities": [
+            "prompt:inject",
+            "media:video-generate"
+          ],
+          "surface": "video"
+        }
+      }
+    }
+  ]
+}

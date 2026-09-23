@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "VERSION_NOT_FOUND",
+    "message": "version not found"
+  }
+}

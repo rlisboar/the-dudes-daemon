@@ -1,3 +1,5 @@
+// T-897 (ambiente): parte deste arquivo EXIGE `ps` funcional (sandbox do agente nega com
+// EPERM) — os testes afetados dão `skip` com motivo em vez de falhar por ambiente.
 /**
  * T-815: o loop do suite-park no daemon amostrava com spawnSync a cada 60s
  * (240–340ms de event loop parado por amostra, medido no dashboard T-812) e o
@@ -7,6 +9,7 @@
  * sem spawnSync.
  */
 import { test } from "node:test";
+import { semPs } from "./env-exigido.js";
 import assert from "node:assert/strict";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import {
@@ -106,7 +109,7 @@ test("T-815: erro do execFile vira o mesmo PsSpawnResult do spawnSync", () => {
   assert.equal(describePsFailure(semBinario), "erro");
 });
 
-test("T-815: runPsAsync lê a tabela real sem spawnSync", async () => {
+test("T-815: runPsAsync lê a tabela real sem spawnSync", { skip: semPs() }, async () => {
   const orig = cp.spawnSync;
   const chamadas: string[] = [];
   cp.spawnSync = (bin: string) => { chamadas.push(String(bin)); throw new Error("T-815: spawnSync proibido"); };
@@ -121,7 +124,7 @@ test("T-815: runPsAsync lê a tabela real sem spawnSync", async () => {
   assert.deepEqual(chamadas, []);
 });
 
-test("T-815: o loop do daemon amostra com o ps assíncrono por padrão", async () => {
+test("T-815: o loop do daemon amostra com o ps assíncrono por padrão", { skip: semPs() }, async () => {
   const orig = cp.spawnSync;
   const logs: string[] = [];
   cp.spawnSync = () => { throw new Error("T-815: spawnSync proibido"); };

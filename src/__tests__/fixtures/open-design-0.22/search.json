@@ -1,0 +1,65 @@
+{
+  "query": "design",
+  "matches": [
+    {
+      "file": "MIGRATION.md",
+      "line": 1,
+      "snippet": "# Migração para o Design System v2.0"
+    },
+    {
+      "file": "MIGRATION.md",
+      "line": 3,
+      "snippet": "Este guia leva `design-system.css` e `tokens.ts` deste catálogo para"
+    },
+    {
+      "file": "MIGRATION.md",
+      "line": 169,
+      "snippet": "   `:root` e `:root[data-theme=\"light\"]` de `design-system.css`, só com os"
+    },
+    {
+      "file": "MIGRATION.md",
+      "line": 190,
+      "snippet": "   `docs/DESIGN.md`."
+    },
+    {
+      "file": "index.html",
+      "line": 6,
+      "snippet": "<title>Claudinhos — Design System v2</title>"
+    },
+    {
+      "file": "index.html",
+      "line": 45,
+      "snippet": "<link rel=\"stylesheet\" href=\"design-system.css\">"
+    },
+    {
+      "file": "index.html",
+      "line": 271,
+      "snippet": "        <span class=\"eyebrow\">Design system · v2.0</span>"
+    },
+    {
+      "file": "index.html",
+      "line": 647,
+      "snippet": "    <p class=\"footer\">Catálogo de proposta, sem conexão com o backend. A fonte da verdade é <code>design-system.css</code>, espelhado em <code>tokens.ts</code>. O plano de integração em <code>web/src</code> está em <code…"
+    },
+    {
+      "file": "tokens.ts",
+      "line": 2,
+      "snippet": " * Claudinhos Design System v2.0 — aliases TypeScript."
+    },
+    {
+      "file": "tokens.ts",
+      "line": 4,
+      "snippet": " * design-system.css é a fonte da verdade. Tudo aqui é `var(--x)`, nunca um"
+    },
+    {
+      "file": "tokens.ts",
+      "line": 162,
+      "snippet": "/** Valores numéricos para cálculo JS. Espelho de design-system.css. */"
+    },
+    {
+      "file": "design-system.css",
+      "line": 2,
+      "snippet": " * Claudinhos Design System v2.0"
+    }
+  ]
+}

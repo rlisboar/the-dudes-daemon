@@ -1,0 +1,84 @@
+{
+  "files": [
+    {
+      "name": "MIGRATION.md",
+      "path": "MIGRATION.md",
+      "localPath": "/tmp/od/projects/MIGRATION.md",
+      "type": "file",
+      "size": 10478,
+      "mtime": 1790146297484.2166,
+      "kind": "text",
+      "mime": "text/markdown; charset=utf-8",
+      "artifactKind": "markdown-document",
+      "artifactManifest": {
+        "version": 1,
+        "kind": "markdown-document",
+        "title": "MIGRATION.md",
+        "entry": "MIGRATION.md",
+        "renderer": "markdown",
+        "status": "complete",
+        "exports": [
+          "md",
+          "html",
+          "pdf",
+          "zip"
+        ],
+        "metadata": {
+          "inferred": true
+        }
+      }
+    },
+    {
+      "name": "index.html",
+      "path": "index.html",
+      "localPath": "/tmp/od/projects/index.html",
+      "type": "file",
+      "size": 59772,
+      "mtime": 1790146247310.5715,
+      "kind": "html",
+      "mime": "text/html; charset=utf-8",
+      "artifactKind": "html",
+      "artifactManifest": {
+        "version": 1,
+        "kind": "html",
+        "title": "index.html",
+        "entry": "index.html",
+        "renderer": "html",
+        "status": "complete",
+        "exports": [
+          "html",
+          "pdf",
+          "zip"
+        ],
+        "createdAt": "2026-09-23T06:50:47.310Z",
+        "updatedAt": "2026-09-23T06:50:47.310Z",
+        "metadata": {
+          "inferred": true,
+          "reconciled": true
+        }
+      }
+    },
+    {
+      "name": "tokens.ts",
+      "path": "tokens.ts",
+      "localPath": "/tmp/od/projects/tokens.ts",
+      "type": "file",
+      "size": 5587,
+      "mtime": 1790146038626.5022,
+      "kind": "code",
+      "mime": "text/typescript; charset=utf-8",
+      "artifactManifest": null
+    },
+    {
+      "name": "design-system.css",
+      "path": "design-system.css",
+      "localPath": "/tmp/od/projects/design-system.css",
+      "type": "file",
+      "size": 26595,
+      "mtime": 1790146004146.8015,
+      "kind": "code",
+      "mime": "text/css; charset=utf-8",
+      "artifactManifest": null
+    }
+  ]
+}

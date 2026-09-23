@@ -1,0 +1,363 @@
+{
+  "agents": [
+    {
+      "id": "amr",
+      "name": "AMR",
+      "bin": "vela",
+      "versionArgs": [
+        "--version"
+      ],
+      "streamFormat": "acp-json-rpc",
+      "resumesSessionViaAcpLoad": true,
+      "supportsCustomModel": false,
+      "supportsImagePaths": true,
+      "defaultModelEnvVar": "VELA_DEFAULT_MODEL",
+      "models": [],
+      "modelsSource": "fallback",
+      "available": false,
+      "diagnostics": [
+        {
+          "reason": "not-on-path",
+          "severity": "error",
+          "message": "AMR (`vela`) was not found on your PATH.",
+          "searchedDirs": [
+            "/Users/lisboa/.cargo/bin",
+            "/usr/local/bin"
+          ],
+          "fixActions": [
+            {
+              "kind": "openInstall"
+            },
+            {
+              "kind": "setEnv",
+              "envKey": "VELA_BIN"
+            },
+            {
+              "kind": "rescan"
+            }
+          ]
+        }
+      ],
+      "installUrl": "https://open-design.ai/amr",
+      "docsUrl": "https://github.com/nexu-io/open-design/blob/main/docs/new-agent-runtime-acp.md"
+    },
+    {
+      "id": "claude",
+      "name": "Claude Code",
+      "bin": "claude",
+      "versionArgs": [
+        "--version"
+      ],
+      "hiddenCapabilityFlags": {
+        "probeArgsPrefix": [
+          "-p"
+        ],
+        "flags": {
+          "--thinking-display": "thinkingDisplay"
+        }
+      },
+      "promptViaStdin": true,
+      "promptInputFormat": "stream-json",
+      "streamFormat": "claude-stream-json",
+      "externalMcpInjection": "claude-mcp-json",
+      "resumesSessionViaCli": true,
+      "models": [
+        {
+          "id": "default",
+          "label": "Default (CLI config)"
+        },
+        {
+          "id": "sonnet",
+          "label": "Sonnet (alias)"
+        },
+        {
+          "id": "opus",
+          "label": "Opus (alias)"
+        },
+        {
+          "id": "haiku",
+          "label": "Haiku (alias)"
+        },
+        {
+          "id": "fable",
+          "label": "Fable (alias)"
+        },
+        {
+          "id": "claude-opus-5",
+          "label": "claude-opus-5"
+        },
+        {
+          "id": "claude-sonnet-5",
+          "label": "claude-sonnet-5"
+        },
+        {
+          "id": "claude-fable-5",
+          "label": "claude-fable-5"
+        },
+        {
+          "id": "claude-opus-4-5",
+          "label": "claude-opus-4-5"
+        },
+        {
+          "id": "claude-sonnet-4-5",
+          "label": "claude-sonnet-4-5"
+        },
+        {
+          "id": "claude-haiku-4-5",
+          "label": "claude-haiku-4-5"
+        }
+      ],
+      "modelsSource": "fallback",
+      "available": true,
+      "path": "/Users/lisboa/.local/bin/claude",
+      "version": "2.1.280 (Claude Code)",
+      "authStatus": "ok",
+      "installUrl": "https://docs.anthropic.com/en/docs/claude-code/setup",
+      "docsUrl": "https://docs.anthropic.com/en/docs/claude-code"
+    },
+    {
+      "id": "codex",
+      "name": "Codex CLI",
+      "bin": "codex",
+      "versionArgs": [
+        "--version"
+      ],
+      "reasoningOptions": [
+        {
+          "id": "default",
+          "label": "Default"
+        },
+        {
+          "id": "none",
+          "label": "None"
+        },
+        {
+          "id": "minimal",
+          "label": "Minimal"
+        },
+        {
+          "id": "low",
+          "label": "Low"
+        },
+        {
+          "id": "medium",
+          "label": "Medium"
+        },
+        {
+          "id": "high",
+          "label": "High"
+        },
+        {
+          "id": "xhigh",
+          "label": "XHigh"
+        }
+      ],
+      "promptViaStdin": true,
+      "resumesSessionViaCli": true,
+      "capturesSessionIdFromStream": true,
+      "streamFormat": "json-event-stream",
+      "eventParser": "codex",
+      "models": [
+        {
+          "id": "default",
+          "label": "Default (CLI config)"
+        },
+        {
+          "id": "gpt-6-astra",
+          "label": "GPT-6-Astra",
+          "additionalSpeedTiers": [
+            "fast"
+          ],
+          "serviceTierOptions": [
+            {
+              "id": "priority",
+              "label": "Fast"
+            }
+          ]
+        },
+        {
+          "id": "gpt-6-sol",
+          "label": "GPT-6-Sol",
+          "additionalSpeedTiers": [
+            "fast"
+          ],
+          "serviceTierOptions": [
+            {
+              "id": "priority",
+              "label": "Fast"
+            }
+          ]
+        },
+        {
+          "id": "gpt-6-luna",
+          "label": "GPT-6-Luna",
+          "additionalSpeedTiers": [
+            "fast"
+          ],
+          "serviceTierOptions": [
+            {
+              "id": "priority",
+              "label": "Fast"
+            }
+          ]
+        },
+        {
+          "id": "gpt-reserve",
+          "label": "GPT-Reserve",
+          "additionalSpeedTiers": [
+            "fast"
+          ],
+          "serviceTierOptions": [
+            {
+              "id": "priority",
+              "label": "Fast"
+            }
+          ]
+        },
+        {
+          "id": "gpt-5.6-sol",
+          "label": "GPT-5.6-Sol",
+          "additionalSpeedTiers": [
+            "fast"
+          ],
+          "serviceTierOptions": [
+            {
+              "id": "priority",
+              "label": "Fast"
+            }
+          ]
+        },
+        {
+          "id": "gpt-5.6-terra",
+          "label": "GPT-5.6-Terra",
+          "additionalSpeedTiers": [
+            "fast"
+          ],
+          "serviceTierOptions": [
+            {
+              "id": "priority",
+              "label": "Fast"
+            }
+          ]
+        },
+        {
+          "id": "gpt-5.6-luna",
+          "label": "GPT-5.6-Luna",
+          "additionalSpeedTiers": [
+            "fast"
+          ],
+          "serviceTierOptions": [
+            {
+              "id": "priority",
+              "label": "Fast"
+            }
+          ]
+        },
+        {
+          "id": "gpt-5.5",
+          "label": "GPT-5.5",
+          "additionalSpeedTiers": [
+            "fast"
+          ],
+          "serviceTierOptions": [
+            {
+              "id": "priority",
+              "label": "Fast"
+            }
+          ]
+        },
+        {
+          "id": "codex-auto-review",
+          "label": "Codex Auto Review",
+          "additionalSpeedTiers": [
+            "fast"
+          ],
+          "serviceTierOptions": [
+            {
+              "id": "priority",
+              "label": "Fast"
+            }
+          ]
+        }
+      ],
+      "modelsSource": "live",
+      "available": true,
+      "path": "/opt/homebrew/bin/codex",
+      "version": "codex-cli 0.156.0",
+      "authStatus": "ok",
+      "installUrl": "https://github.com/openai/codex",
+      "docsUrl": "https://developers.openai.com/codex"
+    },
+    {
+      "id": "devin",
+      "name": "Devin for Terminal",
+      "bin": "devin",
+      "versionArgs": [
+        "--version"
+      ],
+      "streamFormat": "acp-json-rpc",
+      "externalMcpInjection": "acp-merge",
+      "models": [
+        {
+          "id": "default",
+          "label": "Default (CLI config)"
+        },
+        {
+          "id": "adaptive",
+          "label": "adaptive"
+        },
+        {
+          "id": "swe",
+          "label": "swe"
+        },
+        {
+          "id": "opus",
+          "label": "opus"
+        },
+        {
+          "id": "sonnet",
+          "label": "sonnet"
+        },
+        {
+          "id": "codex",
+          "label": "codex"
+        },
+        {
+          "id": "gpt",
+          "label": "gpt"
+        },
+        {
+          "id": "gemini",
+          "label": "gemini"
+        }
+      ],
+      "modelsSource": "fallback",
+      "available": false,
+      "diagnostics": [
+        {
+          "reason": "not-on-path",
+          "severity": "error",
+          "message": "Devin for Terminal (`devin`) was not found on your PATH.",
+          "searchedDirs": [
+            "/Users/lisboa/.cargo/bin",
+            "/usr/local/bin"
+          ],
+          "fixActions": [
+            {
+              "kind": "openInstall"
+            },
+            {
+              "kind": "setEnv",
+              "envKey": "DEVIN_BIN"
+            },
+            {
+              "kind": "rescan"
+            }
+          ]
+        }
+      ],
+      "installUrl": "https://cli.devin.ai/docs",
+      "docsUrl": "https://docs.devin.ai/"
+    }
+  ]
+}

@@ -282,7 +282,15 @@ function racePrepareReexec(deps: SelfUpdateDeps, timeoutMs: number): Promise<voi
 
 async function requestReexec(deps: SelfUpdateDeps): Promise<"updated" | "updated-restart-pending"> {
   if (!deps.underLauncher) {
-    deps.log("warn", "[self-update] binário atualizado, mas SEM launcher — o novo código só vale após restart manual");
+    // T-937 (achado QA-A na revisão do #896): sem launcher não há exit 42, então
+    // os flags do dreno ficavam DE PÉ até alguém reiniciar à mão — o daemon
+    // seguia "drenando" para sempre e o /health mostrava causa que não existia
+    // mais. Regra: o estado de dreno volta a falso quando o dreno deixa de
+    // existir, nunca por inércia.
+    const estava = updateDraining || drainForced;
+    updateDraining = false;
+    drainForced = false;
+    deps.log("warn", `[self-update] binário atualizado, mas SEM launcher — o novo código só vale após restart manual${estava ? " (dreno desligado: o re-exec não vai sair)" : ""}`);
     return "updated-restart-pending";
   }
   // T-100: filhos ANTES do exit 42. Sem prepareReexec (testes antigos) o

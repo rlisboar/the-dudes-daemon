@@ -1,3 +1,5 @@
+// T-897 (ambiente): parte deste arquivo EXIGE `ps` funcional (sandbox do agente nega com
+// EPERM) — os testes afetados dão `skip` com motivo em vez de falhar por ambiente.
 /**
  * T-815: o relay resolvia o peer-pid com spawnSync(perl) + execFileSync(ps)
  * por hop DENTRO do handler — o event loop inteiro do daemon parava a cada
@@ -7,6 +9,7 @@
  * se algum voltar para o caminho do relay, a resolução falha e o teste cai.
  */
 import { afterEach, test } from "node:test";
+import { semPs } from "./env-exigido.js";
 import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
@@ -99,7 +102,7 @@ test("T-815: leitor default de peer-pid resolve o pid real sem spawnSync e sem p
   }
 });
 
-test("T-815: ppid assíncrono lê o pai real sem execFileSync e cacheia o resultado", async () => {
+test("T-815: ppid assíncrono lê o pai real sem execFileSync e cacheia o resultado", { skip: semPs() }, async () => {
   resetParentPidCache();
   const origExecFile = cp.execFile as (...a: unknown[]) => unknown;
   let psCalls = 0;
@@ -170,7 +173,7 @@ test("T-815: leitor injetado continua síncrono e é chamado igual (contagem pre
   assert.deepEqual([peer, parent], [1, 1]);
 });
 
-test("T-815: relay com leitores default autoriza o peer real e barra o alheio, sem chamada síncrona", async () => {
+test("T-815: relay com leitores default autoriza o peer real e barra o alheio, sem chamada síncrona", { skip: semPs() }, async () => {
   delete process.env.THE_DUDES_PEER_PID_INSECURE;
   const relay = new BridgeRelay("http://127.0.0.1:9", null);
   await relay.start();

@@ -1,3 +1,4 @@
+import { semPs } from "./env-exigido.js";
 /**
  * T-824 (revisão independente): o SIGTERM passou a manter os agentes running,
  * o que levou todo reinício por caminhos que já estavam com defeito:
@@ -132,7 +133,7 @@ test("revisão T-824: wiring do shutdown — WS fecha antes, spool/ids antes dos
   assert.match(src, /loadDeliverySeen\(profileHome\(\)\)/, "boot carrega os ids vistos antes de conectar");
 });
 
-test("revisão T-824: o instalador não se inclui (nem pais nem filhos) no snapshot de órfãos do daemon", async () => {
+test("revisão T-824: o instalador não se inclui (nem pais nem filhos) no snapshot de órfãos do daemon", { skip: semPs() }, async () => {
   const script = readFileSync(fileURLToPath(new URL("../../scripts/install-launchagent.sh", import.meta.url)), "utf8");
   const fn = /\nsnapshot_descendants\(\) \{[\s\S]*?\n\}\n/.exec(script);
   assert.ok(fn, "função snapshot_descendants presente no instalador");

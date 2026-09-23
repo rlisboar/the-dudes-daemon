@@ -30,21 +30,29 @@ import { AgentRunner } from "../agent-runner.js";
 import { killProcess } from "../runners/process-lifecycle.js";
 import { turnGateStats, _resetTurnGateForTest } from "../runners/turn-gate.js";
 
-/** Mesmo stub do t417: regista o argv de cada spawn e NUNCA sai. */
-const STUB = `#!/usr/bin/env node
+/** Mesmo stub do t417: regista o argv de cada spawn e NUNCA sai.
+ *  T-997: com `portao`, o processo nasce na hora mas só registra o argv
+ *  depois que o teste cria o arquivo `liberar` — o "spawn lento" do T-825
+ *  vira ordem garantida, não sorte de relógio. */
+const stubCom = (portao: boolean) => `#!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
 import url from "node:url";
 const dir = path.dirname(url.fileURLToPath(import.meta.url));
 const flat = process.argv.slice(2).join(" ").replace(/[\\r\\n]+/g, " ");
-fs.appendFileSync(path.join(dir, "argv.log"), flat + "\\n");
+const anunciar = () => fs.appendFileSync(path.join(dir, "argv.log"), flat + "\\n");
+if (${portao}) {
+  const t = setInterval(() => { if (fs.existsSync(path.join(dir, "liberar"))) { clearInterval(t); anunciar(); } }, 20);
+} else {
+  anunciar();
+}
 setInterval(() => {}, 1000);
 `;
 
-function makeHarness() {
+function makeHarness(portao = false) {
   const dir = mkdtempSync(path.join(os.tmpdir(), "t417leak-"));
   const stub = path.join(dir, "cli.mjs");
-  writeFileSync(stub, STUB);
+  writeFileSync(stub, stubCom(portao));
   chmodSync(stub, 0o755);
   const cmd = { command: stub, source: "override" as const, available: true };
   const off = { command: "false", source: "override" as const, available: false };
@@ -69,6 +77,8 @@ function makeHarness() {
   const children: ChildProcess[] = [];
   return {
     runner, children, stub,
+    /** T-997: abre o portão do stub (ele registra o argv). */
+    liberar: () => writeFileSync(path.join(dir, "liberar"), ""),
     argvLines: () => {
       try {
         return readFileSync(path.join(dir, "argv.log"), "utf8").split("\n").filter((l) => l.trim());
@@ -206,16 +216,26 @@ test("T-417 flake: reset do gate DEPOIS do close do filho morto não deixa dívi
   }
 });
 
+// T-997: o "spawn lento" era sorte do runner — "sem aquecer" não garante spawn
+// > 30ms (no CI e no Linux o stub se anunciava antes e a rejeição não vinha).
+// Agora o stub só se anuncia quando o teste abre o portão, DEPOIS de ver o
+// estouro: a ordem é garantida por mais rápido (aquecido) ou lento (carga)
+// que seja o runner.
 test("T-825: spawn lento (until estoura) ainda mata o stub — a suíte não fica presa", async () => {
-  const h = makeHarness();
+  const h = makeHarness(true);
   _resetTurnGateForTest();
   try {
-    // Sem aquecer: o spawn tem a janela apertada e o `until` estoura.
+    await aquecer(h);
     await assert.rejects(turnoEmVoo(h, 30), /timeout aguardando spawn do stub/);
-    // O filho pode ter nascido depois do estouro: espera ele aparecer.
-    await new Promise((r) => setTimeout(r, 500));
+    // O filho nasce e só se anuncia depois do estouro, fora de h.children: só
+    // o ocActiveProc o conhece — é o caso que travava a suíte. Espera o spawn
+    // do lado do daemon (não o boot do filho).
+    await until(() => !!asAny(h.runner).ocActiveProc, "spawn do stub no runner", 10_000);
+    h.liberar();
+    await until(() => h.argvLines().length === 1, "anúncio do stub depois do estouro", 30_000);
     const vivo = asAny(h.runner).ocActiveProc as ChildProcess | null | undefined;
     assert.ok(vivo, "o stub chegou a nascer (é o que travava a suíte)");
+    assert.equal(h.children.includes(vivo!), false, "o stub não foi capturado pelo turnoEmVoo");
   } finally {
     await limpar(h);
   }

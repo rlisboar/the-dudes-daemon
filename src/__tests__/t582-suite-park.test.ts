@@ -1,3 +1,5 @@
+// T-897 (ambiente): parte deste arquivo EXIGE `ps` funcional (sandbox do agente nega com
+// EPERM) — os testes afetados dão `skip` com motivo em vez de falhar por ambiente.
 /**
  * T-582: suites de teste abandonadas ficam penduradas para sempre.
  *
@@ -11,6 +13,7 @@
  * comentário da entrega.
  */
 import { describe, test } from "node:test";
+import { semPs } from "./env-exigido.js";
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { mkdtempSync, writeFileSync } from "node:fs";
@@ -88,7 +91,7 @@ test("T-582: assinatura da raiz — `node … --test` nu, não o worker nem o `s
   assert.equal(isTestRoot("node /path/vite --port 30474 --strictPort"), false);
 });
 
-test("T-761: ps morto ou vazio não vira host sem processos", () => {
+test("T-761: ps morto ou vazio não vira host sem processos", { skip: semPs() }, () => {
   const sentinela = "SENTINELA_STDOUT_NAO_ENTRA_NO_ERRO";
   const timeout: PsSpawnResult = {
     status: null,
@@ -231,7 +234,7 @@ test("T-582 C1/C2 (unidade): pendurada exige CPU plana E idade; CPU a crescer = 
   assert.equal(assessSuites(parada, null, opts)[0].state, "indeterminada");
 });
 
-test("T-667: CPU plana só é pendurada sem sinal RUNNABLE REPETIDO (≥2 procs, ou o mesmo pid nas duas pontas)", () => {
+test("T-667: CPU plana só é pendurada sem sinal RUNNABLE REPETIDO (≥2 procs, ou o mesmo pid nas duas pontas)", { skip: semPs() }, () => {
   const opts = { minAgeMs: 30_000, maxCpuDeltaMs: 1_000, windowMs: 180_000 };
   const avaliar = (agora: ProcRow[], antes: ProcRow[] = agora) =>
     assessSuites(collectSuites(agora, 999), sampleOf(antes), opts)[0];
@@ -373,8 +376,8 @@ function runCli(flags: string[]): { status: number | null; stdout: string; stder
   return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
 
-describe("T-582 integração (serial: o CLI varre o host inteiro)", { concurrency: 1 }, () => {
-test("T-582 C1: `--list-suites` lista a pendurada e declara o critério de corte", { timeout: CLI_TEST_TIMEOUT_MS }, async () => {
+describe("T-582 integração (serial: o CLI varre o host inteiro)", { concurrency: 1, skip: semPs() }, () => {
+test("T-582 C1: `--list-suites` lista a pendurada e declara o critério de corte", { skip: semPs() }, { timeout: CLI_TEST_TIMEOUT_MS }, async () => {
   const { dir, child } = spawnFakeSuite("pendurada");
   try {
     const suite = await findSuite(dir);
@@ -410,7 +413,7 @@ test("T-582 C1: `--list-suites` lista a pendurada e declara o critério de corte
   }
 });
 
-test("T-582 C2: suite EM VOO (CPU a crescer) não é classificada pendurada nem morta", { timeout: CLI_TEST_TIMEOUT_MS }, async () => {
+test("T-582 C2: suite EM VOO (CPU a crescer) não é classificada pendurada nem morta", { skip: semPs() }, { timeout: CLI_TEST_TIMEOUT_MS }, async () => {
   const { dir, child } = spawnFakeSuite("viva");
   try {
     const suite = await findSuite(dir);
@@ -467,7 +470,7 @@ test("T-667: janela com dCPU ~0 (limiar absurdo) NÃO lê a suite EM VOO como pe
   }
 });
 
-test("T-582 C4: o reap mata a ÁRVORE (raiz + worker + neto + grep) sem deixar órfão", { timeout: 45_000 }, async () => {
+test("T-582 C4: o reap mata a ÁRVORE (raiz + worker + neto + grep) sem deixar órfão", { skip: semPs() }, { timeout: 45_000 }, async () => {
   const { dir, child } = spawnFakeSuite("pendurada");
   try {
     const suite = await findSuite(dir, 4);

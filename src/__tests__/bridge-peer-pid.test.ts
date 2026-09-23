@@ -1,4 +1,7 @@
+// T-897 (ambiente): parte deste arquivo EXIGE `ps` funcional (sandbox do agente nega com
+// EPERM) — os testes afetados dão `skip` com motivo em vez de falhar por ambiente.
 import { afterEach, test } from "node:test";
+import { semPs } from "./env-exigido.js";
 import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
@@ -208,7 +211,7 @@ test("T-592: leitor default resolve o peer pid real do host (perl) dentro do tim
   }
 });
 
-test("T-592: ppid do host é lido corretamente e o cache curto devolve o mesmo valor", () => {
+test("T-592: ppid do host é lido corretamente e o cache curto devolve o mesmo valor", { skip: semPs() }, () => {
   resetParentPidCache();
   const want = Number(
     execFileSync("ps", ["-p", String(process.pid), "-o", "ppid="], { encoding: "utf8" }).trim(),

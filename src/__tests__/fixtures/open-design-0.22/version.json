@@ -1,0 +1,12 @@
+{
+  "version": {
+    "version": "0.22.2",
+    "channel": "stable",
+    "packaged": true,
+    "platform": "darwin",
+    "arch": "arm64",
+    "capabilities": {
+      "slideRenderer": false
+    }
+  }
+}

@@ -80,7 +80,10 @@ test("T-426 codex: token fora do argv; config.toml 0600 fora do worktree", async
   process.env.CODEX_HOME = homeBase;
   const argvDump = path.join(homeBase, "argv.txt");
   const fake = path.join(homeBase, "fake-codex.sh");
-  writeFileSync(fake, `#!/bin/sh\nprintf '%s\\n' "$@" > "${argvDump}"\nprintf '%s\\n' "$CODEX_HOME" > "${argvDump}.home"\nprintf '%s\\n' '{"type":"thread.started","thread_id":"s426"}' '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":1}}'\n`);
+  // T-897/T-709: publicação ATÔMICA (o `.home` era lido antes de existir — ENOENT
+  // no CI e no sandbox). Os dois vão para `.tmp` e o `mv` do argv.txt é o último
+  // passo: argv.txt existe ⇒ .home existe.
+  writeFileSync(fake, `#!/bin/sh\nprintf '%s\\n' "$@" > "${argvDump}.tmp"\nprintf '%s\\n' "$CODEX_HOME" > "${argvDump}.home.tmp"\nmv "${argvDump}.home.tmp" "${argvDump}.home"\nmv "${argvDump}.tmp" "${argvDump}"\nprintf '%s\\n' '{"type":"thread.started","thread_id":"s426"}' '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":1}}'\n`);
   chmodSync(fake, 0o755);
 
   const runner = makeRunner("codex", {

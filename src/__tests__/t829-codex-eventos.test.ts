@@ -1,3 +1,5 @@
+// T-897 (ambiente): parte deste arquivo EXIGE `~/.codex` gravável (o runner codex escreve o
+// config.toml no home real) — o teste afetado dá `skip` com motivo em vez de falhar por ambiente.
 /**
  * T-829: o runner codex "não aparecia" no dashboard e na RUNS. O parser só
  * virava tool o `mcp_tool_call`; shell/build/testes (`command_execution`) e
@@ -8,6 +10,7 @@
  * Eventos no formato real do codex-cli 0.156.0 (capturados do WEB).
  */
 import { test } from "node:test";
+import { semCodexHome } from "./env-exigido.js";
 import assert from "node:assert/strict";
 import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -92,7 +95,7 @@ test("T-829 runner: tool em voo por item — o completed desconta e o contador v
   assert.deepEqual(sink.thoughts, ["pensando no build"], "raciocínio chega à UI");
 });
 
-test("T-829 runner: neto segurando o pipe não prende o turno — fecha após o exit sem HARD recover", async () => {
+test("T-829 runner: neto segurando o pipe não prende o turno — fecha após o exit sem HARD recover", { skip: semCodexHome() }, async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "t829-"));
   const script = path.join(dir, "fake-codex.sh");
   const lines = [

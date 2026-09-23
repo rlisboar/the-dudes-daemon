@@ -34,7 +34,7 @@ import { MAX_DAEMON_WIRE_MESSAGE_BYTES, WireMessageTooLargeError, parseWireMessa
 import { AgentHost, agentErrorKind, sealAgentErrorMessage } from "./agent-host.js";
 import { assertWorkspaceScoped, autoWorkspaceCwd, describeGitRoots, ensureWritableDir, expandBasePath, isInsideRoot, validateBasePath, validateGitHash, validateGitRef } from "./workspace.js";
 import { buildGraph, graphMtime, graphPath, hasSemanticMarker, loadGraphJsonForUi, needsSemanticUpdate } from "./graph-indexer.js";
-import { apagarArquivoOd, apagarProjetoOd, buscarArquivosOd, cancelarRunOd, copiarDesignSystemOd, criarProjetoOd, duplicarProjetoOd, gravarArquivoOd, guiarRunOd, iniciarRunOd, lerArquivoOd, lerArtefatoOd, lerRunOd, listarAgentsOd, listarArquivosOd, listarPluginsOd, listarProjetosOd, listarSkillsCatalogoOd, listarVersoesOd, restaurarVersaoOd } from "./open-design-client.js";
+import { apagarArquivoOd, apagarProjetoOd, buscarArquivosOd, cancelarRunOd, copiarDesignSystemOd, criarProjetoOd, duplicarProjetoOd, gravarArquivoOd, guiarRunOd, iniciarRunOd, lerArquivoOd, lerArtefatoOd, lerRunOd, listarAgentsOd, listarArquivosOd, listarPluginsOd, listarProjetosOd, listarSkillsCatalogoOd, listarVersoesOd, restaurarVersaoOd, historicoNota, setLogOd, versaoOd } from "./open-design-client.js";
 import { ensureGraphWatch, stopAllGraphWatches } from "./graph-watcher.js";
 import { detectDropTarget, spawnDropped, type DropTarget } from "./privileges.js";
 import { BridgeRelay, type PeerPidMode } from "./bridge-relay.js";
@@ -297,6 +297,8 @@ export class DaemonClient {
   // projeto ATIVO). Sem state global pra evitar last-write-wins.
   /** Spawns adiados esperando project key E2EE (race: spawn chega antes do wrap). */
   private pendingSpawns = new Map<string, FromOrch[]>(); // projectId → agent:spawn msgs
+  /** T-844: a versão do Open Design é logada uma vez por processo. */
+  private odVersaoLogada = false;
   /** agentIds que já esperaram SPAWN_KEY_WAIT_MS — evita loop infinito de adiar. */
   private spawnKeyWaited = new Set<string>();
   private static readonly SPAWN_KEY_WAIT_MS = 8_000;
@@ -2049,6 +2051,15 @@ export class DaemonClient {
   /** Aba Open Design: HTTP só no daemon local. Erro curto no mesmo correlationId. */
   private async handleOpenDesign(msg: Extract<FromOrch, { type: `open_design:${string}` }>): Promise<void> {
     const kind = kindOpenDesign(msg.type);
+    // T-844: no primeiro pedido da vida do processo, registra QUAL Open Design
+    // está instalado — era impossível diagnosticar sem isto.
+    if (!this.odVersaoLogada) {
+      this.odVersaoLogada = true;
+      void versaoOd().then(
+        (v) => log("info", `[open_design] Open Design ${v ?? "versão desconhecida"} — histórico de arquivo: ${historicoNota(v)}`),
+        (e) => log("warn", `[open_design] /api/version falhou: ${(e as Error).message}`),
+      );
+    }
     try {
       if (msg.type === "open_design:list") {
         this.send({ type: "open_design:result", correlationId: msg.correlationId, kind: "projects", projects: await listarProjetosOd() });
@@ -2987,6 +2998,9 @@ const cliConfig = mergeCliConfig(
   { cliPaths: args.cliPaths },
 );
 const cliCommands = resolveCliCommands(cliConfig);
+// T-844: cada pedido open_design:* vira uma linha no log (operação, duração e
+// status/erro). Sem isto a ação que falhou para o dono não aparecia em lugar nenhum.
+setLogOd((nivel, msg) => log(nivel, msg));
 if (SELF_BOOTSTRAP) {
   new DaemonClient(args, cliCommands).start().catch(async (e) => {
     capture(e, { phase: "startup" });

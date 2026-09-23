@@ -1,5 +1,8 @@
 import type { CliRunner } from "../types.js";
 import type { DropTarget } from "../privileges.js";
+import { mkdirSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { QWEN_STREAM_MAX_LIFETIME_MS } from "./turn-watchdog.js";
 
 /** Vars do processo pai que o CLI do agente pode herdar. Nada além disto. */
@@ -89,12 +92,27 @@ export function buildGeminiEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
  *  de UMA resposta) sai da MESMA fonte que o teto de lifetime do turno
  *  (turn-watchdog) e fica acima dele — o daemon corta primeiro com re-fila;
  *  sem isto um env velho (8min) abortaria a resposta antes do teto do turno,
- *  e aborto do CLI fecha o turno sem recover (mensagem em voo perdida). */
+ *  e aborto do CLI fecha o turno sem recover (mensagem em voo perdida).
+ *
+ *  T-751 (boot ~15s por turno — spawn por mensagem): o custo NÃO é modelo nem
+ *  discovery; o CLI re-executa a si mesmo para subir o heap (`relaunch`) e o
+ *  grafo ESM de ~54MB é compilado/carregado DUAS vezes. Medido em probe
+ *  isolado (n≥2, init do stream até `system/init`): 14–16s no default;
+ *  desligar o relaunch cai para 9,1–9,7s, e somar o compile cache do V8
+ *  (NODE_COMPILE_CACHE) cai para 6,5–7,6s — `assistant` (1º evento) de
+ *  ~19,8s para ~10,3s (p50). O heap que o relaunch subiria é reposto via
+ *  NODE_OPTIONS; o `--expose-gc` o entry já passa. Contrato do runner
+ *  intacto (só env). Evidência: .orchestrator/evidence/T-751/. */
 export function buildQwenEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const cacheDir = path.join(base.HOME ?? os.homedir(), ".cache", "the-dudes", "qwen-compile-cache");
+  try { mkdirSync(cacheDir, { recursive: true }); } catch { /* cache é otimização, não pré-requisito */ }
   return {
     ...base,
     QWEN_CODE_SUPPRESS_YOLO_WARNING: "1",
     QWEN_STREAM_MAX_LIFETIME_MS: String(QWEN_STREAM_MAX_LIFETIME_MS),
+    QWEN_CODE_NO_RELAUNCH: "1",
+    NODE_COMPILE_CACHE: base.NODE_COMPILE_CACHE || cacheDir,
+    NODE_OPTIONS: [base.NODE_OPTIONS, "--max-old-space-size=8192"].filter(Boolean).join(" "),
   };
 }
 

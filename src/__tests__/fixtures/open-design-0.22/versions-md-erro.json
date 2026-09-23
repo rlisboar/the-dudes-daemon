@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "BAD_REQUEST",
+    "message": "versions are only available for HTML files"
+  }
+}

@@ -1,0 +1,100 @@
+{
+  "file": {
+    "buffer": {
+      "type": "Buffer",
+      "data": [
+        60,
+        33,
+        100,
+        111,
+        99,
+        116,
+        121,
+        112,
+        101,
+        32,
+        104,
+        116,
+        109,
+        108,
+        62,
+        10,
+        60,
+        104,
+        116,
+        109,
+        108,
+        32,
+        108,
+        97,
+        110,
+        103,
+        61,
+        34,
+        112,
+        116,
+        45,
+        66,
+        82,
+        34,
+        32,
+        100,
+        97,
+        116,
+        97,
+        45,
+        116,
+        104,
+        101,
+        109,
+        101,
+        61,
+        34,
+        100
+      ]
+    },
+    "name": "index.html",
+    "path": "index.html",
+    "size": 59772,
+    "mtime": 1790146247310.5715,
+    "mime": "text/html; charset=utf-8",
+    "kind": "html",
+    "artifactKind": "html",
+    "artifactManifest": {
+      "version": 1,
+      "kind": "html",
+      "title": "index.html",
+      "entry": "index.html",
+      "renderer": "html",
+      "status": "complete",
+      "exports": [
+        "html",
+        "pdf",
+        "zip"
+      ],
+      "createdAt": "2026-09-23T06:50:47.310Z",
+      "updatedAt": "2026-09-23T06:50:47.310Z",
+      "metadata": {
+        "inferred": true,
+        "reconciled": true
+      }
+    }
+  },
+  "versions": [
+    {
+      "id": "e378aa2c-6b4e-46ce-ab32-75ef909b16b8",
+      "fileName": "index.html",
+      "version": 1,
+      "label": "Version 1",
+      "createdAt": 1790146314578,
+      "source": "ai",
+      "prompt": "[form answers — ds-scope]\n- Onde aplicar a melhoria?: Catálogo primeiro, integração no app depois [value: both]\n- Quais pontos priorizar?: Unificar tokens CSS/TS (raios, motion) [value: tokens], Componentes e estados (botão, campo, diálogo) [value: components], Tirar valores soltos (--size-*, fontes duplicadas) [value: cleanup], Tipografia e escala de texto [value: type]",
+      "size": 59772,
+      "mime": "text/html; charset=utf-8",
+      "kind": "html",
+      "current": true,
+      "promptSource": "message",
+      "contentDigest": "902efd18e86f952fd10c8c7d5bb88acd53ce5d73d3ee8f86c97d12fbd649bf06"
+    }
+  ]
+}

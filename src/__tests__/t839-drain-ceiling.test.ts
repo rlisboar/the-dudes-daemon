@@ -234,3 +234,47 @@ test("T-839: turnElapsedMs do claude é a idade do turno aberto, e o dashboard c
   assert.match(dreno!.title, new RegExp(OCUPADO));
   assert.match(dreno!.detail, /result/);
 });
+
+test("T-937: teto do dreno SEM launcher não deixa o daemon drenando para sempre", async () => {
+  // Achado do QA-A: sem launcher o re-exec não sai (restart-pending), mas os
+  // flags do dreno ficavam de pé — /health mostrava updateDraining=true sem
+  // causa até alguém reiniciar à mão. O dreno tem de voltar a falso quando
+  // deixa de existir, com motivo no log.
+  const { _resetIdleRestartForTest, checkAndApplyUpdate, runningReleaseInfo, DRAIN_AFTER_MS, DRAIN_FORCE_MS } = await import("../self-update.js");
+  _resetIdleRestartForTest();
+  const clock = { t: 0 };
+  const ticks: Array<() => void> = [];
+  const logs: string[] = [];
+  let drenos = 0;
+  const inst = signedInstall(`#!/usr/bin/env node\nconst DAEMON_BUILD_TS = Number("2000000000000");\n`, "bridge");
+  const r = await checkAndApplyUpdate({
+    orchBase: "http://x",
+    selfPath: path.join(mkdtempSync(path.join(os.tmpdir(), "t937-")), "daemon.cjs"),
+    runningHash: "b".repeat(64),
+    runningBuildTs: 1_000_000_000_000,
+    log: (_l, m) => { logs.push(m); },
+    underLauncher: false, // <- o caso do card
+    fetchFn: inst.fetchFn,
+    trustedPubs: inst.pubs,
+    isIdle: () => false,
+    startDrain: () => { drenos++; },
+    idleRecheckMs: 15_000,
+    nowFn: () => clock.t,
+    setTimeoutFn: (fn) => { ticks.push(fn); return 0; },
+    exitFn: () => {},
+  });
+  assert.equal(r, "updated-awaiting-idle");
+  const teto = DRAIN_AFTER_MS + DRAIN_FORCE_MS;
+  for (let i = 0; i < ticks.length && clock.t <= teto; i++) {
+    clock.t += 15_000;
+    ticks[i]!();
+    await new Promise((r2) => setImmediate(r2));
+  }
+  assert.equal(drenos, 1, "o dreno ligou");
+  assert.ok(logs.some((l) => l.includes("SEM launcher") && l.includes("dreno desligado")), logs.join("\n"));
+  // O estado NÃO segue "drenando" (é o que o /health mostra): o flag voltou a
+  // falso no caminho sem launcher.
+  const info = runningReleaseInfo() as { updateDraining?: boolean; updatePending?: boolean };
+  assert.equal(info.updateDraining, false, "dreno desligado depois do teto sem launcher");
+  assert.equal(info.updatePending, true, "o update pendente continua declarado (é real)");
+});

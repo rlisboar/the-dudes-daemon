@@ -90,6 +90,17 @@ test("qwen env: QWEN_HOME por agente só para o runner qwen; yolo warning silenc
   );
 });
 
+test("T-751: env do qwen desliga o relaunch interno e liga o compile cache do V8", () => {
+  const env = buildQwenEnv({ HOME: "/tmp/t714-home" });
+  assert.equal(env.QWEN_CODE_NO_RELAUNCH, "1", "relaunch re-executa o CLI e dobra o load do grafo");
+  assert.equal(env.NODE_COMPILE_CACHE, "/tmp/t714-home/.cache/the-dudes/qwen-compile-cache");
+  assert.match(env.NODE_OPTIONS ?? "", /--max-old-space-size=8192/, "heap reposto sem o relaunch");
+  // Respeita o que o ambiente já trouxe (não sobrescreve escolha externa).
+  const custom = buildQwenEnv({ HOME: "/tmp/x", NODE_COMPILE_CACHE: "/meu/cache", NODE_OPTIONS: "--trace-warnings" });
+  assert.equal(custom.NODE_COMPILE_CACHE, "/meu/cache");
+  assert.equal(custom.NODE_OPTIONS, "--trace-warnings --max-old-space-size=8192");
+});
+
 test("qwen janela: contextWindowSize do settings do dono vence; ausente = 200k real do CLI", () => {
   const mk = (win?: number) => ({
     modelProviders: { openai: [{ id: "rezulto/qwen3.8-flash", baseUrl: "https://x/v1", ...(win ? { generationConfig: { contextWindowSize: win } } : {}) }] },
