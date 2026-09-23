@@ -68,8 +68,15 @@
   <key>ThrottleInterval</key>
   <integer>5</integer>
 
+  <!--
+    T-813: Interactive = mesma prioridade do terminal (pri 31). Background
+    aplicava o clamp de QoS de background (pri 4, CPU e I/O estrangulados),
+    herdado por TODO filho: runners, MCPs, builds e testes dos agentes.
+    O launchd só lê ProcessType no bootstrap; o re-exec do self-update não
+    troca. Instalação antiga precisa de reload do agente.
+  -->
   <key>ProcessType</key>
-  <string>Background</string>
+  <string>Interactive</string>
 
   <key>StandardOutPath</key>
   <string>__STDOUT__</string>
