@@ -1,5 +1,5 @@
 /* R7 (T-462): turno extraído do agent-runner — `self` é o AgentRunner. */
-import { endTurn } from "./end-turn.js";
+import { beginTurn, endTurn } from "./end-turn.js";
 import {ChildProcess} from "node:child_process";
 import {ImageAttachment} from "../../types.js";
 import {PER_MSG_TURN_TIMEOUT_MS} from "../../agent-runner.js";
@@ -65,6 +65,7 @@ export async function runGeminiMessage(self: any, content: string, images?: Imag
     // clear/compact descartou) — e o resumo pendente seria perdido junto.
     const pendingSummary = firstTurnSnapshot.pendingSummary;
     const epoch = self.messageSession.epoch;
+    const turnKey = beginTurn(self);
     if (firstTurn) {
       message = self.initialMessage(content, pendingSummary);
     }
@@ -161,7 +162,7 @@ export async function runGeminiMessage(self: any, content: string, images?: Imag
     proc.on("close", (code) => {
       // R7: fim de turno único/idempotente (T-417 + T-251 preservados dentro).
       timing?.finish(sawResult ? "completed" : code === 0 ? "error" : "process-exit");
-      endTurn(self, { epoch, code, sawResult, firstTurnSnapshot, beforeCleanup: flush, imgCleanup });
+      endTurn(self, { epoch, turnKey, code, sawResult, firstTurnSnapshot, beforeCleanup: flush, imgCleanup });
     });
   }
   /* ---------- Qwen Code per-message model (fork do Gemini CLI, stream JSONL

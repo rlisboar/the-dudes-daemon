@@ -1,5 +1,5 @@
 /* R7 (T-462): turno extraído do agent-runner — `self` é o AgentRunner. */
-import { endTurn } from "./end-turn.js";
+import { beginTurn, endTurn } from "./end-turn.js";
 import {AgentUsage, ImageAttachment} from "../../types.js";
 import {ChildProcess} from "node:child_process";
 import {PER_MSG_TURN_TIMEOUT_MS} from "../../agent-runner.js";
@@ -98,6 +98,7 @@ export async function runCodexMessage(self: any, content: string, images?: Image
     // Epoch do spawn: eventos deste turno só valem enquanto a sessão não foi
     // resetada (clear/compact) — ver handleCodexEvent.
     const epoch = self.messageSession.epoch;
+    const turnKey = beginTurn(self);
     let buf = "";
     proc.stdout!.setEncoding("utf8");
     proc.stderr!.setEncoding("utf8");
@@ -135,7 +136,7 @@ export async function runCodexMessage(self: any, content: string, images?: Image
       buf = "";
       // R7: fim de turno único/idempotente (T-417 + T-251 preservados dentro).
       timing?.finish(code === 0 ? "completed" : "process-exit");
-      endTurn(self, { epoch, code, imgCleanup });
+      endTurn(self, { epoch, turnKey, code, imgCleanup });
       if (!self.stopped && self.messageSession.owns(epoch)) {
         // T-245: ocupação REAL pós-turno (último token_count do rollout). O
         // billing do turn.completed já reportado acima é substituído pelo
