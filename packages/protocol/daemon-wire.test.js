@@ -158,9 +158,10 @@ test("T-878: project:features existe nos dois lados do contrato e exige a flag",
  * handler usa o objeto CRU, então `strip` não perde nada.
  */
 test("T-878: schema de typesafe:shadow é não-estrito (chave extra passa) e os novos campos são opcionais", () => {
-  const schema = daemonWireSchemas["typesafe:shadow"];
-  const modo = schema._def?.unknownKeys ?? schema.def?.unknownKeys;
-  assert.equal(modo, "strip", "esquema ficou estrito: daemon novo x server antigo passaria a exigir ordem de deploy");
+  // T-974: asserção por COMPORTAMENTO (vale em qualquer zod). A introspecção do
+  // `_def.unknownKeys` era do zod 3 e o lock resolve zod 4 — o teste morria
+  // com o contrato certo.
+  assert.equal(validateDaemonMessage(shadowBase()).ok, true, "sem os campos novos (daemon antigo) tem de passar");
 
   // o que um SERVER ANTIGO vê de um daemon novo: campos que o schema dele não
   // declara. Tem de passar.
@@ -170,24 +171,43 @@ test("T-878: schema de typesafe:shadow é não-estrito (chave extra passa) e os 
     domain: "server", confidence: null, destructiveNoul: 0.1, disagreeTaskType: false, disagreeComplexity: false,
     source: "task", taskId: "task_1", hashKind: "hmac1", probabilidadesDoFuturo: { a: 1 },
   };
-  assert.equal(validateDaemonMessage(legadoComCampoFuturo).ok, true, "chave extra foi rejeitada");
+  assert.equal(validateDaemonMessage(legadoComCampoFuturo).ok, true,
+    "chave extra foi rejeitada: esquema ficou estrito e daemon novo x server antigo passaria a exigir ordem de deploy");
+  // strip, não passthrough nem strict: a chave desconhecida some do parse (o
+  // handler usa o objeto CRU, então nada se perde)
+  const parsed = daemonWireSchemas["typesafe:shadow"].safeParse(legadoComCampoFuturo);
+  assert.equal(parsed.success, true);
+  assert.equal("probabilidadesDoFuturo" in parsed.data, false, "chave extra devia ser descartada (strip)");
 });
 
 test("T-878: vocabulário do hashKind bate com o CHECK da v22 (sha256|hmac1)", () => {
   // Fonte da verdade no server: migrations v22 (T-853),
   // CHECK (hash_kind IS NULL OR hash_kind IN ('sha256', 'hmac1')).
   // Um terceiro valor aqui (ex.: md5) passaria no pacote e morreria no INSERT.
+  // T-974: `unwrap()`/`options` são API PÚBLICA (zod 3 e 4) — o `_def` não é.
   const hk = daemonWireSchemas["typesafe:shadow"].shape.hashKind;
-  const valores = hk._def.innerType._def.values;
-  assert.deepEqual([...valores], ["sha256", "hmac1"], "vocabulário divergiu do CHECK da v22");
-  assert.equal(validateDaemonMessage({ ...shadowBase(), hashKind: "md5" }).ok, false);
+  assert.deepEqual([...hk.unwrap().options].sort(), ["hmac1", "sha256"], "vocabulário divergiu do CHECK da v22");
+  // e o comportamento, que é o que o wire vê
+  for (const kind of ["sha256", "hmac1"]) {
+    assert.equal(validateDaemonMessage({ ...shadowBase(), hashKind: kind }).ok, true, `${kind} é do contrato`);
+  }
+  for (const kind of ["md5", "SHA256", "", null, 1]) {
+    assert.equal(validateDaemonMessage({ ...shadowBase(), hashKind: kind }).ok, false, `${JSON.stringify(kind)} fora do contrato`);
+  }
+  // ausente = daemon antigo (só delegate). `null` NÃO: o daemon nunca manda
+  // (typesafe-task-shadow.ts tipa só "hmac1" | "sha256").
+  assert.equal(validateDaemonMessage(shadowBase()).ok, true, "hashKind ausente é o legado");
 });
 
 test("T-878: project:features é não-estrito e exige só (projectId, jev)", () => {
   const schema = fromOrchSchemas["project:features"];
-  assert.equal(schema._def?.unknownKeys ?? schema.def?.unknownKeys, "strip", "esquema ficou estrito");
-  assert.equal(schema.safeParse({ type: "project:features", projectId: "p1", jev: false, futuro: 1 }).success, true);
+  // T-974: comportamento em vez de `_def.unknownKeys` (zod 3)
+  assert.equal(schema.safeParse({ type: "project:features", projectId: "p1", jev: false, futuro: 1 }).success, true,
+    "chave extra foi rejeitada: esquema ficou estrito");
+  assert.equal(schema.safeParse({ type: "project:features", projectId: "p1", jev: true }).success, true);
   assert.equal(schema.safeParse({ projectId: "p1", jev: true }).success, false, "type obrigatório");
+  assert.equal(schema.safeParse({ type: "project:features", jev: true }).success, false, "projectId obrigatório");
+  assert.equal(schema.safeParse({ type: "project:features", projectId: "p1" }).success, false, "jev obrigatório");
 });
 
 /** Payload mínimo do shadow do daemon (só os campos obrigatórios do contrato). */
