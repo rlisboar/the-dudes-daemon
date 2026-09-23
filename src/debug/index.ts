@@ -236,6 +236,8 @@ export function diagnose(input: {
   now?: number;
   platform?: NodeJS.Platform;
   history?: HistorySummary | null;
+  /** T-839: estado do host (dreno + quem segura). O dashboard manda o record cru. */
+  host?: Record<string, unknown>;
 }): Alert[] {
   const now = input.now ?? Date.now();
   const platform = input.platform ?? process.platform;
@@ -337,6 +339,29 @@ export function diagnose(input: {
       add("warn", "agente", `${name}: turno ativo com ${procs.procs} processo(s) a ${procs.cpuPct}% de CPU`, "CLI parado esperando algo (rede do provedor, lock, stdin).");
     }
     if (r.alive === false && a.hasRunner) add("warn", "agente", `${name}: runner marcado mas processo morto`, "");
+    // T-839: turno aberto de verdade (claude espera `result`). Sem o dreno
+    // ligado isto só explica o rótulo; com o dreno, o alerta de baixo nomeia
+    // quem segura o re-exec.
+    if (r.longTurn && input.host?.draining !== true) {
+      add("info", "agente", `turno longo: ${a.agentId} há ${fmtMs(r.turnElapsedMs)}`,
+        `Motivo: ${r.turnHoldReason ?? r.state}. O claude contínuo só fecha o turno no evento result; monitor ou tool em segundo plano mantém o stream aberto. É turno de verdade — a idade é deste turno, não um flag preso desde o boot.`);
+    }
+  }
+
+  if (input.host?.draining === true) {
+    const bruto = input.host.drainHolders;
+    const holders = Array.isArray(bruto)
+      ? bruto as Array<{ agentId: string; turnAgeMs: number; runner?: string; state?: string; reason?: string }>
+      : [];
+    if (holders.length === 0) {
+      add("warn", "dreno", "dreno do self-update ligado sem agente nomeado",
+        "O re-exec espera o teto. Nenhum snapshot de turno chegou — veja o turn-gate.");
+    }
+    for (const h of holders) {
+      const longo = h.turnAgeMs >= 10 * MIN;
+      add("warn", "dreno", `${longo ? "turno longo" : "turno"} segura o dreno: ${h.agentId} há ${fmtMs(h.turnAgeMs)}`,
+        `runner=${h.runner ?? "?"} state=${h.state ?? "?"} motivo=${h.reason ?? "?"}. O claude contínuo permanece em turno até o evento result; um monitor em segundo plano não emite result. No teto o re-exec sai com keepRunning e o turno volta pelo spool e --resume.`);
+    }
   }
 
   // Turnos por runner (última hora).
@@ -625,6 +650,7 @@ export async function startDebugDashboard(deps: DashboardDeps): Promise<Dashboar
   const overview = () => {
     const agents = deps.agents();
     const gate = deps.gate();
+    const host = deps.hostState();
     const ws = { ...deps.wsLive(), ...(wsSnapshot() as Record<string, unknown>), rttSeries: undefined, events: undefined, inbound: undefined, outbound: undefined };
     const proc = sampler.latestSample();
     const pinfo = processInfo();
@@ -642,14 +668,14 @@ export async function startDebugDashboard(deps: DashboardDeps): Promise<Dashboar
       gate,
       agents: agents.map((a) => ({ ...a, turns1h: turnByAgent.get(String(a.agentId)) ?? null, procs: cpuByAgent.get(String(a.agentId)) ?? null })),
       liveTurns: liveTurnsSnapshot(),
-      host: deps.hostState(),
+      host,
       ws,
       relay: { ...deps.relayLive(), ...(relaySnapshot(0) as Record<string, unknown>), recent: undefined },
       procs: proc ? { ts: proc.ts, tookMs: proc.tookMs, error: proc.error, hostProcs: proc.hostProcs, totals: proc.totals, byAgent: proc.byAgent, orphans: proc.orphans.length, hotOrphans: proc.hotOrphans.length, self: proc.self, priCounts: proc.priCounts } : null,
       logs: queryLogs({ limit: 1 }).counts,
       stalls5m: stallsSnapshot(400).recent.filter((s) => Date.now() - s.ts < 5 * MIN).length,
       cliCapture: cliCaptureEnabled(),
-      alerts: diagnose({ agents, gate, loop: lastLoop, proc, ws, process: pinfo, system: sys, history }),
+      alerts: diagnose({ agents, gate, loop: lastLoop, proc, ws, process: pinfo, system: sys, history, host }),
       historyAt: history?.generatedAt ?? null,
       point: timeSeries(1)[0] ?? null,
     };

@@ -23,6 +23,7 @@ import {ContextTracker, CumulativeUsageTracker} from "./runners/context-tracker.
 import {killGrokLeader, killPidTree, killProcess, pidAlive, processAlive as procAlive, terminateWithEscalation} from "./runners/process-lifecycle.js";
 
 import {createActivityClock, hangPhase, hangThresholds, hardRecoverNotifyPolicy, toolsInFlightHardDue, touchActivityClock, turnLifetimeExceeded, type HardRecoverKind, type TurnActivityClock} from "./runners/turn-watchdog.js";
+import {LONG_TURN_MS} from "./self-update.js";
 import {OpenCodeTransport} from "./runners/opencode-transport.js";
 import {HANG_RECOVER_NUDGE_BACKOFF_MS, HANG_RECOVER_NUDGE_MAX, deliverHangRecoverNudge, planHangRecoverNudge} from "./runners/hang-nudge.js";
 
@@ -306,7 +307,7 @@ export class AgentRunner {
    *  roda, então a pendente só é consumida quando OUTRA escrita chega (paradas
    *  de 25min em prod). Serializa: 1 write por vez; o próximo só sai no result.
    *  A espera fica no NOSSO queue (observável), não no pipe do CLI. */
-  private claudeWriteQueue: Array<{ content: string; images?: ImageAttachment[]; timingMessage: object }> = [];
+  private claudeWriteQueue: Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string; timingMessage: object }> = [];
   /** T-758: mensagem escrita e ainda não aceita pelo CLI (sem `system/init`).
    *  `claudeUnacceptedSince` arma o watchdog; zera no accept. */
   private claudeInflight: { content: string; images?: ImageAttachment[]; timingMessage: object; timing: TurnTiming } | null = null;
@@ -391,11 +392,15 @@ export class AgentRunner {
   /** Mensagens recebidas durante restart (kill→startClaude). Flushed
    *  quando o novo proc estiver writable. Sem isso, mission engine
    *  perde dispatches feitos no meio do clearContext/compact. */
-  private pendingMessages: Array<{ content: string; images?: ImageAttachment[] }> = [];
+  private pendingMessages: Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string }> = [];
 
   /** Hang watchdog: última atividade SEMÂNTICA (eventos parseados / tools / state).
    *  NÃO bytes brutos de stdout/stderr — ver touchActivity + runGrokMessage. */
   private activityClock: TurnActivityClock = createActivityClock();
+  /** T-839: quando o turno corrente do claude abriu. O relógio do watchdog
+   *  nasce com o runner e, no claude, nunca é rearmado — usar ele como idade
+   *  do turno mostrava "2h" desde o boot. */
+  private turnActiveSince: number | null = null;
   /**
    * T-593: pids de turnos spawnados por este runner cujo `close` ainda não
    * chegou. `ocActiveProc` sozinho não basta: um `close` TARDIO de turno já
@@ -425,6 +430,9 @@ export class AgentRunner {
     images?: ImageAttachment[];
     attempt: number;
   } | null = null;
+  /** T-842: mensagem do turno aberto (com deliveryId). O SIGTERM a põe no
+   *  spool; o fim normal do turno não — busy/claudeInflight/dsh já cairam. */
+  private currentTurn: { content: string; images?: ImageAttachment[]; deliveryId?: string } | null = null;
   /**
    * Claude (e similares): tool_use abertos sem tool_result ainda.
    * Enquanto >0 e com stream recente o CLI pode ficar minutos sem texto —
@@ -633,7 +641,11 @@ export class AgentRunner {
   /** M18 (T-441): turno VIVO do claude contínuo — o self-update usava só o
    *  turn-gate (per-message) e reiniciava no meio do turno do claude, matando
    *  a sessão. Estados de trabalho + mensagens bufferizadas com proc vivo
-   *  contam; per-message devolve false (lá o turn-gate é a fonte). */
+   *  contam; per-message devolve false (lá o turn-gate é a fonte).
+   *
+   *  T-839: fica true por horas quando um monitor/tool em segundo plano não
+   *  deixa o CLI emitir `result`. É turno de verdade (o stream não fechou),
+   *  não um flag preso. O dreno nomeia este agente e, no teto, re-executa. */
   isTurnActive(): boolean {
     if (this.exited || this.stopped) return false;
     if (this.opts.cliRunner !== "claude") return false;
@@ -641,6 +653,26 @@ export class AgentRunner {
     // T-758: fila serializada do stdin também é trabalho não terminado.
     if ((this.claudeWriteQueue.length > 0 || this.claudeInflight) && procAlive(this.proc)) return true;
     return this.currentState === "thinking" || this.currentState === "sending" || this.currentState === "speaking";
+  }
+
+  /** T-839: por que o claude ainda está em turno. Null se o turno fechou. */
+  turnHoldReason(): string | null {
+    if (!this.isTurnActive()) return null;
+    if (this.pendingMessages.length > 0) return "fila-pendente";
+    if (this.claudeWriteQueue.length > 0 || this.claudeInflight) return "stdin-em-voo";
+    // Tool (monitor inclusive) ainda sem tool_result: o CLI não manda `result`.
+    if (this.toolsInFlight > 0) return "tool-em-voo-sem-result";
+    return "stream-sem-result";
+  }
+
+  /** T-839: idade do turno aberto. Fora de turno, null — não é o uptime do runner. */
+  activeTurnAgeMs(now = Date.now()): number | null {
+    if (!this.isTurnActive()) {
+      if (this.currentState === "idle" || this.currentState === "stopping" || this.stopped) this.turnActiveSince = null;
+      return null;
+    }
+    if (this.turnActiveSince == null) this.turnActiveSince = now;
+    return Math.max(0, now - this.turnActiveSince);
   }
 
   /** T-812: estado interno para o dashboard de debug local. Só metadados —
@@ -659,6 +691,8 @@ export class AgentRunner {
       state: this.currentState,
       alive: this.isAlive(),
       turnActive: this.isTurnActive(),
+      turnHoldReason: this.turnHoldReason(),
+      longTurn: (this.activeTurnAgeMs(now) ?? 0) >= LONG_TURN_MS,
       inTurn: this.isInTurn(),
       stopped: this.stopped,
       exited: this.exited,
@@ -681,7 +715,10 @@ export class AgentRunner {
       ocToolParts: this.ocToolRunningPartIds.size,
       ocPendingPermissions: this.ocPendingPermissionIds.size,
       idleMs: now - clock.lastActivityAt,
-      turnElapsedMs: now - clock.turnStartedAt,
+      // Claude: idade do turno aberto (turnActiveSince). Os outros runners
+      // rearmam turnStartedAt em cada spawn; o claude não, e o número virava
+      // o uptime desde o boot.
+      turnElapsedMs: this.opts.cliRunner === "claude" ? this.activeTurnAgeMs(now) : now - clock.turnStartedAt,
       firstEventAgoMs: age(clock.firstEventAt),
       softReported: clock.softReported,
       deadMs: age(clock.deadSince),
@@ -836,6 +873,7 @@ export class AgentRunner {
     this.touchActivity();
     const next = this.messageSession.dequeue();
     if (!next) { this.messageSession.busy = false; return; }
+    this.currentTurn = { content: next.content, images: next.images, deliveryId: next.deliveryId };
     this.turnLatency.activate(next, this.messageSession.sessionId ? "resume" : "cold");
     const { content, images } = next;
     if (this.opts.cliRunner === "gemini") {
@@ -877,30 +915,67 @@ export class AgentRunner {
    * e fila do dsh — na ordem de chegada. O turno em curso não está em nenhuma
    * delas e segue intacto. O host re-cifra isto no spool do re-exec.
    */
-  takeQueuedForDrain(): Array<{ content: string; images?: ImageAttachment[] }> {
-    const out: Array<{ content: string; images?: ImageAttachment[] }> = [];
-    for (const m of this.messageSession.takeAllForDrain()) out.push({ content: m.content, images: m.images });
+  takeQueuedForDrain(): Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string }> {
+    const out: Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string }> = [];
+    for (const m of this.messageSession.takeAllForDrain()) out.push({ content: m.content, images: m.images, deliveryId: m.deliveryId });
     for (const m of this.pendingMessages) this.turnLatency.discard(m, "drained");
-    out.push(...this.pendingMessages.splice(0));
+    out.push(...this.pendingMessages.splice(0).map((m) => ({ content: m.content, images: m.images, deliveryId: m.deliveryId })));
     // T-758: escrita serializada ainda não enviada também é drainável.
     for (const m of this.claudeWriteQueue) this.turnLatency.discard(m.timingMessage, "drained");
-    out.push(...this.claudeWriteQueue.map((m) => ({ content: m.content, images: m.images })));
+    out.push(...this.claudeWriteQueue.map((m) => ({ content: m.content, images: m.images, deliveryId: m.deliveryId })));
     this.claudeWriteQueue = [];
     out.push(...dshTakeQueue(this as unknown as Record<string, unknown>));
     return out;
   }
 
-  pushUserMessage(content: string, images?: ImageAttachment[], latencyMessage?: { content: string; images?: ImageAttachment[] }) {
+  /** T-899: itens não iniciados que o stop tirou do runner (o host retém). */
+  private retidasNoStop: Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string }> = [];
+
+  /** T-899: o host colhe isto logo depois do stop. Uma vez só. */
+  takeQueueForRetain(): Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string }> {
+    const out = this.retidasNoStop;
+    this.retidasNoStop = [];
+    return out;
+  }
+
+  /**
+   * T-899 (parecer do SECURITY, item 1): as TRÊS fontes saem por aqui, com
+   * `source` explícito — `claudeWriteQueue`, `pendingMessages` e a fila do dsh
+   * entram pelo mesmo `takeQueuedForDrain` do dreno T-720 (o `clearQueue`
+   * sozinho cobria menos da metade e a `claudeWriteQueue` saía muda).
+   * O host recebe pelo callback e retém sob o agentId.
+   */
+  private capturarFilaParaRetencao(source: "stop" | "context-clear" | "loop-stop"): void {
+    const itens = this.takeQueuedForDrain();
+    if (itens.length === 0) return;
+    this.opts.log("info", `[cli:${this.info.id}:${this.opts.cliRunner}] ${itens.length} msg(s) não iniciada(s) retidas (source=${source})`);
+    (this.opts as { onQueueRetained?: (m: typeof itens, s: string) => void }).onQueueRetained?.(itens, source);
+  }
+
+  /** T-842: mensagem do turno que o SIGTERM vai matar. Uma vez: a segunda
+   *  chamada (prepareReexec depois do shutdown) devolve null. */
+  takeInFlightForShutdown(): { content: string; images?: ImageAttachment[]; deliveryId?: string } | null {
+    const dshVivo = !!(this as unknown as { dshPromptInFlight?: boolean }).dshPromptInFlight;
+    const vivo = this.messageSession.busy || !!this.claudeInflight || dshVivo;
+    if (!vivo || !this.currentTurn) return null;
+    const t = this.currentTurn;
+    this.currentTurn = null;
+    return { content: t.content, images: t.images, deliveryId: t.deliveryId };
+  }
+
+  pushUserMessage(content: string, images?: ImageAttachment[], latencyMessage?: { content: string; images?: ImageAttachment[]; deliveryId?: string }, deliveryId?: string) {
     if (isLoopStopMessage(content)) {
-      const dropped = this.messageSession.clearQueue();
-      if (dropped > 0) {
-        this.opts.log("warn", `[cli:${this.info.id}:${this.opts.cliRunner}] loop-stop — limpou ${dropped} msg(s) da fila`);
+      // T-899: loop-stop é mensagem do usuário — retém em vez de descartar.
+      const antes = this.messageSession.queuedCount();
+      this.capturarFilaParaRetencao("loop-stop");
+      if (antes > 0) {
+        this.opts.log("warn", `[cli:${this.info.id}:${this.opts.cliRunner}] loop-stop — ${antes} msg(s) da fila retidas (source=loop-stop)`);
       }
     }
     if (isPerMessageRunner(this.opts.cliRunner)) {
       const queued = this.messageSession.queuedCount();
       const outcome = this.messageSession.enqueueOrCoalesce(
-        { content, images },
+        { content, images, deliveryId },
         AgentRunner.MAX_BUFFERED_MESSAGES,
         AgentRunner.MAX_COALESCED_BYTES,
       );
@@ -933,7 +1008,7 @@ export class AgentRunner {
     if (this.opts.cliRunner === "dsh") {
       // T-690: fila própria do ACP (1 prompt por vez por sessão); o driver
       // buffera até o handshake concluir.
-      dshPushUserMessage(this as unknown as Record<string, unknown>, content, images);
+      dshPushUserMessage(this as unknown as Record<string, unknown>, content, images, deliveryId);
       return;
     }
     if (this.restarting || !this.proc || !this.proc.stdin.writable) {
@@ -948,15 +1023,15 @@ export class AgentRunner {
         return;
       }
       if (this.pendingMessages.length < AgentRunner.MAX_BUFFERED_MESSAGES / 2) this.restartDropNoticeSent = false;
-      const pending = latencyMessage ?? { content, images };
+      const pending = { ...(latencyMessage ?? { content, images }), deliveryId };
       this.turnLatency.enqueue(pending);
       this.pendingMessages.push(pending);
       this.opts.log("info", `[cli:${this.info.id}:claude] buffered message during restart (queued=${this.pendingMessages.length})`);
       return;
     }
-    const latencyInput = latencyMessage ?? { content, images };
+    const latencyInput = latencyMessage ?? { content, images, deliveryId };
     this.turnLatency.enqueue(latencyInput);
-    const item = { content, images, timingMessage: latencyInput };
+    const item = { content, images, deliveryId, timingMessage: latencyInput };
     // T-758: serializa — turno em voo segura a escrita (o CLI não lê stdin
     // durante o turno e linhas no mesmo chunk se perdem).
     if (this.claudeInflight || this.claudeTimings.length > 0) {
@@ -969,8 +1044,9 @@ export class AgentRunner {
 
   /** T-758: escreve UMA mensagem no stdin do claude e arma a vigilância de
    *  aceitação. Só chamar com CLI ocioso (sem claudeInflight). */
-  private sendClaudeMessage(item: { content: string; images?: ImageAttachment[]; timingMessage: object }): void {
+  private sendClaudeMessage(item: { content: string; images?: ImageAttachment[]; deliveryId?: string; timingMessage: object }): void {
     const { content, images, timingMessage } = item;
+    this.currentTurn = { content, images, deliveryId: item.deliveryId };
     // Não-imagem não cabe no payload inline do claude — vai por arquivo.
     const anexos = this.attachNonImageFiles(content, images);
     const messageContent = buildClaudeUserContent(anexos.content, images);
@@ -1045,11 +1121,10 @@ export class AgentRunner {
     });
   }
 
-  stop() {
+  stop(fonte: "stop" | "replace" = "stop") {
     this.turnLatency.finishAll("stopped", "stop");
     for (const timing of this.claudeTimings) timing.finish("stopped", "stop");
     this.claudeTimings = [];
-    this.claudeWriteQueue = [];
     this.claudeInflight = null;
     this.claudeUnacceptedSince = null;
     this.claudeUnacceptedWarned = false;
@@ -1059,16 +1134,20 @@ export class AgentRunner {
       clearTimeout(this.hangNudgeTimer);
       this.hangNudgeTimer = null;
     }
-    // Limpa buffers pendentes — sem isso, mensagens bufferadas durante
-    // restart ficam em memory por toda vida do AgentRunner (mesmo após
-    // stop). Cleanup explicit pra GC. M18: o isTurnActive segura o
-    // self-update enquanto há buffer com proc vivo; se o stop chega com
-    // buffer, o descarte é DECLARADO (antes era mudo).
-    if (this.pendingMessages.length > 0) {
-      this.opts.log("info", `[cli:${this.info.id}:${this.opts.cliRunner}] stop com ${this.pendingMessages.length} msg(s) bufferizada(s) — descartadas`);
+    // T-899: as TRÊS fontes (buffer de restart do claude, stdin em voo e fila
+    // do message-session; a do dsh entra no take) saem daqui para a retenção —
+    // antes eram descartadas em parte muda. O `takeQueuedForDrain` já limpa
+    // todas (mesmo conjunto do dreno T-720); quem chama decide se retém.
+    // T-899: o stop NÃO descarta — o host retém pelo callback (source=stop).
+    // ACUMULA no take legado porque o stop pode ser chamado mais de uma vez
+    // (reconfig/teardown) e a segunda chamada acha a fila vazia.
+    const paradas = this.takeQueuedForDrain();
+    if (paradas.length > 0) {
+      this.opts.log("info", `[cli:${this.info.id}:${this.opts.cliRunner}] stop com ${paradas.length} msg(s) não iniciada(s) — retidas para reentrega`);
+      (this.opts as { onQueueRetained?: (m: typeof paradas, s: string) => void }).onQueueRetained?.(paradas, fonte);
     }
-    this.pendingMessages = [];
-    this.messageSession.clearQueue();
+    // (o host também pode colher por `takeQueueForRetain` — vem vazio aqui,
+    // porque o callback já levou; vale para runners sem callback.)
     this.openCodeTransport.stop();
     // One-shot de resumo em voo (compact): sem kill, roda órfão por até
     // ONE_SHOT_TIMEOUT_MS consumindo API — e o emitExit abaixo apaga o tmpdir
@@ -1126,6 +1205,10 @@ export class AgentRunner {
     }
     this.clearing = true;
     try {
+      // T-924: o clear de contexto descarta sessão em TODOS os runners — a fila
+      // não iniciada é retida aqui, uma vez, ANTES dos ramos (o claude e o dsh
+      // saem por caminhos próprios e não passavam pelo gancho genérico).
+      this.capturarFilaParaRetencao("context-clear");
       if (this.opts.cliRunner === "claude") {
         await this.killClaudeForRestart();
         this.opts.resumeSessionId = undefined;
@@ -1155,7 +1238,6 @@ export class AgentRunner {
       // turno da sessão descartada).
       this.killTrackedTurnPids("SIGKILL");
       terminateWithEscalation(this.ocActiveProc);
-      this.messageSession.clearQueue();
       this.messageSession.busy = false;
       this.resetWithSummary(undefined);
       this.info.sessionId = undefined;
@@ -1266,6 +1348,11 @@ export class AgentRunner {
     if (state === this.currentState) return;
     this.currentState = state;
     this.info.state = state;
+    if (state === "thinking" || state === "sending" || state === "speaking") {
+      if (this.turnActiveSince == null) this.turnActiveSince = Date.now();
+    } else if (state === "idle" || state === "stopping") {
+      this.turnActiveSince = null;
+    }
     // Atividade real (não stalled/idle/queued) zera o soft-stall.
     // "queued" = espera de gate — NÃO reseta o relógio (T-055).
     if (state !== "idle" && state !== "stopping" && state !== "stalled" && state !== "queued") {

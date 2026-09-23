@@ -18,6 +18,7 @@ import {
 import { DELEGATION_CONTEXT_MAX, delegationMissionTitle, delegationStepTitle, delegationTaskPrompt } from "@the-dudes/protocol/delegation";
 import { decryptForProject, encryptForProject, E2eeRequiredError, isE2eEncrypted, isE2eeRequired, rememberCredentialPlaintext } from "./daemon-crypto.js";
 import { scheduleDelegateShadow } from "./typesafe-delegate-shadow.js";
+import { scheduleTaskShadow, type PatchTask } from "./typesafe-task-shadow.js";
 import { performance } from "node:perf_hooks";
 import { recordRelayConnection, recordRelayRequest } from "./debug/store.js";
 
@@ -92,6 +93,25 @@ const BRIDGE_CIPHER_OPS: ReadonlySet<string> = new Set<string>([
  * Rota de cifra de um path `/api/bridge/<agentId>/<op>`.
  * `null` = path não carrega campo de catálogo (segue em claro, como hoje).
  */
+/**
+ * T-852: presença dos campos que decidem `event`/skip da sombra do Jev nas
+ * tasks. Lê só o FORMATO do request (o valor já pode estar cifrado): título e
+ * descrição = edited, responsável = reassigned, só status = nada.
+ */
+export function camposDoPatch(body: Buffer | null | undefined): PatchTask {
+  const out: PatchTask = { title: false, description: false, assignee: false };
+  try {
+    const j = JSON.parse((body ?? Buffer.alloc(0)).toString("utf8")) as Record<string, unknown>;
+    if (!j || typeof j !== "object") return out;
+    const alvo = j.task && typeof j.task === "object" ? j.task : j.patch && typeof j.patch === "object" ? j.patch : j;
+    const t = alvo as Record<string, unknown>;
+    out.title = "title" in t;
+    out.description = "description" in t;
+    out.assignee = "assignee" in t || "assigneeAgentId" in t;
+  } catch { /* corpo não-JSON: sem patch */ }
+  return out;
+}
+
 export function bridgeCipherRoute(pathname: string): { kind: BridgeEncryptKind; agentId: string } | null {
   const m = pathname.match(/^\/api\/bridge\/([^/]+)\/([A-Za-z0-9_]+)$/);
   if (!m) return null;
@@ -969,6 +989,11 @@ export class BridgeRelay {
               // alcançado. Um `else if` só por forma de campo engoliria
               // qualquer op futura que carregue `task` de outra tabela.
               decTask(json.task);
+              // T-852: sombra do Jev nas tasks. Só aqui o `task` da resposta
+              // 2xx existe já decifrado; o request só decide evento/skip.
+              if (op === "tasks_add" || op === "tasks_update") {
+                try { scheduleTaskShadow({ op, projectId, task: json.task, patch: camposDoPatch(body) }); } catch { /* sombra não falha a task */ }
+              }
             } else if (op === "tasks_comment_list" && Array.isArray(json.comments)) {
               for (const c of json.comments) {
                 if (c.content) c.content = dec(c.content, E2EE_TABLE.TASK_COMMENTS, "content");

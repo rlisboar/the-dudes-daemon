@@ -17,7 +17,7 @@ import { createHash, generateKeyPairSync, sign as edSign, randomBytes, publicEnc
 process.env.THE_DUDES_DAEMON_KEY_PATH = path.join(os.tmpdir(), `td-t720-key-${process.pid}-${Date.now()}.pem`);
 process.env.THE_DUDES_PROJECT_KEYS_PATH = path.join(os.tmpdir(), `td-t720-pkeys-${process.pid}-${Date.now()}.json`);
 
-const { _resetIdleRestartForTest, checkAndApplyUpdate, runningReleaseInfo, DRAIN_AFTER_MS } = await import("../self-update.js");
+const { _resetIdleRestartForTest, checkAndApplyUpdate, runningReleaseInfo, DRAIN_AFTER_MS, DRAIN_FORCE_MS } = await import("../self-update.js");
 const { AgentHost } = await import("../agent-host.js");
 const { getDaemonPublicKey, rememberProjectKey, encryptForProject } = await import("../daemon-crypto.js");
 const { aadV2 } = await import("@the-dudes/protocol/e2ee-fields");
@@ -158,25 +158,32 @@ test("T-720 (1): time com turnos contínuos → SEM dreno nunca aplica (o bug); 
   }
 });
 
-test("T-720 (2): dreno NUNCA mata turno — turno que não termina segura o re-exec (só warn após o teto de aviso)", async () => {
+test("T-720 (2) / T-839: turno que não termina NÃO segura o re-exec além do teto do dreno", async () => {
   const clock = { t: 0 };
   const ticks: Array<() => void> = [];
   const logs: string[] = [];
   let exit: number | null = null;
   let drenos = 0;
+  let preparou = 0;
   await armarPendente({
     isIdle: () => false, // um turno eterno
     startDrain: () => { drenos++; },
     clockRef: clock, ticks, logs,
+    prepareReexec: () => { preparou++; },
     onExit: (c) => { exit = c; },
   });
-  for (let i = 0; i < ticks.length && clock.t < 2 * 3600_000; i++) {
+  const teto = DRAIN_AFTER_MS + DRAIN_FORCE_MS;
+  for (let i = 0; i < ticks.length && clock.t < teto && exit == null; i++) {
     clock.t += 15_000;
     ticks[i]!();
+    await new Promise((r) => setImmediate(r));
   }
-  assert.equal(exit, null, "sem idle, sem exit 42: turno em curso não é morto");
+  assert.equal(exit, 42, "no teto o re-exec sai mesmo com turno aberto");
+  assert.equal(clock.t, teto, "sai no teto, não antes");
   assert.equal(drenos, 1, "dreno liga uma vez só");
-  assert.ok(logs.some((l) => l.includes("turno em curso nunca é morto")), "aviso de dreno longo");
+  assert.equal(preparou, 1, "prepareReexec (keepRunning no main) corre no teto");
+  assert.ok(logs.some((l) => l.includes("teto do dreno") && l.includes("keepRunning")), "log do teto");
+  assert.ok(!logs.some((l) => l.includes("nunca é morto")));
 });
 
 test("T-720 (3): health/hello expõem updatePendingSince e updateDraining", async () => {

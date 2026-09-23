@@ -583,3 +583,23 @@ test("T-581 contrato: o prompt de delegação do relay é o MESMO do server (uma
     `# Delegated task (from PM)\ng\n\n## Context\nc\n\nWhen you finish, send your concise result to "PM" using mcp__the-dudes__send_message (to: "PM"). Then you are done.`,
   );
 });
+
+test("T-899 (paridade): mensagem RETIDA usa o MESMO AAD de messages/content (e imagens)", async () => {
+  // O parecer do SECURITY (item 5) exige o caso retido na paridade: a fila
+  // retida tem de cifrar/decifrar com o AAD canônico da mensagem, senão vira
+  // porta de plaintext num projeto e2eeRequired (o web renderiza claro sem
+  // reclamar e o furo fica invisível).
+  const { encryptForProject, decryptForProject } = await import("../daemon-crypto.js");
+  const aad = aadV2({ projectId: PID, table: E2EE_TABLE.MESSAGES, field: "content" });
+  const cifrado = encryptForProject("mensagem retida", PID, aad);
+  assert.ok(cifrado && cifrado.startsWith("e2e:v2:"), "retenção sobe CIFRADA (v2)");
+  assert.equal(decryptForProject(cifrado, PID, aad), "mensagem retida", "abre com o mesmo AAD da mensagem");
+
+  // Imagens da fila seguem o MESMO field das imagens da mensagem.
+  const aadImg = aadV2({ projectId: PID, table: E2EE_TABLE.MESSAGES, field: MESSAGE_IMAGE_FIELD });
+  const { encryptBytesForProject, decryptBytesForProject } = await import("../daemon-crypto.js");
+  const bytes = Buffer.from("png-fake");
+  const cifBytes = encryptBytesForProject(bytes, PID, aadImg);
+  assert.ok(cifBytes && cifBytes.startsWith("e2e:v2:"));
+  assert.equal(decryptBytesForProject(cifBytes, PID, aadImg)?.toString("utf8"), "png-fake");
+});

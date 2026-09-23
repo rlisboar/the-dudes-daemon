@@ -9,6 +9,8 @@ import {decryptForProject, encryptForProject, isE2eEncrypted, isE2eeRequired, se
 import {classifyRunnerFailure} from "./runners/error-classifier.js";
 import {migratedSeedFor, MIGRATED_SEED_LIMIT_BYTES} from "./migrated-seed.js";
 import {agentStateInfo, cliIoCounters, recordAgentEvent, recordAgentState} from "./debug/store.js";
+import {formatDrainHolders, type DrainHolder} from "./self-update.js";
+import {expirar as expirarFilaRetida, devolver as devolverFilaRetida, esquecer as esquecerFilaRetida, TTL_ITEM_MS, listar as listarFilaRetida, paraFio, reter as reterFila, tamanho as tamanhoFilaRetida, tomar as tomarFilaRetida, totalRetido, CAP_POR_AGENTE} from "./queue-retained.js";
 
 /** 1 enum operacional (paridade hung.soft). Classifica no plaintext ANTES do seal. */
 export type AgentErrorKind = "rate_limit" | "other";
@@ -100,6 +102,12 @@ function resolveBridge(): { command: string; args: string[] } {
 interface Entry {
   info: AgentInfo;
   runner: AgentRunner | null;
+  /** T-899: parado pelo dono — mensagem que chega vai para a retenção até o
+   *  próximo spawn (antes caía num runner morto e morria com ele). */
+  parado?: boolean;
+  /** T-899: reentrega da fila retida no spawn. Default LIGADO (o "opcional"
+   *  do dono é poder desligar). */
+  queueAutoRedeliver?: boolean;
   autoApprove: boolean;
   /** Project ID, captured at spawn. Used to look up the E2EE key when
    *  the bridge relay needs to encrypt/decrypt agent_to_agent traffic. */
@@ -230,6 +238,10 @@ export class AgentHost {
       agents: this.entries.size,
       withRunner: [...this.entries.values()].filter((e) => !!e.runner).length,
       draining: this.draining,
+      // T-899: visibilidade da fila retida (o dono vê o que ficou no stop).
+      filaRetida: totalRetido(),
+      filaRetidaPorAgente: this.filaRetidaPorAgente(),
+      drainHolders: this.drainHolders(),
       reexecuting: this.reexecuting,
       inboundAgents: [...this.inboundAgentIds].map((id) => ({ agentId: id, pending: this.inboundBuffer.size(id) })),
       drainHeld: [...this.drainHeld.entries()].map(([id, l]) => ({ agentId: id, held: l.length })),
@@ -244,6 +256,23 @@ export class AgentHost {
       if (e.runner?.isTurnActive()) return true;
     }
     return false;
+  }
+
+  /** T-839: claude em turno, com agentId e idade. O turn-gate entra pelo main. */
+  drainHolders(now = Date.now()): DrainHolder[] {
+    const out: DrainHolder[] = [];
+    for (const [agentId, e] of this.entries) {
+      const r = e.runner;
+      if (!r?.isTurnActive()) continue;
+      out.push({
+        agentId,
+        turnAgeMs: r.activeTurnAgeMs(now) ?? 0,
+        runner: e.info?.cliRunner ?? "claude",
+        state: e.info?.state,
+        reason: r.turnHoldReason() ?? undefined,
+      });
+    }
+    return out;
   }
   private autoApproveDefault = false;
   /** Liga watch debounced do grafo (setado pelo DaemonClient). */
@@ -403,7 +432,10 @@ export class AgentHost {
       // Reconfig OU runner stale (M17): derruba o antigo antes de criar o
       // novo. Seu onExit tardio não vai zerar o novo (guard
       // `e.runner === thisRunner`).
-      try { existing.runner.stop(); } catch { /* já morto */ }
+      // T-899: `replace` diz a origem — o callback `onQueueRetained` do runner
+      // retém sob o agentId (a fila é do AGENTE) e o spawn a reentrega abaixo.
+      try { existing.runner.stop("replace"); } catch { /* já morto */ }
+      this.retainFromRunner(msg.agent.id, existing, "replace"); // fallback (callback cobre o runner real)
       existing.runner = null;
     }
 
@@ -768,7 +800,7 @@ export class AgentHost {
     const runner = new AgentRunner(msg.agent, opts);
     thisRunner = runner;
     try { recordAgentEvent(msg.agent.id, "spawn", `runner=${cliRunner} model=${msg.agent.model ?? "-"} effort=${msg.agent.effort ?? "-"} resume=${resumeSessionId ? "sim" : "não"} cwd=${cwd}`); } catch { /* observação */ }
-    runner.start().catch((e) => this.log("error", `agent ${msg.agent.id} start failed: ${(e as Error).message}`));
+    const subiu = runner.start().catch((e) => this.log("error", `agent ${msg.agent.id} start failed: ${(e as Error).message}`));
     this.entries.set(msg.agent.id, {
       info: msg.agent,
       runner,
@@ -820,6 +852,18 @@ export class AgentHost {
         migrationId: msg.agent.seedFrom?.migrationId,
       });
     }
+    // T-899: o agente voltou — reentrega a fila retida ANTES do buffer de
+    // inbound (T-037), na ordem. `queueAutoRedeliver` desligado mantém retido.
+    const entrada = this.entries.get(msg.agent.id);
+    if (entrada) {
+      // T-899: espera o runner SUBIR antes de entregar — o `start()` rearma a
+      // sessão do runner e uma entrega cedo demais era zerada por ele (a fila
+      // do agente sumia entre a entrega e a subida).
+      await subiu;
+      entrada.parado = false;
+      entrada.queueAutoRedeliver = (msg.agent as { queueAutoRedeliver?: boolean }).queueAutoRedeliver !== false;
+      this.entregarFilaRetida(msg.agent.id);
+    }
     // T-037: agent:send que chegou no gap pré-spawn (self-update / auto-resume)
     this.flushInboundBuffer(msg.agent.id);
   }
@@ -832,13 +876,155 @@ export class AgentHost {
     return out;
   }
 
+  /**
+   * T-852: elenco do projeto para a sombra do Jev nas tasks. WHITELIST:
+   * só `name` e `role` (o AgentInfo carrega systemPrompt já decifrado).
+   * Ordem estável por agentId para o rótulo não depender da ordem de spawn.
+   */
+  elencoDoProjeto(projectId: string): Array<{ agentId: string; name: string; role: string }> {
+    const out: Array<{ agentId: string; name: string; role: string }> = [];
+    for (const [agentId, e] of this.entries) {
+      if (e.projectId !== projectId) continue;
+      const info = e.info as { name?: string; role?: string } | undefined;
+      out.push({
+        agentId,
+        name: typeof info?.name === "string" ? info.name : agentId,
+        role: typeof info?.role === "string" ? info.role : "",
+      });
+    }
+    return out.sort((a, b) => a.agentId.localeCompare(b.agentId, "en"));
+  }
+
   stop(agentId: string) {
     const e = this.entries.get(agentId);
     if (!e?.runner) return;
+    e.parado = true;
     e.runner.stop();
     // M25 (T-448): worktree do agente pára com ele — hoje ficava no disco.
     void this.removeWorktreeOf(e);
+    // T-899: a fila NÃO INICIADA sai pelo callback do runner (source=stop);
+    // `retainFromRunner` fica como fallback para runner sem callback (testes).
+    this.retainFromRunner(agentId, e, "stop");
     try { recordAgentEvent(agentId, "stop", "agent:stop do orchestrator"); } catch { /* observação */ }
+  }
+
+  /** T-899: GC do TTL do item retido — o host é quem tem log. */
+  private gcFilaRetida(): void {
+    const saiu = expirarFilaRetida();
+    if (saiu > 0) this.log("warn", `[fila] ${saiu} item(ns) retido(s) expirou(aram) (TTL de ${Math.round(TTL_ITEM_MS / 3_600_000)}h) e saiu(íram) da fila`);
+  }
+
+  /** T-899: retenção vinda do runner (fila do agente), com source explícito. */
+  private reterDoRunner(agentId: string, msgs: Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string }>, source: "stop" | "context-clear" | "loop-stop" | "replace"): number {
+    this.gcFilaRetida();
+    const r = reterFila(agentId, msgs.map((m) => ({ content: m.content, images: m.images, deliveryId: m.deliveryId, enqueuedAt: Date.now(), source })));
+    if (r.retidos > 0) this.log("info", `[fila] ${r.retidos} msg(s) de ${agentId} retida(s) (source=${source}) — entregues no próximo spawn`);
+    if (r.duplicados > 0) this.log("info", `[fila] ${r.duplicados} msg(s) de ${agentId} já estavam retidas (idempotência por deliveryId)`);
+    if (r.descartados > 0) this.log("warn", `[fila] cap de ${CAP_POR_AGENTE} estourado para ${agentId} — descarte declarado`);
+    this.enviarFilaRetida(agentId, this.entries.get(agentId)?.projectId);
+    return r.retidos;
+  }
+
+  /** T-899: colhe o que o runner parou de segurar e retém (idempotente). */
+  private retainFromRunner(agentId: string, e: Entry, source: "stop" | "context-clear" | "replace"): number {
+    const take = (e.runner as unknown as { takeQueueForRetain?: () => Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string }> } | null)?.takeQueueForRetain;
+    const itens = typeof take === "function" ? take.call(e.runner) ?? [] : [];
+    if (itens.length === 0) return 0;
+    const r = reterFila(agentId, itens.map((m) => ({ content: m.content, images: m.images, deliveryId: m.deliveryId, enqueuedAt: Date.now(), source })));
+    if (r.retidos > 0) this.log("info", `[fila] ${r.retidos} msg(s) de ${agentId} retida(s) no stop (source=${source}) — entregues no próximo spawn`);
+    if (r.duplicados > 0) this.log("info", `[fila] ${r.duplicados} msg(s) de ${agentId} já estavam retidas (idempotência por deliveryId)`);
+    if (r.descartados > 0) this.log("warn", `[fila] cap de ${CAP_POR_AGENTE} estourado para ${agentId} — ${r.descartados} item(ns) mais antigo(s) descartado(s)`);
+    this.enviarFilaRetida(agentId, e.projectId);
+    return r.retidos;
+  }
+
+  /** T-899: melhor esforço para o server (o WEB lista por lá, #898/#900).
+   *  O daemon NÃO depende de ack nesta fase: a cópia local é a fonte. */
+  private enviarFilaRetida(agentId: string, projectId?: string): void {
+    if (!projectId) return;
+    const itens = listarFilaRetida(agentId);
+    if (itens.length === 0) return;
+    const { enviar, semChave } = paraFio(agentId, projectId, itens);
+    if (semChave.length > 0) {
+      this.log("warn", `[fila] ${semChave.length} item(ns) de ${agentId} SEM chave do projeto — ficam locais (nunca em claro)`);
+    }
+    if (enviar.length === 0) return;
+    try {
+      this.send({ type: "agent:queue_retain", agentId, projectId, reason: "stop", items: enviar } as never);
+    } catch { /* best-effort: a cópia local segue valendo */ }
+  }
+
+  /** T-899: agente removido/limpo — a fila retida dele vai embora junto. */
+  esquecerFilaRetida(agentId: string): number {
+    const n = esquecerFilaRetida(agentId);
+    if (n > 0) this.log("info", `[fila] ${n} msg(s) retida(s) de ${agentId} esquecida(s) (agente removido)`);
+    return n;
+  }
+
+  /** T-899: itens retidos de um agente (visibilidade/dashboard). */
+  filaRetida(agentId: string) {
+    return { itens: listarFilaRetida(agentId), total: totalRetido() };
+  }
+
+  /** T-899 (correção de desenho): a CONTAGEM é por AGENTE — é o número que o
+   *  card do agente exibe, e vale com o agente parado (é justamente o caso da
+   *  fila retida). O que estiver retido no server entra quando o #898 subir. */
+  filaRetidaPorAgente(): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const [agentId] of this.entries) {
+      const n = tamanhoFilaRetida(agentId);
+      if (n > 0) out[agentId] = n;
+    }
+    return out;
+  }
+
+  /** T-899: entrega a fila retida NO SPAWN, antes do buffer de inbound, na
+   *  ordem, uma vez só. `queueAutoRedeliver` false mantém retido. */
+  entregarFilaRetida(agentId: string): number {
+    this.gcFilaRetida();
+    const e = this.entries.get(agentId);
+    if (!e?.runner) return 0;
+    if (e.queueAutoRedeliver === false) {
+      const n = tamanhoFilaRetida(agentId);
+      if (n > 0) this.log("info", `[fila] ${n} msg(s) retida(s) de ${agentId} — reentrega DESLIGADA (ficam na fila)`);
+      return 0;
+    }
+    const itens = tomarFilaRetida(agentId);
+    if (itens.length === 0) return 0;
+    let entregues = 0;
+    for (const item of itens) {
+      try {
+        // Direto no runner: fora do `deliveryDedup` do main (o id já foi visto
+        // no aceite; reentregar por `agent:send` seria descartado como duplicata).
+        e.runner.pushUserMessage(item.content, item.images, undefined, item.deliveryId);
+        entregues++;
+      } catch {
+        devolverFilaRetida(agentId, [item]);
+      }
+    }
+    this.log("info", `[fila] reentrega agent=${agentId}: ${entregues} msg(s) retida(s) na ordem`);
+    return entregues;
+  }
+
+  /**
+   * T-846: outro processo com o mesmo token assumiu a conexão (close 4000).
+   * Mata os CLIs locais para não duplicar trabalho. Os agentes seguem running
+   * no server (quem ficou é o dono); se aquele processo morrer, o replay dos
+   * agentes no nosso hello passivo devolve cada um ao spawn.
+   *
+   * Worktree fica (o outro processo pode estar usando): o re-spawn reconcilia.
+   * Sem agent:exit: quem anuncia isso é o processo que ficou.
+   */
+  stopLocalClis(motivo: string): number {
+    let n = 0;
+    for (const [agentId, e] of this.entries) {
+      if (!e.runner) continue;
+      try { e.runner.stop(); } catch { /* segue os outros */ }
+      try { recordAgentEvent(agentId, "stop", motivo); } catch { /* observação */ }
+      n++;
+    }
+    if (n > 0) this.log("warn", `[handoff] ${n} CLI(s) local(is) parado(s) — aguardando o processo que ficou`);
+    return n;
   }
 
   /** M25 (T-448): remove (1×) o worktree do entry. Limpa o campo antes pra
@@ -894,7 +1080,17 @@ export class AgentHost {
       );
       return;
     }
-    e.runner.pushUserMessage(content, images);
+    // T-899: agente PARADO — antes a mensagem caía num runner morto e morria
+    // com ele (maior parte da perda). Agora vai para a retenção e sai no
+    // próximo spawn, na ordem.
+    if (e.parado) {
+      const r = reterFila(agentId, [{ content, images, deliveryId, enqueuedAt: Date.now(), source: "inbound" }]);
+      if (r.descartados > 0) this.log("warn", `[fila] cap de ${CAP_POR_AGENTE} estourado para ${agentId} — descarte declarado`);
+      this.log("info", `[fila] agente ${agentId} parado — mensagem retida (${listarFilaRetida(agentId).length} na fila)`);
+      this.enviarFilaRetida(agentId, e.projectId);
+      return;
+    }
+    e.runner.pushUserMessage(content, images, undefined, deliveryId);
   }
 
   /** Chamado após spawn bem-sucedido — drena fila local T-037. */
@@ -952,18 +1148,50 @@ export class AgentHost {
     this.drainReason = reason;
     let moved = 0;
     for (const [agentId, e] of this.entries) {
-      const take = (e.runner as unknown as { takeQueuedForDrain?: () => Array<{ content: string; images?: ImageAttachment[] }> } | null)?.takeQueuedForDrain;
+      const take = (e.runner as unknown as { takeQueuedForDrain?: () => Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string }> } | null)?.takeQueuedForDrain;
       if (!e.runner || typeof take !== "function") continue;
       for (const m of take.call(e.runner)) {
-        this.holdForDrain(agentId, { content: m.content, images: m.images, enqueuedAt: Date.now() });
+        this.holdForDrain(agentId, { content: m.content, images: m.images, deliveryId: m.deliveryId, enqueuedAt: Date.now() });
         moved++;
       }
     }
-    this.log("info", `[self-update] dreno ligado: ${moved} msg(s) tiradas das filas dos runners; nenhum turno novo até o re-exec`);
+    this.log("info", `[self-update] dreno ligado: ${moved} msg(s) tiradas das filas dos runners; nenhum turno novo até o re-exec; segura: ${formatDrainHolders(this.drainHolders())}`);
     return moved;
   }
 
   isDraining(): boolean { return this.draining; }
+
+  /** T-842: no SIGTERM o turno em curso morre com o processo. A mensagem
+   *  vai para o spool (o id continua visto, então o replay não a duplica).
+   *  Idempotente: o runner entrega o in-flight uma vez. */
+  holdInFlightForShutdown(): number {
+    let n = 0;
+    for (const [agentId, e] of this.entries) {
+      const take = (e.runner as unknown as {
+        takeInFlightForShutdown?: () => { content: string; images?: ImageAttachment[]; deliveryId?: string } | null;
+      } | null)?.takeInFlightForShutdown;
+      if (!e.runner || typeof take !== "function") continue;
+      const m = take.call(e.runner);
+      if (!m) continue;
+      this.holdForDrain(agentId, { content: m.content, images: m.images, deliveryId: m.deliveryId, enqueuedAt: Date.now() });
+      n++;
+    }
+    if (n > 0) this.log("info", `[shutdown] ${n} mensagem(ns) em turno retida(s) para o spool`);
+    return n;
+  }
+
+  /** T-842: aviso de reinício enquanto o WS ainda aceita envio. Uma vez
+   *  por agente que tem mensagem retida neste dreno. */
+  announceRestart(): number {
+    let n = 0;
+    for (const agentId of this.drainHeld.keys()) {
+      if (!this.entries.has(agentId) || this.drainNotified.has(agentId)) continue;
+      this.drainNotified.add(agentId);
+      this.emitAgentError(agentId, "[daemon] daemon reiniciando: esta mensagem fica retida e é entregue quando o processo novo subir.");
+      n++;
+    }
+    return n;
+  }
 
   /** Revisão T-824: SIGTERM no meio do dreno do update — o aviso passa a ser
    *  o de reinício (o de "não precisa reiniciar" viraria mentira). */
@@ -994,20 +1222,23 @@ export class AgentHost {
         records.push({ agentId, projectId, deliveryId: item.deliveryId, enqueuedAt: item.enqueuedAt, blob });
       }
     }
-    this.drainHeld.clear();
     // Revisão T-824: o spool do boot anterior que ainda não foi entregue
-    // (agente que não subiu a tempo) entra junto — antes o rename o
-    // sobrescrevia e dois reinícios seguidos perdiam as retidas mais antigas.
+    // entra junto. T-842: só esvazia a memória DEPOIS do rename — um throw
+    // no write deixa as mensagens no drainHeld e o caller não grava os vistos.
     const pendentes = [...this.spooled.values()].flat();
     records.push(...pendentes);
-    this.spooled.clear();
-    if (records.length === 0) return { spooled: 0, lost, path: null };
+    if (records.length === 0) {
+      this.drainHeld.clear();
+      return { spooled: 0, lost, path: null };
+    }
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     fs.chmodSync(dir, 0o700);
     const file = path.join(dir, SPOOL_FILE);
     const tmp = `${file}.tmp-${process.pid}`;
     fs.writeFileSync(tmp, JSON.stringify({ v: 1, createdAt: Date.now(), records }), { mode: 0o600 });
     fs.renameSync(tmp, file);
+    this.drainHeld.clear();
+    this.spooled.clear();
     return { spooled: records.length, lost, path: file };
   }
 

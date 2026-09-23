@@ -11,7 +11,6 @@
  * re-sonda porque as entradas verdadeiras tinham sido expulsas por ordem de
  * inserção.
  */
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir } from "./tmp.js";
 
-process.env.HOME = mkdtempSync(`${tmpdir()}/the-dudes-scratch-home-`);
+process.env.HOME = tmpdir("the-dudes-scratch-home-");

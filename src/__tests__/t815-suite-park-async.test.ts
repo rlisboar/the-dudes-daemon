@@ -85,7 +85,10 @@ test("T-815: o grace do reaper não para o event loop", async () => {
   } finally {
     clearInterval(iv);
   }
-  assert.ok(ticks >= 5, `timers rodaram durante o grace (ticks=${ticks}); com sleepSync seriam 0`);
+  // T-858: o limite era 5 e dependia da velocidade do runner (o CI da main
+  // quebrou com ticks=4 sob carga). A propriedade é "o event loop NÃO trava",
+  // e com sleepSync a contagem seria 0 — 2 separa os dois casos com folga.
+  assert.ok(ticks >= 2, `timers rodaram durante o grace (ticks=${ticks}); com sleepSync seriam 0`);
 });
 
 test("T-815: erro do execFile vira o mesmo PsSpawnResult do spawnSync", () => {

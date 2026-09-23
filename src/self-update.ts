@@ -81,21 +81,57 @@ export interface SelfUpdateDeps {
   reexecTimeoutMs?: number;
   /**
    * T-720: pendente há mais que isto sem idle natural → DRENO: o host para de
-   * alimentar os runners (nenhum turno novo começa) e os turnos em curso
-   * terminam normalmente; o re-exec sai no primeiro idle. Default 10min.
+   * alimentar os runners (nenhum turno novo começa). Default 10min.
+   * T-839: o dreno tem teto (`drainForceMs`). Passado o teto o re-exec sai
+   * mesmo com turno aberto — o caller (main) usa keepRunning, spool e --resume.
    */
   drainAfterMs?: number;
+  /** T-839: quanto o dreno espera o turno aberto antes de forçar o re-exec. Default 15min. */
+  drainForceMs?: number;
   /** T-720: liga o dreno no host (sem turno novo; mensagens retidas p/ spool). */
   startDrain?: () => void;
+  /** T-839: quem está em turno agora. O log do dreno nomeia agentId e idade. */
+  drainHolders?: () => DrainHolder[];
   /** Relógio injetável (testes). */
   nowFn?: () => number;
 }
 
+/** Quem segura o idle do self-update (claude contínuo ou slot do turn-gate). */
+export interface DrainHolder {
+  agentId: string;
+  turnAgeMs: number;
+  runner?: string;
+  state?: string;
+  reason?: string;
+}
+
 /** T-720: janela de idle natural antes do dreno. */
 export const DRAIN_AFTER_MS = 10 * 60_000;
-/** T-720: dreno acima disto só é logado (nunca mata turno): os caps de turno
- *  (qwen 35min T-598, grok 720s + pós-evento) já limitam o tempo real. */
+/**
+ * T-839: teto do dreno. O claude contínuo não tem cap de lifetime — um monitor
+ * em segundo plano segura o evento `result` por horas (T-720 esperava que os
+ * caps de qwen/grok bastassem). Passado isto o re-exec sai com o turno ainda
+ * aberto; o spool e o --resume retomam, como no reinício por sinal (T-824).
+ */
+export const DRAIN_FORCE_MS = 15 * 60_000;
+/** Idade a partir da qual o log e o dashboard chamam o turno de "turno longo". */
+export const LONG_TURN_MS = 10 * 60_000;
+/** @deprecated T-839 o teto força o re-exec; o aviso de 45min não espera mais. */
 export const DRAIN_WARN_MS = 45 * 60_000;
+
+/** Uma linha: agentId e idade de cada turno que segura o dreno. */
+export function formatDrainHolders(holders: readonly DrainHolder[]): string {
+  if (holders.length === 0) return "nenhum agente em turno";
+  return holders.map((h) => {
+    const idadeS = Math.max(0, Math.round(h.turnAgeMs / 1000));
+    const longo = h.turnAgeMs >= LONG_TURN_MS ? " turno-longo" : "";
+    const partes = [`agentId=${h.agentId}`, `idade=${idadeS}s${longo}`];
+    if (h.runner) partes.push(`runner=${h.runner}`);
+    if (h.state) partes.push(`state=${h.state}`);
+    if (h.reason) partes.push(`motivo=${h.reason}`);
+    return partes.join(" ");
+  }).join("; ");
+}
 
 /** Teto de segurança: idle-restart não pode travar esperando filho zumbi. */
 export const REEXEC_SHUTDOWN_MS = 10_000;
@@ -167,7 +203,7 @@ let updatePending = false;
 let updatePendingSince: number | null = null;
 /** T-720: dreno ligado (nenhum turno novo até o re-exec). Vai no health. */
 let updateDraining = false;
-let drainWarned = false;
+let drainForced = false;
 /** SHA publicado do último swap bem-sucedido neste processo. */
 let appliedReleaseHash: string | undefined;
 /** SHA da imagem carregada — capturado uma vez, nunca re-lê o arquivo. */
@@ -212,7 +248,7 @@ export function _resetIdleRestartForTest(): void {
   updatePending = false;
   updatePendingSince = null;
   updateDraining = false;
-  drainWarned = false;
+  drainForced = false;
   appliedReleaseHash = undefined;
   bootBinaryHash = undefined;
   bootHashCaptured = false;
@@ -260,9 +296,19 @@ async function requestReexec(deps: SelfUpdateDeps): Promise<"updated" | "updated
   return "updated";
 }
 
+function holdersAgora(deps: SelfUpdateDeps): DrainHolder[] {
+  try { return deps.drainHolders?.() ?? []; }
+  catch (e) {
+    deps.log("warn", `[self-update] drainHolders falhou: ${(e as Error).message}`);
+    return [];
+  }
+}
+
 /**
- * T-088: após o swap, re-exec SÓ com 0 turnos. Ocupado → pending + recheck.
- * Não mata turno no meio (exit 42 derruba sessões).
+ * T-088: após o swap, re-exec com 0 turnos. Ocupado → pending + recheck.
+ * T-720: passada a janela, dreno (nenhum turno novo).
+ * T-839: o dreno tem teto. Turno que não fecha (claude + monitor) não segura
+ * o re-exec para sempre: sai keepRunning e o turno volta pelo spool/--resume.
  */
 function planRestartWhenIdle(deps: SelfUpdateDeps): Promise<"updated" | "updated-awaiting-idle" | "updated-restart-pending"> | "updated-awaiting-idle" {
   const idle = deps.isIdle ?? (() => true);
@@ -274,26 +320,31 @@ function planRestartWhenIdle(deps: SelfUpdateDeps): Promise<"updated" | "updated
   const later = deps.setTimeoutFn ?? setTimeout;
   const now = deps.nowFn ?? Date.now;
   const drainAfter = deps.drainAfterMs ?? DRAIN_AFTER_MS;
+  const forceAfter = deps.drainForceMs ?? DRAIN_FORCE_MS;
   const tick = () => {
+    if (drainForced) return;
     if (idle()) {
       idleRestartArmed = false;
       void requestReexec(deps);
       return;
     }
-    // T-720: com o time sempre ativo o idle natural nunca fecha. Passada a
-    // janela, drena: turno novo não começa, o em curso termina (nunca é
-    // morto) e o idle acima fecha sozinho.
     const pendingMs = now() - (updatePendingSince ?? now());
+    const quem = () => formatDrainHolders(holdersAgora(deps));
     if (!updateDraining && deps.startDrain && pendingMs >= drainAfter) {
       updateDraining = true;
-      deps.log("info", `[self-update] pendente há ${Math.round(pendingMs / 60_000)}min sem idle — DRENO: nenhum turno novo; aplica quando os turnos em curso terminarem`);
+      deps.log("info", `[self-update] pendente há ${Math.round(pendingMs / 60_000)}min sem idle — DRENO: nenhum turno novo; segura: ${quem()}`);
       try { deps.startDrain(); } catch (e) {
         deps.log("warn", `[self-update] startDrain falhou: ${(e as Error).message}`);
       }
     }
-    if (updateDraining && !drainWarned && pendingMs >= drainAfter + DRAIN_WARN_MS) {
-      drainWarned = true;
-      deps.log("warn", `[self-update] dreno há ${Math.round((pendingMs - drainAfter) / 60_000)}min e ainda há turno ativo — segue esperando (turno em curso nunca é morto)`);
+    // T-839: teto. O turno aberto é interrompido; prepareReexec (keepRunning)
+    // grava o spool e o processo novo retoma a sessão com --resume.
+    if (updateDraining && pendingMs >= drainAfter + forceAfter) {
+      drainForced = true;
+      idleRestartArmed = false;
+      deps.log("warn", `[self-update] teto do dreno (${Math.round(forceAfter / 60_000)}min) — re-exec keepRunning; turno retomado pelo spool e --resume; segura: ${quem()}`);
+      void requestReexec(deps);
+      return;
     }
     later(tick, ms);
   };

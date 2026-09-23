@@ -14,6 +14,8 @@ import { captureBootBinaryHash, checkAndApplyUpdate, runningReleaseInfo } from "
 import { DAEMON_BUILD_TS } from "./daemon-build-ts.js";
 import { createSelfUpdateGate } from "./self-update-gate.js";
 import { createDeliveryDeduper, loadDeliverySeen, saveDeliverySeen } from "./inbound-dedup.js";
+import { decidirClose, proximoDelayPassivo } from "./ws-handoff.js";
+import { commitReexecSnapshot } from "./reexec-snapshot.js";
 import {
   resolveGrokSessionRoots,
   scheduleGrokSessionCleanup,
@@ -36,7 +38,8 @@ import { apagarArquivoOd, apagarProjetoOd, buscarArquivosOd, cancelarRunOd, copi
 import { ensureGraphWatch, stopAllGraphWatches } from "./graph-watcher.js";
 import { detectDropTarget, spawnDropped, type DropTarget } from "./privileges.js";
 import { BridgeRelay, type PeerPidMode } from "./bridge-relay.js";
-import { definirEmissorSombra, registrarJevDoProjeto } from "./typesafe-delegate-shadow.js";
+import { definirEmissorSombra, definirLogJev, registrarJevDoProjeto } from "./typesafe-delegate-shadow.js";
+import { definirElencoProjeto } from "./typesafe-task-shadow.js";
 import { defaultDaemonConfigPath, formatCliStatus, loadDaemonCliConfig, mergeCliConfig, resolveCliCommands, type DaemonCliConfig, type ResolvedCliCommands } from "./cli-config.js";
 import { applyRunnerPolicy, buildInstalledRunnerAvailability, helloRunnerLists, POLICY_GATED_RUNNERS, type InstalledRunnerAvailability } from "./runner-policy.js";
 import { assembleAgentSendParts, contentAadChain, openWithAnyHeldProject, type FromDaemon, type FromOrch, type TaskUpdatedEv } from "./protocol.js";
@@ -249,6 +252,12 @@ export class DaemonClient {
   // (hot loop). Escala 200ms→5s e reseta ao conectar.
   private transientBackoff = 200;
   private stableConnTimer: NodeJS.Timeout | null = null;
+  /** T-846: hello `passive: true` — retomada depois de 4000/4001. */
+  private helloPassivo = false;
+  /** T-846: cooldown corrente do passivo (30s → 5min). */
+  private passivoDelayMs = 0;
+  /** T-846: o warn do handoff sai uma vez por episódio. */
+  private handoffLogado = false;
   private static readonly TRANSIENT_BASE_MS = 200;
   private static readonly TRANSIENT_BACKOFF_CAP_MS = 5_000;
   // Tracker de disconnects transient (1006/1005/1011) — sliding window
@@ -383,6 +392,13 @@ export class DaemonClient {
     definirEmissorSombra((veredito) => {
       try { this.send(veredito); } catch { /* a emissão não falha o delegate */ }
     });
+    // T-868: ligar/desligar o Jev pelo toggle não muda em silêncio.
+    definirLogJev((nivel, msg) => log(nivel, msg));
+    // T-852: elenco do projeto para as opções do Jev nas tasks. Só name/role
+    // (whitelist) — o AgentInfo carrega o systemPrompt já decifrado.
+    definirElencoProjeto((projectId) => {
+      try { return this.host.elencoDoProjeto(projectId); } catch { return []; }
+    });
     this.relay = new BridgeRelay(this.orchUrl, this.dropTo, (agentId) => this.host.getAgentProjectId(agentId), {
       // T-581: o prompt de delegação cifrado cita o nome do pai (o subagente
       // responde por send_message pra ele). Closures lazy — `host` nasce abaixo.
@@ -511,6 +527,36 @@ export class DaemonClient {
     };
   }
 
+  /**
+   * T-846: voltar passivo depois do cooldown. No 4000 (fomos assumidos) os
+   * CLIs locais param — quem ficou é dono dos agentes; no 4001 já estamos
+   * parados e só esperamos. Sem replay e sem revezamento: se o vencedor morrer,
+   * o server aceita o passivo e faz o replay dos agentes.
+   */
+  private agendarRetomadaPassiva(decisao: "passivo-superseded" | "passivo-occupied"): void {
+    const delay = proximoDelayPassivo(this.passivoDelayMs);
+    this.passivoDelayMs = delay;
+    this.helloPassivo = true;
+    if (decisao === "passivo-superseded") {
+      const n = this.host.stopLocalClis("T-846: conexão assumida por outro processo com o mesmo token");
+      if (!this.handoffLogado) {
+        this.handoffLogado = true;
+        log(
+          "warn",
+          `outro processo com o mesmo token assumiu a conexão (pid=${process.pid} host=${os.hostname()}) — ` +
+          `este daemon parou ${n} CLI(s) local(is), segue vivo e tenta voltar passivo em ${Math.round(delay / 1000)}s`,
+        );
+      } else {
+        log("info", `[handoff] assumido de novo — ${n} CLI(s) local(is) parado(s); passivo em ${Math.round(delay / 1000)}s`);
+      }
+    } else if (!this.handoffLogado) {
+      this.handoffLogado = true;
+      log("info", `token ocupado por outro processo (close 4001) — nova tentativa passiva em ${Math.round(delay / 1000)}s`);
+    }
+    breadcrumb("ws", "handoff", { decisao, delayMs: delay, passivo: true });
+    setTimeout(() => this.connect(), delay);
+  }
+
   private connect() {
     if (this.stopped) return;
     const url = wsUrlFromOrch(this.args.orch);
@@ -582,6 +628,10 @@ export class DaemonClient {
         hostname: os.hostname(),
         version: VERSION,
         protocolVersion: WIRE_PROTOCOL_VERSION,
+        // T-846: hello passivo não substitui; o server responde 4001 se o
+        // token ainda estiver ocupado por outro processo vivo. O campo ainda
+        // não está no DaemonHello do protocolo (o server o lê cru), daí o cast.
+        passive: this.helloPassivo,
         ...runningReleaseInfo(),
         cryptoPublicKey,
         // Resume: server reenvia msgs com seq > lastSeenSeq do buffer
@@ -594,7 +644,7 @@ export class DaemonClient {
           cli: !!this.cliCommands.graphify?.available,
           mcp: !!this.cliCommands.graphifyMcp?.available,
         },
-      });
+      } as FromDaemon);
       // Ressincroniza tokens de agents já rodando localmente — sem isso,
       // após restart do server, o Map agentTokens fica vazio e o
       // mcp-bridge (que mantém o token antigo em env) começa a receber
@@ -661,6 +711,20 @@ export class DaemonClient {
       recordWsEvent("close", reason?.toString() || "(no reason)", code);
       if (this.stopped) return;
       const reasonStr = reason?.toString() || "(no reason)";
+      // T-846: handoff de token — outro processo com o mesmo token assumiu
+      // (4000) ou o token segue ocupado para o nosso hello passivo (4001).
+      // Nada de reconexão imediata: sem isto os dois processos se revezavam.
+      const decisao = decidirClose(code, reasonStr);
+      if (decisao !== "normal") {
+        this.agendarRetomadaPassiva(decisao);
+        return;
+      }
+      if (this.helloPassivo) {
+        // Close "comum" durante o passivo (rede caiu e o vencedor morreu, por
+        // exemplo): volta ao caminho normal, com backoff próprio.
+        this.helloPassivo = false;
+        this.passivoDelayMs = 0;
+      }
       const isTransient = code === 1006 || code === 1005 || code === 1011;
       const baseDelay = isTransient ? this.transientBackoff : this.reconnectDelay;
       const jittered = Math.floor(baseDelay * (0.75 + Math.random() * 0.5));
@@ -752,9 +816,26 @@ export class DaemonClient {
   }
 
   private async handleInner(msg: FromOrch) {
+    // T-852/T-878: `project:features` ainda não está no FromOrch da main (o
+    // tipo chega com o contrato do SERVER). Daemon antigo ignora a mensagem
+    // desconhecida; aqui ela desliga o Jev do projeto com efeito IMEDIATO, sem
+    // esperar o próximo spawn. Fora do switch porque a case não é comparável.
+    const tipos = msg as { type: string; projectId?: unknown; jev?: unknown };
+    if (tipos.type === "project:features") {
+      registrarJevDoProjeto(String(tipos.projectId ?? ""), tipos.jev === true);
+      return;
+    }
     switch (msg.type) {
       case "daemon:welcome":
         log("info", `authed as ${msg.user.name} <${msg.user.email}>`);
+        // T-846: fomos aceitos (inclusive como passivo, quando o vencedor
+        // morreu). Daqui em diante vale o caminho normal de reconexão.
+        if (this.helloPassivo) {
+          log("info", "[handoff] assumimos a conexão de volta — operação normal");
+          this.helloPassivo = false;
+        }
+        this.passivoDelayMs = 0;
+        this.handoffLogado = false;
         // M35 (T-475): o server anuncia a versão de fio no welcome; mismatch
         // aqui = daemon velho contra server novo (o outro lado nos recusaria
         // no hello, mas quando É o server que subiu primeiro queremos o aviso
@@ -2572,6 +2653,7 @@ export class DaemonClient {
       // T-720: pendente sem idle natural → dreno (sem turno novo; mensagens
       // retidas para o spool cifrado do re-exec).
       startDrain: () => { this.host.startDrain(); },
+      drainHolders: () => this.drainHoldersAgora(),
     }),
     log: (level, msg) => log(level, msg),
   });
@@ -2590,6 +2672,22 @@ export class DaemonClient {
     primeira.unref?.();
     this.selfUpdateTimer = setInterval(rodar, 60 * 60_000);
     this.selfUpdateTimer.unref?.();
+  }
+
+  /** T-839: claude em turno (agentId) mais quem segura slot do turn-gate. */
+  private drainHoldersAgora() {
+    const agora = Date.now();
+    const doHost = this.host.drainHolders(agora);
+    const vistos = new Set(doHost.map((h) => h.agentId));
+    const doGate = turnGateDebug(agora).holders
+      .map((h) => ({
+        agentId: h.label,
+        turnAgeMs: h.heldMs,
+        runner: h.label.split(":")[0] || "gate",
+        reason: `turn-gate:${h.pool}`,
+      }))
+      .filter((h) => !vistos.has(h.agentId));
+    return [...doHost, ...doGate];
   }
 
   /** Snapshot de saúde → server → UI. Falha silenciosa se o canal caiu. */
@@ -2642,11 +2740,18 @@ export class DaemonClient {
     if (opts.keepRunning) {
       if (!this.host.isDraining()) this.host.startDrain(opts.porSinal ? "shutdown" : "update");
       else if (opts.porSinal) this.host.setDrainReason("shutdown");
+      // T-842 x T-839: vale para os DOIS caminhos de keepRunning. No sinal o
+      // shutdown já chamou isto com o WS aberto (2ª chamada é idempotente); no
+      // teto do dreno do self-update é AQUI que o turno aberto entra no spool —
+      // sem isto o teto do #839 cortaria o turno e a mensagem em voo sumiria.
+      this.host.holdInFlightForShutdown();
     }
     // Revisão T-824: no sinal o WS já fechou (nada novo chega). Grava spool e
     // ids vistos ANTES de matar os CLIs: um daemon novo que suba em paralelo
     // (bootout+bootstrap, Ctrl-C+rerun) já acha os arquivos no boot.
-    if (opts.keepRunning && opts.porSinal) this.gravarSpoolEVistos("[shutdown]");
+    if (opts.keepRunning && opts.porSinal) {
+      this.gravarSpoolEVistos("[shutdown]");
+    }
     const n = await this.host.shutdown({ reexec: !!opts.keepRunning });
     if (opts.keepRunning && opts.porSinal) log("info", `[shutdown] ${n} agent(s) mantidos running`);
     else if (opts.keepRunning) log("info", `[self-update] reexec: ${n} agent(s) mantidos running`);
@@ -2657,19 +2762,14 @@ export class DaemonClient {
     await new Promise((r) => setTimeout(r, 2_500));
   }
 
-  /** Revisão T-824: spool das retidas + ids de entrega vistos, por perfil. */
+  /** Revisão T-824 / T-842: spool primeiro; vistos só se o spool foi gravado. */
   private gravarSpoolEVistos(tag: string): void {
-    try {
-      const sp = this.host.writeReexecSpool();
-      log("info", `${tag} spool: ${sp.spooled} msg(s) gravadas cifradas${sp.lost ? `, ${sp.lost} perdida(s) sem chave (não gravadas em claro)` : ""}`);
-    } catch (e) {
-      log("warn", `${tag} spool falhou: ${(e as Error).message} — mensagens retidas perdidas na saída`);
-    }
-    try {
-      saveDeliverySeen(profileHome(), this.deliveryDedup.snapshot());
-    } catch (e) {
-      log("warn", `${tag} ids de entrega vistos: gravação falhou (${(e as Error).message}) — o replay pode reentregar`);
-    }
+    commitReexecSnapshot({
+      tag,
+      writeSpool: () => this.host.writeReexecSpool(),
+      saveSeen: () => saveDeliverySeen(profileHome(), this.deliveryDedup.snapshot()),
+      log: (level, msg) => log(level, msg),
+    });
   }
 
   private async shutdown() {
@@ -2690,9 +2790,13 @@ export class DaemonClient {
         log("info", "[shutdown] parada definitiva pedida (uninstall) — anunciando exit dos agentes");
         await this.prepareReexec();
       } else {
-        // Revisão T-824: fecha o WS PRIMEIRO. Sem agent:exit, a conexão velha
-        // seguia no registry do server com os agentes "ativos" até o fim do
-        // shutdown, e um daemon novo que subisse antes tinha o replay pulado.
+        // T-842: o aviso de reinício e o flush saem com o WS ainda OPEN.
+        // O close continua ANTES do spool e dos CLIs (filtro de tokenId
+        // do server): prepareReexec grava o snapshot e só então mata os filhos.
+        this.host.startDrain("shutdown");
+        this.host.holdInFlightForShutdown();
+        this.host.announceRestart();
+        this.flushOutboundQueue();
         this.stopPing();
         this.stopHeartbeat();
         try { this.ws?.close(1000, "shutdown"); } catch { /* noop */ }

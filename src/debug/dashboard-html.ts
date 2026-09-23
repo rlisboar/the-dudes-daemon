@@ -564,7 +564,11 @@ const JS = String.raw`
     return table("agents-summary", [
       { key: "name", label: "agente", render: function (a) { return h("span", { title: a.agentId }, a.name, a.ephemeral ? h("span", { cls: "muted", text: " (efêmero)" }) : null); } },
       { key: "cliRunner", label: "runner", render: function (a) { return a.cliRunner + (a.model ? " · " + a.model : ""); } },
-      { key: "state", label: "estado", sortv: function (a) { return a.runner && a.runner.state; }, render: function (a) { return a.runner ? stateChip(a.runner.state) : chip("neutral", "○", "sem runner"); } },
+      { key: "state", label: "estado", sortv: function (a) { return a.runner && (a.runner.longTurn ? "turno longo" : a.runner.state); }, render: function (a) {
+        if (!a.runner) return chip("neutral", "○", "sem runner");
+        if (a.runner.longTurn) return chip("warning", "▶", "turno longo", (a.runner.turnHoldReason || "result não chegou") + " · " + fmtMs(a.runner.turnElapsedMs));
+        return stateChip(a.runner.state);
+      } },
       { key: "phase", label: "fase do turno", sortv: function (a) { return a.runner && a.runner.currentTurn && a.runner.currentTurn.phase; }, render: function (a) { var t = a.runner && a.runner.currentTurn; return t && t.phase !== "ended" ? t.phase + " · " + fmtMs(t.sinceStartMs != null ? t.sinceStartMs : t.sinceEnqueueMs) : "–"; } },
       { key: "idle", label: "sem atividade", num: true, sortv: function (a) { return a.runner && a.runner.inTurn ? a.runner.idleMs : null; }, render: function (a) { return a.runner && a.runner.inTurn ? fmtMs(a.runner.idleMs) : "–"; }, help: "tempo desde o último evento semântico (só em turno)" },
       { key: "queued", label: "fila", num: true, sortv: function (a) { return a.runner ? (a.runner.queued + a.runner.pendingMessages + a.runner.claudeWriteQueue) : null; }, render: function (a) { return a.runner ? String(a.runner.queued + a.runner.pendingMessages + a.runner.claudeWriteQueue) : "–"; } },
@@ -595,11 +599,11 @@ const JS = String.raw`
       var th = r.thresholds || {};
       var ct = r.currentTurn;
       box.appendChild(h("div", { cls: "card agent" },
-        h("h4", null, a.name, a.runner ? stateChip(r.state) : chip("neutral", "○", "sem runner"), a.ephemeral ? chip("neutral", "◌", "efêmero") : null),
+        h("h4", null, a.name, a.runner ? (r.longTurn ? chip("warning", "▶", "turno longo", r.turnHoldReason || "") : stateChip(r.state)) : chip("neutral", "○", "sem runner"), a.ephemeral ? chip("neutral", "◌", "efêmero") : null),
         h("div", { cls: "meta", text: a.agentId + " · " + a.cliRunner + (a.model ? " · " + a.model : "") + (a.effort ? " · effort " + a.effort : "") + (a.projectId ? " · proj " + a.projectId : "") }),
         kv([
           ["turno", ct && ct.phase !== "ended" ? ct.phase + " · desde início " + fmtMs(ct.sinceStartMs) + " · gate " + fmtMs(ct.gateWaitMs) + " · 1º evento " + fmtMs(ct.firstEventMs) + (ct.attempt ? " · tentativa " + ct.attempt : "") : (r.inTurn ? "em turno (sem timing)" : "sem turno")],
-          ["atividade", "última há " + fmtMs(r.idleMs) + " · turno há " + fmtMs(r.turnElapsedMs) + (r.softReported ? " · SOFT reportado" : "") + (r.deadMs != null ? " · processo morto há " + fmtMs(r.deadMs) : "")],
+          ["atividade", "última há " + fmtMs(r.idleMs) + " · turno há " + fmtMs(r.turnElapsedMs) + (r.longTurn ? " · TURNO LONGO (" + (r.turnHoldReason || "result não chegou") + ")" : "") + (r.softReported ? " · SOFT reportado" : "") + (r.deadMs != null ? " · processo morto há " + fmtMs(r.deadMs) : "")],
           ["limiares", "soft " + fmtMs(th.softMs) + " · hard " + fmtMs(th.hardMs) + " · 1º evento " + fmtMs(th.firstEventMs) + " · pós-evento " + fmtMs(th.postEventMs) + " · tools " + fmtMs(th.toolsHardMs) + (th.lifetimeMs ? " · lifetime " + fmtMs(th.lifetimeMs) : "") + (th.lifetimeCapMs ? " · cap " + fmtMs(th.lifetimeCapMs) : "")],
           ["fila", "per-message " + (r.queued || 0) + " · restart " + (r.pendingMessages || 0) + " · stdin claude " + (r.claudeWriteQueue || 0) + (r.claudeInflight ? " · 1 em voo" : "") + (r.claudeUnacceptedMs != null ? " · NÃO aceita há " + fmtMs(r.claudeUnacceptedMs) : "") + " · buffer host " + a.inboundBuffered],
           ["flags", h("span", { cls: "pill-row" }, boolChip(r.busy, "busy", "livre"), boolChip(r.waitingTurnGate, "esperando gate", "fora do gate"), boolChip(r.holdsGateSlot, "segura slot", "sem slot"), r.compacting ? chip("warning", "▲", "compact " + fmtMs(r.compactingMs)) : null, r.recoveringHung ? chip("serious", "↻", "recuperando") : null, r.restarting ? chip("serious", "↻", "reiniciando") : null, r.clearing ? chip("neutral", "•", "clear") : null)],

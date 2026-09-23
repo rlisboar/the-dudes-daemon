@@ -141,11 +141,35 @@ const emVoo = new Set<Promise<void>>();
 const jevPorProjeto = new Map<string, true>();
 let emissorSombra: ((msg: TypesafeShadow) => void) | null = null;
 
-/** Chamado no agent:spawn. Sem hot-update: o próximo spawn substitui. */
+let logJev: ((nivel: "info", msg: string) => void) | null = null;
+
+/** T-868: o daemon liga aqui o log() central — a flag não muda em silêncio. */
+export function definirLogJev(fn: ((nivel: "info", msg: string) => void) | null): void {
+  logJev = fn;
+}
+
+/**
+ * Chamado no agent:spawn e no `project:features` (T-868) — o toggle do admin
+ * vale NA HORA, sem esperar o próximo spawn. Projeto sem mensagem = desligado
+ * (nenhum default ligado). Uma linha em info na primeira vez que liga e quando
+ * desliga, para o dono seguir a fase 1 sem abrir banco.
+ */
 export function registrarJevDoProjeto(projectId: string, ligado: boolean): void {
   if (!projectId) return;
-  if (ligado) jevPorProjeto.set(projectId, true);
-  else jevPorProjeto.delete(projectId);
+  const antes = jevPorProjeto.get(projectId) === true;
+  if (ligado === antes) return;
+  if (ligado) {
+    jevPorProjeto.set(projectId, true);
+    logJev?.("info", `[jev] projeto ${projectId}: feature LIGADA — sombra do delegate e das tasks ativa`);
+  } else {
+    jevPorProjeto.delete(projectId);
+    logJev?.("info", `[jev] projeto ${projectId}: feature DESLIGADA — sombra para na hora`);
+  }
+}
+
+/** Testes: zera o mapa de projetos (o default é sempre desligado). */
+export function _resetJevProjetosForTest(): void {
+  jevPorProjeto.clear();
 }
 
 /** O daemon entrega o veredito no socket. A sombra não espera essa entrega. */
@@ -155,6 +179,33 @@ export function definirEmissorSombra(fn: ((msg: TypesafeShadow) => void) | null)
 
 function jevLigado(projectId: string): boolean {
   return jevPorProjeto.get(projectId) === true;
+}
+
+// T-852: a sombra das tasks usa o MESMO interruptor de projeto e o mesmo
+// caminho de emissão/rede — só a flag de kill-switch e as perguntas mudam.
+
+/** `jev_enabled` do projeto (alimentado pelo spawn e pelo project:features). */
+export function isJevLigado(projectId: string): boolean {
+  return jevLigado(projectId);
+}
+
+/** Emissão compartilhada do veredito (socket do daemon). */
+export function emitirSombra(msg: TypesafeShadow): void {
+  emissorSombra?.(msg);
+}
+
+export interface SombraFetchOpts {
+  timeoutMs: number;
+  maxRedirects: number;
+}
+
+/** safeFetch de produção da sombra (maxRedirects 0 obrigatório). */
+export function safeFetchSombra(
+  url: string,
+  init: DelegateShadowRequestInit,
+  opts: SombraFetchOpts,
+): Promise<{ status: number; text: () => Promise<string> }> {
+  return safeFetchEmUso(url, init, opts);
 }
 
 /** Opts da chamada de produção. `maxRedirects: 0` é obrigatório. */

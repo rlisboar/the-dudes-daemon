@@ -5,6 +5,8 @@ export interface QueuedMessage {
   images?: ImageAttachment[];
   /** T-364: origem não-user na fila (ex.: "hang-recover"). */
   synthetic?: string;
+  /** T-842: id de entrega, para o spool do SIGTERM não perder o dedup. */
+  deliveryId?: string;
 }
 
 /** T-818: o que `enqueueOrCoalesce` fez com a mensagem. */

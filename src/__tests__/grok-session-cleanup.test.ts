@@ -12,7 +12,7 @@ import {
   readdirSync,
   statSync as fsStatSync,
 } from "node:fs";
-import os from "node:os";
+import { baseTmp } from "./tmp.js";
 import path from "node:path";
 import {
   cleanGrokTempSessions,
@@ -283,12 +283,12 @@ test("rm falha isolada não derruba (errors++, continua)", () => {
 });
 
 test("fixture real no disco: old removido, fresh+projeto intactos", () => {
-  const base = path.join(os.tmpdir(), `td-grok-sess-test-${process.pid}-${Date.now()}`);
+  const base = path.join(baseTmp(), `td-grok-sess-test-${process.pid}-${Date.now()}`);
   const sessions = path.join(base, ".grok", "sessions");
   mkdirSync(sessions, { recursive: true });
 
-  const oldName = enc(path.join(os.tmpdir(), "the-dudes-cli-oldFix"));
-  const freshName = enc(path.join(os.tmpdir(), "the-dudes-cli-freshFix"));
+  const oldName = enc(path.join(baseTmp(), "the-dudes-cli-oldFix"));
+  const freshName = enc(path.join(baseTmp(), "the-dudes-cli-freshFix"));
   const projectName = enc("/Users/lisboa/Documents/eonf/projects/claudinhos");
 
   const oldDir = path.join(sessions, oldName);
@@ -360,7 +360,7 @@ test("scheduleGrokSessionCleanup: boot chama run + stop limpa timer", () => {
 });
 
 test("dirByteSize soma arquivos", () => {
-  const base = path.join(os.tmpdir(), `td-bytes-${process.pid}-${Date.now()}`);
+  const base = path.join(baseTmp(), `td-bytes-${process.pid}-${Date.now()}`);
   mkdirSync(base, { recursive: true });
   writeFileSync(path.join(base, "a"), "12345");
   try {

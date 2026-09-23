@@ -460,7 +460,7 @@ const DSH_BACKOFF_CAP_MS = 30_000;
 /** Nome do bridge do the-dudes: sem ele o agente não fala com o time (fatal). */
 const BRIDGE_MCP_NAME = "the-dudes";
 
-interface DshQueued { content: string }
+interface DshQueued { content: string; deliveryId?: string }
 
 /** mcpServers do session/new: bridge the-dudes + extras (stdio ou http). */
 function dshMcpServers(self: any): DshMcpServer[] {
@@ -689,7 +689,7 @@ export function dshTakeQueue(self: any): Array<{ content: string }> {
   const queue = (self.dshQueue as DshQueued[] | undefined) ?? [];
   for (const q of queue) self.turnLatency?.discard(q, "drained");
   self.dshQueue = [];
-  return queue.map((q) => ({ content: q.content }));
+  return queue.map((q) => ({ content: q.content, deliveryId: q.deliveryId }));
 }
 
 /** T-827: `rawInput` do ACP só vale como objeto (é o que os RUNS mostram). */
@@ -698,7 +698,7 @@ export function dshToolInput(raw: unknown): Record<string, unknown> | undefined 
 }
 
 /** Enfileira mensagem do usuário; o pump serializa (ACP: 1 prompt por vez). */
-export function dshPushUserMessage(self: any, content: string, images?: ImageAttachment[]): void {
+export function dshPushUserMessage(self: any, content: string, images?: ImageAttachment[], deliveryId?: string): void {
   const queue = (self.dshQueue as DshQueued[] | undefined) ?? [];
   if (queue.length >= MAX_DSH_QUEUE) {
     self.opts.log("warn", `[cli:${self.info.id}:dsh] fila cheia (${queue.length}) — drop mensagem`);
@@ -717,7 +717,7 @@ export function dshPushUserMessage(self: any, content: string, images?: ImageAtt
     self.scheduleAttachmentCleanup(cleanup);
     message = appendPathAttachmentPrompt(message, files, "dsh");
   }
-  const queued = { content: message };
+  const queued = { content: message, deliveryId };
   self.turnLatency?.enqueue(queued);
   queue.push(queued);
   self.dshQueue = queue;
@@ -734,6 +734,7 @@ function dshPump(self: any): void {
   const timing = self.turnLatency?.activate(next, self.dshFreshSession ? "cold" : "resume");
   timing?.start();
   self.dshPromptInFlight = true;
+  self.currentTurn = { content: next.content, deliveryId: next.deliveryId };
   self.setState("thinking");
   void (async () => {
     try {
