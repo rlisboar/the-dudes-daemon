@@ -696,7 +696,7 @@ export interface RelayRecord {
   method: string;
   status: number;
   totalMs: number;
-  /** Tempo SÍNCRONO resolvendo o peer-pid (spawnSync perl + ps por hop). */
+  /** Tempo resolvendo o peer-pid (perl + ps por hop; assíncrono desde o T-815). */
   peerMs: number;
   upstreamMs: number | null;
   bytesIn: number;

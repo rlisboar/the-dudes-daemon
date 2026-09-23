@@ -171,7 +171,8 @@ export interface DshSession {
 export interface DshHandlers {
   onText(text: string): void;
   onThought(text: string): void;
-  onTool(ev: { id: string; title?: string; status?: string; kind?: string; phase: "call" | "update" }): void;
+  /** T-827: `input` = `rawInput` do ACP (argumentos da tool), quando vier objeto. */
+  onTool(ev: { id: string; title?: string; status?: string; kind?: string; phase: "call" | "update"; input?: Record<string, unknown> }): void;
   onUsage(used: number, size: number): void;
   onConfig(options: DshConfigOption[]): void;
   onStderr(line: string): void;
@@ -375,6 +376,7 @@ export class DshClient {
           status: typeof update.status === "string" ? update.status : undefined,
           kind: typeof update.kind === "string" ? update.kind : undefined,
           phase: kind === "tool_call" ? "call" : "update",
+          input: dshToolInput(update.rawInput),
         });
       } else if (kind === "usage_update") {
         this.handlers.onUsage(Number(update.used) || 0, Number(update.size) || 0);
@@ -544,7 +546,10 @@ export function startDsh(self: any): void {
         self.turnLatency?.current?.semantic("tool");
         if (self.toolsInFlight === 0) self.toolsInFlightSince = Date.now();
         self.toolsInFlight++;
-        self.opts.onToolUse(ev.title ?? ev.id, {});
+        // T-827: o dsh manda os argumentos no `rawInput` do tool_call (medido
+        // no dsh 0.1.5: bash {command, description}, read {file_path, limit});
+        // antes ia `{}` e os RUNS ficavam vazios.
+        self.opts.onToolUse(ev.title ?? ev.id, ev.input ?? {});
         self.setState((ev.title ?? "").includes("send_message") ? "sending" : "thinking");
       } else if (ev.status === "completed" || ev.status === "failed") {
         self.toolsInFlight = Math.max(0, self.toolsInFlight - 1);
@@ -687,13 +692,25 @@ export function dshTakeQueue(self: any): Array<{ content: string }> {
   return queue.map((q) => ({ content: q.content }));
 }
 
+/** T-827: `rawInput` do ACP só vale como objeto (é o que os RUNS mostram). */
+export function dshToolInput(raw: unknown): Record<string, unknown> | undefined {
+  return raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : undefined;
+}
+
 /** Enfileira mensagem do usuário; o pump serializa (ACP: 1 prompt por vez). */
 export function dshPushUserMessage(self: any, content: string, images?: ImageAttachment[]): void {
   const queue = (self.dshQueue as DshQueued[] | undefined) ?? [];
   if (queue.length >= MAX_DSH_QUEUE) {
     self.opts.log("warn", `[cli:${self.info.id}:dsh] fila cheia (${queue.length}) — drop mensagem`);
+    // T-818: descarte declarado a quem vê o chat (uma vez por rajada) —
+    // antes era só log.
+    if (!self.dshDropNoticeSent) {
+      self.dshDropNoticeSent = true;
+      self.opts.onError?.(`[fila] mensagem descartada: a fila do dsh está cheia (${queue.length}) — reenvie quando ela baixar (próximos descartes só no log)`);
+    }
     return;
   }
+  if (queue.length < MAX_DSH_QUEUE / 2) self.dshDropNoticeSent = false;
   let message = content;
   if (images && images.length) {
     const { files, cleanup } = self.writeAttachmentFiles(images);

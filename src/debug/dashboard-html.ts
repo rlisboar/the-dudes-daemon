@@ -916,7 +916,7 @@ const JS = String.raw`
     el.appendChild(table("relay-recent", [
       { key: "ts", label: "hora", fmt: fmtTime }, { key: "agentId", label: "agente", fmt: function (v) { return agentName(v); } }, { key: "op", label: "op" },
       { key: "status", label: "status", render: function (r) { return r.status >= 400 || r.error ? chip("critical", "✖", String(r.status)) : chip("good", "✓", String(r.status)); } },
-      { key: "totalMs", label: "total", num: true, fmt: fmtMs }, { key: "upstreamMs", label: "orchestrator", num: true, fmt: fmtMs }, { key: "peerMs", label: "peer (síncrono)", num: true, fmt: fmtMs },
+      { key: "totalMs", label: "total", num: true, fmt: fmtMs }, { key: "upstreamMs", label: "orchestrator", num: true, fmt: fmtMs }, { key: "peerMs", label: "peer-pid", num: true, fmt: fmtMs },
       { key: "bytesIn", label: "enviado", num: true, fmt: fmtBytes }, { key: "bytesOut", label: "recebido", num: true, fmt: fmtBytes }, { key: "error", label: "erro" }
     ], d.recent.slice().reverse(), { sort: "ts", limit: 400 }));
   }

@@ -859,12 +859,18 @@ export class AgentHost {
       // Se o agente nunca subir, TTL 15min limpa. Antes: drop + agent:error e a
       // TASK_ASSIGN sumia mesmo com o server reenviando.
       this.inboundAgentIds.add(agentId);
-      this.inboundBuffer.push(agentId, {
+      const evicted = this.inboundBuffer.push(agentId, {
         deliveryId,
         content,
         images,
         enqueuedAt: Date.now(),
       });
+      if (evicted > 0) {
+        // Revisão T-818: o buffer de antes do spawn descartava a mais antiga
+        // em silêncio. Mesmo formato de linha que o histórico do dashboard
+        // conta como descarte por fila cheia.
+        this.log("warn", `[cli:${agentId}:inbound] pendingMessages cheia (${this.inboundBuffer.size(agentId)}) — drop de ${evicted} mensagem(ns) mais antiga(s) antes do spawn`);
+      }
       this.log(
         "warn",
         `send_message para ${agentId} sem runner ativo (entry=${e ? "existe" : "ausente"}) — enfileirado (${this.inboundBuffer.size(agentId)} pending)`,

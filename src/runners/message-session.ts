@@ -7,6 +7,12 @@ export interface QueuedMessage {
   synthetic?: string;
 }
 
+/** T-818: o que `enqueueOrCoalesce` fez com a mensagem. */
+export type EnqueueOutcome = "queued" | "coalesced" | "dropped";
+
+/** T-818: separador entre mensagens agrupadas no mesmo item da fila. */
+export const COALESCE_SEPARATOR = "\n\n--- mensagem seguinte (agrupada: a fila do agente estava no teto) ---\n\n";
+
 export interface FirstTurnSnapshot {
   firstTurn: boolean;
   pendingSummary?: string;
@@ -62,6 +68,32 @@ export class PerMessageSessionState {
     this.observe?.queued(message, false);
     this.queue.push(message);
     return true;
+  }
+
+  /**
+   * T-818: com a fila no teto, a mensagem nova era DESCARTADA em silêncio (59
+   * descartes em 7 dias nos dois perfis do dono; quem mandou nunca soube).
+   * Agora ela entra no fim da última mensagem de usuário ainda não iniciada:
+   * nada se perde, a ordem de chegada se mantém e a fila continua com no
+   * máximo `maxSize` turnos. Só descarta quando o item agrupado passaria de
+   * `maxBytes` em UTF-8 (flood, loop agent↔agent) — o caller avisa. O teto é
+   * em BYTES porque grok/codex/gemini/crush levam o prompt no argv, e o Linux
+   * limita cada argumento a 128 KiB (E2BIG perderia o item inteiro).
+   * Sintética (hang-recover) não recebe mensagem de usuário: o dreno a deixa
+   * de fora.
+   */
+  enqueueOrCoalesce(message: QueuedMessage, maxSize: number, maxBytes: number): EnqueueOutcome {
+    if (this.enqueue(message, maxSize)) return "queued";
+    for (let i = this.queue.length - 1; i >= 0; i--) {
+      const alvo = this.queue[i]!;
+      if (alvo.synthetic) continue;
+      const content = alvo.content + COALESCE_SEPARATOR + message.content;
+      if (Buffer.byteLength(content, "utf8") > maxBytes) return "dropped";
+      alvo.content = content;
+      if (message.images?.length) alvo.images = [...(alvo.images ?? []), ...message.images];
+      return "coalesced";
+    }
+    return "dropped";
   }
 
   prepend(message: QueuedMessage): void { this.observe?.queued(message, true); this.queue.unshift(message); }

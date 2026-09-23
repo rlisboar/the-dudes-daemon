@@ -37,3 +37,13 @@ test("buffer cap: descarta os mais antigos", () => {
   const d = buf.drain("a");
   assert.deepEqual(d.map((m) => m.content), ["2", "3"]);
 });
+
+test("revisão T-818: push do buffer de antes do spawn devolve quantas mais antigas saíram", () => {
+  const buf = createAgentInboundBuffer({ maxPerAgent: 2 });
+  assert.equal(buf.push("a", { content: "1", enqueuedAt: Date.now() }), 0);
+  assert.equal(buf.push("a", { content: "2", enqueuedAt: Date.now() }), 0);
+  assert.equal(buf.push("a", { content: "3", enqueuedAt: Date.now() }), 1, "a mais antiga saiu");
+  assert.equal(buf.push("a", { content: "3b", deliveryId: "d1", enqueuedAt: Date.now() }), 1);
+  assert.equal(buf.push("a", { content: "dup", deliveryId: "d1", enqueuedAt: Date.now() }), 0, "duplicata não entra nem expulsa");
+  assert.deepEqual(buf.drain("a").map((m) => m.content), ["3", "3b"]);
+});

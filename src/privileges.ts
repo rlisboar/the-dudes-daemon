@@ -6,7 +6,7 @@
  * in the user's workspace and CLI tools may refuse to run.
  */
 
-import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { execFile, execFileSync, spawn, spawnSync } from "node:child_process";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { accessSync, constants as fsConstants, existsSync, readFileSync } from "node:fs";
 import { recordSpawn } from "./debug/store.js";
@@ -302,6 +302,36 @@ export function getParentPid(pid: number): number | null {
   }
 }
 
+/**
+ * T-815: versões assíncronas para o relay. O leitor default resolvia o peer
+ * com spawnSync(perl) + execFileSync(ps) por hop dentro do handler: 25–85ms
+ * de event loop parado por conexão nova num host calmo, 120–280ms por hop sob
+ * carga (T-592), no caminho de TODOS os runners (stdout, WS, watchdog). Aqui
+ * os MESMOS leitores rodam sem bloquear. Leitor injetado (testes) continua
+ * síncrono e é chamado do mesmo jeito, com as mesmas contagens.
+ */
+export async function getUnixPeerPidAsync(sock: object): Promise<number | null> {
+  try {
+    const pid = peerPidReader === defaultGetUnixPeerPid
+      ? await defaultGetUnixPeerPidAsync(sock)
+      : peerPidReader(sock);
+    return pid && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function getParentPidAsync(pid: number): Promise<number | null> {
+  try {
+    const ppid = parentPidReader === defaultGetParentPid
+      ? await defaultGetParentPidAsync(pid)
+      : parentPidReader(pid);
+    return ppid && ppid > 0 ? ppid : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Sobe a árvore de pais até achar um pid registrado (teto ~10). */
 export function resolveAgentIdFromPid(pid: number): string | null {
   let current = pid;
@@ -408,6 +438,44 @@ function readParentPidFromPs(pid: number): number | null {
   }
 }
 
+/** T-815: mesma política de cache do `readParentPidCached` (e o MESMO mapa):
+ *  só resultado bem-sucedido entra; o TTL conta do início da leitura. */
+export async function readParentPidCachedAsync(
+  pid: number,
+  read: (pid: number) => Promise<number | null>,
+): Promise<number | null> {
+  const cached = parentPidCache.get(pid);
+  const now = Date.now();
+  if (cached && now - cached.at < PARENT_PID_TTL_MS) return cached.ppid;
+  const ppid = await read(pid);
+  if (ppid == null) parentPidCache.delete(pid);
+  else parentPidCache.set(pid, { ppid, at: now });
+  return ppid;
+}
+
+async function defaultGetParentPidAsync(pid: number): Promise<number | null> {
+  // Linux lê /proc: leitura local, sem processo filho — o síncrono serve.
+  if (process.platform === "linux") return defaultGetParentPid(pid);
+  return readParentPidCachedAsync(pid, readParentPidFromPsAsync);
+}
+
+function readParentPidFromPsAsync(pid: number): Promise<number | null> {
+  return new Promise((resolve) => {
+    try {
+      execFile("ps", ["-p", String(pid), "-o", "ppid="], {
+        encoding: "utf8",
+        timeout: PARENT_PID_PS_TIMEOUT_MS,
+      }, (err, stdout) => {
+        if (err) { resolve(null); return; }
+        const ppid = Number(String(stdout).trim());
+        resolve(Number.isFinite(ppid) && ppid > 0 ? ppid : null);
+      });
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
 /* ---------- T-592: leitor de peer-pid por perl, python3 como fallback ---------- */
 
 /**
@@ -505,4 +573,62 @@ function defaultGetUnixPeerPid(sock: object): number | null {
     } catch { /* tenta o próximo */ }
   }
   return null;
+}
+
+/** T-815: o mesmo getsockopt do leitor default, com spawn assíncrono. O fd é
+ *  duplicado no filho no momento do spawn; se a conexão fechar depois, a
+ *  leitura ainda responde ou falha em null (fail-closed no relay). */
+async function defaultGetUnixPeerPidAsync(sock: object): Promise<number | null> {
+  const fd0 = unixSocketFd(sock);
+  if (fd0 == null) return null;
+  for (const probe of peerPidProbes()) {
+    // Revisão T-815: entre uma sonda e a próxima o loop gira. Se a conexão
+    // fechou nesse meio-tempo, o NÚMERO do fd pode já ser de outra conexão (o
+    // accept reusa o menor fd livre) e a sonda leria o peer errado. Relê e
+    // confere imediatamente antes do spawn, sem await no meio.
+    const fd = unixSocketFd(sock);
+    if (fd == null || fd !== fd0 || (sock as { destroyed?: boolean }).destroyed) return null;
+    const pid = await runPeerPidProbe(probe, fd);
+    if (pid != null) return pid;
+  }
+  return null;
+}
+
+function runPeerPidProbe(probe: PeerPidProbe, fd: number): Promise<number | null> {
+  return new Promise((resolve) => {
+    let child: ChildProcess;
+    try {
+      child = spawn(probe.bin, probe.args, { stdio: ["ignore", "pipe", "ignore", fd] });
+    } catch {
+      resolve(null);
+      return;
+    }
+    let out = "";
+    let done = false;
+    const finish = (pid: number | null) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(pid);
+    };
+    const timer = setTimeout(() => {
+      // Revisão T-815: com o loop bloqueado por outro código, o timer pode
+      // vencer o close de uma sonda que JÁ terminou. Adia a decisão um giro
+      // (setImmediate roda depois do poll de I/O) para o close entrar antes.
+      setImmediate(() => {
+        if (done) return;
+        try { child.kill("SIGKILL"); } catch { /* já saiu */ }
+        finish(null);
+      });
+    }, probe.timeout);
+    timer.unref?.();
+    child.stdout?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk: string) => { if (out.length < 64) out += chunk; });
+    child.on("error", () => finish(null));
+    child.on("close", (code) => {
+      if (code !== 0) { finish(null); return; }
+      const pid = Number(out.trim());
+      finish(Number.isFinite(pid) && pid > 0 ? pid : null);
+    });
+  });
 }

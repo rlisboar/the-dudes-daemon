@@ -858,6 +858,16 @@ export class AgentRunner {
   // 20 cobre retomada legítima; loop agent↔agent com Grok enchia 100 e
   // queimava tokens por horas.
   private static readonly MAX_BUFFERED_MESSAGES = 20;
+  /** T-818: teto do item agrupado quando a fila per-message está cheia —
+   *  ~30 mensagens de 2KB. Em BYTES e com folga sob os 128 KiB por argumento
+   *  do Linux (runners que levam o prompt no argv). Passou disso é flood:
+   *  descarta e avisa. */
+  private static readonly MAX_COALESCED_BYTES = 64 * 1024;
+  /** T-818: avisos de fila vão ao chat UMA vez por rajada (voltam a valer
+   *  quando a fila cair abaixo da metade do teto). */
+  private queueCoalesceNoticeSent = false;
+  private queueDropNoticeSent = false;
+  private restartDropNoticeSent = false;
 
   /**
    * T-720: dreno do self-update. Devolve e LIMPA as mensagens enfileiradas e
@@ -887,9 +897,31 @@ export class AgentRunner {
     }
     if (isPerMessageRunner(this.opts.cliRunner)) {
       const queued = this.messageSession.queuedCount();
-      if (!this.messageSession.enqueue({ content, images }, AgentRunner.MAX_BUFFERED_MESSAGES)) {
-        this.opts.log("warn", `[cli:${this.info.id}:${this.opts.cliRunner}] ocQueue cheia (${queued}) — drop mensagem`);
+      const outcome = this.messageSession.enqueueOrCoalesce(
+        { content, images },
+        AgentRunner.MAX_BUFFERED_MESSAGES,
+        AgentRunner.MAX_COALESCED_BYTES,
+      );
+      const tag = `[cli:${this.info.id}:${this.opts.cliRunner}]`;
+      if (outcome === "dropped") {
+        this.opts.log("warn", `${tag} ocQueue cheia (${queued}) — drop mensagem (agrupamento no teto de ${AgentRunner.MAX_COALESCED_BYTES} bytes)`);
+        if (!this.queueDropNoticeSent) {
+          this.queueDropNoticeSent = true;
+          this.opts.onError(`[fila] mensagem descartada: a fila deste agente está cheia (${queued}) e o agrupamento chegou ao teto de 64 KiB — reenvie quando a fila baixar (próximos descartes desta rajada só no log)`);
+        }
         return;
+      }
+      if (outcome === "coalesced") {
+        this.opts.log("warn", `${tag} fila no teto (${queued}) — mensagem agrupada na última da fila`);
+        if (!this.queueCoalesceNoticeSent) {
+          this.queueCoalesceNoticeSent = true;
+          this.opts.onError(`[fila] ${queued} mensagens esperando: as próximas serão agrupadas na última da fila até ela baixar (nada se perde até 64 KiB agrupados)`);
+        }
+      } else if (queued < AgentRunner.MAX_BUFFERED_MESSAGES / 2) {
+        // Histerese: fila rondando o teto (sai 1 turno, entra 1 mensagem) não
+        // repete o aviso; só depois de ela esvaziar pela metade.
+        this.queueCoalesceNoticeSent = false;
+        this.queueDropNoticeSent = false;
       }
       this.drainOcQueue();
       return;
@@ -905,8 +937,15 @@ export class AgentRunner {
     if (this.restarting || !this.proc || !this.proc.stdin.writable) {
       if (this.pendingMessages.length >= AgentRunner.MAX_BUFFERED_MESSAGES) {
         this.opts.log("warn", `[cli:${this.info.id}:claude] pendingMessages cheia (${this.pendingMessages.length}) — drop mensagem durante restart`);
+        // T-818: descarte declarado a quem vê o chat (uma vez por rajada) —
+        // antes era só log.
+        if (!this.restartDropNoticeSent) {
+          this.restartDropNoticeSent = true;
+          this.opts.onError(`[fila] mensagem descartada: ${this.pendingMessages.length} mensagens já esperavam o restart do claude — reenvie quando ele voltar (próximos descartes só no log)`);
+        }
         return;
       }
+      if (this.pendingMessages.length < AgentRunner.MAX_BUFFERED_MESSAGES / 2) this.restartDropNoticeSent = false;
       const pending = latencyMessage ?? { content, images };
       this.turnLatency.enqueue(pending);
       this.pendingMessages.push(pending);

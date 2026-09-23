@@ -96,7 +96,8 @@ function handle(msg) {
     promptInFlight = { id: msg.id, text };
     // Updates na ordem do contrato: thought → tool (call+update) → texto → usage.
     notify("session/update", { sessionId, update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "pensando…" } } });
-    notify("session/update", { sessionId, update: { sessionUpdate: "tool_call", toolCallId: "tc_1", title: "list_tasks", kind: "other", status: "pending" } });
+    // T-827: o dsh real manda os argumentos no rawInput do tool_call (dsh 0.1.5).
+    notify("session/update", { sessionId, update: { sessionUpdate: "tool_call", toolCallId: "tc_1", title: "list_tasks", kind: "other", status: "pending", rawInput: { status: "open", limit: 5 } } });
     notify("session/update", { sessionId, update: { sessionUpdate: "tool_call_update", toolCallId: "tc_1", status: "completed" } });
     // Permission request (server→client) — só depois da resposta seguimos.
     const pid = serverReqId++;

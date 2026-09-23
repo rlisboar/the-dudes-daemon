@@ -59,7 +59,8 @@ export function createAgentInboundBuffer(opts: {
   maxPerAgent?: number;
   ttlMs?: number;
 } = {}): {
-  push: (agentId: string, msg: BufferedInbound) => void;
+  /** Revisão T-818: devolve quantas mensagens MAIS ANTIGAS saíram pelo teto. */
+  push: (agentId: string, msg: BufferedInbound) => number;
   drain: (agentId: string) => BufferedInbound[];
   size: (agentId?: string) => number;
   clear: () => void;
@@ -81,10 +82,12 @@ export function createAgentInboundBuffer(opts: {
     push(agentId, msg) {
       gc(agentId);
       const list = byAgent.get(agentId) ?? [];
-      if (msg.deliveryId && list.some((m) => m.deliveryId === msg.deliveryId)) return;
+      if (msg.deliveryId && list.some((m) => m.deliveryId === msg.deliveryId)) return 0;
       list.push({ ...msg, enqueuedAt: msg.enqueuedAt || Date.now() });
-      while (list.length > max) list.shift();
+      let evicted = 0;
+      while (list.length > max) { list.shift(); evicted++; }
       byAgent.set(agentId, list);
+      return evicted;
     },
     drain(agentId) {
       gc(agentId);

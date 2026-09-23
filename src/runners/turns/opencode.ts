@@ -2,6 +2,7 @@
 import {AgentRunner, OPENCODE_TURN_TIMEOUT_MS, OPENCODE_POST_CAP_MS} from "../../agent-runner.js";
 import {AgentUsage, ImageAttachment} from "../../types.js";
 import {OPENCODE_MANAGED_AGENT} from "../opencode-effort.js";
+import {OPENCODE_TURN_TOOLS} from "../mcp-config.js";
 import {UsageSemantics} from "../context-tracker.js";
 import {buildOpenCodeParts} from "../attachments.js";
 import {parseOpenCodeTurnEvent} from "../turn-parsers.js";
@@ -189,7 +190,9 @@ export async function runOpenCodeMessageAttached(self: any, content: string, ima
       resp = await self.ocServeFetch(
         `/session/${self.messageSession.sessionId}/message`,
         "POST",
-        { ...(providerID && modelID ? { model: { providerID, modelID }, agent: OPENCODE_MANAGED_AGENT } : {}), parts },
+        // T-826: `tools` desliga a `question` (espera resposta no TUI) mesmo
+        // num serve que ainda roda com config antiga.
+        { ...(providerID && modelID ? { model: { providerID, modelID }, agent: OPENCODE_MANAGED_AGENT } : {}), tools: OPENCODE_TURN_TOOLS, parts },
         OPENCODE_TURN_TIMEOUT_MS,
         // T-776: renova enquanto o agente dá sinal de vida (SSE), com cap.
         { idleTimeoutMs: OPENCODE_TURN_TIMEOUT_MS, totalTimeoutMs: OPENCODE_POST_CAP_MS, activity: () => self.activityClock.lastActivityAt },

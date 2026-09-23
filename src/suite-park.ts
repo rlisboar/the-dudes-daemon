@@ -46,7 +46,7 @@
  *
  * Não toca nos testes em si (escopo do card).
  */
-import { spawnSync } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 
 /** Defaults do mecanismo. Override por env para calibração no host. */
 export const SUITE_PARK_DEFAULTS = {
@@ -222,10 +222,12 @@ export function primeiraAmostraUtil(tentativas: PsSpawnResult[]): ProcRow[] {
   throw new Error(`ps indisponível (${describePsFailure(last)}) — amostra descartada`);
 }
 
+const PS_ARGS = ["-axo", "pid=,ppid=,pgid=,stat=,etime=,time=,command="];
+
 export function runPs(): ProcRow[] {
   const tentativas: PsSpawnResult[] = [];
   for (let i = 0; i < PS_TENTATIVAS; i++) {
-    const r = spawnSync("ps", ["-axo", "pid=,ppid=,pgid=,stat=,etime=,time=,command="], {
+    const r = spawnSync("ps", PS_ARGS, {
       encoding: "utf8",
       timeout: PS_TIMEOUT_MS,
       maxBuffer: PS_MAX_BUFFER,
@@ -236,6 +238,51 @@ export function runPs(): ProcRow[] {
     if (i + 1 < PS_TENTATIVAS) sleepSync(200 * (i + 1));
   }
   return primeiraAmostraUtil(tentativas);
+}
+
+/**
+ * T-815: o loop do daemon amostrava com o `runPs` síncrono a cada 60s — o
+ * dashboard T-812 mediu 240–340ms de event loop parado por amostra (até 3
+ * tentativas + sleepSync), no caminho de TODOS os runners. Mesma política de
+ * tentativas, sem bloquear. O CLI (`--suite-park`) continua no síncrono.
+ */
+export async function runPsAsync(): Promise<ProcRow[]> {
+  const tentativas: PsSpawnResult[] = [];
+  for (let i = 0; i < PS_TENTATIVAS; i++) {
+    const r = await psAttemptAsync();
+    tentativas.push(r);
+    const rows = rowsFromPsAttempt(r);
+    if (rows) return rows;
+    if (i + 1 < PS_TENTATIVAS) await sleepAsync(200 * (i + 1));
+  }
+  return primeiraAmostraUtil(tentativas);
+}
+
+/** Traduz o callback do execFile para o mesmo `PsSpawnResult` do spawnSync:
+ *  exit != 0 vira status; timeout (filho morto pelo execFile) vira ETIMEDOUT;
+ *  buffer estourado e erro de spawn seguem como erro. */
+export function psResultFromExecFile(err: unknown, stdout: string): PsSpawnResult {
+  if (!err) return { status: 0, stdout, error: null };
+  const e = err as Error & { code?: string | number | null; killed?: boolean };
+  if (typeof e.code === "number") return { status: e.code, stdout, error: null };
+  if (typeof e.code === "string") return { status: null, stdout, error: e as Error & { code?: string } };
+  if (e.killed) return { status: null, stdout, error: Object.assign(new Error("ps: timeout"), { code: "ETIMEDOUT" }) };
+  return { status: null, stdout, error: e as Error & { code?: string } };
+}
+
+function psAttemptAsync(): Promise<PsSpawnResult> {
+  return new Promise((resolve) => {
+    try {
+      execFile("ps", PS_ARGS, { encoding: "utf8", timeout: PS_TIMEOUT_MS, maxBuffer: PS_MAX_BUFFER },
+        (err, stdout) => resolve(psResultFromExecFile(err, String(stdout ?? ""))));
+    } catch (e) {
+      resolve({ status: null, stdout: "", error: e as Error & { code?: string } });
+    }
+  });
+}
+
+export function sleepAsync(ms: number): Promise<void> {
+  return ms > 0 ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve();
 }
 
 // ──────────────────────────── modelagem da árvore ───────────────────────────
@@ -487,6 +534,38 @@ export const defaultReapDeps: ReapDeps = {
   sleep: sleepSync,
 };
 
+/** T-815: dependências do reaper no loop do daemon — espera e checagem de
+ *  zumbi sem bloquear (o grace de 2s do SIGTERM parava o loop inteiro). */
+export interface ReapDepsAsync {
+  kill: (pid: number, signal: NodeJS.Signals) => void;
+  alive: (pid: number) => boolean | Promise<boolean>;
+  sleep: (ms: number) => Promise<void>;
+}
+
+export function aliveNotZombieAsync(pid: number): Promise<boolean> {
+  try {
+    process.kill(pid, 0);
+  } catch (e) {
+    return Promise.resolve((e as NodeJS.ErrnoException).code === "EPERM");
+  }
+  return new Promise((resolve) => {
+    try {
+      execFile("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8", timeout: 2_000 }, (_err, stdout) => {
+        const stat = String(stdout ?? "").trim();
+        resolve(stat !== "" && !stat.startsWith("Z"));
+      });
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
+export const defaultReapDepsAsync: ReapDepsAsync = {
+  kill: (pid, signal) => { process.kill(pid, signal); },
+  alive: aliveNotZombieAsync,
+  sleep: sleepAsync,
+};
+
 function killTree(suite: Suite, signal: NodeJS.Signals, deps: ReapDeps, sinais: string[]): void {
   let hit = false;
   if (suite.killGroup) {
@@ -531,6 +610,42 @@ export function reapSuites(
   results.forEach((r, i) => {
     r.sobreviventes = suites[i].members.filter((pid) => deps.alive(pid));
   });
+  return results;
+}
+
+/** T-815: o mesmo `reapSuites`, passo a passo, com espera e checagem
+ *  assíncronas. Qualquer mudança de política vale para os dois. */
+export async function reapSuitesAsync(
+  suites: Suite[],
+  opts: { graceMs: number },
+  deps: ReapDepsAsync = defaultReapDepsAsync,
+): Promise<ReapResult[]> {
+  const results: ReapResult[] = suites.map((s) => ({
+    rootPid: s.rootPid,
+    pgid: s.pgid,
+    viaGrupo: s.killGroup,
+    sinais: [],
+    sobreviventes: [],
+  }));
+  const syncKill: ReapDeps = { kill: deps.kill, alive: () => false, sleep: () => {} };
+  suites.forEach((s, i) => killTree(s, "SIGTERM", syncKill, results[i].sinais));
+  if (opts.graceMs > 0) await deps.sleep(opts.graceMs);
+  for (const [i, s] of suites.entries()) {
+    const vivos: number[] = [];
+    for (const pid of s.members) if (await deps.alive(pid)) vivos.push(pid);
+    if (!vivos.length) continue;
+    killTree(s, "SIGKILL", syncKill, results[i].sinais);
+    for (const pid of vivos) {
+      if (!(await deps.alive(pid))) continue;
+      try { deps.kill(pid, "SIGKILL"); results[i].sinais.push(`${pid}:SIGKILL`); } catch { /* ESRCH */ }
+    }
+  }
+  if (opts.graceMs > 0) await deps.sleep(Math.min(opts.graceMs, 1_000));
+  for (const [i, r] of results.entries()) {
+    const sobreviventes: number[] = [];
+    for (const pid of suites[i].members) if (await deps.alive(pid)) sobreviventes.push(pid);
+    r.sobreviventes = sobreviventes;
+  }
   return results;
 }
 
@@ -705,15 +820,16 @@ export function suiteParkCliArgs(argv: string[]): SuiteParkCliOpts | null {
 
 export interface SuiteParkHandle {
   stop: () => void;
-  tick: () => Assessment[];
+  /** T-815: assíncrono; tick com outro em curso devolve `null` sem amostrar. */
+  tick: () => Promise<Assessment[] | null>;
 }
 
 export interface StartSuiteParkInput {
   log: (level: "info" | "warn" | "error", msg: string) => void;
   opts?: SuiteParkOpts;
   /** Injetável em teste. */
-  ps?: () => ProcRow[];
-  deps?: ReapDeps;
+  ps?: () => ProcRow[] | Promise<ProcRow[]>;
+  deps?: ReapDepsAsync;
   ownPid?: number;
 }
 
@@ -724,14 +840,30 @@ export interface StartSuiteParkInput {
  */
 export function startSuitePark(input: StartSuiteParkInput): SuiteParkHandle {
   const opts = input.opts ?? suiteParkOptsFromEnv();
-  const ps = input.ps ?? runPs;
-  const deps = input.deps ?? defaultReapDeps;
+  const ps = input.ps ?? runPsAsync;
+  const deps = input.deps ?? defaultReapDepsAsync;
   const ownPid = input.ownPid ?? process.pid;
   const history: Array<{ at: number; sample: Sample }> = [];
   let timer: NodeJS.Timeout | null = null;
+  let emCurso = false;
+  // Revisão T-815: stop() com tick em curso não pode matar árvores depois.
+  let parado = false;
 
-  const tick = (): Assessment[] => {
-    const rows = ps();
+  const tick = async (): Promise<Assessment[] | null> => {
+    // ps lento (host saturado) não pode empilhar amostras: a próxima só sai
+    // quando esta terminar.
+    if (emCurso) return null;
+    emCurso = true;
+    try {
+      return await tickInner();
+    } finally {
+      emCurso = false;
+    }
+  };
+
+  const tickInner = async (): Promise<Assessment[]> => {
+    const rows = await ps();
+    if (parado) return [];
     const suites = collectSuites(rows, ownPid);
     const now = Date.now();
     // Baseline = amostra mais recente que já dista >= flatWindowMs.
@@ -748,10 +880,10 @@ export function startSuitePark(input: StartSuiteParkInput): SuiteParkHandle {
     while (history.length > opts.historyMax) history.shift();
 
     const penduradas = assessments.filter((a) => a.state === "pendurada");
-    if (!penduradas.length) return assessments;
+    if (!penduradas.length || parado) return assessments;
     input.log("warn", `[suite-park] ${penduradas.length} suite(s) pendurada(s): ` +
       penduradas.map((a) => `pid=${a.suite.rootPid} idade=${fmtDuration(a.suite.ageMs)} cpu=${a.suite.cpuMs}ms`).join(", "));
-    const results = reapSuites(penduradas.map((a) => a.suite), { graceMs: opts.graceMs }, deps);
+    const results = await reapSuitesAsync(penduradas.map((a) => a.suite), { graceMs: opts.graceMs }, deps);
     for (const r of results) {
       input.log(
         r.sobreviventes.length ? "warn" : "info",
@@ -762,15 +894,15 @@ export function startSuitePark(input: StartSuiteParkInput): SuiteParkHandle {
     return assessments;
   };
 
-  // Primeira amostra imediata (barata) para o histórico já ter base.
-  try { tick(); } catch (e) { input.log("warn", `[suite-park] amostra inicial falhou: ${(e as Error).message}`); }
+  // Primeira amostra imediata para o histórico já ter base.
+  void tick().catch((e) => input.log("warn", `[suite-park] amostra inicial falhou: ${(e as Error).message}`));
   timer = setInterval(() => {
-    try { tick(); } catch (e) { input.log("warn", `[suite-park] tick falhou: ${(e as Error).message}`); }
+    void tick().catch((e) => input.log("warn", `[suite-park] tick falhou: ${(e as Error).message}`));
   }, opts.sampleMs);
   timer.unref?.();
 
   return {
-    stop: () => { if (timer) { clearInterval(timer); timer = null; } },
+    stop: () => { parado = true; if (timer) { clearInterval(timer); timer = null; } },
     tick,
   };
 }

@@ -317,7 +317,16 @@ export function diagnose(input: {
       add("warn", "agente", `${name} em turno sem atividade há ${fmtMs(r.idleMs)}`, `Soft do runner: ${fmtMs(r.thresholds?.softMs)}, hard: ${fmtMs(r.thresholds?.hardMs)}.`);
     }
     if (r.toolsInFlight > 0 && typeof r.toolsInFlightMs === "number" && r.toolsInFlightMs >= 5 * MIN) {
-      add("info", "agente", `${name}: ${r.toolsInFlight} tool(s) em voo há ${fmtMs(r.toolsInFlightMs)}`, `Teto absoluto: ${fmtMs(r.thresholds?.toolsHardMs)}.`);
+      // T-826: tool em voo SEM atividade nenhuma além do soft é o formato da
+      // `question` do opencode (espera resposta no TUI) ou de tool travada —
+      // o watchdog, com tool em voo, só age no teto absoluto.
+      const semAtividade = typeof r.idleMs === "number" && r.idleMs >= (r.thresholds?.softMs ?? 3 * MIN);
+      if (semAtividade) {
+        add("warn", "agente", `${name}: ${r.toolsInFlight} tool(s) em voo há ${fmtMs(r.toolsInFlightMs)} sem nenhuma atividade`, `Sem evento há ${fmtMs(r.idleMs)}; o watchdog só age no teto absoluto (${fmtMs(r.thresholds?.toolsHardMs)}).`,
+          "Ver a tool pendente no CLI (opencode: GET /question e /permission do serve do agente); tool que espera resposta humana trava o turno.");
+      } else {
+        add("info", "agente", `${name}: ${r.toolsInFlight} tool(s) em voo há ${fmtMs(r.toolsInFlightMs)}`, `Teto absoluto: ${fmtMs(r.thresholds?.toolsHardMs)}.`);
+      }
     }
     if (r.queued > 0 && !r.busy && !r.waitingTurnGate) add("warn", "agente", `${name}: fila com ${r.queued} msg(s) sem turno rodando`, "Fila órfã — o watchdog tenta drenar a cada 30s.");
     if (r.queued >= 5) add("warn", "agente", `${name}: ${r.queued} mensagens enfileiradas`, "O agente está recebendo mais do que consegue processar.");
@@ -395,7 +404,7 @@ export function diagnose(input: {
   for (const op of relay.byOp ?? []) {
     if (op.count >= 3 && op.total.p95 != null && op.total.p95 >= 5000) add("warn", "relay", `Tool MCP "${op.op}" lenta: p95 ${fmtMs(op.total.p95)} (${op.count} chamadas)`, "Latência do orchestrator/rede vista pelo agente.");
     if (op.count >= 5 && op.errors / op.count >= 0.1) add("warn", "relay", `Tool MCP "${op.op}": ${op.errors}/${op.count} com erro`, "");
-    if ((op.peer.max ?? 0) >= 500) add("warn", "relay", `Resolução de peer-pid síncrona chegou a ${fmtMs(op.peer.max)} em "${op.op}" (média ${fmtMs(op.peer.mean)})`, "spawnSync(perl) + ps por hop — bloqueia o loop a cada conexão nova do bridge.");
+    if ((op.peer.max ?? 0) >= 500) add("warn", "relay", `Resolução de peer-pid chegou a ${fmtMs(op.peer.max)} em "${op.op}" (média ${fmtMs(op.peer.mean)})`, "perl + ps por hop (assíncrono desde o T-815): não para o loop, mas atrasa a tool MCP a cada conexão nova do bridge.");
   }
 
   // Processos.
@@ -434,8 +443,8 @@ export function diagnose(input: {
     const fmtList = (xs: Array<{ agent: string; n: number }>, k = 4) => xs.slice(0, k).map((x) => `${x.agent} ${x.n}`).join(", ");
     const drops7 = d7.queueFullDrops.reduce((a, x) => a + x.n, 0);
     if (drops7 > 0) {
-      add("crit", "fila", `${drops7} mensagem(ns) DESCARTADA(S) por fila cheia do agente em 7 dias`, `Por agente: ${fmtList(d7.queueFullDrops)}. A fila por agente tem teto de 20 (MAX_BUFFERED_MESSAGES); o excedente some sem aviso ao remetente.`,
-        "Aplicar backpressure no server (não entregar ao agente com fila cheia) ou aumentar o teto; reduzir o fan-out de mensagens para o agente mais visado.", "7d");
+      add("crit", "fila", `${drops7} mensagem(ns) DESCARTADA(S) por fila cheia do agente em 7 dias`, `Por agente: ${fmtList(d7.queueFullDrops)}. A fila por agente tem teto de 20 (MAX_BUFFERED_MESSAGES). Desde o T-818 o excedente é agrupado na última da fila; só descarta acima de 64 KiB agrupados (flood), com aviso no chat. Descartes anteriores ao T-818 foram silenciosos.`,
+        "Se continuar aparecendo depois do T-818, é flood: ver quem manda tanto para o agente (loop agent↔agent, notificações em massa).", "7d");
     }
     const days = Math.max(1, Object.keys(h.reexecsByDay).length);
     if (d7.reexecs >= 14) {

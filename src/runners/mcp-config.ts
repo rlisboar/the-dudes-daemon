@@ -147,6 +147,25 @@ export function buildCrushMcpConfig(
   return { config: { $schema: "https://charm.land/crush.json", mcp }, warnings, envRefs };
 }
 
+/**
+ * T-826: tools do opencode que ESPERAM resposta humana no TUI. Sob o daemon
+ * não há TUI e a UI do the-dudes não mostra a pergunta: a tool fica `running`
+ * para sempre, a sessão `busy` e o turno preso — e, com tool em voo, o
+ * watchdog troca o soft de 3min pelo teto de 20min. Negadas na config (vale
+ * também para subagentes do `task`) e desligadas em cada POST de turno; o
+ * modelo passa a perguntar em texto, no chat. Medido no opencode 1.18.31.
+ */
+export const OPENCODE_INTERACTIVE_TOOLS = ["question"] as const;
+
+/** T-826: `tools` do POST /session/:id/message — desliga as interativas. */
+export const OPENCODE_TURN_TOOLS: Record<string, boolean> = Object.fromEntries(
+  OPENCODE_INTERACTIVE_TOOLS.map((tool) => [tool, false]),
+);
+
+const OPENCODE_INTERACTIVE_DENY: Record<string, "deny"> = Object.fromEntries(
+  OPENCODE_INTERACTIVE_TOOLS.map((tool) => [tool, "deny" as const]),
+);
+
 export function buildOpenCodeMcpConfig(extras: Record<string, McpServerConfig> | undefined, bridge: BridgeConfig, autoApprove: boolean, managedAgent?: Record<string, unknown>) {
   const mcp: Record<string, unknown> = {};
   const warnings: string[] = [];
@@ -178,7 +197,11 @@ export function buildOpenCodeMcpConfig(extras: Record<string, McpServerConfig> |
     config: {
       $schema: "https://opencode.ai/config.json",
       mcp,
-      permission: autoApprove ? "allow" : { edit: "ask", bash: "ask", webfetch: "ask", external_directory: "ask" },
+      // T-826: `{"*":"allow"}` é a forma que o serve dá ao "allow" — só
+      // acrescenta a negação das interativas (bash/edit seguem sem ask).
+      permission: autoApprove
+        ? { "*": "allow", ...OPENCODE_INTERACTIVE_DENY }
+        : { edit: "ask", bash: "ask", webfetch: "ask", external_directory: "ask", ...OPENCODE_INTERACTIVE_DENY },
       ...(managedAgent ? { agent: { "the-dudes-managed": managedAgent } } : {}),
     },
     warnings,

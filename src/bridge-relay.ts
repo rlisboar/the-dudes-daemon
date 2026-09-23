@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import { chmodSync, chownSync, existsSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
 import type { DropTarget } from "./privileges.js";
-import { getParentPid, getParentPidReader, getUnixPeerPid, resolveAgentIdFromPid, setParentPidReader } from "./privileges.js";
+import { getParentPidAsync, getParentPidReader, getUnixPeerPidAsync, resolveAgentIdFromPid, setParentPidReader } from "./privileges.js";
 import {
   aadReadChain,
   aadV2,
@@ -307,6 +307,9 @@ type PeerOsFacts = {
   peerPid?: number | null;
   parentByPid: Map<number, number | null>;
   walked: boolean;
+  /** T-815: a resolução virou assíncrona. Duas requests na MESMA conexão
+   *  (pipelining) passam por esta fila e não intercalam a leitura dos fatos. */
+  pending?: Promise<unknown>;
 };
 
 /**
@@ -498,10 +501,10 @@ export class BridgeRelay {
   /**
    * Teto POR TENTATIVA do self-test (T-569) — não um total agregado. Cada
    * tentativa tem a folga própria, e o que o teto realmente guarda é a CHEGADA
-   * do `connection`: o leitor de peer-pid roda dentro do handler via spawnSync
-   * e bloqueia o loop, então leitor lento não é cortado por este timer (o
-   * handler resolve a promessa antes de o timer vencer). Medido no host do dono
-   * (load ~32 em 18 cpus): accept em 0–13ms, 12 amostras.
+   * do `connection`: a leitura do peer-pid não é cortada por este timer (o
+   * handler para o timer quando a conexão chega — T-815; antes o spawnSync
+   * bloqueava o loop e dava no mesmo). Medido no host do dono (load ~32 em 18
+   * cpus): accept em 0–13ms, 12 amostras.
    */
   /**
    * Teto POR TENTATIVA do self-test (T-569) — não um total agregado. O valor é
@@ -510,10 +513,9 @@ export class BridgeRelay {
    * volta para 1500ms. Tolerância efetiva 3 × 4500 = 13,5s.
    *
    * Por que 4500 e não 2500 (ruling do PM, ~20:3xZ): o que o teto guarda é a
-   * CHEGADA do `connection` — o leitor de peer-pid roda dentro do handler via
-   * spawnSync e bloqueia o loop, então leitor lento não é cortado por este
-   * timer (o handler resolve a promessa antes do timer vencer; medido no host
-   * do dono, load ~32 em 18 cpus: accept em 0–13ms, 12 amostras). Mas com 2500
+   * CHEGADA do `connection` — leitor lento não é cortado por este timer (o
+   * handler o para quando a conexão chega, T-815; medido no host do dono,
+   * load ~32 em 18 cpus: accept em 0–13ms, 12 amostras). Mas com 2500
    * sobra a faixa (2500, 4500] de bloqueio de loop SUSTENTADO — exatamente a
    * que o T-592 mediu (accept sem chegar em 1620ms, python3 de fallback em
    * 2,0–3,8s): as 3 tentativas cairiam na mesma faixa curta, esgotariam e o
@@ -570,7 +572,12 @@ export class BridgeRelay {
       // relay ia a fail-CLOSED (503 para todo mundo) com o leitor funcionando.
       const timer = setTimeout(() => finish(false), BridgeRelay.SELF_TEST_TIMEOUT_MS);
       const onConn = (sock: net.Socket) => {
-        finish(getUnixPeerPid(sock) === process.pid);
+        // T-815: o teto guarda só a CHEGADA do connection. Com o leitor
+        // síncrono ele nunca cortava a leitura (o loop ficava parado até ela
+        // acabar); com o assíncrono cortaria. A leitura segue com os timeouts
+        // de cada sonda (perl 1s, python3 4s).
+        clearTimeout(timer);
+        void getUnixPeerPidAsync(sock).then((pid) => finish(pid === process.pid));
       };
       this.server.on("connection", onConn);
       client = net.connect(this.socketPath);
@@ -614,10 +621,16 @@ export class BridgeRelay {
    * deixava a conexão inteira em 403 até o cliente reconectar. Foi o que o QA
    * e o PM mediram (12 curls → 7×403; 5 conexões novas → 5×403).
    */
-  private resolvePeerAgentId(sock: object): string | null {
+  private resolvePeerAgentId(sock: object): Promise<string | null> {
     const facts = this.bindPeerOsFacts(sock);
+    const run = (facts.pending ?? Promise.resolve()).then(() => this.resolvePeerAgentIdSerial(sock, facts));
+    facts.pending = run.catch(() => undefined);
+    return run;
+  }
+
+  private async resolvePeerAgentIdSerial(sock: object, facts: PeerOsFacts): Promise<string | null> {
     for (let attempt = 0; attempt < PEER_RESOLVE_ATTEMPTS; attempt++) {
-      const id = this.resolvePeerAgentIdOnce(sock, facts);
+      const id = await this.resolvePeerAgentIdOnce(sock, facts);
       if (id) return id;
       // Cadeia lida por inteiro e pid lido: o registro é que não bate (403
       // legítimo, T-061) — repetir não muda nada e custa spawn.
@@ -633,22 +646,24 @@ export class BridgeRelay {
     return null;
   }
 
-  private resolvePeerAgentIdOnce(sock: object, facts: PeerOsFacts): string | null {
+  private async resolvePeerAgentIdOnce(sock: object, facts: PeerOsFacts): Promise<string | null> {
     if (facts.peerPid === undefined) {
       // Leitor devolveu null (spawn estourou) → fica undefined, não null: a
       // próxima tentativa volta a perguntar ao SO em vez de congelar o null.
-      const pid = getUnixPeerPid(sock);
+      const pid = await getUnixPeerPidAsync(sock);
       if (pid != null) facts.peerPid = pid;
     }
     const peerPid = facts.peerPid;
     if (peerPid == null) return null;
 
-    if (!facts.walked) facts.walked = this.walkParents(facts, peerPid);
+    if (!facts.walked) facts.walked = await this.walkParents(facts, peerPid);
 
     // Walk de resolveAgentIdFromPid usa só o cache desta conexão. O reader
     // vigente é PRESERVADO e devolvido: restaurar `null` incondicionalmente
     // (T-592) descartava o reader de quem chamou, e o retry da request caía no
-    // `ps` real contra pids que só existiam na injeção.
+    // `ps` real contra pids que só existiam na injeção. T-815: a troca é
+    // síncrona de ponta a ponta (sem await entre set e restore), então nenhuma
+    // outra conexão enxerga o reader desta.
     const prevReader = getParentPidReader();
     setParentPidReader((pid) => (facts.parentByPid.has(pid) ? facts.parentByPid.get(pid) ?? 0 : 0));
     try {
@@ -667,13 +682,13 @@ export class BridgeRelay {
    * antes bastava um hop falho para `walked=true` congelar uma cadeia truncada
    * e o 403 virar permanente na conexão.
    */
-  private walkParents(facts: PeerOsFacts, peerPid: number): boolean {
+  private async walkParents(facts: PeerOsFacts, peerPid: number): Promise<boolean> {
     let current: number | null = peerPid;
     const seen = new Set<number>();
     for (let i = 0; i < PEER_OS_WALK_MAX; i++) {
       if (!current || current <= 1 || seen.has(current)) return true;
       seen.add(current);
-      const ppid = getParentPid(current);
+      const ppid = await getParentPidAsync(current);
       if (ppid == null) {
         facts.parentByPid.delete(current);
         return false;
@@ -694,7 +709,7 @@ export class BridgeRelay {
    *  Bridge MCP espera no Unix socket → hang do agente. Critério: 25s. */
   static readonly UPSTREAM_FETCH_TIMEOUT_MS = 25_000;
 
-  /** T-812: mede cada request (status, upstream, peer-pid síncrono) para o
+  /** T-812: mede cada request (status, upstream, peer-pid) para o
    *  dashboard de debug — a tool MCP lenta do agente aparece aqui por op. */
   private async handle(req: http.IncomingMessage, res: http.ServerResponse) {
     const t0 = performance.now();
@@ -754,8 +769,14 @@ export class BridgeRelay {
     if (this.peerPidEnforced) {
       const urlAgent = parsed.pathname.match(/^\/api\/bridge\/([^/]+)/)?.[1];
       const peerT0 = performance.now();
-      const peerAgent = this.resolvePeerAgentId(req.socket);
+      const peerAgent = await this.resolvePeerAgentId(req.socket);
       timing.peerMs = performance.now() - peerT0;
+      // Revisão T-815: a resolução agora é assíncrona; o cliente pode ter
+      // caído no meio (agente parado com tool em voo). Nada a responder.
+      if (req.destroyed || req.socket.destroyed) {
+        timing.error = "cliente desconectou durante a resolução do peer";
+        return;
+      }
       if (!peerAgent || !urlAgent || peerAgent !== urlAgent) {
         res.writeHead(403, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "bridge peer does not match agent" }));
@@ -783,16 +804,23 @@ export class BridgeRelay {
     if (req.method !== "GET" && req.method !== "HEAD") {
       const chunks: Buffer[] = [];
       let total = 0;
-      for await (const chunk of req) {
-        const buf = chunk as Buffer;
-        total += buf.length;
-        if (total > BridgeRelay.MAX_BODY_BYTES) {
-          res.writeHead(413, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "payload too large" }));
-          req.destroy();
-          return;
+      try {
+        for await (const chunk of req) {
+          const buf = chunk as Buffer;
+          total += buf.length;
+          if (total > BridgeRelay.MAX_BODY_BYTES) {
+            res.writeHead(413, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "payload too large" }));
+            req.destroy();
+            return;
+          }
+          chunks.push(buf);
         }
-        chunks.push(buf);
+      } catch (e) {
+        // Revisão T-815: body abortado pelo cliente ("aborted") não pode virar
+        // unhandledRejection — antes do T-815 o body já estava no buffer.
+        timing.error = `body abortado: ${(e as Error).message}`;
+        return;
       }
       body = Buffer.concat(chunks);
       timing.bytesIn = body.length;

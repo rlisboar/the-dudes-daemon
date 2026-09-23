@@ -73,7 +73,7 @@ test("OpenCode serializes stdio as local and http/sse as remote (T-308); only mi
   assert.deepEqual(mcp.sse, { type: "remote", enabled: true, url: "https://sse" });
   assert.equal(result.warnings.length, 1);
   assert.match(result.warnings[0], /"broken".*requires url/);
-  assert.deepEqual(result.config.permission, { edit: "ask", bash: "ask", webfetch: "ask", external_directory: "ask" });
+  assert.deepEqual(result.config.permission, { edit: "ask", bash: "ask", webfetch: "ask", external_directory: "ask", question: "deny" });
   assert.deepEqual((result.config.agent as Record<string, unknown>)["the-dudes-managed"], { model: "openai/gpt-5", reasoningEffort: "high" });
 });
 
