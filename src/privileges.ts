@@ -9,6 +9,7 @@
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { accessSync, constants as fsConstants, existsSync, readFileSync } from "node:fs";
+import { recordSpawn } from "./debug/store.js";
 
 export interface DropTarget {
   uid: number;
@@ -317,6 +318,8 @@ export function resolveAgentIdFromPid(pid: number): string | null {
 
 function trackSpawnedAgent(child: ChildProcess, opts: SpawnOptions): ChildProcess {
   const env = (opts.env ?? process.env) as NodeJS.ProcessEnv;
+  // T-812: todo spawnDropped entra no registro de processos do dashboard.
+  try { recordSpawn(child, { cwd: opts.cwd, env }); } catch { /* observação não muda o spawn */ }
   const agentId = env.THE_DUDES_AGENT_ID;
   const pid = child.pid;
   if (pid && typeof agentId === "string" && agentId) {

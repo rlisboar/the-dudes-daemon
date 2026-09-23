@@ -641,6 +641,74 @@ export class AgentRunner {
     return this.currentState === "thinking" || this.currentState === "sending" || this.currentState === "speaking";
   }
 
+  /** T-812: estado interno para o dashboard de debug local. Só metadados —
+   *  contagens, idades, pids, flags; nunca conteúdo de mensagem. O sessionId
+   *  sai truncado (prefixo) só para casar com o log do CLI. */
+  debugSnapshot(now = Date.now()): Record<string, unknown> {
+    const pidOf = (p: { pid?: number } | null | undefined) => (p && typeof p.pid === "number" ? p.pid : null);
+    const age = (t: number | null | undefined) => (t == null ? null : now - t);
+    const clock = this.activityClock;
+    const sid = this.messageSession.sessionId ?? this.info.sessionId ?? this.opts.resumeSessionId;
+    const dsh = (this as unknown as { dsh?: { alive?: boolean } }).dsh;
+    let currentTurn: Record<string, unknown> | null = null;
+    try { currentTurn = this.turnLatency.current?.debugState() ?? null; } catch { /* */ }
+    return {
+      runner: this.opts.cliRunner,
+      state: this.currentState,
+      alive: this.isAlive(),
+      turnActive: this.isTurnActive(),
+      inTurn: this.isInTurn(),
+      stopped: this.stopped,
+      exited: this.exited,
+      busy: this.messageSession.busy,
+      queued: this.messageSession.queuedCount(),
+      pendingMessages: this.pendingMessages.length,
+      claudeWriteQueue: this.claudeWriteQueue.length,
+      claudeInflight: !!this.claudeInflight,
+      claudeUnacceptedMs: age(this.claudeUnacceptedSince),
+      claudeOpenTurns: this.claudeTimings.length,
+      waitingTurnGate: this.waitingTurnGate,
+      holdsGateSlot: !!this.activeTurnRelease,
+      recoveringHung: this.recoveringHung,
+      restarting: this.restarting,
+      compacting: this.compacting,
+      compactingMs: age(this.compactingSince),
+      clearing: this.clearing,
+      toolsInFlight: this.toolsInFlight,
+      toolsInFlightMs: age(this.toolsInFlightSince),
+      ocToolParts: this.ocToolRunningPartIds.size,
+      ocPendingPermissions: this.ocPendingPermissionIds.size,
+      idleMs: now - clock.lastActivityAt,
+      turnElapsedMs: now - clock.turnStartedAt,
+      firstEventAgoMs: age(clock.firstEventAt),
+      softReported: clock.softReported,
+      deadMs: age(clock.deadSince),
+      thresholds: hangThresholds(this.opts.cliRunner),
+      hardRecoversLastHour: this.hardRecoverTimes.filter((ts) => now - ts < AgentRunner.HARD_RECOVER_WINDOW_MS).length,
+      hangNudgesUsed: this.hangNudgeTimes.length,
+      nudgeScheduled: !!this.hangNudgeTimer,
+      inflightAttempt: this.inflightPerMessage?.attempt ?? null,
+      epoch: this.messageSession.epoch,
+      firstTurn: this.messageSession.firstTurn,
+      sessionId: sid ? `${sid.slice(0, 8)}…` : null,
+      procPid: pidOf(this.proc),
+      procAlive: procAlive(this.proc),
+      turnProcPid: pidOf(this.ocActiveProc),
+      turnProcAlive: procAlive(this.ocActiveProc),
+      oneShotPid: pidOf(this.oneShotProc),
+      liveTurnPids: [...this.liveTurnPids],
+      dshAlive: dsh ? dsh.alive ?? null : null,
+      opencodeServe: this.opts.cliRunner === "opencode" ? { ready: this.openCodeTransport.ready(), url: this.openCodeTransport.url() ?? null } : null,
+      contextUsed: this.contextTracker.lastUsed(),
+      contextLimit: this.contextTracker.limitKnownValue(),
+      activeTaskId: this.activeTaskId,
+      currentTurn,
+      model: this.info.model ?? null,
+      effort: this.info.effort ?? null,
+      workspace: this.opts.workspaceRoot,
+    };
+  }
+
   /** T-768: extras de MCP PARA SPAWN — servidor com `tools` declaradas vira
    *  proxy filtrado (mcp-bridge --mcp-proxy); sem declaração passa igual. */
   mcpServersForSpawn(): Record<string, unknown> | undefined {

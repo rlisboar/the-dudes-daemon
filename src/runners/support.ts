@@ -1,7 +1,10 @@
 /* R7 (T-462): support extraído do agent-runner — `self` é o AgentRunner. */
 import {CliRunner} from "../types.js";
 import {statSync} from "node:fs";
+import {recordCliIo} from "../debug/store.js";
 export function traceCli(self: any, runner: CliRunner, direction: "spawn" | "argv" | "stdin" | "stdout" | "stderr", text: string) {
+    // T-812: contadores de I/O por agente (sempre) + captura opt-in do dashboard.
+    try { recordCliIo(String(self.info?.id ?? "?"), runner, direction, String(text ?? "")); } catch { /* observação */ }
     if (!self.opts.verbose) return;
     if (self.opts.verboseHumanIo) {
       if (direction === "stderr" || direction === "spawn") return;

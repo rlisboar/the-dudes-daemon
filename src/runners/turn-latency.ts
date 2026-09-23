@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { recordTurnEnd, trackLiveTurn, untrackLiveTurn } from "../debug/store.js";
 
 export type SemanticKind = "text" | "thinking" | "tool";
 export type SessionMode = "cold" | "resume";
@@ -47,6 +48,28 @@ export class TurnTiming {
    *  esse trecho; `firstEventMs - acceptMs` é o resíduo (modelo/CLI). Uma vez
    *  só — inits tardios de outra mensagem não sobrescrevem. */
   accept(): void { if (!this.ended && this.startedAt !== null && this.acceptAt === null) this.acceptAt = this.now(); }
+  /** T-812: fase do turno em voo para o dashboard de debug (idades em ms,
+   *  mesma allowlist do emit: nada de payload, nome ou sessão). */
+  debugState(): Record<string, unknown> {
+    const now = this.now();
+    const age = (t: number | null) => (t === null ? null : Math.round(now - t));
+    const phase = this.ended ? "ended"
+      : this.startedAt === null ? (this.gateAt !== null ? "gate" : "queued")
+        : this.firstAt === null ? "waiting-first-event" : "streaming";
+    return {
+      turnId: this.turnId,
+      attempt: this.attempt,
+      phase,
+      sessionMode: this.sessionMode,
+      sinceEnqueueMs: age(this.enqueuedAt),
+      sinceStartMs: age(this.startedAt),
+      gateWaitMs: this.gateMs !== null ? Math.round(this.gateMs) : (this.gateAt !== null && this.startedAt === null ? age(this.gateAt) : null),
+      firstEventMs: this.firstAt !== null && this.startedAt !== null ? Math.round(this.firstAt - this.startedAt) : null,
+      firstEventKind: this.firstKind,
+      acceptMs: this.acceptAt !== null && this.startedAt !== null ? Math.round(this.acceptAt - this.startedAt) : null,
+      bootMs: this.bootMs === null ? null : Math.round(this.bootMs),
+    };
+  }
   finish(endReason: TurnEndReason, killedBy: KilledBy | null = null, recoverKind: RecoverKind | null = null): void {
     if (this.ended) return;
     this.ended = true;
@@ -72,11 +95,17 @@ export class TurnLatency {
   constructor(private readonly agentId: string, private readonly runner: string,
     private readonly log: (level: "info", message: string) => void) {}
   create(attempt = 0): TurnTiming {
-    return new TurnTiming(attempt, fields => {
+    const timing: TurnTiming = new TurnTiming(attempt, fields => {
       // Explicit allowlist in TurnTiming: no names, session IDs, model output or raw errors.
       try { this.log("info", `[turn-latency] ${JSON.stringify({ agentId: this.agentId, runner: this.runner, ...fields })}`); }
       catch { /* Observation must not change runner execution. */ }
+      // T-812: mesmo registro, estruturado, para o dashboard de debug.
+      try { untrackLiveTurn(timing); recordTurnEnd(this.agentId, this.runner, fields); }
+      catch { /* idem */ }
     });
+    try { trackLiveTurn(timing, { agentId: this.agentId, runner: this.runner, createdAt: Date.now(), state: () => timing.debugState() }); }
+    catch { /* idem */ }
+    return timing;
   }
   enqueue(message: object, retry = false): void {
     if (!this.queued.has(message)) this.queued.set(message, this.create(retry ? (this.current?.attempt ?? 0) + 1 : 0));

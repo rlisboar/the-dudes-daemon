@@ -18,6 +18,16 @@ import {
 import { DELEGATION_CONTEXT_MAX, delegationMissionTitle, delegationStepTitle, delegationTaskPrompt } from "@the-dudes/protocol/delegation";
 import { decryptForProject, encryptForProject, E2eeRequiredError, isE2eEncrypted, isE2eeRequired, rememberCredentialPlaintext } from "./daemon-crypto.js";
 import { scheduleDelegateShadow } from "./typesafe-delegate-shadow.js";
+import { performance } from "node:perf_hooks";
+import { recordRelayConnection, recordRelayRequest } from "./debug/store.js";
+
+/** T-812: tempos de uma request do relay (preenchidos pelo handleInner). */
+interface RelayTiming {
+  peerMs: number;
+  upstreamMs: number | null;
+  bytesIn: number;
+  error: string | null;
+}
 
 /**
  * Local Unix-socket HTTP relay. The MCP bridge child process talks to this
@@ -373,6 +383,7 @@ export class BridgeRelay {
     // o objeto do evento `connection`). `close` do cliente não é
     // síncrono com o do servidor — amarra a liberação no accept.
     this.server.on("connection", (sock) => {
+      try { recordRelayConnection(); } catch { /* observação */ }
       const forget = () => { this.peerOsBySocket.delete(sock); };
       sock.once("close", forget);
     });
@@ -683,7 +694,35 @@ export class BridgeRelay {
    *  Bridge MCP espera no Unix socket → hang do agente. Critério: 25s. */
   static readonly UPSTREAM_FETCH_TIMEOUT_MS = 25_000;
 
+  /** T-812: mede cada request (status, upstream, peer-pid síncrono) para o
+   *  dashboard de debug — a tool MCP lenta do agente aparece aqui por op. */
   private async handle(req: http.IncomingMessage, res: http.ServerResponse) {
+    const t0 = performance.now();
+    const timing: RelayTiming = { peerMs: 0, upstreamMs: null, bytesIn: 0, error: null };
+    try {
+      await this.handleInner(req, res, timing);
+    } finally {
+      try {
+        const m = /^\/api\/bridge\/([^/?]+)\/([A-Za-z0-9_]+)/.exec(req.url ?? "");
+        const ms = (v: number) => Math.round(v * 10) / 10;
+        recordRelayRequest({
+          ts: Date.now(),
+          agentId: m?.[1] ?? null,
+          op: m?.[2] ?? "(fora da allowlist)",
+          method: req.method ?? "?",
+          status: res.statusCode,
+          totalMs: ms(performance.now() - t0),
+          peerMs: ms(timing.peerMs),
+          upstreamMs: timing.upstreamMs == null ? null : ms(timing.upstreamMs),
+          bytesIn: timing.bytesIn,
+          bytesOut: Number(res.getHeader("content-length")) || 0,
+          error: timing.error,
+        });
+      } catch { /* observação nunca muda a resposta */ }
+    }
+  }
+
+  private async handleInner(req: http.IncomingMessage, res: http.ServerResponse, timing: RelayTiming) {
     // Path allowlist: bridge relay deve só forward /api/bridge/*. Outros
     // paths (ex: /api/admin/users) seriam bypass de auth — atacante local
     // com acesso ao socket poderia chamar endpoints arbitrários via
@@ -714,7 +753,9 @@ export class BridgeRelay {
     }
     if (this.peerPidEnforced) {
       const urlAgent = parsed.pathname.match(/^\/api\/bridge\/([^/]+)/)?.[1];
+      const peerT0 = performance.now();
       const peerAgent = this.resolvePeerAgentId(req.socket);
+      timing.peerMs = performance.now() - peerT0;
       if (!peerAgent || !urlAgent || peerAgent !== urlAgent) {
         res.writeHead(403, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "bridge peer does not match agent" }));
@@ -754,6 +795,7 @@ export class BridgeRelay {
         chunks.push(buf);
       }
       body = Buffer.concat(chunks);
+      timing.bytesIn = body.length;
     }
     // E2EE: agent_to_agent send goes through /api/bridge/<agentId>/send.
     // Encrypt the `content` field with the source agent's project key so
@@ -823,6 +865,7 @@ export class BridgeRelay {
         if (!res.writableFinished) onClientGone();
       });
       let upstream: Response;
+      const upT0 = performance.now();
       try {
         upstream = await fetch(url, {
           method: req.method,
@@ -835,6 +878,7 @@ export class BridgeRelay {
         req.removeListener("aborted", onClientGone);
       }
       let buf = Buffer.from(await upstream.arrayBuffer());
+      timing.upstreamMs = performance.now() - upT0;
       // E2EE: decrypt cipher fields in list-style responses so the LLM sees
       // plaintext. Server stores ciphertext per project; daemon holds the
       // project key and rewrites the response body in place before handing
@@ -970,6 +1014,7 @@ export class BridgeRelay {
       });
       res.end(buf);
     } catch (e) {
+      timing.error = String((e as Error).message ?? e).slice(0, 300);
       res.writeHead(502, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: `relay failed: ${(e as Error).message}` }));
     }

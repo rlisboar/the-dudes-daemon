@@ -8,6 +8,7 @@ import {aadV2, E2EE_TABLE, MIGRATE_SEED_DROPPED_REASON, MIGRATE_SEED_RESUME_SKIP
 import {decryptForProject, encryptForProject, isE2eEncrypted, isE2eeRequired, setE2eeRequired, redactCredentials, redactCredentialsDeep} from "./daemon-crypto.js";
 import {classifyRunnerFailure} from "./runners/error-classifier.js";
 import {migratedSeedFor, MIGRATED_SEED_LIMIT_BYTES} from "./migrated-seed.js";
+import {agentStateInfo, cliIoCounters, recordAgentEvent, recordAgentState} from "./debug/store.js";
 
 /** 1 enum operacional (paridade hung.soft). Classifica no plaintext ANTES do seal. */
 export type AgentErrorKind = "rate_limit" | "other";
@@ -183,6 +184,49 @@ export class AgentHost {
   /** Quantos agentes este daemon mantém vivos — indicador de saúde da UI. */
   agentCount(): number {
     return this.entries.size;
+  }
+
+  /** T-812: visão de debug de cada agente (metadados; nunca conteúdo). */
+  debugSnapshot(): Array<Record<string, unknown>> {
+    const out: Array<Record<string, unknown>> = [];
+    for (const [id, e] of this.entries) {
+      let runner: Record<string, unknown> | null = null;
+      try { runner = e.runner ? e.runner.debugSnapshot() : null; } catch (err) { runner = { error: (err as Error).message }; }
+      out.push({
+        agentId: id,
+        name: e.info.name,
+        role: e.info.role ?? null,
+        cliRunner: e.info.cliRunner ?? "claude",
+        model: e.info.model ?? null,
+        effort: e.info.effort ?? null,
+        ephemeral: !!e.info.ephemeral,
+        projectId: e.projectId ?? null,
+        autoApprove: e.autoApprove,
+        worktree: e.worktreePath ?? null,
+        telegramMirror: !!e.telegramMirror,
+        hasRunner: !!e.runner,
+        inboundBuffered: this.inboundBuffer.size(id),
+        drainHeld: this.drainHeld.get(id)?.length ?? 0,
+        spooled: this.spooled.get(id)?.length ?? 0,
+        stateInfo: agentStateInfo(id),
+        io: cliIoCounters(id),
+        runner,
+      });
+    }
+    return out;
+  }
+
+  /** T-812: estado do host (dreno/spool/buffers) para o dashboard. */
+  debugHostState(): Record<string, unknown> {
+    return {
+      agents: this.entries.size,
+      withRunner: [...this.entries.values()].filter((e) => !!e.runner).length,
+      draining: this.draining,
+      reexecuting: this.reexecuting,
+      inboundAgents: [...this.inboundAgentIds].map((id) => ({ agentId: id, pending: this.inboundBuffer.size(id) })),
+      drainHeld: [...this.drainHeld.entries()].map(([id, l]) => ({ agentId: id, held: l.length })),
+      spoolPending: this.spoolPendingCount(),
+    };
   }
 
   /** M18 (T-441): algum runner com turno VIVO fora do turn-gate (claude
@@ -586,8 +630,12 @@ export class AgentHost {
       verboseHumanIo: this.verboseHumanIo,
       log: this.log,
       cliLog: this.cliLog,
-      onState: (state) => { this.deliver({ type: "agent:state", agentId: msg.agent.id, state }); },
+      onState: (state) => {
+        try { recordAgentState(msg.agent.id, state); } catch { /* observação */ }
+        this.deliver({ type: "agent:state", agentId: msg.agent.id, state });
+      },
       onHung: (info) => {
+        try { recordAgentEvent(msg.agent.id, info.parked ? "park" : info.soft ? "hung-soft" : "hung-hard", `${info.reason} (idle ${Math.round(info.idleMs / 1000)}s)`); } catch { /* observação */ }
         this.deliver({
           type: "agent:hung",
           agentId: msg.agent.id,
@@ -673,10 +721,13 @@ export class AgentHost {
       },
       onGraphWatch: (root, gbin) => this.onGraphWatch?.(root, gbin, msg.projectId),
       onError: (err) => {
+        // T-812: o erro (redatado de credenciais) também fica no dashboard local.
+        try { recordAgentEvent(msg.agent.id, "error", msg.projectId ? redactCredentials(msg.projectId, String(err ?? "")) : String(err ?? "")); } catch { /* observação */ }
         // T-092: redact + cifra (messages.content), paridade com agent:text.
         this.emitAgentError(msg.agent.id, String(err ?? ""), msg.projectId);
       },
       onExit: (code) => {
+        try { recordAgentEvent(msg.agent.id, "exit", `code=${code}${thisRunner && this.entries.get(msg.agent.id)?.runner !== thisRunner ? " (runner substituído)" : ""}`); } catch { /* observação */ }
         const e = this.entries.get(msg.agent.id);
         // Se este runner já foi substituído (reconfig/troca de runner), seu
         // exit tardio NÃO deve mexer no estado do agente — senão derruba o
@@ -708,6 +759,7 @@ export class AgentHost {
     };
     const runner = new AgentRunner(msg.agent, opts);
     thisRunner = runner;
+    try { recordAgentEvent(msg.agent.id, "spawn", `runner=${cliRunner} model=${msg.agent.model ?? "-"} effort=${msg.agent.effort ?? "-"} resume=${resumeSessionId ? "sim" : "não"} cwd=${cwd}`); } catch { /* observação */ }
     runner.start().catch((e) => this.log("error", `agent ${msg.agent.id} start failed: ${(e as Error).message}`));
     this.entries.set(msg.agent.id, {
       info: msg.agent,
@@ -778,6 +830,7 @@ export class AgentHost {
     e.runner.stop();
     // M25 (T-448): worktree do agente pára com ele — hoje ficava no disco.
     void this.removeWorktreeOf(e);
+    try { recordAgentEvent(agentId, "stop", "agent:stop do orchestrator"); } catch { /* observação */ }
   }
 
   /** M25 (T-448): remove (1×) o worktree do entry. Limpa o campo antes pra

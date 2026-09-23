@@ -1,5 +1,9 @@
 import { healthSnapshot, recentLogs, recordLog, recordWsRtt } from "./health-monitor.js";
-import { turnGateStats } from "./runners/turn-gate.js";
+import { turnGateDebug, turnGateStats } from "./runners/turn-gate.js";
+import { installSyncProbes, startLoopMonitor } from "./debug/probes.js";
+import { profileHome, startDebugDashboard, type DashboardHandle } from "./debug/index.js";
+import { recordDebugLog, recordRtt, recordWsEvent, recordWsHandler, recordWsIn, recordWsOut, setCurrentInbound, setDebugScrubber } from "./debug/store.js";
+import { performance } from "node:perf_hooks";
 import {
   channelCanSend,
   createOutboundQueue,
@@ -19,7 +23,7 @@ import { initSentry, capture, captureWarn, breadcrumb, setTag, flush as flushSen
 initSentry(); // gated em SENTRY_DSN_DAEMON / SENTRY_DSN; no-op sem env
 
 import os from "node:os";
-import { parseArgs } from "node:util";
+import { format as formatArgs, parseArgs } from "node:util";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -411,7 +415,88 @@ export class DaemonClient {
         log("warn", `suite-park init falhou: ${(e as Error).message}`);
       }
     }
+    // T-812: dashboard de debug local — não bloqueia o boot nem a conexão.
+    void this.startDebugDashboard().catch((e) => log("warn", `[debug-http] falhou: ${(e as Error).message}`));
     this.connect();
+  }
+
+  /** T-812: dashboard de debug (loopback + token; opt-out THE_DUDES_DEBUG_HTTP=0). */
+  private debugDashboard: DashboardHandle | null = null;
+
+  private async startDebugDashboard(): Promise<void> {
+    if (process.env.THE_DUDES_DEBUG_HTTP === "0" || this.debugDashboard) return;
+    this.debugDashboard = await startDebugDashboard({
+      log,
+      scrub: scrubLog,
+      identity: () => this.debugIdentity(),
+      agents: () => this.host.debugSnapshot(),
+      agentCount: () => this.host.agentCount(),
+      hostState: () => this.host.debugHostState(),
+      gate: () => turnGateDebug(),
+      wsLive: () => this.debugWsLive(),
+      runners: () => {
+        const lists = helloRunnerLists(this.cliCommands, this.installedRunnerAvailability);
+        return { commands: this.cliCommands, available: lists.availableRunners, installed: lists.installedRunners };
+      },
+      health: () => ({
+        ...healthSnapshot({ turnGate: turnGateStats(), agentsRunning: this.host.agentCount(), e2eeProjects: countUsableProjectKeys() }),
+        ...runningReleaseInfo(),
+        ...this.peerPidHealthFields(),
+      }),
+      relayLive: () => ({
+        socketPath: this.relay?.socketPath ?? null,
+        peerPid: this.relay?.peerPidState() ?? null,
+        peerCacheSize: this.relay?.unixPeerOsCacheSize() ?? 0,
+      }),
+    });
+  }
+
+  /** T-812: identidade do processo para o dashboard (sem token: argv passa pelo scrub). */
+  private debugIdentity(): Record<string, unknown> {
+    return {
+      name: this.args.name,
+      version: VERSION,
+      buildTs: DAEMON_BUILD_TS,
+      protocolVersion: WIRE_PROTOCOL_VERSION,
+      protocolMismatch: this.protocolMismatch,
+      bootBinaryHash: BOOT_BINARY_HASH ? BOOT_BINARY_HASH.slice(0, 16) : null,
+      release: runningReleaseInfo(),
+      pid: process.pid,
+      ppid: process.ppid,
+      hostname: os.hostname(),
+      orch: this.orchUrl,
+      profileHome: profileHome(),
+      execPath: process.execPath,
+      script: process.argv[1] ?? null,
+      argv: scrubLog(process.argv.slice(2).join(" ")),
+      cwd: process.cwd(),
+      node: process.version,
+      launcher: process.env.THE_DUDES_LAUNCHER === "1",
+      dropTo: this.dropTo ? { user: this.dropTo.user, uid: this.dropTo.uid } : null,
+      verbose: { verbose: this.args.verbose, human: this.args.verboseHuman, humanIo: this.args.verboseHumanIo },
+      pingMs: this.args.pingMs,
+      selfUpdate: process.env.THE_DUDES_SELF_UPDATE !== "0",
+      draining: this.host.isDraining(),
+    };
+  }
+
+  /** T-812: estado vivo do WS com o orchestrator. */
+  private debugWsLive(): Record<string, unknown> {
+    const ws = this.ws;
+    const now = Date.now();
+    return {
+      url: wsUrlFromOrch(this.args.orch),
+      readyState: ws ? ws.readyState : null,
+      bufferedAmount: ws?.bufferedAmount ?? 0,
+      outboundQueued: this.outboundQueue.items.length,
+      lastSeenSeq: this.lastSeenSeq,
+      lastPongAgoMs: this.lastPongAt ? now - this.lastPongAt : null,
+      reconnectDelay: this.reconnectDelay,
+      transientBackoff: this.transientBackoff,
+      transientRecent: this.transientDisconnects.filter((t) => now - t < DaemonClient.TRANSIENT_WINDOW_MS).length,
+      protocolMismatch: this.protocolMismatch,
+      stopped: this.stopped,
+    };
   }
 
   private connect() {
@@ -452,7 +537,10 @@ export class DaemonClient {
     ws.on("pong", () => {
       this.lastPongAt = Date.now();
       // RTT do canal com o orchestrator — vira o indicador de latência da UI.
-      if (this.lastPingSentAt) recordWsRtt(Date.now() - this.lastPingSentAt);
+      if (this.lastPingSentAt) {
+        recordWsRtt(Date.now() - this.lastPingSentAt);
+        recordRtt(Date.now() - this.lastPingSentAt);
+      }
     });
 
     ws.on("open", () => {
@@ -465,6 +553,7 @@ export class DaemonClient {
         this.transientBackoff = DaemonClient.TRANSIENT_BASE_MS;
       }, 30_000);
       this.lastPongAt = Date.now();
+      recordWsEvent("open", url);
       log("info", "connected · sending hello");
       breadcrumb("ws", "open", { url });
       let cryptoPublicKey: string | undefined;
@@ -521,6 +610,7 @@ export class DaemonClient {
         if (e instanceof WireMessageTooLargeError) {
           log("warn", `mensagem do orchestrator grande demais (${e.bytes}B > ${e.maxBytes}B) — descartada`);
         }
+        recordWsIn("(inválida)", raw.length);
         return;
       }
       // Tracka maior seq visto pra resume no próximo reconnect. Server
@@ -531,7 +621,23 @@ export class DaemonClient {
       if (Number.isFinite(seq) && seq > this.lastSeenSeq) {
         this.lastSeenSeq = seq;
       }
-      this.handle(msg);
+      // T-812: tipo, bytes e tempo do handler (parte síncrona = loop bloqueado).
+      const tipo = String((msg as { type?: unknown }).type ?? "?");
+      recordWsIn(tipo, raw.length);
+      const t0 = performance.now();
+      setCurrentInbound(tipo);
+      let handled: Promise<void>;
+      try {
+        handled = this.handle(msg);
+      } finally {
+        setCurrentInbound(null);
+      }
+      const syncMs = performance.now() - t0;
+      // Rejeição segue sem dono como antes (o throw re-propaga ao unhandledRejection).
+      void handled.then(
+        () => { recordWsHandler(tipo, syncMs, performance.now() - t0); },
+        (err) => { recordWsHandler(tipo, syncMs, performance.now() - t0); throw err; },
+      );
     });
 
     ws.on("close", (code, reason) => {
@@ -540,6 +646,7 @@ export class DaemonClient {
       // Cai antes dos 30s de estabilidade → não reseta o backoff transient.
       if (this.stableConnTimer) { clearTimeout(this.stableConnTimer); this.stableConnTimer = null; }
       this.ws = null;
+      recordWsEvent("close", reason?.toString() || "(no reason)", code);
       if (this.stopped) return;
       const reasonStr = reason?.toString() || "(no reason)";
       const isTransient = code === 1006 || code === 1005 || code === 1011;
@@ -590,11 +697,13 @@ export class DaemonClient {
     });
 
     ws.on("error", (err) => {
+      recordWsEvent("error", (err as Error).message);
       log("error", `ws error: ${(err as Error).message}`);
       capture(err, { phase: "ws:error" });
     });
 
     ws.on("unexpected-response", (_req, res) => {
+      recordWsEvent("handshake", `HTTP ${res.statusCode}`);
       log("error", `handshake failed: HTTP ${res.statusCode}`);
       captureWarn(`ws handshake HTTP ${res.statusCode}`, { status: res.statusCode });
       if (res.statusCode === 401) {
@@ -2341,6 +2450,7 @@ export class DaemonClient {
       send: (j) => { this.ws!.send(j); },
       queue: this.outboundQueue,
     });
+    recordWsOut((obj as { type: string }).type, json.length, ok);
     if (!ok) {
       log(
         "warn",
@@ -2540,6 +2650,8 @@ export class DaemonClient {
       if (this.relay) this.relay.stop();
       this.stopPing();
       this.stopHeartbeat();
+      try { this.debugDashboard?.stop(); } catch { /* noop */ }
+      this.debugDashboard = null;
       try { this.grokSessionCleanup?.stop(); } catch { /* noop */ }
       this.grokSessionCleanup = null;
       try { this.suitePark?.stop(); } catch { /* noop */ }
@@ -2594,19 +2706,37 @@ function scrubLog(msg: string): string {
 }
 
 function log(level: "info" | "warn" | "error", msg: string) {
+  const safe = scrubLog(msg);
+  const lines = safe.split(/\r?\n/);
+  // T-812: o dashboard de debug recebe o log mesmo no modo -vh (que silencia o stdout).
+  for (const line of lines) recordDebugLog(level, line);
   if (args.verboseHumanIo) return;
   const ts = new Date().toISOString();
   const stream = level === "error" || level === "warn" ? process.stderr : process.stdout;
-  const safe = scrubLog(msg);
-  for (const line of safe.split(/\r?\n/)) {
+  for (const line of lines) {
     stream.write(`[${ts}] [${level}] ${line}\n`);
     // Ring de debug da UI — sempre DEPOIS do scrub, nunca o texto cru.
     recordLog(level, line);
   }
 }
 
+/** T-812: console.* de módulos que não passam pelo log() central (relay,
+ *  privileges, sentry) também chega ao dashboard — texto passa pelo scrub e a
+ *  saída original fica intocada. */
+function captureConsoleForDebug(): void {
+  const pares = [["log", "info"], ["info", "info"], ["warn", "warn"], ["error", "error"]] as const;
+  for (const [method, level] of pares) {
+    const orig = console[method].bind(console);
+    console[method] = (...a: unknown[]) => {
+      orig(...a);
+      try { recordDebugLog(level, scrubLog(formatArgs(...a)), "console"); } catch { /* observação */ }
+    };
+  }
+}
+
 function cliLog(level: "info" | "warn" | "error", msg: string) {
   if (!args.verbose && !args.verboseHuman && !args.verboseHumanIo) return;
+  try { recordDebugLog(level, scrubLog(msg), "cli"); } catch { /* observação */ }
   const stream = level === "error" || level === "warn" ? process.stderr : process.stdout;
   const prefix = args.verboseHumanIo ? "" : `[cli] `;
   if (args.verboseHumanIo) {
@@ -2654,6 +2784,14 @@ const args: Args = SELF_BOOTSTRAP
       cliConfigPath: `/tmp/t252-nonexistent-${process.pid}.json`,
       cliPaths: {},
     };
+// T-812: sondas do dashboard de debug ANTES do resto do boot (o resolve dos
+// CLIs logo abaixo já faz spawnSync). Só no processo real, nunca em teste.
+if (SELF_BOOTSTRAP && process.env.THE_DUDES_DEBUG_HTTP !== "0") {
+  installSyncProbes();
+  startLoopMonitor();
+  setDebugScrubber(scrubLog);
+  captureConsoleForDebug();
+}
 const cliConfig = mergeCliConfig(
   loadDaemonCliConfig(args.cliConfigPath),
   { cliPaths: args.cliPaths },
