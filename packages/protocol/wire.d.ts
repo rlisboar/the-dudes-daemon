@@ -833,9 +833,20 @@ export interface BoardBlock {
 /** Playhead de animação de fluxo controlado pelo agent ou UI. */
 export interface BoardPlayhead {
   blockId: string;
+  /** Índice-BASE do play (o passo em que ele começou, ou o que o agente apontou).
+   *  Quem anima é o cliente; o passo exibido agora sai de `startedAt`. */
   stepIndex: number;
   playing: boolean;
   intervalMs: number;
+  /**
+   * T-1107 — âncora de tempo do play (epoch ms), gravada quando `playing` vira
+   * true (ou quando o base/intervalo muda tocando). O cliente calcula o passo por
+   * `passoCorrente()`: `stepIndex + floor((Date.now() - startedAt) / intervalMs)`
+   * módulo o nº de passos. Sem ela, um cliente que entra atrasado ou recarrega a
+   * página recomincia do base e dois clientes animam com fases independentes —
+   * era a limitação registrada no #1104. Ausente = play pausado/congelado.
+   */
+  startedAt?: number;
 }
 
 /** Frase falada via TTS na UI (efêmera — uma por revision). */
