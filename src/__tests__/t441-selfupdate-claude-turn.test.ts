@@ -73,8 +73,13 @@ async function until(cond: () => boolean, ms = 5000): Promise<void> {
   }
 }
 
-test("T-441: turno claude vivo conta como ativo; result volta a idle", async () => {
+test("T-441: turno claude vivo conta como ativo; result volta a idle", async (t) => {
   const h = harness("echo-result");
+  // T-1078 (QA-A): o teardown NÃO pode depender de chegar à última linha. Em
+  // qualquer asserção/`until` que estoure, o stub do claude (persistente, com
+  // setInterval) ficava vivo segurando os pipes e o processo do ARQUIVO nunca
+  // saía — a suíte pendurava quando roda sem `--test-force-exit` (1 em 3).
+  t.after(() => h.stopped());
   await h.runner.start();
   await until(() => h.runner.isAlive());
   assert.equal(h.runner.isTurnActive(), false, "idle antes de enviar");
@@ -85,8 +90,9 @@ test("T-441: turno claude vivo conta como ativo; result volta a idle", async () 
   h.stopped();
 });
 
-test("T-441: per-message não conta (turn-gate é a fonte)", async () => {
+test("T-441: per-message não conta (turn-gate é a fonte)", async (t) => {
   const h = harness("echo-result", "codex");
+  t.after(() => h.stopped());
   await h.runner.start();
   await until(() => h.runner.isAlive());
   assert.equal(h.runner.isTurnActive(), false);
