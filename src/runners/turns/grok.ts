@@ -13,6 +13,8 @@ import {existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync}
 import {grokHeadlessArgs} from "../args.js";
 import {isAbortedFailure, isAuthenticationFailure, isMissingSessionFailure as isMissingSessionMessage} from "../error-classifier.js";
 import {parseGrokStreamEvent} from "../turn-parsers.js";
+import { GrokAcpClient, grokAcpHabilitado } from "./grok-acp.js";
+import { toAcpMcpServers, type DshMcpServer } from "./dsh.js";
 import {recordTurnEnd, recordTurnStart} from "../../health-monitor.js";
 import {spawnDropped} from "../../privileges.js";
 
@@ -178,6 +180,12 @@ export async function runGrokMessage(self: any, content: string, images?: ImageA
     if (!self.grokToolsPrimed) {
       self.grokToolsPrimed = true;
       if (self.messageSession.sessionId) self.grokSweepToolCalls(self.messageSession.sessionId, false);
+    }
+    // T-1054: caminho ACP (processo persistente) — o headless fica como
+    // rollback atrás da flag. O prólogo acima (gate, inflight, systemPrompt do
+    // 1º turno, anexos, prime do sweep) é o MESMO; daqui pra baixo é que muda.
+    if (grokAcpHabilitado()) {
+      return runGrokTurnAcp(self, { epoch, firstTurn, pendingSummary, content, images, message, imgCleanup, timing, grokTurnT0 });
     }
     const args = self.buildGrokHeadlessArgs(message, {
       resume: self.messageSession.sessionId,
@@ -743,3 +751,254 @@ export async function pollGrokContextOccupancy(self: any, sessionId: string): Pr
    *  concorrentes (processo claude órfão + resumo duplicado). Cooldown em vez
    *  de latch: se o compact falhar (provider flaky, timeout), o próximo sinal
    *  de contexto cheio re-dispara a compaction em vez de silenciar pra sempre. */
+/* ---------- T-1054: turno por ACP persistente (`grok agent stdio`) ---------- */
+
+/** Achata `configOptions[].options` (grupos aninhados) nos valores anunciados. */
+function valoresDeConfig(opcoes: unknown): string[] {
+  const out: string[] = [];
+  const anda = (lista: unknown): void => {
+    if (!Array.isArray(lista)) return;
+    for (const o of lista) {
+      const obj = o as { value?: unknown; options?: unknown };
+      if (typeof obj?.value === "string") out.push(obj.value);
+      if (obj?.options) anda(obj.options);
+    }
+  };
+  anda(opcoes);
+  return out;
+}
+
+/** T-1054: model/effort no ACP vão por `set_config_option` (o `agent stdio`
+ *  não aceita flags). Casa o desejado com o valor anunciado quando existir —
+ *  o CLI encoda o modelo (ex.: `["provider","model"]`); sem match manda cru. */
+async function aplicarModeloEffort(self: any, client: GrokAcpClient, configOptions?: Array<{ id: string; options?: unknown }>): Promise<void> {
+  const tentar = async (configId: string, desejado: string | null | undefined, aviso = false): Promise<void> => {
+    if (!desejado) return;
+    const anunciado = (configOptions ?? []).find((c) => c.id === configId);
+    const valores = valoresDeConfig(anunciado?.options);
+    const match = valores.find((v) => v === desejado)
+      ?? valores.find((v) => v.includes(desejado) || JSON.stringify(v).includes(desejado));
+    try {
+      await client.setConfigOption(configId, match ?? desejado);
+    } catch (e) {
+      self.opts.log("warn", `[grok-acp:${self.info.name}] set ${configId}=${desejado} falhou: ${(e as Error).message}`);
+    }
+    if (aviso && !match && valores.length > 0) {
+      self.opts.log("info", `[grok-acp:${self.info.name}] ${configId} "${desejado}" não está no catálogo anunciado (${valores.length} opções) — mandei cru`);
+    }
+  };
+  await tentar("model", self.info.model as string | undefined, true);
+  await tentar("reasoning_effort", self.info.effort as string | undefined);
+}
+
+/**
+ * T-1054: um TURNO pelo ACP persistente. O processo (e a sessão) sobrevivem
+ * entre mensagens — é isso que mata o boot por turno do headless.
+ *
+ * Paridade: turn-gate (release no FIM do turno, não no close do processo),
+ * watchdog (armHardTimeout por turno), `liveTurnPids`, thinking em stream
+ * (T-705/T-712), texto bufferizado em UMA mensagem, tools pelo contador por id
+ * (T-819), sweep/contexto/billing via `finishGrokTurn` — que já lê
+ * `chat_history.jsonl`/`signals.json` (o ACP grava os MESMOS artefatos).
+ */
+export async function runGrokTurnAcp(self: any, t: {
+  epoch: number;
+  firstTurn: boolean;
+  pendingSummary?: string;
+  content: string;
+  images?: ImageAttachment[];
+  message: string;
+  imgCleanup: () => void;
+  timing: any;
+  grokTurnT0: number;
+}): Promise<void> {
+  const { epoch, timing } = t;
+  let fullText = "";
+  let thinkingSeg = "";
+  let thinkingTimer: NodeJS.Timeout | undefined;
+  let errFromJson = "";
+  let errOut = "";
+  let sawEnd = false;
+  let emittedAny = false;
+  let limparGuarda: () => void = () => {};
+  const inicio = Date.now();
+
+  const flushThinking = (): void => {
+    if (thinkingTimer) { clearTimeout(thinkingTimer); thinkingTimer = undefined; }
+    const seg = thinkingSeg;
+    thinkingSeg = "";
+    if (!seg.trim() || !self.messageSession.owns(epoch)) return;
+    self.opts.onThinkingText?.(seg);
+  };
+  const emitOnce = (): boolean => {
+    if (!self.messageSession.owns(epoch) || emittedAny) return true;
+    const texto = fullText.trim();
+    if (!texto) return true;
+    self.setState("speaking");
+    const ok = self.opts.onAssistantText(texto);
+    emittedAny = true;
+    if (ok === false) {
+      self.handleUndeliveredTurnResult("agent:text não entregue ao server (WS down/backpressure)");
+      return false;
+    }
+    return true;
+  };
+
+  let client: GrokAcpClient | null = self.grokAcp ?? null;
+  /** T-1054: os handlers nascem com o PROCESSO e vivem entre turnos — por isso
+   *  delegam para o turno ATUAL (sem isto o 2º prompt escrevia no buffer do 1º). */
+  type Ctx = { onText(t: string): void; onThought(t: string): void; onTool(ev: { id: string; title?: string; status?: string; phase: "call" | "update"; input?: Record<string, unknown> }): void };
+  try {
+    self.setState("thinking");
+    self.touchActivity();
+    if (!client || !client.vivo()) {
+      client?.matar();
+      const cwd = self.opts.workspaceRoot;
+      // Mesma fonte/limpeza do caminho headless (o .grok/config.toml), no
+      // formato do handshake ACP (comando inexistente sai da lista, T-726).
+      const brutos = Object.entries((self.mcpServersForSpawn?.() ?? {}) as Record<string, Omit<DshMcpServer, "name">>);
+      const conv = toAcpMcpServers(brutos.map(([name, def]) => ({ name, ...def })));
+      for (const s of conv.skipped) self.opts.log("warn", `[grok-acp:${self.info.name}] MCP ${s.name} fora: ${s.reason}`);
+      const mcpServers = conv.servers;
+      let pidAcp: number | undefined;
+      client = new GrokAcpClient({
+        onText: (txt) => { (self.grokAcpCtx as Ctx | null)?.onText(txt); },
+        onThought: (txt) => { (self.grokAcpCtx as Ctx | null)?.onThought(txt); },
+        onTool: (ev) => { (self.grokAcpCtx as Ctx | null)?.onTool(ev as Parameters<Ctx["onTool"]>[0]); },
+        onUsage: (used, size) => { try { self.reportContextOccupancy(used, size); } catch { /* observação */ } },
+        onConfig: () => {},
+        onStderr: (linha) => {
+          self.traceCli(self.opts.cliRunner, "stderr", linha);
+          errOut = self.capAccum(self.opts.cliRunner, errOut, linha);
+          self.checkContextFullError(linha);
+        },
+        onExit: (code) => {
+          if (pidAcp) self.untrackTurnPid(pidAcp);
+          if (self.messageSession.owns(epoch) || self.stopped) self.ocActiveProc = null;
+          self.opts.log("info", `[grok-acp:${self.info.name}] processo saiu code=${code ?? "?"}`);
+        },
+      });
+      self.grokAcp = client;
+      self.writeGrokConfig();
+      // boot honesto: do spawn ao HANDSHAKE (era o bug do bootMs no headless,
+      // onde o evento `session` só chega no fim do stream).
+      timing?.bootStart();
+      self.traceSpawn(self.opts.cliRunner, ["agent", "stdio"]);
+      client.start(self.runnerCommand(self.opts.cliRunner), ["agent", "stdio"], {
+        cwd, env: self.grokTurnEnv(), dropTo: self.opts.dropTo ?? null,
+      });
+      self.ocActiveProc = client.procRef();
+      pidAcp = client.pid();
+      self.trackTurnPid(pidAcp);
+      const caps = await client.initialize();
+      const antiga = self.messageSession.sessionId as string | undefined;
+      let configOptions: Array<{ id: string; options?: unknown }> | undefined;
+      // T-1063 (QA-A): resume que FALHA não pode matar o runner. Sessão
+      // expurgada é o caso clássico pós-restart — cai para sessão NOVA no mesmo
+      // turno E esquece o id velho, senão o próximo turno repetiria o load que
+      // falha (e o cliente ficaria vivo sem sessão, falhando para sempre).
+      const metodo = caps.loadSession ? "session/load" as const : caps.resume ? "session/resume" as const : null;
+      if (antiga && metodo) {
+        if (timing) timing.sessionMode = "resume";
+        try {
+          configOptions = (await client.carregarSessao(antiga, cwd, mcpServers, metodo)).configOptions;
+        } catch (e) {
+          const msg = (e as Error).message.slice(0, 140);
+          self.opts.log("warn", `[grok-acp:${self.info.name}] ${metodo} da sessão ${antiga.slice(0, 8)}… falhou (${msg}) — abrindo sessão nova`);
+          if (self.info) self.info.sessionId = undefined;
+          self.messageSession.sessionId = undefined;
+          if (self.opts.onSessionId) self.opts.onSessionId("");
+          if (timing) timing.sessionMode = "cold";
+          configOptions = (await client.novaSessao(cwd, mcpServers)).configOptions;
+        }
+      } else {
+        if (timing) timing.sessionMode = "cold";
+        configOptions = (await client.novaSessao(cwd, mcpServers)).configOptions;
+      }
+      timing?.bootReady();
+      await aplicarModeloEffort(self, client, configOptions);
+      if (client.sessionId && self.messageSession.owns(epoch)) {
+        self.messageSession.sessionId = client.sessionId;
+        if (self.opts.onSessionId) self.opts.onSessionId(client.sessionId);
+      }
+      self.opts.log("info", `[grok-acp:${self.info.name}] turno iniciado pid=${client.pid() ?? "?"} session=${client.sessionId?.slice(0, 8) ?? "?"} primeiro=${t.firstTurn} boot=${Math.round(Date.now() - inicio)}ms`);
+    }
+    self.grokAcpCtx = {
+      onText: (txt) => {
+        fullText += txt;
+        timing?.semantic("text");
+        if (txt.trim()) { self.clearGrokToolsInFlight(); flushThinking(); }
+        self.touchActivity();
+      },
+      onThought: (txt) => {
+        timing?.semantic("thinking");
+        self.touchActivity();
+        if (self.info.collectThinking && txt) {
+          thinkingSeg += txt;
+          if (thinkingSeg.length >= GROK_THINKING_FLUSH_CHARS) flushThinking();
+          else if (!thinkingTimer) thinkingTimer = setTimeout(flushThinking, GROK_THINKING_FLUSH_MS);
+        }
+        self.setState("thinking");
+      },
+      onTool: (ev) => {
+        timing?.semantic("tool");
+        self.touchActivity();
+        const chave = ev.id || `acp:${ev.title ?? "tool"}`;
+        if (ev.phase === "call") {
+          if (ev.title && !self.grokSeenToolCallIds.has(chave)) {
+            self.grokSeenToolCallIds.add(chave);
+            self.opts.onToolUse(ev.title, ev.input ?? {});
+          }
+          // T-819 (branch própria, ainda não na main): com chave fica
+          // idempotente por id; na main o mesmo nome só incrementa.
+          self.noteGrokToolInFlight(chave);
+          self.setState((ev.title ?? "").includes("send_message") ? "sending" : "thinking");
+        } else if (ev.status === "completed" || ev.status === "failed") {
+          self.noteToolFechada(chave);
+        }
+      },
+    } satisfies Ctx;
+    // Backstop por TURNO no processo persistente (o headless armava no filho
+    // que nascia por turno). Kill derruba o cliente; a próxima mensagem sobe um.
+    const proc = client.procRef();
+    if (proc) {
+      limparGuarda = armHardTimeout(proc, GROK_TURN_TIMEOUT_MS, () => {
+        timing?.finish("hard-recover", "hard-timeout", "hang");
+        self.opts.log("warn", `[grok-acp:${self.info.name}] turno excedeu ${GROK_TURN_TIMEOUT_MS / 1000}s — matando o cliente ACP`);
+        client!.matar();
+      }, () => self.messageSession.owns(epoch), GROK_TURN_TIMEOUT_MS);
+    }
+    await client.prometer(t.message);
+    sawEnd = true;
+  } catch (e) {
+    errFromJson = (e as Error).message;
+    // T-1063 (QA-A): setup incompleto (initialize, session/new|load ou
+    // set_config_option falhou) deixa um cliente VIVO e SEM sessão — o próximo
+    // turno pularia o handshake e reprovaria em `prometer()` ("acp: sem
+    // sessão") para sempre. Descarta o cliente para o próximo refazer tudo.
+    if (client && !client.sessionId) {
+      const proc = client.procRef();
+      client.matar();
+      if (self.grokAcp === client) self.grokAcp = null;
+      if (self.ocActiveProc && self.ocActiveProc === proc) self.ocActiveProc = null;
+      self.opts.log("warn", `[grok-acp:${self.info.name}] setup incompleto (${errFromJson.slice(0, 120)}) — cliente descartado; o próximo turno refaz o handshake`);
+    }
+  } finally {
+    self.grokAcpCtx = null;
+    limparGuarda();
+    flushThinking();
+    t.imgCleanup();
+    emitOnce();
+    // Turno acabou ⇒ o slot do gate volta AGORA (o processo continua vivo).
+    if (self.messageSession.owns(epoch) || self.stopped) self.releaseActiveTurnSlot();
+    recordTurnEnd(self.opts.cliRunner, Date.now() - t.grokTurnT0, sawEnd && !errFromJson);
+    if (self.stopped && self.grokAcp) { self.grokAcp.matar(); self.grokAcp = null; }
+    await self.finishGrokTurn({
+      code: sawEnd && !errFromJson ? 0 : 1,
+      epoch, firstTurn: t.firstTurn, pendingSummary: t.pendingSummary,
+      content: t.content, images: t.images,
+      sawEnd, endSessionId: client?.sessionId ?? undefined,
+      errOut, errFromJson, emittedAny,
+    });
+  }
+}

@@ -42,6 +42,7 @@ import {writeCodexConfig, runCodexMessage, handleCodexEvent, codexSessionsRoot, 
 import {buildGrokHeadlessArgs, writeGrokConfig, grokTurnEnv, runGrokMessage, finishGrokTurn, grokSignalsCandidates, readGrokContextSignals, grokChatHistoryPath, grokSweepToolCalls, grokUpdatesCandidates, readGrokUpdatesContextTokens, readGrokTurnBilling, pollGrokContextOccupancy} from "./runners/turns/grok.js";
 import {writeCrushConfig, crushTurnEnv, crushSessionJson, runCrushMessage, finishCrushTurn, ingestCrushChunk} from "./runners/turns/crush.js";
 import {startDsh, dshPushUserMessage, dshStop, dshIsInTurn, dshKillForRestart, dshTakeQueue, dshPeekQueue, dshRemoveQueued} from "./runners/turns/dsh.js";
+import {grokAcpStop} from "./runners/turns/grok-acp.js";
 import {compactContext, compactContextInner, waitOcIdle, parseAndStripMemory, saveExtractedMemory, fetchExistingMemories, memoryAlreadyBlock, parseEpisodeJson, memoryTitleNearDup, postBridgeJson, handleUndeliveredTurnResult, resetContextAccounting, checkContextUsage, reportContextOccupancy, notifyContextFull, registerCompactFailure, checkContextFullError} from "./runners/compact.js";
 import {runOneShot, runOneShotWithSession, killClaudeForRestart} from "./runners/one-shot.js";
 import {traceCli, traceSpawn, renderVerboseIoBlock, traceInternalCli, renderVerboseBlock, colorizeAgentName, supportsAnsi, hexToRgb, extractVerbosePayload, extractValueText, prettyPrintVerboseText, cleanupAgentTmpDir, grokSessionRecentWrite} from "./runners/support.js";
@@ -1193,6 +1194,10 @@ export class AgentRunner {
           this.opts.log("warn", `[cli:${this.info.id}:${this.opts.cliRunner}] matou leader grok pid=${pid} (stop, via ${via})`));
       } catch { /* best-effort */ }
     }
+    // T-1054: o cliente ACP do grok é um processo PERSISTENTE e não vive em
+    // `ocActiveProc`/`this.proc` — o ramo abaixo (per-message) retorna antes do
+    // kill genérico, então ele sai daqui.
+    grokAcpStop(this as unknown as Record<string, unknown>);
     if (isPerMessageRunner(this.opts.cliRunner)) {
       // T-593: turno abandonado por hard recover não está em `ocActiveProc` —
       // sem isto o stop() deixava o CLI vivo (o daemon só morre junto com os
