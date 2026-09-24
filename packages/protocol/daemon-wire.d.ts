@@ -660,7 +660,24 @@ export interface GraphFetchRequest { type: "graph:fetch"; correlationId?: string
 export interface TypesafeShadow extends JevVerdict {
   type: "typesafe:shadow";
   /** Ausente = `task` quando há `taskId` (daemon antigo não manda o campo). */
-  source?: "task" | "delegate";
+  source?: "task" | "delegate" | "agent-msg" | "tts-summary" | "reply-suggest";
+  /**
+   * T-1128 — id do que o veredito julga quando não é uma task (mensagem
+   * agente→agente). `taskId` fica nulo de propósito: a coluna tem FK para
+   * `tasks` e um id de mensagem não passaria.
+   */
+  refId?: string;
+  /** T-1128: "a mensagem exige resposta/decisão/ação?" (Noul). */
+  requiresResponseNoul?: number | null;
+  /** T-1128: "repete algo já dito nas últimas N?" (Noul). */
+  repeatsPreviousNoul?: number | null;
+  /** T-1130: "é curta e plana o bastante para ler como está?" — source `tts-summary`.
+   *  Polaridade INVERTIDA das outras: aqui dispensar o LLM é P(alta). */
+  speakAsIsNoul?: number | null;
+  /** T-1130: "pede decisão/resposta/aprovação do humano?" — source `reply-suggest`. */
+  asksHumanNoul?: number | null;
+  /** T-1128: desfecho real do turno do destinatário (linha própria, mesmo refId). */
+  outcome?: { acted: boolean; tokens?: number | null; durationMs?: number | null } | null;
   /** Task dona do veredito. O server só liga se a task for do projeto. */
   taskId?: string;
   /** `create` | `edit` | `shadow` (delegate). */
