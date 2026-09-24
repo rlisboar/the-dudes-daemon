@@ -452,7 +452,7 @@ test("T-391 agent_save: required+chave cifra; sem chave recusa (fail-closed como
 });
 
 test("T-581 rota: /api/bridge/<agent>/delegate é rota de cifra (senão sobe em claro)", async () => {
-  const { bridgeCipherRoute } = await import("../bridge-relay.ts");
+  const { bridgeCipherRoute } = await import("../bridge-relay.js");
   assert.deepEqual(bridgeCipherRoute("/api/bridge/ag-1/delegate"), { kind: "delegate", agentId: "ag-1" });
   // Regressão das rotas que já existiam — a lista saiu do handleRequest.
   assert.deepEqual(bridgeCipherRoute("/api/bridge/ag-1/send"), { kind: "send", agentId: "ag-1" });

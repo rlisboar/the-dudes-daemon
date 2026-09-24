@@ -45,10 +45,10 @@ test("T-055 aceite: turno enfileirado >hardMs NÃO dispara hang (queued)", async
 
   // 4º turno enfileira — como runGrokMessage com waitingTurnGate
   let waiterGranted = false;
-  let releaseWaiter: (() => void) | null = null;
+  // T-1040: sem a variável intermediária — o TS estreitava `releaseWaiter` a
+  // `null` (a atribuição morre dentro do callback) e a chamada virava `never`.
   const waiting = acquireTurnSlot("grok:queued-agent", (l, m) => logs.push(`[${l}] ${m}`)).then((r) => {
     waiterGranted = true;
-    releaseWaiter = r;
     return r;
   });
   await new Promise((r) => setTimeout(r, 30));
@@ -78,7 +78,7 @@ test("T-055 aceite: turno enfileirado >hardMs NÃO dispara hang (queued)", async
   assert.equal(hangPhase(0, t), "ok");
   assert.equal(Date.now() - clock.lastActivityAt < 100, true);
 
-  releaseWaiter?.();
+  (await waiting)(); // T-1040: o valor resolvido é o releaser do slot
   for (const h of holds.slice(1)) h();
   _resetTurnGateForTest();
 });

@@ -67,36 +67,17 @@ export { DEFAULT_CONTEXT_LIMIT, MODEL_CONTEXT_LIMITS, contextLimitFor, lookupCon
  *  - "inclusive" (codex/gemini): `input` já INCLUI o cache lido;
  *  - "auto" (opencode): o formato segue o provider — decide pela relação
  *    entre as parcelas (cache ⊆ input ⇒ inclusivo, senão soma). */
-/** Timeout dos one-shots de resumo (compact). Sem isso, um CLI travado
- *  segura o guard `compacting` pra sempre e o agente fica sem processo. */
-export const ONE_SHOT_TIMEOUT_MS = 300_000;
-/** Timeout do turno opencode via API do serve (POST /message é síncrono e pode
- *  rodar tools por minutos). Generoso; o serve é morto no stop() se preciso. */
-/** T-750: teto do POST síncrono `/session/:id/message` do opencode.
- *  Era 600s (10min) fixos — mas o POST só resolve quando o RUN termina, e um
- *  turno real com tools longas passa disso: em 20/09 o BACKEND morreu 4× em
- *  error com durationMs 600.002ms cravados enquanto o run SEGUIA no serve
- *  (steps 10+ após o abort — log do provedor em evidence/T-750). O teto
- *  precisa cobrir o pior toolsHardMs do watchdog (~20min) com folga: quem
- *  apanha run travado é o watchdog (idle 10min / tool 20min), não este POST. */
-export const OPENCODE_TURN_TIMEOUT_MS = 30 * 60_000;
+/* T-820: estes tetos moram em `runners/turn-limits.ts` (fonte única, com os do
+ *  qwen) para o valve anti-deadlock do turn-gate derivar do MAIOR deles. Seguem
+ *  reexportados daqui — quem já importava deste módulo não muda. */
 
-/** T-776: cap ABSOLUTO do turno opencode (POST + stream). Medido em prod
- *  21/09 pós-T-750: 6/28 turnos morreram cravados no teto de 30min, p90 dos
- *  completed 888s, máx 1509s — e UM run abortado seguiu no serve por 81min
- *  até concluir (134 steps). O teto de 30min vira OCIOSIDADE (sem evento),
- *  e o turno pode viver até este cap com progresso: 120min cobre o pior
- *  observado (81min) com folga. */
-export const OPENCODE_POST_CAP_MS = 120 * 60_000;
-/** Timeout do turno headless Grok (`grok -p …`). Sem isso, um resume + system
- *  prompt gigante (skills) deixa o processo zumbi por horas com busy=true e
- *  a fila enche (`ocQueue cheia`). 12 min cobre turnos longos com tools. */
-export const GROK_TURN_TIMEOUT_MS = 12 * 60_000;
-/** Cap absoluto por turno pra codex/gemini/crush. Antes só grok/opencode
- *  tinham; um CLI travado em loop dependia só do hang-watch por inatividade,
- *  que não dispara se ele segue emitindo. Generoso pra não matar turno longo
- *  legítimo (build/tool). armHardTimeout auto-limpa no exit do processo. */
-export const PER_MSG_TURN_TIMEOUT_MS = 15 * 60_000;
+export {
+  ONE_SHOT_TIMEOUT_MS,
+  OPENCODE_TURN_TIMEOUT_MS,
+  OPENCODE_POST_CAP_MS,
+  GROK_TURN_TIMEOUT_MS,
+  PER_MSG_TURN_TIMEOUT_MS,
+} from "./runners/turn-limits.js";
 
 // Banner de rate-limit do provider que o claude CLI emite como TEXTO do assistant
 // (não como erro). Sem isto o server trata como output real, cifra (E2EE), e o

@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { mcpToScanPayload, scanMCPs } from "../mcps-scanner.js";
+import { mcpToScanPayload, scanMCPs, type MCPScanWire } from "../mcps-scanner.js";
 import { scanSkills, skillToScanPayload } from "../skills-scanner.js";
 
 const GHP = "ghp_TESTSECRET_do_not_send_abc123";
@@ -69,8 +69,12 @@ test("T-415 mcps:scan: envKeys/headerKeys presentes; valores ghp_/Bearer ausente
   };
   assertNoSecrets("mcps:scan", wire);
 
-  const stdio = wire.mcps.find((m) => m.name === "stdio-secret");
-  const http = wire.mcps.find((m) => m.name === "http-secret");
+  // T-1040: `MCPScanWire` omite `env`/`headers` de propósito; o teste confere
+  // justamente que eles NÃO estão no objeto, então o acesso precisa do tipo que
+  // ainda os declara (senão TS2339).
+  type ComValores = MCPScanWire & { env?: Record<string, string>; headers?: Record<string, string> };
+  const stdio = wire.mcps.find((m) => m.name === "stdio-secret") as ComValores | undefined;
+  const http = wire.mcps.find((m) => m.name === "http-secret") as ComValores | undefined;
   assert.ok(stdio, "stdio-secret no payload");
   assert.ok(http, "http-secret no payload");
   assert.deepEqual(stdio!.envKeys?.sort(), ["GITHUB_TOKEN", "OPENAI_API_KEY"]);

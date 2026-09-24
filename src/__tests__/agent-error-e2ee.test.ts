@@ -24,7 +24,7 @@ const PID = "proj-t092-err";
 
 test("T-092 stderr com chave → e2e:v2 messages.content (abre com o mesmo AAD de agent:text)", () => {
   const sealed = sealAgentErrorMessage(PID, "rate limit 429 no provider");
-  assert.ok(sealed && sealed.startsWith("e2e:v2:"), sealed);
+  assert.ok(sealed && sealed.startsWith("e2e:v2:"), sealed ?? "selo ausente");
   const aad = aadV2({ projectId: PID, table: E2EE_TABLE.MESSAGES, field: "content" });
   assert.equal(decryptForProject(sealed, PID, aad), "rate limit 429 no provider");
 });

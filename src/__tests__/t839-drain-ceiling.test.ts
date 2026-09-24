@@ -216,7 +216,9 @@ test("T-839: turnElapsedMs do claude é a idade do turno aberto, e o dashboard c
       agentId: OCUPADO, name: "PM", cliRunner: "claude", hasRunner: true,
       runner: { state: "thinking", turnActive: true, longTurn: true, turnElapsedMs: 2 * 3_600_000, turnHoldReason: "tool-em-voo-sem-result", inTurn: true, idleMs: 1_000, toolsInFlight: 1, queued: 0, busy: false },
     }],
-    gate: { pools: { main: { forced: 0 }, bg: { forced: 0 } }, waiters: [] },
+    // T-1040: gate parcial DE PROPÓSITO — o alerta sob teste lê só `forced`
+    // (waiters vazio, então active/max/queued nunca são consultados).
+    gate: { pools: { main: { forced: 0 }, bg: { forced: 0 } }, waiters: [] } as unknown as import("../runners/turn-gate.js").TurnGateDebug,
     loop: null,
     proc: null,
     ws: { readyState: 1 },

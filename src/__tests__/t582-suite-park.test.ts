@@ -377,7 +377,7 @@ function runCli(flags: string[]): { status: number | null; stdout: string; stder
 }
 
 describe("T-582 integração (serial: o CLI varre o host inteiro)", { concurrency: 1, skip: semPs() }, () => {
-test("T-582 C1: `--list-suites` lista a pendurada e declara o critério de corte", { skip: semPs() }, { timeout: CLI_TEST_TIMEOUT_MS }, async () => {
+test("T-582 C1: `--list-suites` lista a pendurada e declara o critério de corte", { skip: semPs(), timeout: CLI_TEST_TIMEOUT_MS }, async () => {
   const { dir, child } = spawnFakeSuite("pendurada");
   try {
     const suite = await findSuite(dir);
@@ -413,7 +413,7 @@ test("T-582 C1: `--list-suites` lista a pendurada e declara o critério de corte
   }
 });
 
-test("T-582 C2: suite EM VOO (CPU a crescer) não é classificada pendurada nem morta", { skip: semPs() }, { timeout: CLI_TEST_TIMEOUT_MS }, async () => {
+test("T-582 C2: suite EM VOO (CPU a crescer) não é classificada pendurada nem morta", { skip: semPs(), timeout: CLI_TEST_TIMEOUT_MS }, async () => {
   const { dir, child } = spawnFakeSuite("viva");
   try {
     const suite = await findSuite(dir);
@@ -470,7 +470,7 @@ test("T-667: janela com dCPU ~0 (limiar absurdo) NÃO lê a suite EM VOO como pe
   }
 });
 
-test("T-582 C4: o reap mata a ÁRVORE (raiz + worker + neto + grep) sem deixar órfão", { skip: semPs() }, { timeout: 45_000 }, async () => {
+test("T-582 C4: o reap mata a ÁRVORE (raiz + worker + neto + grep) sem deixar órfão", { skip: semPs(), timeout: 45_000 }, async () => {
   const { dir, child } = spawnFakeSuite("pendurada");
   try {
     const suite = await findSuite(dir, 4);
@@ -515,6 +515,6 @@ test("T-582: parser das flags do comando (defaults e override)", () => {
   assert.equal(o.reap, true);
   assert.equal(o.windowMs, 1_200);
   assert.equal(o.minAgeMs, 0);
-  assert.equal(suiteParkCliArgs(["--list-suites", "--suite-window-ms", "abc"]).windowMs, 60_000);
+  assert.equal(suiteParkCliArgs(["--list-suites", "--suite-window-ms", "abc"])?.windowMs, 60_000);
 });
 });

@@ -162,7 +162,7 @@ test("T-852: o corpo tem as 5 perguntas e o elenco dinâmico com rótulos seguro
   const corpo = JSON.parse(chamadas[0]!.init.body) as {
     model: string;
     state: Record<string, unknown>;
-    questions: Record<string, { type: string; criteria: Record<string, string> }>;
+    questions: Record<string, { type: string; criteria: Record<string, string>; instructions: string }>;
   };
   assert.equal(corpo.model, "jev-1.13.0", "modelo pinado");
   assert.deepEqual(Object.keys(corpo.questions).sort(), ["acceptance", "complexity", "destructive", "domain", "security"]);

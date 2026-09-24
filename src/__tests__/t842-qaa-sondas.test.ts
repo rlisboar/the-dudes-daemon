@@ -22,7 +22,7 @@ process.env.THE_DUDES_DAEMON_KEY_PATH = path.join(os.tmpdir(), `td-t842-sonda-ke
 process.env.THE_DUDES_PROJECT_KEYS_PATH = path.join(os.tmpdir(), `td-t842-sonda-pkeys-${process.pid}-${Date.now()}.json`);
 
 const { test } = await import("node:test");
-const assert = (await import("node:assert/strict")).default;
+const assert: typeof import("node:assert/strict") = (await import("node:assert/strict")).default;
 const { getDaemonPublicKey, rememberProjectKey } = await import("../daemon-crypto.js");
 const { AgentHost } = await import("../agent-host.js");
 const { createDeliveryDeduper, loadDeliverySeen, saveDeliverySeen } = await import("../inbound-dedup.js");
@@ -39,7 +39,7 @@ const off = { command: "false", source: "override", available: false };
 
 function hostComCodex(script: string) {
   const out: Array<Record<string, unknown>> = [];
-  const host = new AgentHost((m) => out.push(m as Record<string, unknown>), null, null, {
+  const host = new AgentHost((m) => { out.push(m as unknown as Record<string, unknown>); }, null, null, {
     claude: off, opencode: off, gemini: off, crush: off, qwen: off, grok: off,
     "grok-custom": off, graphify: off, graphifyMcp: off,
     codex: { command: script, source: "override", available: true },
@@ -68,7 +68,9 @@ test("sonda QA-A 1: a mensagem EM VOO no SIGTERM vai para o spool e NÃO some qu
       },
       projectId: PID, basePath: dir, autoApprove: true, agentToken: "tok",
     } as never);
-    const runner = (host as unknown as { entries: Map<string, { runner: { messageSession: { busy: boolean } } }> }).entries.get("ag_sonda")?.runner;
+    // T-1040: anotação explícita — a regra do TS para funções de asserção exige
+    // nome declarado com tipo, senão o `assert.ok(runner)` abaixo não estreita.
+    const runner: { messageSession: { busy: boolean } } | undefined = (host as unknown as { entries: Map<string, { runner: { messageSession: { busy: boolean } } }> }).entries.get("ag_sonda")?.runner;
     assert.ok(runner, "runner vivo");
     host.send_message("ag_sonda", "mensagem em voo", undefined, "voo-1");
     const t0 = Date.now();

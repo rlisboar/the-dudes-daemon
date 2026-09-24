@@ -20,7 +20,7 @@ process.env.THE_DUDES_DAEMON_KEY_PATH = path.join(os.tmpdir(), `td-t824r-key-${p
 process.env.THE_DUDES_PROJECT_KEYS_PATH = path.join(os.tmpdir(), `td-t824r-pkeys-${process.pid}-${Date.now()}.json`);
 
 const { test } = await import("node:test");
-const assert = (await import("node:assert/strict")).default;
+const assert: typeof import("node:assert/strict") = (await import("node:assert/strict")).default;
 const { getDaemonPublicKey, rememberProjectKey } = await import("../daemon-crypto.js");
 const { AgentHost, reexecSpoolDir } = await import("../agent-host.js");
 const { createDeliveryDeduper, loadDeliverySeen, saveDeliverySeen, DELIVERY_SEEN_TTL_MS } = await import("../inbound-dedup.js");
@@ -43,7 +43,7 @@ function fakeRunner(): FakeRunner {
 }
 function hostCom(agentes: Record<string, FakeRunner | null>) {
   const out: Array<Record<string, unknown>> = [];
-  const host = new AgentHost((m) => { out.push(m as Record<string, unknown>); }, null, null, {} as never, false, false, false, () => {}, () => {});
+  const host = new AgentHost((m) => { out.push(m as unknown as Record<string, unknown>); }, null, null, {} as never, false, false, false, () => {}, () => {});
   const entries = (host as unknown as { entries: Map<string, unknown> }).entries;
   for (const [id, r] of Object.entries(agentes)) entries.set(id, { projectId: PID, runner: r, info: { id } });
   return { host, entries, out };

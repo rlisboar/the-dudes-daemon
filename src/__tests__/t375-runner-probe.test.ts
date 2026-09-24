@@ -208,7 +208,7 @@ test("T-375 timeout não é prova: retry único com orçamento maior rescata o l
   const stBroken = statSync(broken);
   onDisk = JSON.parse(readFileSync(PROBE_CACHE_PATH, "utf8"));
   assert.ok(
-    `${broken}:${stBroken.size}:${stBroken.mtimeMs}` in onDisk,
+    onDisk && `${broken}:${stBroken.size}:${stBroken.mtimeMs}` in onDisk,
     "exit != 0 limpo também é resposta: persiste e não se re-sonda a cada boot",
   );
 });

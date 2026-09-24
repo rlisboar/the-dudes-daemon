@@ -43,7 +43,7 @@ async function hostCom(ids: string[]) {
   const outbound: Out[] = [];
   const off = { command: "false", source: "override" as const, available: false };
   const host = new AgentHost(
-    (m) => { outbound.push(m as Out); },
+    (m) => { outbound.push(m as unknown as Out); },
     null, null,
     {
       claude: { command: stub, source: "override" as const, available: true },

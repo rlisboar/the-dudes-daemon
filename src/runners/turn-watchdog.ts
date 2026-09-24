@@ -4,6 +4,7 @@
  */
 
 import { isGrokFamily } from "./index.js";
+import { QWEN_TURN_LIFETIME_MS, QWEN_TURN_LIFETIME_CAP_MS } from "./turn-limits.js";
 
 export type HangPhase = "ok" | "soft" | "hard";
 
@@ -45,44 +46,17 @@ export interface HangThresholds {
   postEventMs?: number;
 }
 
-/** T-598/T-749: janela de lifetime do turno qwen, agora RENOVÁVEL por evento
- *  semântico. Era um teto absoluto de 8min (T-371 (d)), depois 30min fixo
- *  (T-598); a medição da T-730 mostrou 79 cortes em 17–19/09 (todos qwen),
- *  48,1% com atividade <60s antes do corte — trabalho vivo morria só por
- *  elapsed. Com a renovação, 30min passa a significar "sem NENHUM evento há
- *  30min"; turno produtivo segue até o cap. */
-export const QWEN_TURN_LIFETIME_MS = 30 * 60_000;
+/* T-820: os quatro tiers do qwen moram em `turn-limits.ts` (fonte única, ao
+ *  lado dos tetos dos outros runners) e seguem REEXPORTADOS daqui — quem já
+ *  importava deste módulo não muda. Os comentários de cada tier (T-598/T-749)
+ *  foram com eles. */
 
-/** T-749: teto ABSOLUTO de lifetime do turno qwen, NÃO renovável. Preserva o
- *  apanhe do loop que emite eventos para sempre (F4, que motivou o T-598):
- *  com a janela renovável, só o cap o corta. 2× a janela = 60min — os 2
- *  cortes de QA em 19/09 (1803/1804s, ambos com progresso) completariam
- *  dentro dele.
- *
- *  T-749 (review T-748): os 3 TIERS derivam JUNTOS daqui, com esta ordem
- *  obrigatória — `window < cap < hard-timeout < stream-max`:
- *  - `QWEN_TURN_LIFETIME_MS` (janela, renovável) é o corte por progresso;
- *  - este cap é o corte absoluto (não renovável);
- *  - `QWEN_HARD_TIMEOUT_MS` é o backstop do PROCESSO, acima do cap para o
- *    watchdog cortar primeiro (e, se disparar, passa pelo mesmo recover);
- *  - `QWEN_STREAM_MAX_LIFETIME_MS` é o guard do CLI, acima de todos para o
- *    CLI nunca abortar sozinho e perder a mensagem em voo.
- *  Se um tier não-renovável ficar ABAIXO do cap, o turno saudável morre pelo
- *  tier errado (o cap nunca é alcançado). Teste: t598 (C6). */
-export const QWEN_TURN_LIFETIME_CAP_MS = 2 * QWEN_TURN_LIFETIME_MS;
-
-/** T-598/T-749: par do teto no CLI do qwen (`QWEN_STREAM_MAX_LIFETIME_MS`).
- *  O guard do CLI é por RESPOSTA de streaming (upstream wait, não turno);
- *  fica ACIMA do cap do daemon para o daemon cortar primeiro — kill com
- *  re-fila e sessão preservada — e o CLI nunca abortar sozinho (aborto do
- *  CLI fecha o turno sem recover e a mensagem em voo se perde). */
-export const QWEN_STREAM_MAX_LIFETIME_MS = QWEN_TURN_LIFETIME_CAP_MS + 10 * 60_000;
-
-/** T-598/T-749: backstop do processo do turno qwen (armHardTimeout). Acima do
- *  cap de lifetime para o watchdog cortar primeiro; se ele próprio disparar,
- *  passa pelo mesmo recover (re-fila + sessão preservada), não por um
- *  SIGKILL seco que perde a mensagem em voo. */
-export const QWEN_HARD_TIMEOUT_MS = QWEN_TURN_LIFETIME_CAP_MS + 5 * 60_000;
+export {
+  QWEN_TURN_LIFETIME_MS,
+  QWEN_TURN_LIFETIME_CAP_MS,
+  QWEN_HARD_TIMEOUT_MS,
+  QWEN_STREAM_MAX_LIFETIME_MS,
+} from "./turn-limits.js";
 
 export function hangThresholds(runner?: string): HangThresholds {
   if (isGrokFamily(runner)) {

@@ -37,7 +37,7 @@ test("T-444 integração: webhook com body infinito resolve (antes pendurava)", 
     dispatchWebhook({
       event: { type: "task:done", ts: Date.now() },
       projectId: "p1", projectName: "P", url: `http://127.0.0.1:${port}/wh`,
-      secret: null, format: "json",
+      secret: null, format: "generic",
     }),
     new Promise<never>((_, rej) => setTimeout(() => rej(new Error("dispachou? pendurou >8s")), 8_000)),
   ]);

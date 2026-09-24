@@ -49,7 +49,7 @@ const MARKDOWN = "# Migração de contexto\n\n## Acoes recentes (sumario)\nfez X
 /** Exatamente o AAD com que o daemon sela o resumo no summarize:result. */
 const summaryAad = (pid: string) => aadV2({ projectId: pid, table: E2EE_TABLE.SUMMARIES, field: "summary" });
 
-function agentCom(seedDigest: string): AgentInfo {
+function agentCom(seedDigest: string | undefined): AgentInfo {
   return { id: "a1", name: "a", usage: {}, seedDigest, seedFrom: FROM } as unknown as AgentInfo;
 }
 

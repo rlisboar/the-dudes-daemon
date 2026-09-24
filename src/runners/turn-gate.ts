@@ -18,7 +18,7 @@
  * MAX_HOLD_MS é liberado à força.
  */
 
-import { QWEN_HARD_TIMEOUT_MS } from "./turn-watchdog.js";
+import { MAIOR_TETO_DE_TURNO_MS, VALVE_FOLGA_MS } from "./turn-limits.js";
 
 type Log = (level: "info" | "warn", msg: string) => void;
 
@@ -35,11 +35,18 @@ const MAX_BG = (() => {
   return Number.isFinite(raw) && raw >= 1 ? raw : 2;
 })();
 
-/** Acima do MAIOR hard-timeout legítimo (qwen, T-598: 35min) + folga: só
- *  dispara em slot vazado. Antes era 15min (grok 720s + folga) e um turno
- *  qwen saudável >15min — que a T-598 tornou o caso normal — era "liberado à
- *  força" no meio do turno com log falso de slot preso. */
-const MAX_HOLD_MS = QWEN_HARD_TIMEOUT_MS + 5 * 60_000;
+/**
+ * Acima do MAIOR teto de turno declarado (hoje o post-cap de 120min do
+ * opencode — T-776) + folga: só dispara em slot vazado.
+ *
+ * T-820: era `QWEN_HARD_TIMEOUT_MS + 5min` (70min), ou seja derivava de UM
+ * runner só. Um turno opencode longo e saudável passava dos 70min, o slot era
+ * liberado à força em pleno turno (log falso de "slot preso") e o gate admitia
+ * mais turnos simultâneos que `THE_DUDES_MAX_CLI_TURNS` — 294 vezes no log de
+ * produção. A derivação agora sai de `turn-limits.ts`, que declara todos os
+ * tetos juntos; o teste t820 trava a invariante (valve > todo teto).
+ */
+const MAX_HOLD_MS = MAIOR_TETO_DE_TURNO_MS + VALVE_FOLGA_MS;
 
 /** Exposto pra teste (T-598): o valve anti-deadlock tem de ficar ACIMA do
  *  maior hold legítimo, senão um turno saudável é liberado à força. */

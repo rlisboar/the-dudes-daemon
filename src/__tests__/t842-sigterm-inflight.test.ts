@@ -16,7 +16,7 @@ process.env.THE_DUDES_DAEMON_KEY_PATH = path.join(os.tmpdir(), `td-t842-key-${pr
 process.env.THE_DUDES_PROJECT_KEYS_PATH = path.join(os.tmpdir(), `td-t842-pkeys-${process.pid}-${Date.now()}.json`);
 
 const { test } = await import("node:test");
-const assert = (await import("node:assert/strict")).default;
+const assert: typeof import("node:assert/strict") = (await import("node:assert/strict")).default;
 const { readFileSync } = await import("node:fs");
 const { getDaemonPublicKey, rememberProjectKey } = await import("../daemon-crypto.js");
 const { AgentHost } = await import("../agent-host.js");
@@ -34,7 +34,7 @@ const off = { command: "false", source: "override", available: false };
 
 function hostComCli(script: string) {
   const out: Array<Record<string, unknown>> = [];
-  const host = new AgentHost((m) => out.push(m as Record<string, unknown>), null, null, {
+  const host = new AgentHost((m) => { out.push(m as unknown as Record<string, unknown>); }, null, null, {
     claude: off, opencode: off, gemini: off, crush: off, qwen: off,
     grok: off, "grok-custom": off, graphify: off, graphifyMcp: off,
     codex: { command: script, source: "override", available: true },
@@ -62,7 +62,9 @@ test("T-842: SIGTERM no meio do turno — a mensagem roda de novo, uma vez, no p
       },
       projectId: PID, basePath: dir, autoApprove: true, agentToken: "tok",
     } as never);
-    const runner = (host as unknown as { entries: Map<string, { runner: { messageSession: { busy: boolean } } }> }).entries.get("ag_t842")?.runner;
+    // T-1040: anotação explícita — a regra do TS para funções de asserção exige
+    // nome declarado com tipo, senão o `assert.ok(runner)` abaixo não estreita.
+    const runner: { messageSession: { busy: boolean } } | undefined = (host as unknown as { entries: Map<string, { runner: { messageSession: { busy: boolean } } }> }).entries.get("ag_t842")?.runner;
     assert.ok(runner, "runner vivo");
     host.send_message("ag_t842", "mensagem em voo", undefined, "voo-1");
     const t0 = Date.now();
@@ -116,7 +118,7 @@ test("T-842: o aviso de reinício sai antes do close do WS", () => {
   let ready = 1;
   const host = new AgentHost((m) => {
     assert.equal(ready, 1, "o aviso chega com o socket ainda OPEN");
-    out.push(m as Record<string, unknown>);
+    out.push(m as unknown as Record<string, unknown>);
   }, null, null, {} as never, false, false, false, () => {}, () => {});
   const entries = (host as unknown as { entries: Map<string, unknown> }).entries;
   // O runner do stub responde o que o dreno (T-839) e o SIGTERM (T-842) leem.

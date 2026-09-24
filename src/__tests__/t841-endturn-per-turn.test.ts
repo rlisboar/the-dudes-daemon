@@ -102,12 +102,12 @@ async function tresTurnos(kind: "codex" | "gemini") {
 test("T-888: o histórico de turnos encerrados é podado (sem vazamento de dias)", async () => {
   const { endTurn, ENDED_TURN_KEYS_CAP } = await import("../runners/turns/end-turn.js");
   const self: any = { messageSession: { owns: () => true }, stopped: false, releaseActiveTurnSlot: () => {}, setState: () => {}, drainOcQueue: () => {} };
-  for (let i = 0; i < ENDED_TURN_KEYS_CAP * 2 + 7; i++) endTurn(self, { epoch: 1, turnKey: `t${i}` });
+  for (let i = 0; i < ENDED_TURN_KEYS_CAP * 2 + 7; i++) endTurn(self, { epoch: 1, turnKey: `t${i}`, code: null });
   assert.equal(self.__endedTurnKeys.size, ENDED_TURN_KEYS_CAP, "mapa limitado pelo teto");
   // A garantia que importa segue valendo: o close DUPLO do turno mais recente
   // é engolido (o mais antigo já saiu — e é o comportamento desejado).
   const antes = self.__endedTurnKeys.size;
-  endTurn(self, { epoch: 1, turnKey: `t${ENDED_TURN_KEYS_CAP * 2 + 6}` });
+  endTurn(self, { epoch: 1, turnKey: `t${ENDED_TURN_KEYS_CAP * 2 + 6}`, code: null });
   assert.equal(self.__endedTurnKeys.size, antes, "chave recente continua no mapa");
   assert.ok(!self.__endedTurnKeys.has("t0"), "o turno mais antigo saiu primeiro");
 });

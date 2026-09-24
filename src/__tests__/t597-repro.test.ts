@@ -79,7 +79,7 @@ test("T-597 F1: reconnect com projectId diferente re-spawna e entry+closure nasc
   const outbound: Array<Record<string, unknown>> = [];
   const off = { command: "false", source: "override" as const, available: false };
   const host = new AgentHost(
-    (m) => outbound.push(m as Record<string, unknown>),
+    (m) => { outbound.push(m as unknown as Record<string, unknown>); },
     null,
     null,
     {

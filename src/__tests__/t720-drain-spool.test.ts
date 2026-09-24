@@ -418,7 +418,7 @@ process.stdout.write(JSON.stringify({ type: "end", sessionId: "aaaaaaaa-bbbb-4cc
   chmodSync(stub, 0o755);
   const out: Array<Record<string, unknown>> = [];
   const off = { command: "false", source: "override" as const, available: false };
-  const host = new AgentHost((m) => { out.push(m as Record<string, unknown>); }, null, null, {
+  const host = new AgentHost((m) => { out.push(m as unknown as Record<string, unknown>); }, null, null, {
     claude: off, opencode: off, gemini: off, codex: off, crush: off, qwen: off,
     grok: { command: stub, source: "override" as const, available: true }, "grok-custom": off, graphify: off, graphifyMcp: off,
   } as never, false, false, false, () => {}, () => {});

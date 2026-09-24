@@ -146,7 +146,7 @@ test("T-899: no fio vai CIFRA (AAD de mensagem), nunca claro; sem chave fica loc
 function hostFalso() {
   const enviados: Array<Record<string, unknown>> = [];
   const logs: string[] = [];
-  const host = new AgentHost((m) => enviados.push(m as Record<string, unknown>), null, null, {} as never, false, false, false, (_l: string, m: string) => { logs.push(m); }, () => {});
+  const host = new AgentHost((m) => { enviados.push(m as unknown as Record<string, unknown>); }, null, null, {} as never, false, false, false, (_l: string, m: string) => { logs.push(m); }, () => {});
   const entries = (host as unknown as { entries: Map<string, unknown> }).entries;
   const pushed: string[] = [];
   const runner = {
@@ -231,8 +231,8 @@ test("T-899: retentativa (resetForRetry) NÃO é o caso do stop — a fila fica 
     reset: () => {}, queued: () => {}, resumed: () => {}, firstTurn: () => {},
     discarded: (_m: unknown, r: string) => { descartados.push(r); },
   } as never);
-  s.enqueue({ content: "a", deliveryId: "d1" });
-  s.enqueue({ content: "b", deliveryId: "d2" });
+  s.enqueue({ content: "a", deliveryId: "d1" }, 50);
+  s.enqueue({ content: "b", deliveryId: "d2" }, 50);
   s.resetForRetry("resumo");
   assert.deepEqual(s.takeAllForDrain().map((m) => m.content), ["a", "b"], "a retentativa preserva a fila inteira");
   assert.equal(descartados.includes("queue-cleared"), false, "retentativa não descarta");

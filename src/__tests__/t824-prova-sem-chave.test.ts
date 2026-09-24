@@ -21,7 +21,7 @@ process.env.THE_DUDES_DAEMON_KEY_PATH = path.join(os.tmpdir(), `td-t824p-key-${p
 process.env.THE_DUDES_PROJECT_KEYS_PATH = path.join(os.tmpdir(), `td-t824p-pkeys-${process.pid}-${Date.now()}.json`);
 
 const { test } = await import("node:test");
-const assert = (await import("node:assert/strict")).default;
+const assert: typeof import("node:assert/strict") = (await import("node:assert/strict")).default;
 const { AgentHost } = await import("../agent-host.js");
 const { getDaemonPublicKey, rememberProjectKey } = await import("../daemon-crypto.js");
 const { createDeliveryDeduper, loadDeliverySeen, saveDeliverySeen } = await import("../inbound-dedup.js");

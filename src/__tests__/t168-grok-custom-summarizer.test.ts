@@ -74,7 +74,7 @@ test("T-168 A3: resolveGrokSessionRoots inclui ~/.grok-custom; tmp é candidato,
     statSync: (p) => {
       const st = dirs[p];
       if (!st) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
-      return { isDirectory: () => st.isDir !== false, mtimeMs: st.mtimeMs };
+      return { isDirectory: () => st.isDir !== false, mtimeMs: st.mtimeMs, size: 0 };
     },
     rmSync: (p) => {
       removed.push(p);
