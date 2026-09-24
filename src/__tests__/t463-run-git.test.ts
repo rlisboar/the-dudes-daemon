@@ -34,11 +34,22 @@ test("T-463: runGit roda git real e capa o stderr", async () => {
   assert.ok(bad.status !== 0);
 });
 
-test("T-463: timeout mata o GRUPO (shim + neto)", async () => {
+test("T-463: timeout mata o GRUPO (shim + neto)", async (t) => {
+  // T-1157: teardown que MATA pelos pids do próprio shim — se o kill do timeout
+  // não alcançar o neto, o arquivo pendura em vez de dar vermelho.
+  t.after(() => {
+    for (const arq of [pidFile, pidFileNeto]) {
+      try {
+        const pid = Number(readFileSync(arq, "utf8").trim());
+        if (pid > 1) { try { process.kill(-pid, "SIGKILL"); } catch { try { process.kill(pid, "SIGKILL"); } catch { /* morto */ } } }
+      } catch { /* não gravou */ }
+    }
+  });
   const dir = mkdtempSync(path.join(os.tmpdir(), "t463-shim-"));
   const pidFile = path.join(dir, "child.pid");
   const shim = path.join(dir, "git");
-  writeFileSync(shim, `#!/bin/sh\nsleep 300 &\necho $! > ${pidFile}\nsleep 300\nwait\n`);
+  const pidFileNeto = path.join(dir, "neto.pid");
+  writeFileSync(shim, `#!/bin/sh\nsleep 300 &\necho $! > ${pidFile}\necho $! > ${pidFileNeto}\nsleep 300\nwait\n`);
   chmodSync(shim, 0o755);
   const oldPath = process.env.PATH;
   process.env.PATH = `${dir}:${oldPath}`;

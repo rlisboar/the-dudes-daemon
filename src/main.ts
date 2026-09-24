@@ -2,6 +2,8 @@ import { healthSnapshot, recentLogs, recordLog, recordWsRtt } from "./health-mon
 import { turnGateDebug, turnGateStats } from "./runners/turn-gate.js";
 import { installSyncProbes, startLoopMonitor } from "./debug/probes.js";
 import { profileHome, startDebugDashboard, type DashboardHandle } from "./debug/index.js";
+import { loadOrCreateDaemonId } from "./daemon-id.js";
+import { discoverClaudeConfigAliases, publicConfigDirAliases, sanitizeRunnerDefaults, type LocalRunnerConfigAliases, type RunnerDefaults } from "./runner-defaults-local.js";
 import { recordDebugLog, recordRtt, recordWsEvent, recordWsHandler, recordWsIn, recordWsOut, setCurrentInbound, setDebugScrubber } from "./debug/store.js";
 import { performance } from "node:perf_hooks";
 import {
@@ -44,7 +46,9 @@ import { definirEmissorSombra, definirLogJev, registrarJevDoProjeto } from "./ty
 import { definirElencoProjeto } from "./typesafe-task-shadow.js";
 import { defaultDaemonConfigPath, formatCliStatus, loadDaemonCliConfig, mergeCliConfig, resolveCliCommands, type DaemonCliConfig, type ResolvedCliCommands } from "./cli-config.js";
 import { applyRunnerPolicy, buildInstalledRunnerAvailability, helloRunnerLists, POLICY_GATED_RUNNERS, type InstalledRunnerAvailability } from "./runner-policy.js";
+import { buildRunnerStatusMap, probeRunnerVersion } from "./runner-status.js";
 import { assembleAgentSendParts, contentAadChain, openWithAnyHeldProject, type FromDaemon, type FromOrch, type TaskUpdatedEv } from "./protocol.js";
+import { RUNNERS, type CliRunner } from "@the-dudes/protocol";
 import { runSummarizer } from "./summarizer-runner.js";
 import { aadV2, E2EE_TABLE } from "@the-dudes/protocol/e2ee-fields";
 import { interpolateMissionMemory } from "@the-dudes/protocol/mission-memory";
@@ -294,6 +298,12 @@ export class DaemonClient {
   private dropTo: DropTarget | null;
   private relay: BridgeRelay | null = null;
   private cliCommands: ResolvedCliCommands;
+  private runnerVersions: Partial<Record<CliRunner, string>> = {};
+  private runnerVersionProbeStarted = false;
+  private daemonId: string | undefined;
+  private runnerConfigAliases: LocalRunnerConfigAliases = { claude: [] };
+  private runnerDefaults: RunnerDefaults = {};
+  private runnerDefaultsVersion = -1;
   private modelDiscovery: ModelDiscovery;
   // Workspace é per-request (cada msg do server traz workspaceRoot do
   // projeto ATIVO). Sem state global pra evitar last-write-wins.
@@ -305,20 +315,44 @@ export class DaemonClient {
   private spawnKeyWaited = new Set<string>();
   private static readonly SPAWN_KEY_WAIT_MS = 8_000;
 
-  constructor(args: Args, cliCommands: ResolvedCliCommands) {
+  constructor(args: Args, cliCommands: ResolvedCliCommands, daemonConfig: DaemonCliConfig = {}) {
     this.args = args;
     this.orchUrl = args.orch.replace(/\/$/, "");
     this.dropTo = detectDropTarget();
     this.cliCommands = cliCommands;
     this.installedRunnerAvailability = buildInstalledRunnerAvailability(cliCommands);
     this.modelDiscovery = new ModelDiscovery(cliCommands, this.dropTo);
+    const runnerHome = this.dropTo?.home ?? os.homedir();
+    const runnerOwnerUid = this.dropTo?.uid ?? process.getuid?.();
+    try {
+      this.daemonId = loadOrCreateDaemonId(profileHome(), runnerOwnerUid);
+    } catch (error) {
+      log("warn", `[daemon-identity] stable id unavailable; daemon defaults disabled (${(error as Error).message})`);
+    }
+    this.runnerConfigAliases = {
+      claude: discoverClaudeConfigAliases({
+        home: runnerHome,
+        ownerUid: runnerOwnerUid,
+        configuredPaths: daemonConfig.runnerConfigDirs?.claude,
+      }),
+    };
     if (this.dropTo) {
       log("info", `running as root via sudo — child processes will drop to uid=${this.dropTo.uid} (${this.dropTo.user}) home=${this.dropTo.home}`);
     }
     setTag("daemon_name", this.args.name);
     setTag("hostname", os.hostname());
     this.host = new AgentHost((msg) => this.send(msg), this.dropTo, null, this.cliCommands, this.args.verbose, this.args.verboseHuman, this.args.verboseHumanIo, log, cliLog);
+    this.configureHostRunnerDefaults(this.host);
     this.wireGraphWatch();
+  }
+
+  private configureHostRunnerDefaults(host: AgentHost): void {
+    host.setRunnerDefaults({
+      defaults: this.runnerDefaults,
+      configAliases: this.runnerConfigAliases,
+      home: this.dropTo?.home ?? os.homedir(),
+      ownerUid: this.dropTo?.uid ?? process.getuid?.(),
+    });
   }
 
   /** Liga callback de watch do grafo no AgentHost (rebuilds debounced). */
@@ -414,6 +448,7 @@ export class DaemonClient {
       await this.relay.start();
       log("info", `bridge relay listening on ${this.relay.socketPath}`);
       this.host = new AgentHost((msg) => this.send(msg), this.dropTo, this.relay.socketPath, this.cliCommands, this.args.verbose, this.args.verboseHuman, this.args.verboseHumanIo, log, cliLog);
+      this.configureHostRunnerDefaults(this.host);
       this.wireGraphWatch();
     } catch (e) {
       log("warn", `bridge relay failed to start (${(e as Error).message}) — agents will fetch orch directly`);
@@ -660,6 +695,8 @@ export class DaemonClient {
         os: process.platform,
         hostname: os.hostname(),
         version: VERSION,
+        daemonId: this.daemonId,
+        configDirAliases: publicConfigDirAliases(this.runnerConfigAliases),
         protocolVersion: WIRE_PROTOCOL_VERSION,
         // T-846: hello passivo não substitui; o server responde 4001 se o
         // token ainda estiver ocupado por outro processo vivo. O campo ainda
@@ -678,6 +715,8 @@ export class DaemonClient {
           mcp: !!this.cliCommands.graphifyMcp?.available,
         },
       } as FromDaemon);
+      this.refreshRunnerStatus();
+      this.sendHealth();
       // T-1005: a desconexão limpa a fila ao vivo no server — reemite o
       // snapshot de quem tem fila (debounce; o server trata igual como no-op).
       try { this.host.reemitirFilaVivaNoHello(); } catch { /* observação */ }
@@ -896,6 +935,24 @@ export class DaemonClient {
       case "runner-policy:set": {
         applyRunnerPolicy(this.cliCommands, this.installedRunnerAvailability, msg.allowedRunners);
         log("info", `runner policy synced: ${[...new Set(msg.allowedRunners)].join(", ") || "none"}`);
+        return;
+      }
+      case "runner-defaults:set": {
+        if (!this.daemonId || msg.daemonId !== this.daemonId) {
+          log("warn", "runner defaults ignored: daemon identity does not match this profile");
+          return;
+        }
+        if (!Number.isSafeInteger(msg.version) || msg.version <= this.runnerDefaultsVersion) return;
+        this.runnerDefaults = sanitizeRunnerDefaults({
+          defaults: msg.defaults,
+          configAliases: this.runnerConfigAliases,
+          warn: (message) => log("warn", `[runner-defaults] ${message}`),
+        });
+        this.runnerDefaultsVersion = msg.version;
+        this.configureHostRunnerDefaults(this.host);
+        this.refreshRunnerStatus();
+        this.sendHealth();
+        log("info", `runner defaults synced (version ${msg.version})`);
         return;
       }
       case "daemon:challenge": {
@@ -2777,10 +2834,46 @@ export class DaemonClient {
         agentsRunning: this.host.agentCount(),
         e2eeProjects: countUsableProjectKeys(),
       });
-      this.send({ type: "daemon:health", health: { ...health, ...runningReleaseInfo(), ...this.peerPidHealthFields() } });
+      const runnerStatus = buildRunnerStatusMap({
+        commands: this.cliCommands,
+        installed: this.installedRunnerAvailability,
+        versions: this.runnerVersions,
+        claudeConfigDir: this.host.claudeConfigStatus(),
+      });
+      this.send({ type: "daemon:health", health: { ...health, ...runningReleaseInfo(), ...this.peerPidHealthFields(), runnerStatus } });
     } catch (e) {
       log("warn", `sendHealth falhou: ${(e as Error).message}`);
     }
+  }
+
+  /** Probes installed binaries once per daemon process; the hello/health path
+   * never waits for a CLI. Output is reduced to semver before it can be sent. */
+  private refreshRunnerStatus(): void {
+    if (this.runnerVersionProbeStarted) return;
+    this.runnerVersionProbeStarted = true;
+    const installedRunners = RUNNERS.filter((runner) =>
+      this.installedRunnerAvailability[runner] === true && !!this.cliCommands[runner].resolvedPath,
+    );
+    const home = this.dropTo?.home ?? os.homedir();
+    void (async () => {
+      // Bound process fan-out so a machine with every runner installed does
+      // not start nine version probes at once.
+      for (let i = 0; i < installedRunners.length; i += 3) {
+        const group = installedRunners.slice(i, i + 3);
+        const results = await Promise.all(group.map(async (runner) => {
+          const command = this.cliCommands[runner];
+          const version = await probeRunnerVersion({ ...command, available: true }, this.dropTo, home);
+          return [runner, version] as const;
+        }));
+        for (const [runner, version] of results) {
+          if (version) this.runnerVersions[runner] = version;
+        }
+      }
+      this.sendHealth();
+    })().catch((error: unknown) => {
+      log("warn", `[runner-status] version probing failed: ${(error as Error).message}`);
+      this.sendHealth();
+    });
   }
 
   private stopHeartbeat() {
@@ -3042,7 +3135,7 @@ const cliCommands = resolveCliCommands(cliConfig);
 // status/erro). Sem isto a ação que falhou para o dono não aparecia em lugar nenhum.
 setLogOd((nivel, msg) => log(nivel, msg));
 if (SELF_BOOTSTRAP) {
-  new DaemonClient(args, cliCommands).start().catch(async (e) => {
+  new DaemonClient(args, cliCommands, cliConfig).start().catch(async (e) => {
     capture(e, { phase: "startup" });
     log("error", `failed to start: ${(e as Error).message}`);
     await flushSentry();

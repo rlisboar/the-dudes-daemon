@@ -59,10 +59,12 @@ export function sealAgentErrorMessage(projectId: string | undefined, message: st
 }
 
 import type {ResolvedCliCommands} from "./cli-config.js";
-import type {AgentInfo, ImageAttachment} from "./types.js";
+import type {AgentInfo, CliRunner, ImageAttachment} from "./types.js";
 import type {AgentSpawn, FromDaemon} from "./protocol.js";
 import {type DropTarget} from "./privileges.js";
+import { resolveRunnerSettings, type LocalRunnerConfigAliases, type ResolvedRunnerSettings, type RunnerDefaults } from "./runner-defaults-local.js";
 import {runGit} from "./runners/run-git.js";
+import os from "node:os";
 
 import {compatibleSessionId} from "./runners/index.js";
 import {createAgentInboundBuffer} from "./inbound-dedup.js";
@@ -181,6 +183,11 @@ export function reexecSpoolDir(): string {
 
 export class AgentHost {
   private entries = new Map<string, Entry>();
+  private runnerDefaults: RunnerDefaults = {};
+  private runnerConfigAliases: LocalRunnerConfigAliases = { claude: [] };
+  private runnerConfigHome: string;
+  private runnerConfigOwnerUid: number | undefined;
+  private effectiveRunnerConfig = new Map<CliRunner, Pick<ResolvedRunnerSettings, "configSource" | "configAlias">>();
   /** T-037: agent:send chegando antes do runner (gap pós-spawn/self-update). */
   private inboundBuffer = createAgentInboundBuffer({ maxPerAgent: 20 });
   /** T-720: ids com mensagem no inboundBuffer (o buffer não lista agentes). */
@@ -326,7 +333,40 @@ export class AgentHost {
     private verboseHumanIo: boolean = false,
     private log: (level: "info" | "warn" | "error", msg: string) => void = () => {},
     private cliLog: (level: "info" | "warn" | "error", msg: string) => void = () => {},
-  ) {}
+  ) {
+    this.runnerConfigHome = dropTo?.home ?? os.homedir();
+    this.runnerConfigOwnerUid = dropTo?.uid ?? process.getuid?.();
+  }
+
+  /** Replaced atomically on runner-defaults:set; existing runners keep their
+   *  original AgentInfo and are never mutated by a defaults update. */
+  setRunnerDefaults(input: {
+    defaults: RunnerDefaults;
+    configAliases: LocalRunnerConfigAliases;
+    home: string;
+    ownerUid?: number;
+  }): void {
+    this.runnerDefaults = input.defaults;
+    this.runnerConfigAliases = input.configAliases;
+    this.runnerConfigHome = input.home;
+    this.runnerConfigOwnerUid = input.ownerUid;
+  }
+
+  claudeConfigStatus(): { source: "env" | "agent" | "default" | "native"; alias?: string } {
+    const selected = this.effectiveRunnerConfig.get("claude") ?? resolveRunnerSettings({
+      runner: "claude",
+      agent: {},
+      defaults: this.runnerDefaults.claude,
+      configAliases: this.runnerConfigAliases,
+      home: this.runnerConfigHome,
+      ownerUid: this.runnerConfigOwnerUid,
+      env: process.env,
+    });
+    return {
+      source: selected.configSource,
+      ...(selected.configAlias ? { alias: selected.configAlias.alias } : {}),
+    };
+  }
 
   /** true se o canal aceitou o frame (void legado = assume ok). */
   private deliver(msg: FromDaemon): boolean {
@@ -829,7 +869,34 @@ export class AgentHost {
         }
       },
     };
-    const runner = new AgentRunner(msg.agent, opts);
+    const settings = resolveRunnerSettings({
+      runner: cliRunner,
+      agent: msg.agent,
+      defaults: this.runnerDefaults[cliRunner],
+      configAliases: this.runnerConfigAliases,
+      home: this.runnerConfigHome,
+      ownerUid: this.runnerConfigOwnerUid,
+      env: process.env,
+      warn: (message) => this.log("warn", `[runner-defaults:${cliRunner}] ${message}`),
+    });
+    this.effectiveRunnerConfig.set(cliRunner, {
+      configSource: settings.configSource,
+      configAlias: settings.configAlias,
+    });
+    opts.resolvedClaudeConfigDir = settings.configDir;
+    opts.resolvedClaudeConfigFromEnv = settings.configSource === "env";
+    opts.approvedClaudeConfigAliases = this.runnerConfigAliases.claude;
+    opts.claudeConfigHome = this.runnerConfigHome;
+    opts.claudeConfigOwnerUid = this.runnerConfigOwnerUid;
+    opts.onClaudeConfigDirInvalid = () => {
+      this.effectiveRunnerConfig.set(cliRunner, { configSource: "native" });
+    };
+    const runnerInfo: AgentInfo = {
+      ...msg.agent,
+      model: settings.model,
+      effort: settings.effort,
+    };
+    const runner = new AgentRunner(runnerInfo, opts);
     thisRunner = runner;
     try { recordAgentEvent(msg.agent.id, "spawn", `runner=${cliRunner} model=${msg.agent.model ?? "-"} effort=${msg.agent.effort ?? "-"} resume=${resumeSessionId ? "sim" : "não"} cwd=${cwd}`); } catch { /* observação */ }
     const subiu = runner.start().catch((e) => this.log("error", `agent ${msg.agent.id} start failed: ${(e as Error).message}`));

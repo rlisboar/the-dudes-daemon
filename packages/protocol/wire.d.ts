@@ -1176,6 +1176,25 @@ export interface DaemonStatus {
   daemons: DaemonInfo[];
 }
 
+export type RunnerStatusSource = "env" | "agent" | "default" | "native";
+
+export interface RunnerConfigDirStatus {
+  /** Alias opaco reportado pelo daemon; caminho local nunca atravessa o fio. */
+  alias?: string;
+  source: RunnerStatusSource;
+}
+
+/** Capacidades locais reportadas pelo daemon; campos são somente leitura. */
+export interface RunnerStatus {
+  installed: boolean;
+  version?: string;
+  /** Binário detectado localmente, somente para exibição. */
+  binary?: string;
+  claudeConfigDir?: RunnerConfigDirStatus;
+}
+
+export type RunnerStatusMap = Partial<Record<CliRunner, RunnerStatus>>;
+
 /** Saúde do daemon, medida pelo próprio daemon a cada heartbeat. */
 export interface DaemonHealth {
   ts: number;
@@ -1194,6 +1213,8 @@ export interface DaemonHealth {
   binaryHash?: string;
   buildTs?: number;
   updatePending?: boolean;
+  /** Disponibilidade/versão do runner detectadas localmente (somente leitura). */
+  runnerStatus?: RunnerStatusMap;
 }
 
 export interface DaemonLogLine {

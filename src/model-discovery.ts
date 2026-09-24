@@ -430,6 +430,10 @@ function discoverCodex(command: string, dropTo: DropTarget | null): Promise<Disc
       if (!settled) finish(undefined, new Error(cleanLine(stderr).slice(-300) || `Codex encerrou com código ${code ?? "?"}`));
     });
     const timer = setTimeout(() => finish(undefined, new Error("timeout consultando modelos do Codex")), COMMAND_TIMEOUT_MS);
+    // T-1157: sem `unref`/clear, este timer (COMMAND_TIMEOUT_MS) segurava o event
+    // loop depois de o teste terminar — a suíte só "saía" por causa do
+    // --test-force-exit do CI (o arquivo pendurava isolado sem a flag).
+    timer.unref?.();
     write({
       method: "initialize",
       id: 1,

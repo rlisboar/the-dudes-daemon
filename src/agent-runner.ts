@@ -1,4 +1,5 @@
 import { TurnLatency, type TurnTiming } from "./runners/turn-latency.js";
+import type {LocalConfigDirAlias} from "./runner-defaults-local.js";
 import {type ChildProcess, type ChildProcessWithoutNullStreams} from "node:child_process";
 
 import {readdirSync, realpathSync, existsSync, statSync, openSync, readSync, closeSync} from "node:fs";
@@ -46,7 +47,7 @@ import {grokAcpStop} from "./runners/turns/grok-acp.js";
 import {compactContext, compactContextInner, waitOcIdle, parseAndStripMemory, saveExtractedMemory, fetchExistingMemories, memoryAlreadyBlock, parseEpisodeJson, memoryTitleNearDup, postBridgeJson, handleUndeliveredTurnResult, resetContextAccounting, checkContextUsage, reportContextOccupancy, notifyContextFull, registerCompactFailure, checkContextFullError} from "./runners/compact.js";
 import {runOneShot, runOneShotWithSession, killClaudeForRestart} from "./runners/one-shot.js";
 import {traceCli, traceSpawn, renderVerboseIoBlock, traceInternalCli, renderVerboseBlock, colorizeAgentName, supportsAnsi, hexToRgb, extractVerbosePayload, extractValueText, prettyPrintVerboseText, cleanupAgentTmpDir, grokSessionRecentWrite} from "./runners/support.js";
-import {startClaude, bootPerMessageRunner, featuresEnv, bridgeEnv, writeGeminiConfig, writeQwenConfig, writeOpenCodeConfig, buildEnv, resolveClaudeConfigDir, expandHome, buildClaudeArgs, writeMcpConfig, capAccum, handleStdout, handleStreamEvent, prepareGraphify, refreshGraphifyMcp, bridgePost, runnerCommand, workspaceInfo, promptContext, initialMessage, ensureRunnerAvailable} from "./runners/bootstrap.js";
+import {startClaude, bootPerMessageRunner, featuresEnv, bridgeEnv, writeGeminiConfig, writeQwenConfig, writeOpenCodeConfig, buildEnv, buildClaudeArgs, writeMcpConfig, capAccum, handleStdout, handleStreamEvent, prepareGraphify, refreshGraphifyMcp, bridgePost, runnerCommand, workspaceInfo, promptContext, initialMessage, ensureRunnerAvailable} from "./runners/bootstrap.js";
 export {
   extractOneShotText,
   grokSignalsPath,
@@ -92,6 +93,14 @@ export interface AgentRunnerOptions {
   orchestratorUrl: string;
   agentToken: string;
   cliRunner: CliRunner;
+  /** Resolved, locally approved Claude profile path. Never comes from server. */
+  resolvedClaudeConfigDir?: string;
+  /** Operator-owned env path bypasses the strict alias catalog at spawn. */
+  resolvedClaudeConfigFromEnv?: boolean;
+  approvedClaudeConfigAliases?: readonly LocalConfigDirAlias[];
+  claudeConfigHome?: string;
+  claudeConfigOwnerUid?: number;
+  onClaudeConfigDirInvalid?: () => void;
   autoApprove: boolean;
   workspaceRoot: string;
   resumeSessionId?: string;
@@ -500,8 +509,8 @@ export class AgentRunner {
 
   private startClaude(...args: any[]) { return (startClaude as any)(this, ...args); } private bootPerMessageRunner(...args: any[]) { return (bootPerMessageRunner as any)(this, ...args); } private featuresEnv(...args: any[]) { return (featuresEnv as any)(this, ...args); }
   private bridgeEnv(...args: any[]) { return (bridgeEnv as any)(this, ...args); } private writeGeminiConfig(...args: any[]) { return (writeGeminiConfig as any)(this, ...args); } private writeQwenConfig(...args: any[]) { return (writeQwenConfig as any)(this, ...args); }
-  private writeOpenCodeConfig(...args: any[]) { return (writeOpenCodeConfig as any)(this, ...args); } private buildEnv(...args: any[]) { return (buildEnv as any)(this, ...args); } private resolveClaudeConfigDir(...args: any[]) { return (resolveClaudeConfigDir as any)(this, ...args); }
-  private expandHome(...args: any[]) { return (expandHome as any)(this, ...args); } private buildClaudeArgs(...args: any[]) { return (buildClaudeArgs as any)(this, ...args); } private writeMcpConfig(...args: any[]) { return (writeMcpConfig as any)(this, ...args); }
+  private writeOpenCodeConfig(...args: any[]) { return (writeOpenCodeConfig as any)(this, ...args); } private buildEnv(...args: any[]) { return (buildEnv as any)(this, ...args); }
+  private buildClaudeArgs(...args: any[]) { return (buildClaudeArgs as any)(this, ...args); } private writeMcpConfig(...args: any[]) { return (writeMcpConfig as any)(this, ...args); }
   private capAccum(...args: any[]) { return (capAccum as any)(this, ...args); } private handleStdout(...args: any[]) { return (handleStdout as any)(this, ...args); } private handleStreamEvent(...args: any[]) { return (handleStreamEvent as any)(this, ...args); }
   private prepareGraphify(...args: any[]) { return (prepareGraphify as any)(this, ...args); } public refreshGraphifyMcp(...args: any[]) { return (refreshGraphifyMcp as any)(this, ...args); } private bridgePost(...args: any[]) { return (bridgePost as any)(this, ...args); }
   private runnerCommand(...args: any[]) { return (runnerCommand as any)(this, ...args); } private workspaceInfo(...args: any[]) { return (workspaceInfo as any)(this, ...args); } private promptContext(...args: any[]) { return (promptContext as any)(this, ...args); }

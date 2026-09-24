@@ -23,6 +23,9 @@ export interface CliPathConfig {
 
 export interface DaemonCliConfig {
   cliPaths?: CliPathConfig;
+  /** Optional local Claude profile directories eligible for opaque aliases.
+   *  Every path is still constrained to a direct ~/.claude* child. */
+  runnerConfigDirs?: { claude?: string[] };
 }
 
 export interface ResolvedCliCommand {
@@ -79,6 +82,12 @@ export function mergeCliConfig(...configs: Array<DaemonCliConfig | undefined | n
   for (const cfg of configs) {
     if (!cfg) continue;
     merged.cliPaths = { ...(merged.cliPaths ?? {}), ...(cfg.cliPaths ?? {}) };
+    if (cfg.runnerConfigDirs) {
+      merged.runnerConfigDirs = {
+        ...(merged.runnerConfigDirs ?? {}),
+        ...cfg.runnerConfigDirs,
+      };
+    }
   }
   return sanitizeCliConfig(merged);
 }
@@ -474,6 +483,9 @@ function expandHome(input: string): string {
 
 function sanitizeCliConfig(cfg: DaemonCliConfig): DaemonCliConfig {
   const cliPaths = cfg.cliPaths ?? {};
+  const runnerConfigDirs = cfg.runnerConfigDirs && typeof cfg.runnerConfigDirs === "object"
+    ? { claude: sanitizeConfigDirList(cfg.runnerConfigDirs.claude) }
+    : undefined;
   return {
     cliPaths: {
       claude: normalizePath(cliPaths.claude),
@@ -487,5 +499,15 @@ function sanitizeCliConfig(cfg: DaemonCliConfig): DaemonCliConfig {
       graphify: normalizePath(cliPaths.graphify),
       graphifyMcp: normalizePath(cliPaths.graphifyMcp),
     },
+    ...(runnerConfigDirs ? { runnerConfigDirs } : {}),
   };
+}
+
+function sanitizeConfigDirList(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const cleaned = [...new Set(value
+    .filter((entry): entry is string => typeof entry === "string")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0 && entry.length <= 4096 && !/[\u0000-\u001f\u007f]/.test(entry)))].slice(0, 32);
+  return cleaned.length ? cleaned : undefined;
 }

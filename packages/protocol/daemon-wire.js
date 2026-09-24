@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { RUNNERS } from "./index.js";
 
 /**
  * T-423 (A6/R3): schemas zod das mensagens daemon → server (`FromDaemon`).
@@ -17,6 +18,25 @@ const t = z.string();
 const n = z.number();
 const b = z.boolean();
 const id = z.string();
+const cliRunner = z.enum(RUNNERS);
+const effortLevel = z.enum(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
+const opaqueConfigAlias = z.string().regex(/^[A-Za-z0-9_-]{8,64}$/);
+const runnerHealthStatus = z.object({
+  installed: b,
+  version: z.string().min(1).max(128).optional(),
+  binary: z.string().min(1).max(1024).optional(),
+  claudeConfigDir: z.object({
+    alias: opaqueConfigAlias.optional(),
+    source: z.enum(["env", "agent", "default", "native"]),
+  }).strict().optional(),
+}).strict();
+const configAliasOption = z.object({ alias: opaqueConfigAlias, label: z.string().min(1).max(80) }).strict();
+const runnerDefaultSetValue = z.object({
+  model: z.string().min(1).max(128).optional(),
+  effort: effortLevel.optional(),
+  claudeConfigDir: opaqueConfigAlias.optional(),
+  qwenHome: opaqueConfigAlias.optional(),
+}).strict();
 const fileEntry = z.object({ name: t, path: t, isDirectory: b, size: n.optional() });
 const gitCommit = z.object({ hash: t, message: t, author: t, date: t });
 const gitFileStatus = z.object({ path: t, status: t });
@@ -78,6 +98,11 @@ export const daemonWireSchemas = {
     os: t,
     hostname: t,
     version: t,
+    daemonId: z.string().uuid().optional(),
+    configDirAliases: z.object({
+      claude: z.array(configAliasOption).max(32).optional(),
+      qwen: z.array(configAliasOption).max(32).optional(),
+    }).strict().optional(),
     protocolVersion: n.optional(),
     cryptoPublicKey: t.optional(),
     binaryHash: t.optional(),
@@ -106,6 +131,8 @@ export const daemonWireSchemas = {
       binaryHash: t.optional(),
       buildTs: n.optional(),
       updatePending: b.optional(),
+      // Report somente de leitura para exibição na aba Runners.
+      runnerStatus: z.partialRecord(cliRunner, runnerHealthStatus).optional(),
     }),
   }),
   "daemon:logs:result": msg("daemon:logs:result", {
@@ -439,6 +466,11 @@ export const fromOrchSchemas = {
   "daemon:logs:get": msg("daemon:logs:get", { correlationId: t.optional(), limit: n.optional() }),
   "release:available": msg("release:available", { sha256: t }),
   "runner-policy:set": msg("runner-policy:set", { allowedRunners: z.array(t) }),
+  "runner-defaults:set": msg("runner-defaults:set", {
+    daemonId: z.string().min(1).max(128),
+    version: z.number().int().nonnegative().safe(),
+    defaults: z.partialRecord(cliRunner, runnerDefaultSetValue),
+  }),
   "project:e2ee_required": msg("project:e2ee_required", { projectId: t, value: b }),
   // T-878: só a flag da feature — o daemon para de mandar texto sem esperar spawn.
   "project:features": msg("project:features", { projectId: t, jev: b }),

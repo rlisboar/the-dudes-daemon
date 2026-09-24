@@ -12,7 +12,7 @@ import "./scratch-home.js";
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { ModelDiscovery } from "../model-discovery.js";
@@ -24,6 +24,8 @@ import url from "node:url";
 const dir = path.dirname(url.fileURLToPath(import.meta.url));
 const verbose = process.argv.includes("--verbose");
 const ms = Number(fs.readFileSync(path.join(dir, verbose ? "sleep-verbose" : "sleep-simple"), "utf8").trim()) || 0;
+// T-1157: marca a FASE antes de dormir — asserção observável, imune à carga.
+fs.writeFileSync(path.join(dir, verbose ? "fase-verbose" : "fase-simples"), "1");
 if (ms > 0) await new Promise((r) => setTimeout(r, ms));
 if (verbose) {
   process.stdout.write("zen/fake-a\\n{ \\"variants\\": { \\"low\\": {}, \\"xhigh\\": {} } }\\nzen/fake-b\\n{ \\"variants\\": {} }\\n");
@@ -32,8 +34,10 @@ if (verbose) {
 }
 `;
 
+let ultimoDir = "";
 function makeHarness(sleepVerboseMs: number, sleepSimpleMs: number): ModelDiscovery {
   const dir = mkdtempSync(path.join(os.tmpdir(), "t664-"));
+  ultimoDir = dir;
   const stub = path.join(dir, "cli.mjs");
   writeFileSync(stub, STUB);
   chmodSync(stub, 0o755);
@@ -90,7 +94,12 @@ test("T-664 (C2 contraprova): verbose E fallback além dos tetos → catálogo c
   assert.match(String(cat.error), /timeout consultando modelos/);
   // T-1088: piso pelo FALLBACK (35s), não pela soma: sob carga a fase verbose
   // aborta antes do próprio teto e o erro controlado continua vindo do fallback.
-  assert.ok(ms >= 35_000, `piso = teto do fallback (${ms}ms)`);
+  // T-1157: sem piso de tempo. O que importa é que a fase verbose RODOU e que a
+  // seguinte também — observável pelos marcadores do stub, imune à carga.
+  assert.ok(existsSync(path.join(ultimoDir, "fase-verbose")), "fase verbose rodou (não pulou)");
+  // (o fallback simples só entra quando o verbose não basta — o marcador dele
+  // é checado no caso que de fato cai nele)
+  assert.ok(existsSync(path.join(ultimoDir, "fase-simples")), "caiu no fallback simples depois");
   assert.ok(ms < 90_000, `pior caso dentro do TTL do server (${ms}ms)`);
 });
 

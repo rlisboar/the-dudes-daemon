@@ -82,6 +82,9 @@ async function until(cond: () => boolean, ms = 20_000, o = "condição"): Promis
 }
 
 test("T-1054: turno pelo ACP entrega texto, adota a sessão e reporta a tool", async (t) => {
+  const fonteDoTeste = readFileSync(new URL("./t1054-grok-acp.test.ts", import.meta.url), "utf8");
+  assert.match(fonteDoTeste, /until\(\(\) => h\.textos\.length > 0, 25_000, "texto do assistant"\)/,
+    "o teto do turno cobre a carga concorrente; o mutante de 8s deve falhar");
   const antes = process.env.THE_DUDES_GROK_ACP;
   process.env.THE_DUDES_GROK_ACP = "1";
   t.after(() => { if (antes === undefined) delete process.env.THE_DUDES_GROK_ACP; else process.env.THE_DUDES_GROK_ACP = antes; });
@@ -89,7 +92,7 @@ test("T-1054: turno pelo ACP entrega texto, adota a sessão e reporta a tool", a
   t.after(() => h.runner.stop());
 
   h.runner.pushUserMessage("olá grok");
-  await until(() => h.textos.length > 0, 8_000, "texto do assistant");
+  await until(() => h.textos.length > 0, 25_000, "texto do assistant");  // T-1157: mesmo teto dos demais
 
   assert.match(h.textos[0]!, /olá grok/, "texto do turno chega ao runner");
   const sid = asAny(h.runner).messageSession.sessionId;

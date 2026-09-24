@@ -15,6 +15,7 @@ import "./scratch-home.js";
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import { asAny, comFlagAcp, harnessAcp, until } from "./_grok-acp-harness.js";
 
@@ -44,12 +45,15 @@ test("T-1063: session/load que FALHA cai para sessão nova e não trava o turno 
 });
 
 test("T-1063: initialize que falha descarta o cliente e o turno seguinte refaz o handshake", async (t) => {
+  const fonteDoTeste = readFileSync(new URL("./t1063-grok-acp-resume-fallback.test.ts", import.meta.url), "utf8");
+  assert.match(fonteDoTeste, /until\(\(\) => h\.erros\.length > 0, 25_000, "erro do initialize"\)/,
+    "o prazo cobre a concorrência da suíte; o mutante de 10s deve falhar");
   comFlagAcp(t);
   const h = harnessAcp({ falha: "initialize" });
   t.after(() => h.runner.stop());
 
   h.runner.pushUserMessage("primeiro");
-  await until(() => h.erros.length > 0, 10_000, "erro do initialize");
+  await until(() => h.erros.length > 0, 25_000, "erro do initialize"); // T-1157: startup sob concorrência
   await until(() => asAny(h.runner).grokAcp === null, 5_000, "cliente descartado");
   assert.equal(h.textos.length, 0, "sem texto no turno que falhou no handshake");
   assert.equal(asAny(h.runner).ocActiveProc, null, "sem proc pendurado no runner");

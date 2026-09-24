@@ -43,8 +43,21 @@ function armarFetch() {
     if (r.atrasoMs) {
       // O signal do pedido precisa poder abortar (AbortSignal.timeout).
       await new Promise<void>((res, rej) => {
-        const t = setTimeout(res, r.atrasoMs);
-        init?.signal?.addEventListener("abort", () => { clearTimeout(t); rej(Object.assign(new Error("aborted"), { name: "TimeoutError" })); });
+        const signal = init?.signal;
+        if (signal?.aborted) {
+          rej(Object.assign(new Error("aborted"), { name: "TimeoutError" }));
+          return;
+        }
+        const t = setTimeout(() => {
+          signal?.removeEventListener("abort", abort);
+          res();
+        }, r.atrasoMs);
+        const abort = () => {
+          clearTimeout(t);
+          signal?.removeEventListener("abort", abort);
+          rej(Object.assign(new Error("aborted"), { name: "TimeoutError" }));
+        };
+        signal?.addEventListener("abort", abort, { once: true });
       });
     }
     const corpo = Buffer.from(r.corpo, "utf8");
@@ -67,9 +80,9 @@ beforeEach(() => {
   armarFetch();
 });
 
-test("T-844: catálogo de agents lento (15,9s) termina e a 2ª chamada vem do cache", async () => {
+test("T-844: catálogo de agents lento termina e a 2ª chamada vem do cache", async () => {
   resposta = (u) => u.endsWith("/api/agents")
-    ? { status: 200, corpo: fixture("agents.json"), atrasoMs: 300 }
+    ? { status: 200, corpo: fixture("agents.json"), atrasoMs: 350 }
     : { status: 404, corpo: "{}" };
   const t0 = Date.now();
   const agentes = await listarAgentsOd();
@@ -178,22 +191,29 @@ test("T-844: projeto e busca reais passam pelo parser; versão é logada", async
   assert.ok(logs.some((l) => l.includes("version ok em")), "versão logada");
 });
 
-test("T-844: timeout por operação (o teto de 8s do card não vale para o catálogo)", async () => {
-  // agents responde DEPOIS dos 8s antigos: com o teto velho abortaria.
-  resposta = (u) => u.endsWith("/api/agents")
-    ? { status: 200, corpo: fixture("agents.json"), atrasoMs: 8_600 }
-    : { status: 404, corpo: "{}" };
-  const agentes = await listarAgentsOd();
-  assert.ok(agentes.length > 0, "passou dos 8s sem abortar");
+test("T-844: catálogo recebe teto de 30s e aborta após o prazo configurado", async () => {
+  const timeout = AbortSignal.timeout.bind(AbortSignal);
+  const pedidos: number[] = [];
+  AbortSignal.timeout = (ms: number) => {
+    pedidos.push(ms);
+    // Mantém o caminho real de abort, mas acelera o prazo para este teste.
+    return timeout(25);
+  };
+  try {
+    resposta = (u) => u.endsWith("/api/agents")
+      ? { status: 200, corpo: fixture("agents.json"), atrasoMs: 1 }
+      : { status: 404, corpo: "{}" };
+    const agentes = await listarAgentsOd();
+    assert.ok(agentes.length > 0, "a resposta abaixo do prazo foi aceita");
+    assert.deepEqual(pedidos, [30_000], "a operação configurou os 30s completos");
 
-  // O teto existe de verdade: agents além dos 30s estoura com mensagem clara.
-  _resetOdCacheForTest();
-  const timeoutReal = (globalThis as { setTimeout: typeof setTimeout }).setTimeout;
-  void timeoutReal;
-  resposta = () => ({ status: 200, corpo: "{}", atrasoMs: 30_500 });
-  const t0 = Date.now();
-  await assert.rejects(() => listarAgentsOd(), /não respondeu em 30000ms/);
-  const levou = Date.now() - t0;
-  assert.ok(levou >= 30_000, `respeitou o teto de 30s (${levou}ms)`);
+    _resetOdCacheForTest();
+    pedidos.length = 0;
+    resposta = () => ({ status: 200, corpo: "{}", atrasoMs: 500 });
+    await assert.rejects(() => listarAgentsOd(), /não respondeu em 30000ms/);
+    assert.deepEqual(pedidos, [30_000], "o abort veio do signal criado com 30s");
+  } finally {
+    AbortSignal.timeout = timeout;
+  }
   assert.equal(TTL_CATALOGO_MS, 10 * 60_000, "TTL do cache");
 });

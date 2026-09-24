@@ -8,9 +8,10 @@ import {buildBaseRunnerEnv} from "./env.js";
 import {buildBridgeEnv, buildClaudeMcpConfig, buildGeminiMcpServers, buildOpenCodeMcpConfig, buildQwenMcpServers} from "./mcp-config.js";
 import {buildGraph, checkoutLagWarning, graphExists, graphMtime, graphPath, hasSemanticMarker, needsSemanticUpdate} from "../graph-indexer.js";
 import {buildOpenCodeAgentConfig} from "./opencode-effort.js";
+import {revalidateClaudeConfigAlias} from "../runner-defaults-local.js";
 
 import {claudeThinkingEffort, qwenConfigContextLimit, qwenReasoningEffort} from "./model-policy.js";
-import {existsSync, readFileSync, rmSync, writeFileSync} from "node:fs";
+import {existsSync, readFileSync, rmSync, statSync, writeFileSync} from "node:fs";
 import {isGrokFamily, runnerAdapter} from "./index.js";
 
 import http from "node:http";
@@ -200,6 +201,36 @@ export function buildEnv(self: any, ): NodeJS.ProcessEnv {
     // Scrub adicional: THE_DUDES_DAEMON_TOKEN do process.env do daemon
     // vazaria pro CLI agente (prompt injection no agente poderia fazer
     // ele revelar/exfiltrar). Mesmo motivo pra outras chaves sensíveis.
+    let claudeConfigDir: string | undefined;
+    if (self.opts.cliRunner === "claude" && self.opts.resolvedClaudeConfigDir) {
+      if (self.opts.resolvedClaudeConfigFromEnv) {
+        // Explicit operator config can live outside HOME (for example in the
+        // official Docker image). Preserve it verbatim and only warn if it is
+        // currently unusable; do not silently switch to native config.
+        const operatorConfigDir = self.opts.resolvedClaudeConfigDir as string;
+        claudeConfigDir = operatorConfigDir;
+        try {
+          if (!statSync(operatorConfigDir).isDirectory()) throw new Error("not a directory");
+        } catch {
+          self.opts.log("warn", "THE_DUDES_CLAUDE_CONFIG_DIR is missing or not a directory; passing the operator value through unchanged");
+        }
+      } else {
+        claudeConfigDir = revalidateClaudeConfigAlias(
+          self.opts.resolvedClaudeConfigDir,
+          self.opts.approvedClaudeConfigAliases ?? [],
+          self.opts.claudeConfigHome ?? self.opts.dropTo?.home ?? process.env.HOME ?? "",
+          self.opts.claudeConfigOwnerUid,
+        );
+        if (!claudeConfigDir) {
+          self.opts.resolvedClaudeConfigDir = undefined;
+          self.opts.onClaudeConfigDirInvalid?.();
+          if (!self.opts.claudeConfigDirInvalidLogged) {
+            self.opts.log("warn", "approved Claude profile changed or became unsafe before spawn; using native config");
+            self.opts.claudeConfigDirInvalidLogged = true;
+          }
+        }
+      }
+    }
     const env = buildBaseRunnerEnv({
       inherited: process.env,
       runner: self.opts.cliRunner,
@@ -207,35 +238,12 @@ export function buildEnv(self: any, ): NodeJS.ProcessEnv {
       agentName: self.info.name,
       orchestratorUrl: self.opts.orchestratorUrl,
       bridgeSocketPath: self.opts.bridgeSocketPath ?? undefined,
-      claudeConfigDir: self.opts.cliRunner === "claude" ? self.resolveClaudeConfigDir() : undefined,
+      claudeConfigDir: self.opts.cliRunner === "claude" ? claudeConfigDir : undefined,
       opencodeConfigPath: self.opts.cliRunner === "opencode" ? self.runtimeFiles.openCodeConfigPath() : undefined,
       qwenHome: self.opts.cliRunner === "qwen" ? self.runtimeFiles.qwenHomeDir() : undefined,
     });
     if (self.opts.cliRunner === "codex") env.CODEX_HOME = self.runtimeFiles.codexHomeDir();
     return env;
-  }
-export function resolveClaudeConfigDir(self: any, ): string | undefined {
-    const home = self.opts.dropTo?.home ?? process.env.HOME ?? "";
-    // Override por env (container): ignora o campo por-agente, que costuma
-    // apontar pra path do HOST inexistente no container. Permite montar as
-    // credenciais num único dir fixo (ex: THE_DUDES_CLAUDE_CONFIG_DIR=
-    // /root/.config/claude + -v <creds-do-host>:/root/.config/claude).
-    const forced = process.env.THE_DUDES_CLAUDE_CONFIG_DIR?.trim();
-    if (forced) return self.expandHome(forced, home);
-    const custom = self.info.claudeConfigDir?.trim();
-    if (custom) return self.expandHome(custom, home);
-    // Default nativo: NÃO definir CLAUDE_CONFIG_DIR. Claude Code pode guardar
-    // OAuth no Keychain/credential store associado ao HOME; forçar até mesmo
-    // ~/.claude altera o contexto de autenticação em versões atuais.
-    return undefined;
-  }
-export function expandHome(self: any, p: string, home: string): string {
-    if (!home) return p;
-    if (p === "~" || p === "$HOME") return home;
-    if (p.startsWith("~/")) return path.join(home, p.slice(2));
-    if (p.startsWith("$HOME/")) return path.join(home, p.slice(6));
-    if (p.startsWith("${HOME}/")) return path.join(home, p.slice(8));
-    return p;
   }
 export function buildClaudeArgs(self: any, ): string[] {
     const mcpConfig = self.writeMcpConfig();

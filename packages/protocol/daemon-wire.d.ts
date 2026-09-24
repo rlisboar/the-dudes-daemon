@@ -21,6 +21,7 @@ import type {
   ImageAttachment,
   MCPDefinition,
   RunnerModelCatalog,
+  RunnerStatusMap,
   JevVerdict,
   SkillDefinition,
   SkillFrontmatter,
@@ -63,6 +64,14 @@ export interface DaemonHello {
   os: string;
   hostname: string;
   version: string;
+  /** UUID estável gerado e persistido pelo daemon. Só identifica a fatia de
+   *  preferências; a autenticação continua sendo o token da conexão. */
+  daemonId?: string;
+  /** Aliases opacos descobertos localmente. Caminhos nunca atravessam o fio. */
+  configDirAliases?: {
+    claude?: RunnerConfigAliasOption[];
+    qwen?: RunnerConfigAliasOption[];
+  };
   /** Versão do protocolo de fio (WIRE_PROTOCOL_VERSION). O server compara com
    *  a dele: igual = compatíveis; ausente = daemon antigo. */
   protocolVersion?: number;
@@ -86,6 +95,11 @@ export interface DaemonHello {
   graphify?: { cli: boolean; mcp: boolean };
   /** CLIs instalados (espelho de availableRunners) p/ a UI do mapa. */
   installedRunners?: CliRunner[];
+}
+
+export interface RunnerConfigAliasOption {
+  alias: string;
+  label: string;
 }
 
 export interface ProjectE2eeRequired {
@@ -146,6 +160,24 @@ export interface ReleaseAvailable {
 export interface RunnerPolicySet {
   type: "runner-policy:set";
   allowedRunners: CliRunner[];
+}
+
+/** Defaults globais mais a configuração por alias exclusiva desta máquina. */
+export interface RunnerDefaultSetValue {
+  model?: string;
+  effort?: EffortLevel;
+  /** Alias opaco de `configDirAliases.claude`, não um caminho. */
+  claudeConfigDir?: string;
+  /** Alias opaco de `configDirAliases.qwen`, não um caminho. */
+  qwenHome?: string;
+}
+
+export interface RunnerDefaultsSet {
+  type: "runner-defaults:set";
+  daemonId: string;
+  version: number;
+  /** Contém apenas a fatia da máquina receptora. */
+  defaults: Partial<Record<CliRunner, RunnerDefaultSetValue>>;
 }
 
 /* H-18 proof-of-possession da pubkey RSA do daemon. Server gera nonce
@@ -1217,6 +1249,8 @@ export interface DaemonHealthEv {
     binaryHash?: string;
     buildTs?: number;
     updatePending?: boolean;
+    /** Estado local, somente leitura, exibido ao dono do daemon. */
+    runnerStatus?: RunnerStatusMap;
   };
 }
 
@@ -1267,7 +1301,7 @@ export type FromDaemon =
 
 export type FromOrch =
   | DaemonLogsGetRequest
-  | DaemonWelcome | DaemonPong | DaemonChallenge | RunnerPolicySet
+  | DaemonWelcome | DaemonPong | DaemonChallenge | RunnerPolicySet | RunnerDefaultsSet
   | ReleaseAvailable
   | AgentSpawn | AgentStop | AgentSend | AgentClear | AgentCompact
   | AgentQueueLiveRemove

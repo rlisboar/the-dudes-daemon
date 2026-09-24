@@ -85,6 +85,39 @@ test("T-423: payload válido conhecido passa; campo errado recusa", () => {
   assert.match(validateDaemonMessage({ type: "agent:text", agentId: 7, text: "x" }).error, /agentId/);
 });
 
+test("T-1135: hello reporta UUID e aliases opacos, sem caminhos", () => {
+  const base = { type: "daemon:hello", name: "d", os: "mac", hostname: "h", version: "1" };
+  assert.equal(validateDaemonMessage({
+    ...base,
+    daemonId: "f1c7a34a-98e9-4f45-94d5-7b0398eb6f06",
+    configDirAliases: { claude: [{ alias: "claude-home-01", label: "Perfil pessoal" }], qwen: [] },
+  }).ok, true);
+  assert.equal(validateDaemonMessage({
+    ...base,
+    configDirAliases: { claude: [{ alias: "/Users/alice/.claude", label: "Perfil" }] },
+  }).ok, false);
+  assert.equal(validateDaemonMessage({
+    ...base,
+    configDirAliases: { claude: Array.from({ length: 33 }, (_, i) => ({ alias: `claude-${String(i).padStart(8, "0")}`, label: "Perfil" })) },
+  }).ok, false);
+});
+
+test("T-1135: runner-defaults:set limita runner, effort e alias opaco", () => {
+  const { success } = fromOrchSchemas["runner-defaults:set"].safeParse({
+    type: "runner-defaults:set", daemonId: "f1c7a34a-98e9-4f45-94d5-7b0398eb6f06", version: 2,
+    defaults: { claude: { model: "claude-sonnet-4", effort: "high", claudeConfigDir: "claude-home-01" } },
+  });
+  assert.equal(success, true);
+  assert.equal(fromOrchSchemas["runner-defaults:set"].safeParse({
+    type: "runner-defaults:set", daemonId: "d", version: 0,
+    defaults: { claude: { claudeConfigDir: "/tmp/profile" } },
+  }).success, false);
+  assert.equal(fromOrchSchemas["runner-defaults:set"].safeParse({
+    type: "runner-defaults:set", daemonId: "d", version: 0,
+    defaults: { unknown: { model: "x" } },
+  }).success, false);
+});
+
 test("T-594: agent:send aceita `mem` (mapa de mission scratch) e recusa valor não-string", () => {
   const schema = fromOrchSchemas["agent:send"];
   assert.ok(schema, "agent:send sumiu do contrato FromOrch");
@@ -292,4 +325,57 @@ test("T-1006: agent:queue_live_remove (server → daemon) exige agentId e delive
   assert.equal(schema.safeParse({ type: "agent:queue_live_remove", agentId: "a1" }).success, false, "deliveryId obrigatório");
   assert.equal(schema.safeParse({ type: "agent:queue_live_remove", deliveryId: "d1" }).success, false, "agentId obrigatório");
   assert.equal(schema.safeParse({ type: "agent:queue_live_remove", agentId: "a1", deliveryId: "" }).success, false);
+});
+
+test("T-1135/F2b: daemon:health preserva runnerStatus e valida fields read-only", () => {
+  const health = {
+    ts: 1,
+    uptimeS: 2,
+    memRssMb: 3,
+    wsRttMs: null,
+    turnGate: { active: 0, queued: 0, max: 1 },
+    turns: { started: 0, ok: 0, failed: 0, hardRecovers: 0, hangs: 0 },
+    turnP50Ms: null,
+    turnP95Ms: null,
+    byRunner: {},
+    agentsRunning: 0,
+    e2eeProjects: 0,
+    runnerStatus: {
+      claude: {
+        installed: true,
+        version: "2.1.3",
+        binary: "/usr/local/bin/claude",
+        claudeConfigDir: { alias: "claude-home-01", source: "default" },
+      },
+      qwen: { installed: false },
+    },
+  };
+  const frame = { type: "daemon:health", health };
+  const parsed = daemonWireSchemas["daemon:health"].safeParse(frame);
+  assert.equal(validateDaemonMessage(frame).ok, true);
+  assert.equal(parsed.success, true);
+  assert.deepEqual(parsed.data.health.runnerStatus, health.runnerStatus,
+    "Zod precisa reconhecer o campo para ele não ser removido do health parseado");
+  assert.equal(fromOrchSchemas["runner-defaults:set"].safeParse({
+    type: "runner-defaults:set",
+    daemonId: "d",
+    version: 1,
+    defaults: { claude: { binary: "/tmp/evil" } },
+  }).success, false, "binário de report não vira configuração server→daemon");
+
+  const overVersion = structuredClone(frame);
+  overVersion.health.runnerStatus.claude.version = "v".repeat(129);
+  assert.equal(validateDaemonMessage(overVersion).ok, false, "versão tem teto");
+  const overBinary = structuredClone(frame);
+  overBinary.health.runnerStatus.claude.binary = "b".repeat(1025);
+  assert.equal(validateDaemonMessage(overBinary).ok, false, "binário tem teto");
+  const badSource = structuredClone(frame);
+  badSource.health.runnerStatus.claude.claudeConfigDir.source = "server";
+  assert.equal(validateDaemonMessage(badSource).ok, false, "origem é enum fechada");
+  const badAlias = structuredClone(frame);
+  badAlias.health.runnerStatus.claude.claudeConfigDir.alias = "/Users/alice/.claude";
+  assert.equal(validateDaemonMessage(badAlias).ok, false, "alias nunca é caminho");
+  const unknownRunner = structuredClone(frame);
+  unknownRunner.health.runnerStatus.unknown = { installed: true };
+  assert.equal(validateDaemonMessage(unknownRunner).ok, false, "runner precisa estar no catálogo");
 });
