@@ -41,7 +41,7 @@ import {runQwenMessage} from "./runners/turns/qwen.js";
 import {writeCodexConfig, runCodexMessage, handleCodexEvent, codexSessionsRoot, readCodexRolloutSignals, pollCodexContextOccupancy} from "./runners/turns/codex.js";
 import {buildGrokHeadlessArgs, writeGrokConfig, grokTurnEnv, runGrokMessage, finishGrokTurn, grokSignalsCandidates, readGrokContextSignals, grokChatHistoryPath, grokSweepToolCalls, grokUpdatesCandidates, readGrokUpdatesContextTokens, readGrokTurnBilling, pollGrokContextOccupancy} from "./runners/turns/grok.js";
 import {writeCrushConfig, crushTurnEnv, crushSessionJson, runCrushMessage, finishCrushTurn, ingestCrushChunk} from "./runners/turns/crush.js";
-import {startDsh, dshPushUserMessage, dshStop, dshIsInTurn, dshKillForRestart, dshTakeQueue} from "./runners/turns/dsh.js";
+import {startDsh, dshPushUserMessage, dshStop, dshIsInTurn, dshKillForRestart, dshTakeQueue, dshPeekQueue, dshRemoveQueued} from "./runners/turns/dsh.js";
 import {compactContext, compactContextInner, waitOcIdle, parseAndStripMemory, saveExtractedMemory, fetchExistingMemories, memoryAlreadyBlock, parseEpisodeJson, memoryTitleNearDup, postBridgeJson, handleUndeliveredTurnResult, resetContextAccounting, checkContextUsage, reportContextOccupancy, notifyContextFull, registerCompactFailure, checkContextFullError} from "./runners/compact.js";
 import {runOneShot, runOneShotWithSession, killClaudeForRestart} from "./runners/one-shot.js";
 import {traceCli, traceSpawn, renderVerboseIoBlock, traceInternalCli, renderVerboseBlock, colorizeAgentName, supportsAnsi, hexToRgb, extractVerbosePayload, extractValueText, prettyPrintVerboseText, cleanupAgentTmpDir, grokSessionRecentWrite} from "./runners/support.js";
@@ -172,6 +172,8 @@ export interface AgentRunnerOptions {
    * registro próprio, distinto de idle e do hard comum.
    */
   onHung?: (info: { soft: boolean; reason: string; idleMs: number; parked?: boolean }) => void;
+  /** T-1005: a fila de mensagens não iniciadas mudou (o host publica a fila ao vivo). */
+  onQueueChanged?: () => void;
   /** projectId (pra rotular graph:status emitido pelo auto-build do grafo). */
   projectId?: string;
   /** Reporta status do índice graphify durante o auto-build no spawn. */
@@ -310,7 +312,7 @@ export class AgentRunner {
   private claudeWriteQueue: Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string; timingMessage: object }> = [];
   /** T-758: mensagem escrita e ainda não aceita pelo CLI (sem `system/init`).
    *  `claudeUnacceptedSince` arma o watchdog; zera no accept. */
-  private claudeInflight: { content: string; images?: ImageAttachment[]; timingMessage: object; timing: TurnTiming } | null = null;
+  private claudeInflight: { content: string; images?: ImageAttachment[]; deliveryId?: string; timingMessage: object; timing: TurnTiming } | null = null;
   private claudeUnacceptedSince: number | null = null;
   private claudeUnacceptedWarned = false;
   /** T-760: re-envio condicional — arma durante o kill do restart por não
@@ -928,6 +930,40 @@ export class AgentRunner {
     return out;
   }
 
+  /** T-1005: fila ao vivo — o que ainda não virou turno, nas filas com
+   *  deliveryId (per-message, restart do claude, escrita serializada do
+   *  claude, dsh), na ordem de chegada. NÃO consome. */
+  peekQueue(): Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string; coalescedIds?: string[] }> {
+    const out: Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string; coalescedIds?: string[] }> = [];
+    for (const m of this.messageSession.peekAll()) out.push({ content: m.content, images: m.images, deliveryId: m.deliveryId, coalescedIds: m.coalescedIds });
+    for (const m of this.pendingMessages) out.push({ content: m.content, images: m.images, deliveryId: m.deliveryId });
+    for (const m of this.claudeWriteQueue) out.push({ content: m.content, images: m.images, deliveryId: m.deliveryId });
+    out.push(...dshPeekQueue(this as unknown as Record<string, unknown>));
+    return out;
+  }
+
+  /** T-1005: remove da fila a entrega que ainda NÃO iniciou. Turno em curso
+   *  ou id desconhecido: false (o host loga e ignora). */
+  removeQueued(deliveryId: string): boolean {
+    let ok = !!this.messageSession.removeByDeliveryId(deliveryId);
+    if (!ok) {
+      const i = this.pendingMessages.findIndex((m) => m.deliveryId === deliveryId);
+      if (i >= 0) { this.turnLatency.discard(this.pendingMessages[i]!, "queue-cleared"); this.pendingMessages.splice(i, 1); ok = true; }
+    }
+    if (!ok) {
+      const i = this.claudeWriteQueue.findIndex((m) => m.deliveryId === deliveryId);
+      if (i >= 0) { this.turnLatency.discard(this.claudeWriteQueue[i]!.timingMessage, "queue-cleared"); this.claudeWriteQueue.splice(i, 1); ok = true; }
+    }
+    if (!ok) ok = dshRemoveQueued(this as unknown as Record<string, unknown>, deliveryId);
+    if (ok) this.queueChanged();
+    return ok;
+  }
+
+  /** T-1005: avisa o host que a fila mudou (ele publica o snapshot, com debounce). */
+  private queueChanged(): void {
+    try { this.opts.onQueueChanged?.(); } catch { /* observação */ }
+  }
+
   /** T-899: itens não iniciados que o stop tirou do runner (o host retém). */
   private retidasNoStop: Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string }> = [];
 
@@ -1000,6 +1036,10 @@ export class AgentRunner {
         this.queueCoalesceNoticeSent = false;
         this.queueDropNoticeSent = false;
       }
+      // T-1005: enfileirou ou agrupou = a fila mudou (o host publica o snapshot).
+      // ("dropped" já retornou acima; sem o early-return o estreitamento
+      // confirma, sem comparação redundante.)
+      this.queueChanged();
       this.drainOcQueue();
       return;
     }
@@ -1027,6 +1067,7 @@ export class AgentRunner {
       this.turnLatency.enqueue(pending);
       this.pendingMessages.push(pending);
       this.opts.log("info", `[cli:${this.info.id}:claude] buffered message during restart (queued=${this.pendingMessages.length})`);
+      this.queueChanged();
       return;
     }
     const latencyInput = latencyMessage ?? { content, images, deliveryId };
@@ -1037,6 +1078,7 @@ export class AgentRunner {
     if (this.claudeInflight || this.claudeTimings.length > 0) {
       this.claudeWriteQueue.push(item);
       this.opts.log("info", `[cli:${this.info.id}:claude] serializado (turno em voo; fila=${this.claudeWriteQueue.length})`);
+      this.queueChanged();
       return;
     }
     this.sendClaudeMessage(item);
@@ -1071,7 +1113,7 @@ export class AgentRunner {
     if (this.stopped || this.claudeInflight || this.claudeTimings.length > 0) return;
     if (!this.proc || !this.proc.stdin.writable) return;
     const next = this.claudeWriteQueue.shift();
-    if (next) this.sendClaudeMessage(next);
+    if (next) { this.queueChanged(); this.sendClaudeMessage(next); }
   }
 
   /** T-758: mensagem escrita e NÃO aceita pelo CLI (stdin parado) — evento

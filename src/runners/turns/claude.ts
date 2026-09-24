@@ -39,6 +39,7 @@ export function startClaude(self: any) {
     if (self.pendingMessages.length > 0) {
       const pending = self.pendingMessages.splice(0);
       self.opts.log("info", `[cli:${self.info.id}:claude] flushing ${pending.length} buffered message(s) after restart`);
+      if (pending.length > 0) self.queueChanged?.();
       setTimeout(() => {
         for (const m of pending) self.pushUserMessage(m.content, m.images, m);
       }, 300);

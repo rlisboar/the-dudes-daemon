@@ -497,6 +497,28 @@ export interface AgentInfo {
    * card mostrar a contagem sem fetch por card; ausente = 0.
    */
   queuePending?: number;
+  /**
+   * T-1006: fila AO VIVO do runner (o que espera o agente ocupado terminar o
+   * turno). Estado vivo, como `running`: vem do último snapshot do daemon, não
+   * persiste e some no stop/desconexão. Ausente = vazia.
+   */
+  queueLive?: AgentQueueLiveState;
+  /** T-1006: `queueLive.items.length`. O badge soma com `queuePending` (retidas). */
+  queueLiveCount?: number;
+}
+
+/** T-1006: fila ao vivo do agente como o web a vê (itens como vieram: `e2e:` não é decifrado). */
+export interface AgentQueueLiveState {
+  at: number;
+  truncated?: boolean;
+  items: Array<{
+    deliveryId: string;
+    content: string;
+    images?: unknown[];
+    enqueuedAt: number;
+    origin: "user" | "agent" | "system";
+    silent?: boolean;
+  }>;
 }
 
 export type MessageKind =
@@ -1226,6 +1248,8 @@ export type ServerEvent =
   | { type: "prefs_updated"; prefs: Record<string, unknown> }
   /** T-898: a fila retida de um agente mudou (retain/clear/move/entrega/flag). */
   | { type: "agent:queue"; agentId: string; motivo: string; pending: number }
+  /** T-1006: novo snapshot da fila AO VIVO do agente (lista vazia = esvaziou/limpou). */
+  | ({ type: "agent:queue_live"; agentId: string } & AgentQueueLiveState)
   | { type: "auth"; user: UserPublic | null }
   | { type: "daemon:status"; status: DaemonStatus }
   | {

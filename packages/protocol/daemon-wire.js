@@ -37,6 +37,40 @@ const runnerCatalog = z.object({
 
 const msg = (type, shape = {}) => z.object({ type: z.literal(type), ...shape });
 
+/**
+ * T-1006: tetos do snapshot da fila AO VIVO (`agent:queue_live`). Os dois
+ * lados importam daqui: o daemon corta os itens mais NOVOS para caber (e manda
+ * `truncated: true`); o server recusa o que passar (fail-closed). O snapshot
+ * entra no estado do agente que vai para todo cliente do projeto, por isso o
+ * teto de bytes é bem abaixo do cap do wire (32 MB).
+ */
+export const QUEUE_LIVE_MAX_ITEMS = 200;
+export const QUEUE_LIVE_MAX_BYTES = 1024 * 1024;
+
+const encoder = new TextEncoder();
+/** Bytes que o item ocupa no snapshot: `content` + `images` serializado. */
+export function queueLiveItemBytes(item) {
+  const content = typeof item?.content === "string" ? item.content : "";
+  const images = item?.images === undefined ? "" : JSON.stringify(item.images);
+  return encoder.encode(content).length + encoder.encode(images).length;
+}
+
+const queueLiveItem = z.object({
+  deliveryId: t.min(1).max(120),
+  content: t,
+  images: z.array(z.unknown()).optional(),
+  enqueuedAt: n,
+  origin: z.enum(["user", "agent", "system"]),
+  silent: b.optional(),
+});
+const queueLiveItems = z.array(queueLiveItem).max(QUEUE_LIVE_MAX_ITEMS).superRefine((items, ctx) => {
+  let total = 0;
+  for (const item of items) total += queueLiveItemBytes(item);
+  if (total > QUEUE_LIVE_MAX_BYTES) {
+    ctx.addIssue({ code: "custom", message: `snapshot da fila ao vivo acima de ${QUEUE_LIVE_MAX_BYTES} bytes (${total})` });
+  }
+});
+
 /** type → schema. Chave é o `msg.type` exato do FromDaemon (daemon-wire.d.ts). */
 export const daemonWireSchemas = {
   "daemon:hello": msg("daemon:hello", {
@@ -251,6 +285,16 @@ export const daemonWireSchemas = {
       deliveryId: t.optional(),
     })).max(200),
   }),
+  // T-1006: snapshot COMPLETO da fila pendente do runner (o que ainda não virou
+  // turno). Estado vivo: o server guarda só o último, em memória. `content`
+  // vem como o daemon recebeu (blob `e2e:` em projeto cifrado).
+  "agent:queue_live": msg("agent:queue_live", {
+    agentId: t,
+    projectId: t,
+    at: n,
+    truncated: b.optional(),
+    items: queueLiveItems,
+  }),
   "typesafe:shadow": msg("typesafe:shadow", {
     projectId: t,
     at: n,
@@ -389,6 +433,8 @@ export const fromOrchSchemas = {
     features: contextFeatures.optional(),
   }),
   "agent:stop": msg("agent:stop", { agentId: t }),
+  // T-1006: tira da fila do runner um item que AINDA não iniciou (idempotente).
+  "agent:queue_live_remove": msg("agent:queue_live_remove", { agentId: t, deliveryId: t.min(1).max(120) }),
   "agent:send": msg("agent:send", {
     agentId: t,
     deliveryId: t.optional(),
@@ -409,6 +455,13 @@ export const fromOrchSchemas = {
     images: z.array(imageAtt).optional(),
     telegram: z.object({ botToken: t, chatId: t }).nullable().optional(),
     taskId: t.optional(),
+    /**
+     * T-1006 (acréscimo PM): origem que o server conhece com certeza. O
+     * daemon prefere este campo à dedução por systemPrefix/parts.
+     * Opcionais: daemon antigo ignora (compat).
+     */
+    origin: z.enum(["user", "agent", "system"]).optional(),
+    silent: b.optional(),
   }),
   "agent:clear": msg("agent:clear", { agentId: t }),
   "agent:compact": msg("agent:compact", { agentId: t, saveMemory: b.optional() }),

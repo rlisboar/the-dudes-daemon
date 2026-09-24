@@ -11,8 +11,30 @@ import os from "node:os";
 import path from "node:path";
 import { ensureGraphWatch, stopGraphWatch } from "../graph-watcher.js";
 
-test("T-447: N eventos na janela de debounce = 1 watch-pending", async () => {
+// T-1004: `timeout` + teardown em `t.after`. Antes o `stopGraphWatch` só rodava
+// no fim do corpo: um assert falho deixava o FSWatcher recursivo (FSEvents no
+// macOS) e o timer do debounce vivos, e o arquivo pendurava até ser cancelado
+// (643s na validação local do lote d4c7be6e).
+// T-1004: nada de sono fixo esperando o FS. Sob carga o FSEvents do macOS
+// (a) entregava o burst 1 depois dos 250ms e (b) PERDIA os eventos escritos
+// logo depois de o stream abrir, antes de ele estar ativo. Agora: aquece o
+// watcher com uma sonda até ele provar que entrega (e deixa essa janela
+// fechar), espera cada pending chegar, usa um debounce folgado (eventos
+// atrasados do burst 2 ainda caem na mesma janela, que cada evento reinicia) e
+// confere a contagem quando o debounce dispara — o fim real da janela.
+const DEBOUNCE_MS = 3_000;
+const TETO_MS = 15_000;
+async function ate(cond: () => boolean, oque: string): Promise<void> {
+  const t0 = Date.now();
+  while (!cond()) {
+    if (Date.now() - t0 > TETO_MS) assert.fail(`timeout (${TETO_MS}ms) aguardando ${oque}`);
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
+
+test("T-447: N eventos na janela de debounce = 1 watch-pending", { timeout: 60_000 }, async (t) => {
   const root = mkdtempSync(path.join(os.tmpdir(), "t447-"));
+  t.after(() => { stopGraphWatch(root); });
   mkdirSync(path.join(root, "src"), { recursive: true });
   const graphDir = path.join(root, "graphify-out");
   mkdirSync(graphDir, { recursive: true });
@@ -27,38 +49,44 @@ writeFileSync(${JSON.stringify(path.join(graphDir, "graph.json"))}, JSON.stringi
 
   const statuses: Array<{ status: string; phase?: string }> = [];
   ensureGraphWatch(root, bin, {
-    debounceMs: 1200,
+    debounceMs: DEBOUNCE_MS,
     onStatus: (status, info) => statuses.push({ status, phase: info?.phase }),
     log: () => {},
   });
 
-  // Burst 1: 5 ficheiros; espera o FS entregar; Burst 2 na MESMA janela.
+  const pendings = () => statuses.filter((s) => s.phase === "watch-pending").length;
+  const builds = () => statuses.filter((s) => s.phase === "watch" && s.status === "building").length;
+  const readys = () => statuses.filter((s) => s.phase === "watch" && s.status === "ready").length;
+
+  // Aquecimento: a sonda é regravada até o watcher provar que entrega; depois
+  // a janela dela fecha (build → ready) e o contador parte do zero relativo.
+  const t0 = Date.now();
+  let n = 0;
+  while (pendings() === 0) {
+    if (Date.now() - t0 > TETO_MS) assert.fail(`watcher não entregou evento em ${TETO_MS}ms`);
+    writeFileSync(path.join(root, "src", "sonda.ts"), String(n++));
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  await ate(() => readys() >= 1, "a janela do aquecimento fechar");
+  const p0 = pendings();
+  const b0 = builds();
+  const r0 = readys();
+
+  // Burst 1: 5 ficheiros; o 1º evento entregue abre a janela (1 pending).
   for (let i = 0; i < 5; i++) writeFileSync(path.join(root, "src", `a${i}.ts`), "a");
-  await new Promise((r) => setTimeout(r, 250));
-  const pendingAfterBurst1 = statuses.filter((s) => s.phase === "watch-pending").length;
+  await ate(() => pendings() >= p0 + 1, "o pending do burst 1");
+  // Burst 2 na MESMA janela (o debounce ainda não disparou).
   for (let i = 0; i < 5; i++) writeFileSync(path.join(root, "src", `b${i}.ts`), "b");
-  await new Promise((r) => setTimeout(r, 250));
-  const pendingAfterBurst2 = statuses.filter((s) => s.phase === "watch-pending").length;
 
-  assert.equal(pendingAfterBurst1, 1, "1 pending no burst 1");
-  assert.equal(pendingAfterBurst2, 1, "burst 2 na mesma janela NÃO re-emite pending");
-
-  // Debounce venceu → update roda (building → ready) e fecha a janela.
-  const deadline = Date.now() + 8_000;
-  while (!statuses.some((s) => s.phase === "watch" && s.status === "building") && Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 50));
-  }
-  assert.ok(statuses.some((s) => s.status === "building"), "update após debounce");
-  while (!statuses.some((s) => s.status === "ready" && s.phase === "watch") && Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 50));
-  }
-  assert.ok(statuses.some((s) => s.status === "ready" && s.phase === "watch"), "ready pós-build");
+  // Debounce venceu → update roda (building → ready) e fecha a janela. Só aí
+  // a contagem é final: todos os eventos dos dois bursts já contaram.
+  await ate(() => builds() > b0, "update após debounce");
+  assert.equal(pendings() - p0, 1, "os dois bursts na mesma janela = 1 pending");
+  await ate(() => readys() > r0, "ready pós-build");
 
   // Nova rajada depois do update = nova janela = novo pending (não suprime demais).
-  const before = statuses.filter((s) => s.phase === "watch-pending").length;
+  const before = pendings();
   writeFileSync(path.join(root, "src", "c.ts"), "c");
-  await new Promise((r) => setTimeout(r, 400));
-  assert.equal(statuses.filter((s) => s.phase === "watch-pending").length, before + 1, "janela nova re-avisa stale");
-
-  stopGraphWatch(root);
+  await ate(() => pendings() === before + 1, "o pending da janela nova");
+  assert.equal(pendings(), before + 1, "janela nova re-avisa stale");
 });

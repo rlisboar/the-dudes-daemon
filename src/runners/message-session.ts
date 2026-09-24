@@ -7,6 +7,9 @@ export interface QueuedMessage {
   synthetic?: string;
   /** T-842: id de entrega, para o spool do SIGTERM não perder o dedup. */
   deliveryId?: string;
+  /** T-1005: ids das mensagens agrupadas NESTE item (T-818) — a fila ao vivo
+   *  mostra cada uma; remover qualquer delas tira o item inteiro. */
+  coalescedIds?: string[];
 }
 
 /** T-818: o que `enqueueOrCoalesce` fez com a mensagem. */
@@ -93,6 +96,7 @@ export class PerMessageSessionState {
       if (Buffer.byteLength(content, "utf8") > maxBytes) return "dropped";
       alvo.content = content;
       if (message.images?.length) alvo.images = [...(alvo.images ?? []), ...message.images];
+      if (message.deliveryId) alvo.coalescedIds = [...(alvo.coalescedIds ?? []), message.deliveryId];
       return "coalesced";
     }
     return "dropped";
@@ -110,6 +114,22 @@ export class PerMessageSessionState {
     for (const m of this.queue) this.observe?.discarded(m, "drained");
     this.queue = [];
     return out;
+  }
+
+  /** T-1005: fila ao vivo — cópia do que ainda não virou turno (sintéticas
+   *  ficam de fora: não são do usuário). Não consome. */
+  peekAll(): QueuedMessage[] {
+    return this.queue.filter((m) => !m.synthetic).map((m) => ({ ...m }));
+  }
+
+  /** T-1005: tira da fila o item (ainda não iniciado) desta entrega — pelo id
+   *  próprio ou por um id agrupado nele. `null` se não está na fila. */
+  removeByDeliveryId(deliveryId: string): QueuedMessage | null {
+    const i = this.queue.findIndex((m) => !m.synthetic && (m.deliveryId === deliveryId || m.coalescedIds?.includes(deliveryId)));
+    if (i < 0) return null;
+    const [m] = this.queue.splice(i, 1);
+    this.observe?.discarded(m!, "queue-cleared");
+    return m!;
   }
 
   clearQueue(): number {

@@ -22,6 +22,7 @@ const {
   reter, tomar, listar, tamanho, devolver, esquecer, paraFio, _resetFilaRetidaForTest, CAP_POR_AGENTE, expirar, TTL_ITEM_MS,
 } = await import("../queue-retained.js");
 const { AgentHost } = await import("../agent-host.js");
+const { mkdtempSync } = await import("node:fs");
 const { getDaemonPublicKey, rememberProjectKey, isE2eEncrypted, decryptForProject } = await import("../daemon-crypto.js");
 const { aadV2, E2EE_TABLE } = await import("@the-dudes/protocol/e2ee-fields");
 
@@ -340,4 +341,23 @@ test("T-899: o frame de retenção sai cifrado, com ack e sem claro", () => {
   assert.equal(itens.length, 1);
   assert.ok(itens[0]!.cipher.startsWith("e2e:"), "cipher no frame");
   assert.equal(itens[0]!.ack, createHash("sha256").update(`${AG}\nd1\n${itens[0]!.cipher}`, "utf8").digest("hex").slice(0, 12));
+});
+
+test("T-938: item retido entra no spool do re-exec (senão morre no re-exec de 13-17x/dia)", async () => {
+  const { host } = hostFalso();
+  reter(AG, [item("sobrevive ao re-exec", "d1")]);
+  const dir = mkdtempSync(path.join(os.tmpdir(), "t938-"));
+  const r = host.writeReexecSpool(dir);
+  assert.equal(r.spooled, 1, "a fila retida vai no spool");
+  assert.equal(tamanho(AG), 0, "e SÓ sai da retenção depois de o spool gravar");
+  // No processo novo, o spool entrega (mesmo caminho do re-exec do T-720).
+  const pushed: string[] = [];
+  const novo = new AgentHost(() => {}, null, null, {} as never, false, false, false, () => {}, () => {});
+  (novo as unknown as { entries: Map<string, unknown> }).entries.set(AG, {
+    projectId: PID, info: { id: AG },
+    runner: { pushUserMessage: (c: string) => { pushed.push(c); }, isAlive: () => true, stop: () => {}, isTurnActive: () => false, takeQueuedForDrain: () => [] },
+  });
+  assert.equal(novo.loadReexecSpool(dir), 1);
+  novo.flushInboundBuffer(AG);
+  assert.deepEqual(pushed, ["sobrevive ao re-exec"]);
 });

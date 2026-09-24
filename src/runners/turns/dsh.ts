@@ -692,6 +692,23 @@ export function dshTakeQueue(self: any): Array<{ content: string }> {
   return queue.map((q) => ({ content: q.content, deliveryId: q.deliveryId }));
 }
 
+/** T-1005: fila ao vivo — prompts ainda NÃO enviados, sem consumir. */
+export function dshPeekQueue(self: any): Array<{ content: string; deliveryId?: string }> {
+  const queue = (self.dshQueue as DshQueued[] | undefined) ?? [];
+  return queue.map((q) => ({ content: q.content, deliveryId: q.deliveryId }));
+}
+
+/** T-1005: tira da fila o prompt ainda não enviado desta entrega. */
+export function dshRemoveQueued(self: any, deliveryId: string): boolean {
+  const queue = (self.dshQueue as DshQueued[] | undefined) ?? [];
+  const i = queue.findIndex((q) => q.deliveryId === deliveryId);
+  if (i < 0) return false;
+  const [q] = queue.splice(i, 1);
+  self.turnLatency?.discard(q, "queue-cleared");
+  self.dshQueue = queue;
+  return true;
+}
+
 /** T-827: `rawInput` do ACP só vale como objeto (é o que os RUNS mostram). */
 export function dshToolInput(raw: unknown): Record<string, unknown> | undefined {
   return raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : undefined;
@@ -721,6 +738,7 @@ export function dshPushUserMessage(self: any, content: string, images?: ImageAtt
   self.turnLatency?.enqueue(queued);
   queue.push(queued);
   self.dshQueue = queue;
+  self.queueChanged?.();
   dshPump(self);
 }
 
@@ -731,6 +749,7 @@ function dshPump(self: any): void {
   const next = queue.shift();
   if (!next) return;
   self.dshQueue = queue;
+  self.queueChanged?.();
   const timing = self.turnLatency?.activate(next, self.dshFreshSession ? "cold" : "resume");
   timing?.start();
   self.dshPromptInFlight = true;

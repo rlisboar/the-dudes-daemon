@@ -66,6 +66,7 @@ import {runGit} from "./runners/run-git.js";
 
 import {compatibleSessionId} from "./runners/index.js";
 import {createAgentInboundBuffer} from "./inbound-dedup.js";
+import {montarSnapshot, QUEUE_LIVE_DEBOUNCE_MS, QUEUE_LIVE_RECONCILE_MS, type PendingItem, type WireRecord} from "./queue-live.js";
 
 // Works in both CJS bundle (where __dirname is native) and ESM dev (tsx)
 // where we fall back to the process entry script.
@@ -195,6 +196,13 @@ export class AgentHost {
   private drainNotified = new Set<string>();
   /** T-720: spool carregado no boot do processo novo, entregue no spawn. */
   private spooled = new Map<string, SpoolRecord[]>();
+
+  /** T-1005: fila ao vivo — registro de cada entrega como veio do fio
+   *  (agentId → deliveryId → blob original), debounce e último snapshot. */
+  private filaVivaRegistros = new Map<string, Map<string, WireRecord>>();
+  private filaVivaTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private filaVivaUltimo = new Map<string, string>();
+  private filaVivaReconcilia: ReturnType<typeof setInterval> | null = null;
   private spoolPath: string | null = null;
 
   /** Quantos agentes este daemon mantém vivos — indicador de saúde da UI. */
@@ -256,6 +264,16 @@ export class AgentHost {
       if (e.runner?.isTurnActive()) return true;
     }
     return false;
+  }
+
+  /** T-1017: quantas mensagens estão enfileiradas (não iniciadas) no runner
+   *  do agente — sonda para teste esperar a fila estacionar antes do dreno,
+   *  sem depender de timing. -1 = sem runner. */
+  runnerEnfileiradas(agentId: string): number {
+    const e = this.entries.get(agentId);
+    const q = (e?.runner as unknown as { peekQueue?: () => unknown[] } | null)?.peekQueue;
+    if (typeof q !== "function") return e?.runner ? 0 : -1;
+    try { return q.call(e!.runner)?.length ?? 0; } catch { return 0; }
   }
 
   /** T-839: claude em turno, com agentId e idade. O turn-gate entra pelo main. */
@@ -673,7 +691,10 @@ export class AgentHost {
       onState: (state) => {
         try { recordAgentState(msg.agent.id, state); } catch { /* observação */ }
         this.deliver({ type: "agent:state", agentId: msg.agent.id, state });
+        // T-1005: turno começou/acabou = a fila andou.
+        this.agendarFilaViva(msg.agent.id);
       },
+      onQueueChanged: () => this.agendarFilaViva(msg.agent.id),
       onHung: (info) => {
         try { recordAgentEvent(msg.agent.id, info.parked ? "park" : info.soft ? "hung-soft" : "hung-hard", `${info.reason} (idle ${Math.round(info.idleMs / 1000)}s)`); } catch { /* observação */ }
         this.deliver({
@@ -906,6 +927,129 @@ export class AgentHost {
     // `retainFromRunner` fica como fallback para runner sem callback (testes).
     this.retainFromRunner(agentId, e, "stop");
     try { recordAgentEvent(agentId, "stop", "agent:stop do orchestrator"); } catch { /* observação */ }
+    // T-1005: depois do queue_retain, a fila ao vivo vai vazia.
+    this.agendarFilaViva(agentId);
+  }
+
+  /* ---------------------- T-1005: fila de espera ao vivo ---------------------- */
+
+  /** Agenda o snapshot (debounce). Chamado a cada mudança da fila. */
+  agendarFilaViva(agentId: string): void {
+    const t = this.filaVivaTimers.get(agentId);
+    if (t) clearTimeout(t);
+    const novo = setTimeout(() => {
+      this.filaVivaTimers.delete(agentId);
+      this.emitirFilaViva(agentId);
+    }, QUEUE_LIVE_DEBOUNCE_MS);
+    novo.unref?.();
+    this.filaVivaTimers.set(agentId, novo);
+    this.armarReconciliacaoFilaViva();
+  }
+
+  /**
+   * T-1005 (pedido SERVER #1006): reemite o snapshot de TODOS os agentes
+   * com fila publicada ao reconectar (hello). A desconexão limpa a fila no
+   * server (`clearQueueLiveFrom`); sem isto a tela ficaria vazia até a
+   * próxima mudança. Força o reenvio mesmo sem mudança (o `ultimo` é
+   * esquecido), com debounce — o server trata o snapshot igual como no-op.
+   */
+  reemitirFilaVivaNoHello(): void {
+    const agentes = new Set<string>([...this.filaVivaUltimo.keys(), ...this.filaVivaRegistros.keys()]);
+    for (const [id, e] of this.entries) {
+      if (e.runner) {
+        try {
+          const q = (e.runner as unknown as { peekQueue?: () => unknown[] }).peekQueue;
+          if (typeof q === "function" && (q.call(e.runner) ?? []).length > 0) agentes.add(id);
+        } catch { /* observação */ }
+      }
+      if (this.inboundBuffer.size(id) > 0) agentes.add(id);
+      if ((this.drainHeld.get(id) ?? []).length > 0) agentes.add(id);
+    }
+    for (const id of agentes) {
+      this.filaVivaUltimo.delete(id);
+      this.agendarFilaViva(id);
+    }
+  }
+
+  /** O que ainda não virou turno: fila do runner, buffer pré-spawn e retidas
+   *  no dreno do update, na ordem. */
+  private pendentesDaFilaViva(agentId: string): PendingItem[] {
+    const e = this.entries.get(agentId);
+    const doRunner = (e?.runner as unknown as { peekQueue?: () => PendingItem[] } | null)?.peekQueue;
+    const out: PendingItem[] = typeof doRunner === "function" ? doRunner.call(e!.runner) ?? [] : [];
+    for (const m of this.inboundBuffer.peek(agentId)) out.push({ content: m.content, images: m.images as ImageAttachment[] | undefined, deliveryId: m.deliveryId });
+    for (const m of this.drainHeld.get(agentId) ?? []) out.push({ content: m.content, images: m.images, deliveryId: m.deliveryId });
+    return out;
+  }
+
+  /** Publica o snapshot se mudou desde o último. Vazio também é notícia. */
+  emitirFilaViva(agentId: string): boolean {
+    const e = this.entries.get(agentId);
+    const projectId = e?.projectId;
+    const regs = this.filaVivaRegistros.get(agentId) ?? new Map<string, WireRecord>();
+    const { items, truncated, omitidos } = montarSnapshot(this.pendentesDaFilaViva(agentId), regs, projectId);
+    if (omitidos > 0) this.log("warn", `[fila-viva] ${omitidos} item(ns) de ${agentId} sem como selar no projeto cifrado — fora do snapshot (nunca em claro)`);
+    const assinatura = JSON.stringify({ truncated, items });
+    const anterior = this.filaVivaUltimo.get(agentId);
+    // Nada a dizer: igual ao último, ou vazio sem nunca ter mandado nada.
+    if (assinatura === anterior || (anterior === undefined && items.length === 0)) return false;
+    // Registros de entregas que já saíram da fila (viraram turno) vão embora.
+    const presentes = new Set(items.map((i) => i.deliveryId));
+    for (const id of [...regs.keys()]) if (!presentes.has(id)) regs.delete(id);
+    if (regs.size === 0) this.filaVivaRegistros.delete(agentId);
+    const frame = { type: "agent:queue_live", agentId, projectId, at: Date.now(), ...(truncated ? { truncated: true } : {}), items };
+    let ok = false;
+    try { ok = this.deliver(frame as never); } catch { ok = false; }
+    // Frame que não saiu não vira "último": a reconciliação tenta de novo.
+    if (ok) this.filaVivaUltimo.set(agentId, assinatura);
+    return ok;
+  }
+
+  /** server → daemon `agent:queue_live_remove`: tira a entrega se ainda não
+   *  iniciou (runner, buffer pré-spawn ou dreno) e republica. Idempotente. */
+  removerDaFilaViva(agentId: string, deliveryId: string): boolean {
+    const e = this.entries.get(agentId);
+    const doRunner = (e?.runner as unknown as { removeQueued?: (id: string) => boolean } | null)?.removeQueued;
+    let ok = typeof doRunner === "function" ? doRunner.call(e!.runner, deliveryId) === true : false;
+    if (!ok) ok = this.inboundBuffer.remove(agentId, deliveryId);
+    if (!ok) {
+      const held = this.drainHeld.get(agentId);
+      const i = held?.findIndex((m) => m.deliveryId === deliveryId) ?? -1;
+      if (held && i >= 0) { held.splice(i, 1); ok = true; }
+    }
+    if (ok) {
+      this.log("info", `[fila-viva] ${agentId}: entrega ${deliveryId.slice(0, 8)} removida da fila (ainda não iniciada)`);
+      this.filaVivaRegistros.get(agentId)?.delete(deliveryId);
+    } else {
+      this.log("info", `[fila-viva] ${agentId}: remover ${deliveryId.slice(0, 8)} ignorado — já iniciou ou não está na fila`);
+    }
+    this.agendarFilaViva(agentId);
+    return ok;
+  }
+
+  /** Reconciliação: mutação da fila fora dos caminhos instrumentados (retry
+   *  que re-enfileira, por exemplo) aparece em até ~1s. Só roda enquanto há
+   *  fila ao vivo publicada ou registros pendentes. */
+  private armarReconciliacaoFilaViva(): void {
+    if (this.filaVivaReconcilia) return;
+    this.filaVivaReconcilia = setInterval(() => {
+      const agentes = new Set<string>([...this.filaVivaUltimo.keys(), ...this.filaVivaRegistros.keys()]);
+      for (const id of agentes) if (!this.filaVivaTimers.has(id)) this.emitirFilaViva(id);
+      // Tudo vazio e publicado: desarma.
+      const algoVivo = [...this.filaVivaUltimo.values()].some((s) => s !== JSON.stringify({ truncated: false, items: [] })) || this.filaVivaRegistros.size > 0;
+      if (!algoVivo && this.filaVivaReconcilia) { clearInterval(this.filaVivaReconcilia); this.filaVivaReconcilia = null; }
+    }, QUEUE_LIVE_RECONCILE_MS);
+    this.filaVivaReconcilia.unref?.();
+  }
+
+  /** T-938: retenção por agente das entries conhecidas (para o spool). */
+  private entriesRetidos(): Array<[string, Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string; enqueuedAt: number }>]> {
+    const out: Array<[string, Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string; enqueuedAt: number }>]> = [];
+    for (const [agentId] of this.entries) {
+      const itens = listarFilaRetida(agentId) as Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string; enqueuedAt: number; source: string }>;
+      if (itens.length > 0) out.push([agentId, itens]);
+    }
+    return out;
   }
 
   /** T-899: GC do TTL do item retido — o host é quem tem log. */
@@ -1039,7 +1183,20 @@ export class AgentHost {
       .catch((err) => this.log("warn", `[worktree] remoção falhou ${wt}: ${(err as Error).message}`));
   }
 
-  send_message(agentId: string, content: string, images?: ImageAttachment[], deliveryId?: string) {
+  send_message(agentId: string, content: string, images?: ImageAttachment[], deliveryId?: string, wire?: WireRecord | null) {
+    if (deliveryId && wire) {
+      const regs = this.filaVivaRegistros.get(agentId) ?? new Map<string, WireRecord>();
+      regs.set(deliveryId, wire);
+      this.filaVivaRegistros.set(agentId, regs);
+    }
+    try {
+      this.sendMessageInner(agentId, content, images, deliveryId);
+    } finally {
+      this.agendarFilaViva(agentId);
+    }
+  }
+
+  private sendMessageInner(agentId: string, content: string, images?: ImageAttachment[], deliveryId?: string) {
     if (this.draining) {
       // T-720: dreno — não alimenta o runner (turno novo atrasaria o re-exec);
       // a mensagem vai no spool cifrado e é entregue pelo processo novo.
@@ -1057,7 +1214,10 @@ export class AgentHost {
       return;
     }
     const e = this.entries.get(agentId);
-    if (!e?.runner) {
+    // T-1000: com spool do processo anterior ainda por entregar (o spawn do
+    // replay está subindo), a mensagem nova espera no buffer — o flush entrega
+    // o spool (mais antigo) antes dela e a ordem de chegada se mantém.
+    if (!e?.runner || this.spooled.has(agentId)) {
       // T-037: em vez de dropar, buffera até o spawn (gap self-update / auto-resume).
       // Se o agente nunca subir, TTL 15min limpa. Antes: drop + agent:error e a
       // TASK_ASSIGN sumia mesmo com o server reenviando.
@@ -1074,10 +1234,14 @@ export class AgentHost {
         // conta como descarte por fila cheia.
         this.log("warn", `[cli:${agentId}:inbound] pendingMessages cheia (${this.inboundBuffer.size(agentId)}) — drop de ${evicted} mensagem(ns) mais antiga(s) antes do spawn`);
       }
-      this.log(
-        "warn",
-        `send_message para ${agentId} sem runner ativo (entry=${e ? "existe" : "ausente"}) — enfileirado (${this.inboundBuffer.size(agentId)} pending)`,
-      );
+      if (e?.runner) {
+        this.log("info", `send_message para ${agentId} espera o spool do processo anterior — enfileirado (${this.inboundBuffer.size(agentId)} pending)`);
+      } else {
+        this.log(
+          "warn",
+          `send_message para ${agentId} sem runner ativo (entry=${e ? "existe" : "ausente"}) — enfileirado (${this.inboundBuffer.size(agentId)} pending)`,
+        );
+      }
       return;
     }
     // T-899: agente PARADO — antes a mensagem caía num runner morto e morria
@@ -1107,7 +1271,7 @@ export class AgentHost {
     const e = this.entries.get(agentId);
     if (!e?.runner || pending.length === 0) return 0;
     for (const m of pending) {
-      e.runner.pushUserMessage(m.content, m.images as ImageAttachment[] | undefined);
+      e.runner.pushUserMessage(m.content, m.images as ImageAttachment[] | undefined, undefined, m.deliveryId);
     }
     this.log("info", `flushInboundBuffer agent=${agentId} entregou ${pending.length} msg(s) buffered`);
     return pending.length;
@@ -1133,10 +1297,13 @@ export class AgentHost {
    *  (com teto de 2s; main espera 2.5s antes do re-exec). */
   /* ---------------------- T-720: dreno + spool do re-exec ---------------------- */
 
-  private holdForDrain(agentId: string, item: SpoolItem): void {
+  private holdForDrain(agentId: string, item: SpoolItem, opts: { primeiro?: boolean } = {}): void {
     const list = this.drainHeld.get(agentId) ?? [];
     if (item.deliveryId && list.some((m) => m.deliveryId === item.deliveryId)) return;
-    list.push(item);
+    // T-1000: o turno em voo é a mensagem mais antiga do agente — vai na frente
+    // do que o dreno tirou da fila, senão o processo novo inverte a conversa.
+    if (opts.primeiro) list.unshift(item);
+    else list.push(item);
     this.drainHeld.set(agentId, list);
   }
 
@@ -1173,7 +1340,7 @@ export class AgentHost {
       if (!e.runner || typeof take !== "function") continue;
       const m = take.call(e.runner);
       if (!m) continue;
-      this.holdForDrain(agentId, { content: m.content, images: m.images, deliveryId: m.deliveryId, enqueuedAt: Date.now() });
+      this.holdForDrain(agentId, { content: m.content, images: m.images, deliveryId: m.deliveryId, enqueuedAt: Date.now() }, { primeiro: true });
       n++;
     }
     if (n > 0) this.log("info", `[shutdown] ${n} mensagem(ns) em turno retida(s) para o spool`);
@@ -1202,6 +1369,16 @@ export class AgentHost {
    *  para o disco — perda declarada no log, nunca plaintext. Arquivo 0600 em
    *  diretório 0700, escrita atômica (tmp + rename). */
   writeReexecSpool(dir: string = reexecSpoolDir()): { spooled: number; lost: number; lostDeliveryIds: string[]; path: string | null } {
+    // T-938 (verificação do SECURITY): a fila RETIDA também entra no spool do
+    // re-exec. Sem isto ela vivia só na RAM e morria no próximo re-exec — e o
+    // daemon re-executa 13-17x/dia (#817), ou seja: a promessa da feature
+    // morria justamente no cenário mais comum. Só sai da retenção DEPOIS de o
+    // spool gravar (nunca limpar antes).
+    const doSpool: string[] = [];
+    for (const [agentId, itens] of this.entriesRetidos()) {
+      for (const it of itens) this.holdForDrain(agentId, { content: it.content, images: it.images, deliveryId: it.deliveryId, enqueuedAt: it.enqueuedAt });
+      doSpool.push(agentId);
+    }
     for (const agentId of this.inboundAgentIds) {
       for (const m of this.inboundBuffer.drain(agentId)) this.holdForDrain(agentId, { ...m, images: m.images as ImageAttachment[] | undefined });
     }
@@ -1243,6 +1420,9 @@ export class AgentHost {
     fs.renameSync(tmp, file);
     this.drainHeld.clear();
     this.spooled.clear();
+    // Só agora: o que foi para o spool sai da retenção (dentro da mesma função
+    // e após o rename — um throw antes mantém tudo na retenção).
+    for (const agentId of doSpool) esquecerFilaRetida(agentId);
     return { spooled: records.length, lost, lostDeliveryIds, path: file };
   }
 

@@ -11,18 +11,19 @@ import { afterEach, test } from "node:test";
 import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash, generateKeyPairSync, sign as edSign, randomBytes, publicEncrypt, createPublicKey, constants } from "node:crypto";
 
 process.env.THE_DUDES_DAEMON_KEY_PATH = path.join(os.tmpdir(), `td-t720-key-${process.pid}-${Date.now()}.pem`);
 process.env.THE_DUDES_PROJECT_KEYS_PATH = path.join(os.tmpdir(), `td-t720-pkeys-${process.pid}-${Date.now()}.json`);
 
 const { _resetIdleRestartForTest, checkAndApplyUpdate, runningReleaseInfo, DRAIN_AFTER_MS, DRAIN_FORCE_MS } = await import("../self-update.js");
+const { _resetTurnGateForTest } = await import("../runners/turn-gate.js");
 const { AgentHost } = await import("../agent-host.js");
 const { getDaemonPublicKey, rememberProjectKey, encryptForProject } = await import("../daemon-crypto.js");
 const { aadV2 } = await import("@the-dudes/protocol/e2ee-fields");
 
-afterEach(() => { _resetIdleRestartForTest(); });
+afterEach(() => { _resetIdleRestartForTest(); _resetTurnGateForTest(); });
 
 function signBundle(body: string, privateKey: ReturnType<typeof generateKeyPairSync>["privateKey"]) {
   const bundle = Buffer.from(body);
@@ -388,16 +389,29 @@ test("T-720 takeQueuedForDrain: fila do dsh devolvida em ordem e LIMPA (prompt e
 
 /* ---------------- (2) integração: AgentHost real + turno grok em curso ---------------- */
 
-test("T-720 (2) integração: dreno com turno EM CURSO — o turno termina (texto entregue), a msg enfileirada NÃO começa e vai para o spool", async () => {
+test("T-720 (2) integração: dreno com turno EM CURSO — o turno termina (texto entregue), a msg enfileirada NÃO começa e vai para o spool", async (t) => {
   const { chmodSync } = await import("node:fs");
   const dir = mkdtempSync(path.join(os.tmpdir(), "t720-int-"));
+  t.after(() => { try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ } });
+  // T-1017: NUNCA rode este teste em paralelo com ele mesmo (10× no mesmo
+  // `node --test` ou shell `&`). O stub trava no portão até o teste liberar;
+  // 10 cópias travadas acumulam 10 CLIs + 10 turn-gates + 10 AgentHosts no
+  // mesmo processo — o spawn do stub (Gatekeeper em /tmp, ~800 ms cada em
+  // série) atrasa minutos e os `until` estouram MESMO com a ordem certa.
+  // Isolado: 13/13. Carga real (suíte inteira) continua válida.
   const stub = path.join(dir, "cli.mjs");
   const marca = path.join(dir, "turnos.txt");
-  // Cada turno: registra que começou, pensa ~800ms, responde e sai.
+  // T-1017 (ex-flake sob carga): o turno NÃO tem duração própria — o stub
+  // registra que começou e trava até o teste liberar (portão por arquivo).
+  // Antes: `setTimeout(800)` corria contra o `startDrain` do teste; sob carga
+  // o turno acabava antes do dreno, a 2ª mensagem já tinha virado turno e o
+  // `startDrain()` voltava 0 em vez de 1. Agora a ordem é fato, não timing:
+  // turno 1 em curso (travado no portão) → dreno → libera → turno termina.
+  const portao = path.join(dir, "portao");
   writeFileSync(stub, `#!/usr/bin/env node
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync } from "node:fs";
 appendFileSync(${JSON.stringify(marca)}, "turno\\n");
-await new Promise((r) => setTimeout(r, 800));
+while (!existsSync(${JSON.stringify(portao)})) await new Promise((r) => setTimeout(r, 25));
 process.stdout.write(JSON.stringify({ type: "text", data: "RESPOSTA" }) + "\\n");
 process.stdout.write(JSON.stringify({ type: "end", sessionId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" }) + "\\n");
 `);
@@ -409,23 +423,47 @@ process.stdout.write(JSON.stringify({ type: "end", sessionId: "aaaaaaaa-bbbb-4cc
     grok: { command: stub, source: "override" as const, available: true }, "grok-custom": off, graphify: off, graphifyMcp: off,
   } as never, false, false, false, () => {}, () => {});
   const id = "agent_t720_int";
-  await host.spawn({
+  // T-1017: o spawn é async de verdade (prepareGraphify + sonda de runner).
+  // Sem o await, sob carga o runner ainda não existe quando a "primeira"
+  // chega e ela cai no buffer pré-spawn (T-037) em vez de virar turno.
+  const spawnOk = host.spawn({
     agent: { id, ownerUserId: "u", name: "int", role: "backend", systemPrompt: "", color: "#7aa2ff", state: "idle", running: true,
-      usage: { input: 0, output: 0, cacheCreate: 0, cacheRead: 0 }, ephemeral: false, cliRunner: "grok" },
+      // efêmero = pool `bg` do turn-gate (T-055), que os outros testes do
+      // arquivo não usam — o turno 1 nunca fica preso atrás de slots
+      // ocupados por vizinhos sob carga.
+      ephemeral: true,
+      usage: { input: 0, output: 0, cacheCreate: 0, cacheRead: 0 }, cliRunner: "grok" },
     projectId: PID, basePath: dir, autoApprove: true, agentToken: "tok",
   } as never);
+  // O spawn é async de verdade (prepareGraphify + sonda): sem o await, sob
+  // carga o runner ainda não existe quando a "primeira" chega.
+  await spawnOk;
   const turnos = () => (existsSync(marca) ? readFileSync(marca, "utf8").split("\n").filter(Boolean).length : 0);
-  const until = async (c: () => boolean, ms = 10_000) => { const t0 = Date.now(); while (!c()) { if (Date.now() - t0 > ms) throw new Error("timeout"); await new Promise((r) => setTimeout(r, 25)); } };
+  const until = async (c: () => boolean, ms = 60_000) => { const t0 = Date.now(); while (!c()) { if (Date.now() - t0 > ms) throw new Error("timeout"); await new Promise((r) => setTimeout(r, 25)); } };
+  // Portão na ENTRADA: runner existe (não cai no buffer pré-spawn). Sem
+  // runner seria -1; `===0` prova runner vivo com fila vazia. Se a "primeira"
+  // chegar antes, ela cai no buffer (T-037) e o flush a entrega sem passar
+  // pela fila — o `turnos()===1` nunca aterraria.
+  // Timeout de 60 s (era 10 s): sob carga de 10× o spawn do stub (exec novo
+  // em /tmp no macOS) atrasa segundos; o portão garante a ORDEM (fatos, não
+  // timing), o timeout longo só dá margem ao agendamento.
+  await until(() => host.runnerEnfileiradas(id) === 0, 60_000);
   try {
+    // T-1017 (ex-flake sob carga): o teste exige turno 1 EM CURSO (stub
+    // travado no portão) + "segunda" NA FILA quando o dreno ligar. Depois
+    // do portão de entrada acima, a ordem é por fatos: (1) turno 1
+    // registrou início no stub; (2) "segunda" estacionou na fila do runner
+    // (runnerEnfileiradas===1, turno 1 ainda travado no portão).
     host.send_message(id, "primeira", undefined, "d1");
+    await until(() => turnos() === 1);
     host.send_message(id, "segunda", undefined, "d2");
-    await until(() => turnos() === 1); // turno 1 em curso, "segunda" na fila
+    await until(() => host.runnerEnfileiradas(id) === 1); // "segunda" estacionada, turno 1 ainda travado
     assert.equal(host.startDrain(), 1, "a segunda (não iniciada) sai da fila do runner");
     host.send_message(id, "terceira", undefined, "d3");
+    writeFileSync(portao, "vai"); // libera o turno 1: termina e entrega o texto
     await until(() => out.some((m) => m.type === "agent:text"));
     await until(() => !host.hasActiveTurn(), 5_000);
-    await new Promise((r) => setTimeout(r, 1_200)); // tempo de um turno novo começar, se o dreno falhasse
-    assert.equal(turnos(), 1, "nenhum turno novo começou no dreno");
+    assert.equal(turnos(), 1, "nenhum turno novo começou no dreno (dreno retém, não precisa de espera fixa)");
     const sp = host.writeReexecSpool(path.join(dir, "sp"));
     assert.equal(sp.spooled, 2, "segunda + terceira vão para o spool cifrado");
   } finally {

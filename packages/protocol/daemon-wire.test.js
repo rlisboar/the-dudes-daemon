@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath, URL } from "node:url";
-import { daemonWireSchemas, fromOrchSchemas, validateDaemonMessage } from "./daemon-wire.js";
+import {
+  QUEUE_LIVE_MAX_BYTES, QUEUE_LIVE_MAX_ITEMS, daemonWireSchemas, fromOrchSchemas, queueLiveItemBytes, validateDaemonMessage,
+} from "./daemon-wire.js";
 
 /**
  * T-423 (A6): guarda estrutural do contrato FromDaemon.
@@ -91,6 +93,20 @@ test("T-594: agent:send aceita `mem` (mapa de mission scratch) e recusa valor n�
   assert.equal(schema.safeParse({ ...base, mem: {} }).success, true);
   assert.equal(schema.safeParse({ ...base, mem: { RESULTADO: "relatorio" } }).success, true);
   assert.equal(schema.safeParse({ ...base, mem: { RESULTADO: 42 } }).success, false, "valor não-string");
+});
+
+test("T-1006 (acréscimo PM): agent:send aceita `origin`/`silent` opcionais e recusa origin fora do enum", () => {
+  const schema = fromOrchSchemas["agent:send"];
+  assert.ok(schema, "agent:send sumiu do contrato FromOrch");
+  const base = { type: "agent:send", agentId: "a1", content: "oi" };
+  assert.equal(schema.safeParse(base).success, true, "sem origin/silent segue válido (daemon antigo)");
+  for (const origin of ["user", "agent", "system"]) {
+    assert.equal(schema.safeParse({ ...base, origin }).success, true, `origin ${origin}`);
+  }
+  assert.equal(schema.safeParse({ ...base, origin: "user", silent: true }).success, true);
+  assert.equal(schema.safeParse({ ...base, silent: false }).success, true);
+  assert.equal(schema.safeParse({ ...base, origin: "humano" }).success, false, "origin fora do enum");
+  assert.equal(schema.safeParse({ ...base, silent: "sim" }).success, false, "silent não-boolean");
 });
 
 test("T-423: scanner aninhado tolera campo novo (passthrough) mas exige o núcleo", () => {
@@ -218,3 +234,62 @@ function shadowBase() {
     domain: "server", confidence: null, destructiveNoul: 0.1, disagreeTaskType: false, disagreeComplexity: false,
   };
 }
+
+/**
+ * T-1006: snapshot da fila AO VIVO. Fail-closed nos tetos que o daemon respeita
+ * cortando os mais novos (`truncated`), e o comando de remover do server.
+ */
+function liveSnap(items, extra = {}) {
+  return { type: "agent:queue_live", agentId: "a1", projectId: "p1", at: 1, items, ...extra };
+}
+const liveItem = (i, content = "x") => ({ deliveryId: `d${i}`, content, enqueuedAt: i, origin: "user" });
+
+test("T-1006: agent:queue_live aceita o contrato (vazio, truncated, images, silent, origens)", () => {
+  assert.equal(validateDaemonMessage(liveSnap([])).ok, true, "lista vazia = fila esvaziou");
+  assert.equal(validateDaemonMessage(liveSnap([liveItem(1)], { truncated: true })).ok, true);
+  for (const origin of ["user", "agent", "system"]) {
+    assert.equal(validateDaemonMessage(liveSnap([{ ...liveItem(1), origin }])).ok, true, `origin ${origin}`);
+  }
+  assert.equal(validateDaemonMessage(liveSnap([{ ...liveItem(1), images: [{ mime: "image/png" }], silent: true }])).ok, true);
+  assert.equal(validateDaemonMessage(liveSnap([liveItem(1, "e2e:v2+blob")])).ok, true, "blob e2e: passa como veio");
+});
+
+test("T-1006: agent:queue_live recusa fora do contrato (fail-closed)", () => {
+  assert.equal(validateDaemonMessage(liveSnap([{ ...liveItem(1), origin: "humano" }])).ok, false, "origin fora do enum");
+  assert.equal(validateDaemonMessage(liveSnap([{ ...liveItem(1), deliveryId: "" }])).ok, false, "deliveryId vazio");
+  const semId = liveItem(1);
+  delete semId.deliveryId;
+  assert.equal(validateDaemonMessage(liveSnap([semId])).ok, false, "deliveryId obrigatório");
+  assert.equal(validateDaemonMessage(liveSnap([{ ...liveItem(1), enqueuedAt: "ontem" }])).ok, false);
+  assert.equal(validateDaemonMessage({ ...liveSnap([]), projectId: undefined }).ok, false, "projectId obrigatório");
+  assert.equal(validateDaemonMessage({ ...liveSnap([]), items: undefined }).ok, false, "items obrigatório");
+});
+
+test("T-1006: tetos do snapshot — itens e bytes, exatamente na borda", () => {
+  assert.equal(QUEUE_LIVE_MAX_ITEMS, 200);
+  const cheio = Array.from({ length: QUEUE_LIVE_MAX_ITEMS }, (_, i) => liveItem(i));
+  assert.equal(validateDaemonMessage(liveSnap(cheio)).ok, true, "200 itens cabe");
+  assert.equal(validateDaemonMessage(liveSnap([...cheio, liveItem(999)])).ok, false, "201 itens não cabe");
+
+  // borda de bytes: um item com content de exatamente o teto passa; +1 byte não
+  const noTeto = liveItem(1, "a".repeat(QUEUE_LIVE_MAX_BYTES));
+  assert.equal(queueLiveItemBytes(noTeto), QUEUE_LIVE_MAX_BYTES);
+  assert.equal(validateDaemonMessage(liveSnap([noTeto])).ok, true, "exatamente no teto de bytes");
+  assert.equal(validateDaemonMessage(liveSnap([liveItem(1, "a".repeat(QUEUE_LIVE_MAX_BYTES + 1))])).ok, false, "1 byte acima");
+  // a soma conta: dois itens de metade + 1 estouram
+  const meio = "a".repeat(QUEUE_LIVE_MAX_BYTES / 2 + 1);
+  assert.equal(validateDaemonMessage(liveSnap([liveItem(1, meio), liveItem(2, meio)])).ok, false, "o teto é do snapshot, não do item");
+  // bytes são UTF-8 (não .length): "é" = 2 bytes
+  assert.equal(queueLiveItemBytes({ content: "é" }), 2);
+  // images contam no teto
+  assert.ok(queueLiveItemBytes({ content: "", images: [{ data: "x".repeat(10) }] }) > 10);
+});
+
+test("T-1006: agent:queue_live_remove (server → daemon) exige agentId e deliveryId", () => {
+  const schema = fromOrchSchemas["agent:queue_live_remove"];
+  assert.ok(schema, "sem schema do comando");
+  assert.equal(schema.safeParse({ type: "agent:queue_live_remove", agentId: "a1", deliveryId: "d1" }).success, true);
+  assert.equal(schema.safeParse({ type: "agent:queue_live_remove", agentId: "a1" }).success, false, "deliveryId obrigatório");
+  assert.equal(schema.safeParse({ type: "agent:queue_live_remove", deliveryId: "d1" }).success, false, "agentId obrigatório");
+  assert.equal(schema.safeParse({ type: "agent:queue_live_remove", agentId: "a1", deliveryId: "" }).success, false);
+});

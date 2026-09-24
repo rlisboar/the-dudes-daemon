@@ -319,6 +319,18 @@ export interface AgentSend {
    *  daemon mantém a task ativa do agente por este sinal, NUNCA por parse
    *  de texto. Opcional (retrocompat: servers antigos não enviam). */
   taskId?: string;
+  /**
+   * T-1006 (acréscimo PM): origem que o SERVER conhece com certeza
+   * ("user" = humano/web|schedule|retry, "agent" = agente→agente,
+   * "system" = engine/task/memory/park/loop-stop). O daemon prefere este
+   * campo ao que deduz de `systemPrefix`/`parts`. Opcional (retrocompat).
+   */
+  origin?: "user" | "agent" | "system";
+  /**
+   * T-1006 (acréscimo PM): quando true, nada no chat (ex.: marcação do
+   * Quadro). O daemon propaga ao `agent:queue_live`. Opcional (retrocompat).
+   */
+  silent?: boolean;
 }
 
 /** T-233: task:updated encaminhado pelo server — espelho do wire
@@ -682,6 +694,43 @@ export interface AgentQueueRetainEv {
   agentId: string;
   source: "stop" | "inbound-ttl" | "manual";
   items: Array<{ content: string; images?: unknown[]; deliveryId?: string }>;
+}
+
+/** T-1006: tetos do snapshot da fila ao vivo (daemon corta, server recusa). */
+export declare const QUEUE_LIVE_MAX_ITEMS: 200;
+export declare const QUEUE_LIVE_MAX_BYTES: number;
+/** Bytes que um item ocupa no snapshot (`content` + `images` serializado). */
+export declare function queueLiveItemBytes(item: { content: string; images?: unknown[] }): number;
+
+export interface AgentQueueLiveItem {
+  deliveryId: string;
+  /** Como o daemon recebeu: blob `e2e:` em projeto cifrado — o server não decifra. */
+  content: string;
+  images?: unknown[];
+  enqueuedAt: number;
+  origin: "user" | "agent" | "system";
+  silent?: boolean;
+}
+
+/**
+ * T-1006: snapshot COMPLETO da fila pendente do runner (o que ainda não virou
+ * turno), emitido a cada mudança com debounce, e vazio quando a fila esvazia.
+ * `truncated` = o daemon cortou os itens mais novos para caber nos tetos.
+ */
+export interface AgentQueueLiveEv {
+  type: "agent:queue_live";
+  agentId: string;
+  projectId: string;
+  at: number;
+  truncated?: boolean;
+  items: AgentQueueLiveItem[];
+}
+
+/** T-1006: remove da fila do runner um item que ainda não iniciou (idempotente). */
+export interface AgentQueueLiveRemove {
+  type: "agent:queue_live_remove";
+  agentId: string;
+  deliveryId: string;
 }
 
 export interface OpenDesignListRequest { type: "open_design:list"; correlationId: string; }
@@ -1144,13 +1193,15 @@ export type FromDaemon =
   | OpenDesignResult
   | ModelsCatalogResult
   | TypesafeShadow
-  | AgentQueueRetainEv;
+  | AgentQueueRetainEv
+  | AgentQueueLiveEv;
 
 export type FromOrch =
   | DaemonLogsGetRequest
   | DaemonWelcome | DaemonPong | DaemonChallenge | RunnerPolicySet
   | ReleaseAvailable
   | AgentSpawn | AgentStop | AgentSend | AgentClear | AgentCompact
+  | AgentQueueLiveRemove
   | AutoApproveSet | WorkspaceSet
   | WorkspaceTaskCreateRequest | WorkspaceTaskRemoveRequest
   | FileListRequest | FileReadRequest | FileWriteRequest | FileOperationRequest | FileSearchRequest

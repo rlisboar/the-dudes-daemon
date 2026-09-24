@@ -14,6 +14,7 @@ import { captureBootBinaryHash, checkAndApplyUpdate, runningReleaseInfo } from "
 import { DAEMON_BUILD_TS } from "./daemon-build-ts.js";
 import { createSelfUpdateGate } from "./self-update-gate.js";
 import { createDeliveryDeduper, loadDeliverySeen, saveDeliverySeen } from "./inbound-dedup.js";
+import { registroDoFrame } from "./queue-live.js";
 import { decidirClose, proximoDelayPassivo } from "./ws-handoff.js";
 import { commitReexecSnapshot } from "./reexec-snapshot.js";
 import {
@@ -676,6 +677,9 @@ export class DaemonClient {
           mcp: !!this.cliCommands.graphifyMcp?.available,
         },
       } as FromDaemon);
+      // T-1005: a desconexão limpa a fila ao vivo no server — reemite o
+      // snapshot de quem tem fila (debounce; o server trata igual como no-op).
+      try { this.host.reemitirFilaVivaNoHello(); } catch { /* observação */ }
       // Ressincroniza tokens de agents já rodando localmente — sem isso,
       // após restart do server, o Map agentTokens fica vazio e o
       // mcp-bridge (que mantém o token antigo em env) começa a receber
@@ -1035,6 +1039,18 @@ export class DaemonClient {
         log("info", `stop ${msg.agentId}`);
         this.host.stop(msg.agentId);
         return;
+      case "agent:queue_live_remove": {
+        // T-1005: server → daemon, remover da fila ao vivo a entrega ainda não
+        // iniciada. Idempotente: já iniciada ou inexistente só loga no host.
+        // Tipo real vindo do protocolo (server/T-1006: `AgentQueueLiveRemove`).
+        const q = msg as unknown as { agentId?: unknown; deliveryId?: unknown };
+        if (typeof q.agentId === "string" && typeof q.deliveryId === "string" && q.deliveryId) {
+          this.host.removerDaFilaViva(q.agentId, q.deliveryId);
+        } else {
+          log("warn", "agent:queue_live_remove sem agentId/deliveryId — ignorado");
+        }
+        return;
+      }
       case "agent:send": {
         log("info", `agent:send recebido agent=${msg.agentId} bytes=${String(msg.content ?? "").length} imgs=${(msg.images ?? []).length}`);
         // T-037: reentrega do server (pending + resume) usa o mesmo deliveryId.
@@ -1147,7 +1163,11 @@ export class DaemonClient {
         if (typeof msg.taskId === "string" && msg.taskId.trim()) {
           this.host.setActiveTask(msg.agentId, msg.taskId);
         }
-        this.host.send_message(msg.agentId, content, images, msg.deliveryId);
+        // T-1005: a fila ao vivo manda o conteúdo COMO VEIO do server (blob
+        // e2e original; nunca o texto decifrado) — registro guardado junto.
+        // `origin`/`silent` do server (T-1006, acréscimo PM) vencem a dedução.
+        const wire = registroDoFrame(msg as Parameters<typeof registroDoFrame>[0], content, images ?? undefined);
+        this.host.send_message(msg.agentId, content, images, msg.deliveryId, wire);
         // T-252: visto só agora — decrypt ok + processamento aceito
         // (entregue ao runner ou enfileirado pelo host). Falhas de decrypt
         // acima retornam sem marcar, deixando o retry do server ser processado.

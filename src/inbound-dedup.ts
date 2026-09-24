@@ -69,6 +69,10 @@ export function createAgentInboundBuffer(opts: {
   drain: (agentId: string) => BufferedInbound[];
   size: (agentId?: string) => number;
   clear: () => void;
+  /** T-1005: fila ao vivo — cópia, sem consumir. */
+  peek: (agentId: string) => BufferedInbound[];
+  /** T-1005: tira a entrega (ainda não entregue ao runner). */
+  remove: (agentId: string, deliveryId: string) => boolean;
 } {
   const max = opts.maxPerAgent ?? 20;
   const ttlMs = opts.ttlMs ?? 15 * 60_000;
@@ -99,6 +103,19 @@ export function createAgentInboundBuffer(opts: {
       const list = byAgent.get(agentId) ?? [];
       byAgent.delete(agentId);
       return list;
+    },
+    peek(agentId) {
+      gc(agentId);
+      return (byAgent.get(agentId) ?? []).map((m) => ({ ...m }));
+    },
+    remove(agentId, deliveryId) {
+      const list = byAgent.get(agentId);
+      if (!list) return false;
+      const i = list.findIndex((m) => m.deliveryId === deliveryId);
+      if (i < 0) return false;
+      list.splice(i, 1);
+      if (list.length === 0) byAgent.delete(agentId);
+      return true;
     },
     size(agentId) {
       if (agentId) {
