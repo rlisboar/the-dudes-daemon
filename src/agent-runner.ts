@@ -429,6 +429,14 @@ export class AgentRunner {
   /** T-788 (F1): partIds de tool em `running` — dedup da REEMISSÃO do serve
    *  (cada chunk reenvia o part; contar por evento gruda o contador >0). */
   private ocToolRunningPartIds = new Set<string>();
+  /** T-819: chaves das tools ABERTAS (em voo). O contador é o tamanho deste
+   *  Set: reemissão do MESMO id não infla e o resultado fecha POR id. Antes o
+   *  contador somava por EVENTO e em grok/gemini nada descontava — ele virava
+   *  "tools do turno" (391 "em voo" no log de prod com 1 tool real, cli:grok)
+   *  e o watchdog ficava cego no teto de tools por 10min. */
+  private toolsAbertas = new Set<string>();
+  /** Chave sintética para tool SEM id (formato antigo/incompleto). */
+  private toolsSemIdSeq = 0;
   /** T-788 (F2): permission.asked pendentes de aprovação humana — turno vivo
    *  enquanto existirem (o tick renova o relógio). */
   private ocPendingPermissionIds = new Set<string>();
@@ -1484,17 +1492,36 @@ export class AgentRunner {
     }
   }
 
-  /** Grok: tool_call abriu — protege hang watch até result/text/teto. */
-  private noteGrokToolInFlight(): void {
+  /** Grok: tool_call abriu — protege hang watch até result/text/teto.
+   *  T-819: passou a receber a CHAVE da tool (id) e ficou idempotente — o
+   *  mesmo tool_call reemitido (o CLI reemite, e o sweep vê o mesmo id) não
+   *  conta de novo. Sem chave, gera uma sintética (fecha no fim do turno). */
+  private noteGrokToolInFlight(chave?: string): void {
+    const k = chave && chave.length > 0 ? chave : `sem-id:${++this.toolsSemIdSeq}`;
+    this.toolsAbertas.add(k);
     if (this.toolsInFlight === 0) this.toolsInFlightSince = Date.now();
-    this.toolsInFlight++;
+    this.toolsInFlight = this.toolsAbertas.size;
     this.touchActivity();
   }
 
-  private clearGrokToolsInFlight(): void {
-    if (this.toolsInFlight === 0) return;
+  /** T-819: a tool da chave terminou (tool_result / completed / failed). Sai do
+   *  Set e recomputa o contador — fechamento duplicado não desce abaixo do real. */
+  private noteToolFechada(chave?: string): void {
+    if (chave) this.toolsAbertas.delete(chave);
+    this.toolsInFlight = this.toolsAbertas.size;
+    if (this.toolsInFlight === 0) this.toolsInFlightSince = null;
+  }
+
+  /** T-819: esquece tudo que estava em voo (fim de turno, dreno, hard recover). */
+  private zerarToolsEmVoo(): void {
+    this.toolsAbertas.clear();
     this.toolsInFlight = 0;
     this.toolsInFlightSince = null;
+  }
+
+  private clearGrokToolsInFlight(): void {
+    if (this.toolsInFlight === 0 && this.toolsAbertas.size === 0) return;
+    this.zerarToolsEmVoo();
   }
 
   /**
@@ -1588,8 +1615,7 @@ export class AgentRunner {
       this.activityClock.deadSince = null;
       // Fora de turno: limpa contagem residual de tools.
       if (this.toolsInFlight > 0 && this.currentState === "idle") {
-        this.toolsInFlight = 0;
-        this.toolsInFlightSince = null;
+        this.zerarToolsEmVoo();
       }
       return;
     }
@@ -1674,8 +1700,7 @@ export class AgentRunner {
           `[hang:${this.info.name}] toolsInFlight=${this.toolsInFlight} aberto há ${Math.round(toolsAge / 1000)}s ` +
             `(teto absoluto ${Math.round(t.toolsHardMs / 60000)}min) — tool_result perdido ou teto; reavaliando hang`,
         );
-        this.toolsInFlight = 0;
-        this.toolsInFlightSince = null;
+        this.zerarToolsEmVoo();
         // não return — cai no hangPhase abaixo
       } else {
         // tool viva + processo vivo: não soft/hard; idle semântico NÃO mata
@@ -1781,8 +1806,7 @@ export class AgentRunner {
       this.ocActiveProc = null;
       this.oneShotProc = null;
       this.waitingTurnGate = false;
-      this.toolsInFlight = 0;
-      this.toolsInFlightSince = null;
+      this.zerarToolsEmVoo();
       // T-788: estado de contagem por part/permission do turno morto não
       // pode vazar para o retry.
       this.ocToolRunningPartIds.clear();
@@ -1968,8 +1992,7 @@ export class AgentRunner {
         "warn",
         `[hang:${this.info.name}] HARD recover claude continuous: ${reason}`,
       );
-      this.toolsInFlight = 0;
-      this.toolsInFlightSince = null;
+      this.zerarToolsEmVoo();
       this.messageSession.busy = false;
       this.activityClock.softReported = false;
       this.activityClock.deadSince = null;
@@ -2006,8 +2029,9 @@ export class AgentRunner {
         "warn",
         `[hang:${this.info.name}] HARD recover dsh: ${reason}`,
       );
-      this.toolsInFlight = 0;
-      this.toolsInFlightSince = null;
+      // T-819: pela API — zerar os campos direto deixava o Set de ids aberto e
+      // a próxima tool recomputava o contador a partir dele (inflando de novo).
+      this.zerarToolsEmVoo();
       this.activityClock.softReported = false;
       this.activityClock.deadSince = null;
       const sid = this.info.sessionId || this.opts.resumeSessionId;

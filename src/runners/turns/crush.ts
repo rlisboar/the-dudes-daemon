@@ -131,6 +131,11 @@ export async function runCrushMessage(self: any, content: string, images?: Image
     }
     timing?.bootStart();
     self.ocActiveProc = proc;
+    // T-820: registra o pid no rastreio do runner — `killTrackedTurnPids` (stop,
+    // hard recover, shutdown) alcança o CLI MESMO depois de um close tardio anular
+    // `ocActiveProc` (kill no-op). Antes só o grok fazia isso (T-593): turno órfão
+    // sobrevivia ao stop e o stub detached pendurava a suíte sem `--test-force-exit`.
+    self.trackTurnPid(proc.pid);
     armHardTimeout(proc, PER_MSG_TURN_TIMEOUT_MS, () => {
       timing?.finish("hard-recover", "hard-timeout", "lifetime");
       self.opts.log("warn", `[crush:${self.info.name}] turno excedeu ${PER_MSG_TURN_TIMEOUT_MS / 1000}s — SIGKILL`);
@@ -153,6 +158,7 @@ export async function runCrushMessage(self: any, content: string, images?: Image
       self.checkContextFullError(msg);
     });
     proc.on("close", (code) => {
+      self.untrackTurnPid(proc.pid);
       imgCleanup();
       // T-417: mesmo guarda do bloco qwen (T-371) — close TARDIO de turno já
       // recuperado não liberta o slot nem apaga o proc do turno NOVO. O busy é

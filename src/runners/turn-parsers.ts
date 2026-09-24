@@ -1,8 +1,9 @@
 export type NormalizedTurnEvent =
   | { type: "session"; sessionId: string }
   | { type: "text"; text: string }
-  | { type: "tool"; name: string; input: unknown; id?: string }
-  /** T-829: tool (com id) concluída — desconta o in-flight. */
+  /** T-819: `delta` = chunk de ARGUMENTOS da mesma tool (não é tool nova). */
+  | { type: "tool"; name: string; input: unknown; id?: string; delta?: boolean }
+  /** T-829/T-819: tool (com id) concluída — desconta o in-flight. */
   | { type: "tool_done"; id: string }
   | { type: "usage"; input: number; output: number; cacheCreate: number; cacheRead: number; cumulative: boolean }
   | { type: "plan" }
@@ -291,9 +292,16 @@ export function parseGrokStreamEvent(raw: unknown): NormalizedTurnEvent[] {
     const input = event.rawInput ?? event.input ?? {};
     const idRaw = event.toolCallId ?? event.tool_call_id;
     const id = typeof idRaw === "string" && idRaw ? idRaw : undefined;
+    // T-819: antes os TRÊS kinds viravam `tool` e cada um somava um "em voo":
+    // o delta de argumentos não é tool nova, e o update terminal é a CONCLUSÃO
+    // (virava mais um em voo, nunca descontava — 391 no log de prod).
+    if (kind === "tool_call_update") {
+      const status = typeof event.status === "string" ? event.status : undefined;
+      if ((status === "completed" || status === "failed") && id) return [{ type: "tool_done", id }];
+    }
     const tool: NormalizedTurnEvent = id
-      ? { type: "tool", name, input, id }
-      : { type: "tool", name, input };
+      ? { type: "tool", name, input, id, ...(kind === "tool_call_delta_chunk" ? { delta: true } : {}) }
+      : { type: "tool", name, input, ...(kind === "tool_call_delta_chunk" ? { delta: true } : {}) };
     return [tool];
   }
   if (kind === "end") return typeof event.sessionId === "string" && event.sessionId

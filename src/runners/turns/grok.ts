@@ -316,7 +316,7 @@ export async function runGrokMessage(self: any, content: string, images?: ImageA
           if (event.type === "tool") timing?.semantic("tool");
           sawSemantic = true;
           // Fim do segmento de thought: sai ANTES do text/tool (T-705 + T-712).
-          if (event.type === "text" || event.type === "tool" || event.type === "result" || event.type === "error") {
+          if (event.type === "text" || event.type === "tool" || event.type === "tool_done" || event.type === "result" || event.type === "error") {
             flushThinking();
           }
           if (event.type === "text") {
@@ -337,20 +337,24 @@ export async function runGrokMessage(self: any, content: string, images?: ImageA
               else if (!thinkingTimer) thinkingTimer = setTimeout(flushThinking, GROK_THINKING_FLUSH_MS);
             }
             self.setState("thinking");
+          } else if (event.type === "tool_done") {
+            // T-819: `tool_call_update` terminal fecha a tool CERTA (antes virava
+            // outro "em voo" e nada descontava).
+            self.noteToolFechada(event.id);
           } else if (event.type === "tool") {
             // Stream ACP emite tool_call ao vivo (CLI ≥0.2) — não esperar poll 3s.
             // Dedupe por toolCallId (mesmo id no chat_history.jsonl do sweep).
-            if (event.name) {
-              const toolKey = event.id || `stream:${event.name}:${JSON.stringify(event.input).slice(0, 120)}`;
-              if (!self.grokSeenToolCallIds.has(toolKey)) {
-                self.grokSeenToolCallIds.add(toolKey);
-                self.opts.onToolUse(event.name, event.input);
-              }
+            const toolKey = event.id || `stream:${event.name}:${JSON.stringify(event.input).slice(0, 120)}`;
+            if (event.name && !self.grokSeenToolCallIds.has(toolKey)) {
+              self.grokSeenToolCallIds.add(toolKey);
+              self.opts.onToolUse(event.name, event.input);
             }
             // Tools longas (shell/MCP) podem ficar >120s sem novo evento
             // semântico — sem toolsInFlight o hard hang mata o turno legítimo
-            // (QA T-009 critério 5). Marca em voo; result/text zera.
-            self.noteGrokToolInFlight();
+            // (QA T-009 critério 5). T-819: marca por ID (delta de argumentos da
+            // MESMA tool não conta); quem libera é o tool_done acima, texto ou o
+            // resultado do turno.
+            if (!event.delta) self.noteGrokToolInFlight(event.id || toolKey);
             self.setState(
               event.name.includes("send_message") ? "sending" : "thinking",
             );
@@ -656,7 +660,8 @@ export function grokSweepToolCalls(self: any, sessionId: string, emit: boolean):
         ? (call) => {
           self.opts.onToolUse(call.name, call.input);
           // Poll 3s de chat_history: tool em andamento sem stream JSON.
-          self.noteGrokToolInFlight();
+          // T-819: por ID — o sweep já dedupa, e o contador também.
+          self.noteGrokToolInFlight(call.id);
           // Volta pra thinking/sending: o stream pode ter marcado "speaking"
           // com text intermediário, mas o agente ainda está no tool-loop.
           self.setState(call.name.includes("send_message") ? "sending" : "thinking");

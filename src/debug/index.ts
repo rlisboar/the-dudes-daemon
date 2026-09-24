@@ -510,7 +510,7 @@ export function diagnose(input: {
     if (inflados.length) add("warn", "hang", `Contador de tools em voo inflado em ${inflados.length} agente(s) (até ${inflados[0]!.max}) nas últimas 24h`, `${inflados.slice(0, 5).map((t) => `${t.agent} ${t.max}`).join(", ")}. Com tool "em voo" o watchdog de hang fica suprimido até o teto absoluto (~10min): turno travado demora a ser detectado.`,
       "O contador soma tool_call e não desconta o resultado em alguns runners (mesma classe do T-795 no OpenCode); zerar por turno e descontar no tool_result.", "24h");
     if (d7.stdinNotAccepted >= 3) add("info", "claude", `${d7.stdinNotAccepted} mensagem(ns) não aceitas pelo stdin do claude em 7 dias`, "O watchdog (T-758) reinicia o claude aos 90s; costuma acontecer logo após restart, com o CLI ainda subindo os MCPs.", undefined, "7d");
-    if (d7.stateLost >= 20) add("info", "ws", `${d7.stateLost} mensagem(ns) de estado (running/state/usage/context) perdidas com o WS fora em 7 dias`, "Não entram na fila de reenvio: a UI pode mostrar estado velho até o próximo evento do agente.", undefined, "7d");
+    if (d7.stateLost >= 20) add("info", "ws", `${d7.stateLost} mensagem(ns) de estado (running/state/usage/context) perdidas com o WS fora em 7 dias`, "Elas não entram na fila de reenvio (só text/error/hung/exit/thinking/tool_use entram); o open do WS reemite o estado ATUAL (T-822), então o efeito é a UI/estado do server ficarem defasados até o próximo open.", undefined, "7d");
     if ((p("handshake-orchestrator")?.n ?? 0) >= 10) add("info", "ws", `${p("handshake-orchestrator")!.n} falhas de handshake com o orchestrator em 24h`, "Server fora (deploy/restart) ou rede; os agentes ficam sem canal enquanto isso.", undefined, "24h");
   }
 

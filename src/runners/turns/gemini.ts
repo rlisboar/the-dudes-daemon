@@ -25,6 +25,10 @@ export function ingestGeminiLine(self: any,
       if (event.type === "text") acc.addText(event.text);
       else if (event.type === "tool") {
         acc.flush();
+        // T-819: o stream do gemini não traz tool_result nem id e o CLI é
+        // sequencial — a tool NOVA fecha a anterior. Sem isto o contador virava
+        // "tools do turno" e o watchdog ficava no teto absoluto de tools.
+        self.zerarToolsEmVoo();
         self.noteGrokToolInFlight();
         self.opts.onToolUse(event.name, event.input);
         self.setState("thinking");
@@ -114,6 +118,11 @@ export async function runGeminiMessage(self: any, content: string, images?: Imag
     }
     timing?.bootStart();
     self.ocActiveProc = proc;
+    // T-820: registra o pid no rastreio do runner — `killTrackedTurnPids` (stop,
+    // hard recover, shutdown) alcança o CLI MESMO depois de um close tardio anular
+    // `ocActiveProc` (kill no-op). Antes só o grok fazia isso (T-593): turno órfão
+    // sobrevivia ao stop e o stub detached pendurava a suíte sem `--test-force-exit`.
+    self.trackTurnPid(proc.pid);
     armHardTimeout(proc, PER_MSG_TURN_TIMEOUT_MS, () => {
       timing?.finish("hard-recover", "hard-timeout", "lifetime");
       self.opts.log("warn", `[gemini:${self.info.name}] turno excedeu ${PER_MSG_TURN_TIMEOUT_MS / 1000}s — SIGKILL`);
@@ -160,6 +169,7 @@ export async function runGeminiMessage(self: any, content: string, images?: Imag
       if (msg) { self.traceCli("gemini", "stderr", msg); self.checkContextFullError(msg); self.opts.onError(msg); }
     });
     proc.on("close", (code) => {
+      self.untrackTurnPid(proc.pid);
       // R7: fim de turno único/idempotente (T-417 + T-251 preservados dentro).
       timing?.finish(sawResult ? "completed" : code === 0 ? "error" : "process-exit");
       endTurn(self, { epoch, turnKey, code, sawResult, firstTurnSnapshot, beforeCleanup: flush, imgCleanup });

@@ -96,6 +96,12 @@ for (const stage of ['initialize', 'session/new', 'session/set_config_option', '
       info: { id: 'unit', sessionId: stage === 'session/resume' ? '57eb3eca-0a64-411f-890d-8478bef47e71' : undefined },
       messageSession: {}, runnerCommand: () => 'fake', buildEnv: () => ({}), bridgeEnv: () => ({}),
       setState: () => {}, emitExit: t.mock.fn(),
+      // T-819: o caminho de tool/exit do dsh usa a API de in-flight do runner
+      // (espelha AgentRunner; antes ele escrevia os campos direto).
+      toolsInFlight: 0, toolsInFlightSince: null,
+      zerarToolsEmVoo() { this.toolsInFlight = 0; this.toolsInFlightSince = null; },
+      noteGrokToolInFlight() { this.toolsInFlight++; },
+      noteToolFechada() { this.toolsInFlight = Math.max(0, this.toolsInFlight - 1); },
     };
     const flush = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
     startDsh(self);

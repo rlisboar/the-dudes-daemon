@@ -92,6 +92,11 @@ export async function runQwenMessage(self: any, content: string, images?: ImageA
     proc.stdin?.end(message);
     timing?.bootStart();
     self.ocActiveProc = proc;
+    // T-820: registra o pid no rastreio do runner — `killTrackedTurnPids` (stop,
+    // hard recover, shutdown) alcança o CLI MESMO depois de um close tardio anular
+    // `ocActiveProc` (kill no-op). Antes só o grok fazia isso (T-593): turno órfão
+    // sobrevivia ao stop e o stub detached pendurava a suíte sem `--test-force-exit`.
+    self.trackTurnPid(proc.pid);
     // T-598: backstop do processo ACIMA do teto de lifetime do watchdog — o
     // watchdog corta primeiro, com re-fila + sessão preservada. Se este
     // disparar mesmo assim, passa pelo MESMO recover em vez de um SIGKILL
@@ -198,6 +203,7 @@ export async function runQwenMessage(self: any, content: string, images?: ImageA
       }
     });
     proc.on("close", (code) => {
+      self.untrackTurnPid(proc.pid);
       // T-886: o guarda do T-371 cobria só PROC/BUSY. O `releaseActiveTurnSlot`
       // era incondicional, então o close TARDIO de um turno morto pelo hard
       // recover consumia o handle do gate do turno NOVO que o drain pôs em voo

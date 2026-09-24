@@ -202,6 +202,10 @@ export class AgentHost {
   private filaVivaRegistros = new Map<string, Map<string, WireRecord>>();
   private filaVivaTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private filaVivaUltimo = new Map<string, string>();
+  /** T-822: último `agent:context` de cada agente. O tipo não entra na fila de
+   *  reenvio (só text/error/hung/exit/thinking/tool_use entram), então o open do
+   *  WS reemite o valor ATUAL daqui — sem isto a UI fica com o contexto velho. */
+  private ultimoContexto = new Map<string, { used: number; limit: number }>();
   private filaVivaReconcilia: ReturnType<typeof setInterval> | null = null;
   private spoolPath: string | null = null;
 
@@ -758,7 +762,10 @@ export class AgentHost {
           msg.projectId,
         );
       },
-      onContextUsage: (used, limit) => { this.deliver({ type: "agent:context", agentId: msg.agent.id, used, limit }); },
+      onContextUsage: (used, limit) => {
+        this.ultimoContexto.set(msg.agent.id, { used, limit });
+        this.deliver({ type: "agent:context", agentId: msg.agent.id, used, limit });
+      },
       onContextWarning: (used, limit) => { this.deliver({ type: "agent:context_warning", agentId: msg.agent.id, used, limit }); },
       onContextFull: () => { this.deliver({ type: "agent:context_full", agentId: msg.agent.id }); },
       projectId: msg.projectId,
@@ -953,6 +960,27 @@ export class AgentHost {
    * próxima mudança. Força o reenvio mesmo sem mudança (o `ultimo` é
    * esquecido), com debounce — o server trata o snapshot igual como no-op.
    */
+  /**
+   * T-822: o WS caiu e o estado NÃO crítico (running/state/context) foi
+   * descartado — os três são SETTER de estado no server (idempotentes), não
+   * evento, então reemitir o valor atual no open é seguro e suficiente. Sem
+   * isto um `agent:running=false` perdido deixa o server achando que o agente
+   * está vivo e as mensagens seguintes ficam retidas ("sem runner ativo —
+   * enfileirado"); um `agent:state`/`agent:context` perdido deixa a UI mentindo.
+   */
+  reemitirEstadoNoHello(): void {
+    for (const [agentId, e] of this.entries) {
+      const runner = e.runner as unknown as { currentRuntimeState?: () => string } | null;
+      let state: string | null = null;
+      try { state = runner?.currentRuntimeState?.() ?? null; } catch { /* observação */ }
+      // `runner` nulo = turno/processo morto (mesma verdade dos emissores de exit).
+      this.send({ type: "agent:running", agentId, running: !!(e.runner && state) });
+      if (state) this.send({ type: "agent:state", agentId, state });
+      const ctx = this.ultimoContexto.get(agentId);
+      if (ctx) this.send({ type: "agent:context", agentId, used: ctx.used, limit: ctx.limit });
+    }
+  }
+
   reemitirFilaVivaNoHello(): void {
     const agentes = new Set<string>([...this.filaVivaUltimo.keys(), ...this.filaVivaRegistros.keys()]);
     for (const [id, e] of this.entries) {

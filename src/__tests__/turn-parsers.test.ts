@@ -119,7 +119,7 @@ test("T-705: Grok ACP sessionUpdate thought/text (defesa; stdout medido 1.0.34 �
   );
 });
 
-test("Grok stream tool_call / tool_call_update → tool (estado thinking no runner)", () => {
+test("Grok stream tool_call → tool; update terminal → tool_done; delta → tool delta", () => {
   assert.deepEqual(
     parseGrokStreamEvent({
       type: "tool_call",
@@ -130,6 +130,8 @@ test("Grok stream tool_call / tool_call_update → tool (estado thinking no runn
     }),
     [{ type: "tool", name: "read_file", input: { path: "src/main.rs" }, id: "call_1" }],
   );
+  // T-819: o update TERMINAL é a CONCLUSÃO da tool (antes virava outro `tool`
+  // e o contador "em voo" só somava — 391 no log de prod).
   assert.deepEqual(
     parseGrokStreamEvent({
       type: "tool_call_update",
@@ -137,7 +139,23 @@ test("Grok stream tool_call / tool_call_update → tool (estado thinking no runn
       status: "completed",
       rawOutput: { lines: 42 },
     }),
-    [{ type: "tool", name: "", input: {}, id: "call_1" }],
+    [{ type: "tool_done", id: "call_1" }],
+  );
+  // Update intermediário (sem status terminal) segue sendo `tool`: no runner é
+  // idempotente por id, então não infla.
+  assert.deepEqual(
+    parseGrokStreamEvent({ type: "tool_call_update", toolCallId: "call_1", title: "lendo" }),
+    [{ type: "tool", name: "lendo", input: {}, id: "call_1" }],
+  );
+  // Chunk de ARGUMENTOS da MESMA tool: marcado como delta, não abre tool nova.
+  assert.deepEqual(
+    parseGrokStreamEvent({
+      type: "tool_call_delta_chunk",
+      toolCallId: "call_1",
+      toolName: "read_file",
+      rawInput: { path: "a" },
+    }),
+    [{ type: "tool", name: "read_file", input: { path: "a" }, id: "call_1", delta: true }],
   );
   assert.deepEqual(
     parseGrokStreamEvent({

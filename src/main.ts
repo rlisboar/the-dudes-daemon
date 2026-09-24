@@ -8,6 +8,7 @@ import {
   channelCanSend,
   createOutboundQueue,
   flushOutboundQueue,
+  isCriticalOutbound,
   trySendOutbound,
 } from "./runners/outbound-delivery.js";
 import { captureBootBinaryHash, checkAndApplyUpdate, runningReleaseInfo } from "./self-update.js";
@@ -680,6 +681,10 @@ export class DaemonClient {
       // T-1005: a desconexão limpa a fila ao vivo no server — reemite o
       // snapshot de quem tem fila (debounce; o server trata igual como no-op).
       try { this.host.reemitirFilaVivaNoHello(); } catch { /* observação */ }
+      // T-822: o estado NÃO crítico (running/state/usage/context) é descartado
+      // com o WS fora (não entra na fila de reenvio) — reemite o ATUAL, senão o
+      // server fica com running=true de um agente morto e retém as mensagens.
+      try { this.host.reemitirEstadoNoHello(); } catch { /* observação */ }
       // Ressincroniza tokens de agents já rodando localmente — sem isso,
       // após restart do server, o Map agentTokens fica vazio e o
       // mcp-bridge (que mantém o token antigo em env) começa a receber
@@ -2604,9 +2609,13 @@ export class DaemonClient {
     });
     recordWsOut((obj as { type: string }).type, json.length, ok);
     if (!ok) {
+      // T-822: o texto dizia "drop" para os DOIS casos, e o crítico não é
+      // drop — ele foi enfileirado e sai no reconnect. Quem lê o log (e o
+      // parser do histórico) precisa distinguir.
+      const critico = isCriticalOutbound(obj as { type: string });
       log(
         "warn",
-        `outbound drop type=${(obj as { type: string }).type} ` +
+        `outbound ${critico ? "enfileirado" : "descartado"} type=${(obj as { type: string }).type} ` +
           `(ws=${ws ? ws.readyState : "null"} buffered=${ws?.bufferedAmount ?? 0} ` +
           `queued=${this.outboundQueue.items.length})`,
       );

@@ -91,6 +91,11 @@ export async function runCodexMessage(self: any, content: string, images?: Image
     }
     timing?.bootStart();
     self.ocActiveProc = proc;
+    // T-820: registra o pid no rastreio do runner — `killTrackedTurnPids` (stop,
+    // hard recover, shutdown) alcança o CLI MESMO depois de um close tardio anular
+    // `ocActiveProc` (kill no-op). Antes só o grok fazia isso (T-593): turno órfão
+    // sobrevivia ao stop e o stub detached pendurava a suíte sem `--test-force-exit`.
+    self.trackTurnPid(proc.pid);
     armHardTimeout(proc, PER_MSG_TURN_TIMEOUT_MS, () => {
       timing?.finish("hard-recover", "hard-timeout", "lifetime");
       self.opts.log("warn", `[codex:${self.info.name}] turno excedeu ${PER_MSG_TURN_TIMEOUT_MS / 1000}s — SIGKILL`);
@@ -146,7 +151,10 @@ export async function runCodexMessage(self: any, content: string, images?: Image
         self.drainOcQueue();
       }
     };
-    proc.on("close", (code) => fecharTurno(code));
+    proc.on("close", (code) => {
+      self.untrackTurnPid(proc.pid);
+      fecharTurno(code);
+    });
     proc.on("exit", (code, signal) => {
       const t = setTimeout(() => {
         if (fechado) return;
@@ -181,23 +189,18 @@ export function handleCodexEvent(self: any, event: any, epoch: number) {
           self.opts.onSessionId?.(normalized.sessionId);
         }
       } else if (normalized.type === "tool") {
-        // T-829: in-flight por item (id): o item.completed desconta. Antes só o
-        // turn.completed zerava e o contador inflava (11 "em voo" no WEB),
-        // deixando o watchdog no teto de tools de 20min em vez do soft.
-        if (normalized.id) {
-          const itens: Set<string> = self.codexToolItems ?? (self.codexToolItems = new Set<string>());
-          if (!itens.has(normalized.id)) {
-            itens.add(normalized.id);
-            self.noteGrokToolInFlight();
-          }
-        }
+        // T-829/T-819: in-flight por item (id) no contador COMPARTILHADO, que
+        // já é idempotente por id. Antes o turn.completed zerava tudo e o
+        // contador inflava (11 "em voo" no WEB) — watchdog no teto de tools.
+        // SEM id NÃO abre: `file_change` e `web_search` são tool instantânea
+        // (não têm item.completed par), e a chave sintética `sem-id:N` ficaria
+        // em voo pra sempre — 20 file_change + 10 web_search = 30 "em voo" e o
+        // HARD do codex ia de 12min para o teto de tools (20min). Repro do QA-A.
+        if (normalized.id) self.noteGrokToolInFlight(normalized.id);
         self.opts.onToolUse(normalized.name, normalized.input);
         self.setState(normalized.name.includes("send_message") ? "sending" : "thinking");
       } else if (normalized.type === "tool_done") {
-        if (self.codexToolItems?.delete(normalized.id)) {
-          self.toolsInFlight = Math.max(0, self.toolsInFlight - 1);
-          if (self.toolsInFlight === 0) self.toolsInFlightSince = null;
-        }
+        self.noteToolFechada(normalized.id);
       } else if (normalized.type === "thought") {
         // T-829: raciocínio do codex (item reasoning) não chegava à UI.
         if (self.info.collectThinking) self.opts.onThinkingText?.(normalized.text);

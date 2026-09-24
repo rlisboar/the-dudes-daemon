@@ -500,8 +500,7 @@ export function startDsh(self: any): void {
     self.dsh = null;
     self.dshReady = false;
     self.dshPromptInFlight = false;
-    self.toolsInFlight = 0;
-    self.toolsInFlightSince = null;
+    self.zerarToolsEmVoo();
     if (self.stopped || self.recoveringHung) return;
     // T-726 (d): só o handshake conta para o backoff — saída normal pós-turno
     // (dshHandshakeFails zerado no sucesso) segue com o restart rápido.
@@ -544,16 +543,15 @@ export function startDsh(self: any): void {
       self.touchActivity();
       if (ev.phase === "call") {
         self.turnLatency?.current?.semantic("tool");
-        if (self.toolsInFlight === 0) self.toolsInFlightSince = Date.now();
-        self.toolsInFlight++;
+        // T-819: por ID (o ACP reemite `tool_call` do mesmo id — não é tool nova).
+        self.noteGrokToolInFlight(ev.id);
         // T-827: o dsh manda os argumentos no `rawInput` do tool_call (medido
         // no dsh 0.1.5: bash {command, description}, read {file_path, limit});
         // antes ia `{}` e os RUNS ficavam vazios.
         self.opts.onToolUse(ev.title ?? ev.id, ev.input ?? {});
         self.setState((ev.title ?? "").includes("send_message") ? "sending" : "thinking");
       } else if (ev.status === "completed" || ev.status === "failed") {
-        self.toolsInFlight = Math.max(0, self.toolsInFlight - 1);
-        if (self.toolsInFlight === 0) self.toolsInFlightSince = null;
+        self.noteToolFechada(ev.id);
       }
     },
     onUsage: (used, size) => {

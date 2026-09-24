@@ -173,7 +173,8 @@ export function ingestLogLine(line: string, acc: Acc, names: Map<string, string>
   if (/^\[self-update\] release [0-9a-f]+ ≠ rodando/.test(msg)) acc.releases++;
   if (/^heartbeat timeout/.test(msg)) acc.heartbeat++;
   if (/^handshake failed: HTTP/.test(msg)) acc.handshake++;
-  if (/^outbound drop type=agent:(running|state|usage_delta|context) /.test(msg)) acc.stateLost++;
+  // T-822: o log virou "descartado" (o crítico é "enfileirado" e não se perde).
+  if (/^outbound descartado type=agent:(running|state|usage_delta|context) /.test(msg)) acc.stateLost++;
   if ((x = /^\[turn-gate:\w+\] slot de (.+?) preso há \d+min — liberando à força/.exec(msg))) inc(acc.gateForced, x[1]!);
   if ((x = /^\[hang:(.+?)\] toolsInFlight=(\d+) aberto há \d+s/.exec(msg))) {
     const e = acc.tools.get(x[1]!) ?? { max: 0, n: 0 };

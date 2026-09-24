@@ -123,9 +123,18 @@ const killTurnProc = (r: AgentRunner) => {
  *  vira null no close do filho ANTES de o processo morrer, e um drain tardio
  *  pode spawnar DEPOIS do stop — sem a varredura o stub detached (spawnDropped
  *  usa detached:true) + o timer do armHardTimeout prendem o event loop
- *  (pitfall T-376, mesmo dos testes T-417). */
-function sweepStubs(dir: string): number {
+ *  (pitfall T-376, mesmo dos testes T-417).
+ *
+ *  T-820: a fonte PRIMÁRIA é o rastreio do próprio runner (`killTrackedTurnPids`,
+ *  a mesma lista que o stop usa) — `ps` é NEGADO no sandbox do agente (T-897),
+ *  então a varredura por comando voltava 0 e o stub sobrevivia, pendurando a
+ *  suíte quando ela roda sem `--test-force-exit`. */
+function sweepStubs(dir: string, runner?: AgentRunner): number {
   let vivos = 0;
+  if (runner) {
+    const matar = asAny(runner).killTrackedTurnPids as ((s: NodeJS.Signals) => number) | undefined;
+    if (matar) vivos += matar.call(runner, "SIGKILL");
+  }
   try {
     const out = execFileSync("ps", ["-eo", "pid=,command="], { encoding: "utf8" });
     for (const linha of out.split("\n")) {
@@ -158,9 +167,9 @@ async function withHarness(fn: (h: Harness) => Promise<void>): Promise<void> {
     for (let i = 0; i < 20; i++) {
       await new Promise((r) => setTimeout(r, 150));
       killTurnProc(h.runner);
-      if (sweepStubs(h.dir) === 0 && !asAny(h.runner).ocActiveProc && turnGateStats().ativos === 0) {
+      if (sweepStubs(h.dir, h.runner) === 0 && !asAny(h.runner).ocActiveProc && turnGateStats().ativos === 0) {
         await new Promise((r) => setTimeout(r, 200));
-        if (sweepStubs(h.dir) === 0) break;
+        if (sweepStubs(h.dir, h.runner) === 0) break;
       }
     }
     try {
