@@ -37,6 +37,10 @@
       "types": "./wire-version.d.ts",
       "default": "./wire-version.js"
     },
+    "./summarizer-runners": {
+      "types": "./summarizer-runners.d.ts",
+      "default": "./summarizer-runners.js"
+    },
     "./scrub": {
       "types": "./scrub.d.ts",
       "default": "./scrub.js"
