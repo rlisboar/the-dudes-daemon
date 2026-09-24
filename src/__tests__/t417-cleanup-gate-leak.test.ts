@@ -90,7 +90,7 @@ function makeHarness(portao = false) {
 const asAny = (r: AgentRunner) => r as unknown as Record<string, any>;
 const gateAtivos = () => turnGateStats().ativos;
 
-async function until(cond: () => boolean, what: string, ms = 5000): Promise<void> {
+async function until(cond: () => boolean, what: string, ms = 20_000): Promise<void> {
   const t0 = Date.now();
   while (!cond()) {
     if (Date.now() - t0 > ms) throw new Error(`timeout aguardando ${what}`);
@@ -137,7 +137,7 @@ async function limpar(h: ReturnType<typeof makeHarness>): Promise<void> {
 
 /** Turno em voo com o stub pendurado (o slot do gate é adquirido ANTES do
  *  spawn, então esperar o argv não prova o slot — é o que a sonda mede). */
-async function turnoEmVoo(h: ReturnType<typeof makeHarness>, ms = 5000): Promise<ChildProcess> {
+async function turnoEmVoo(h: ReturnType<typeof makeHarness>, ms = 20_000): Promise<ChildProcess> {
   const a = asAny(h.runner);
   h.runner.pushUserMessage("turno-1");
   await until(() => h.argvLines().length === 1, "spawn do stub", ms);

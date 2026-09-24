@@ -65,7 +65,10 @@ function harness(mode: string, runner: "claude" | "codex" = "claude"): {
   return { runner: r, stopped: () => r.stop() };
 }
 
-async function until(cond: () => boolean, ms = 5000): Promise<void> {
+/** Budget LARGO (20s): sob a carga da suíte o spawn/handshake do claude passa
+ *  dos 5s que o arquivo usava e um `until` estourava (visto no T-1088, isolado
+ *  sob carga). Mesmo critério aplicado no t1070. */
+async function until(cond: () => boolean, ms = 20_000): Promise<void> {
   const t0 = Date.now();
   while (!cond()) {
     if (Date.now() - t0 > ms) throw new Error("timeout");
@@ -85,7 +88,7 @@ test("T-441: turno claude vivo conta como ativo; result volta a idle", async (t)
   assert.equal(h.runner.isTurnActive(), false, "idle antes de enviar");
   h.runner.pushUserMessage("trabalhe");
   assert.equal(h.runner.isTurnActive(), true, "turno em voo precisa ser visível pro self-update");
-  await until(() => !h.runner.isTurnActive(), 8000);
+  await until(() => !h.runner.isTurnActive(), 20_000);
   assert.equal(h.runner.isTurnActive(), false, "result fechou o turno");
   h.stopped();
 });

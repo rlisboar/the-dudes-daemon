@@ -29,6 +29,7 @@ test("T-1063: session/load que FALHA cai para sessão nova e não trava o turno 
   assert.match(h.textos[0]!, /ECO:primeiro/, "o turno COMPLETA mesmo com o load reprovado");
   assert.equal(asAny(h.runner).messageSession.sessionId, "sessao-nova-1", "segue com a sessão NOVA do fallback");
   assert.equal(h.sessoes[h.sessoes.length - 1], "sessao-nova-1", "o server aprende a sessão nova (onSessionId)");
+  assert.notEqual(asAny(h.runner).info.sessionId, "sessao-antiga", "o id velho não fica no info (esquecido no fallback)");
 
   const apos1 = h.lerLog().map((l) => l.method);
   assert.equal(apos1.filter((m) => m === "session/load").length, 1, "tentou o load UMA vez");

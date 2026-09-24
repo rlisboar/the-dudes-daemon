@@ -147,7 +147,9 @@ function sweepStubs(dir: string, runner?: AgentRunner): number {
   return vivos;
 }
 
-async function until(cond: () => boolean, ms = 5000, what = "condição"): Promise<void> {
+async function until(cond: () => boolean, ms = 20_000, what = "condição"): Promise<void> {
+// T-1088: budget LARGO — sob a carga da suíte inteira o spawn do stub passa
+// dos 4-8s e o caso virava falso vermelho (família 'timeout aguardando spawn').
   const t0 = Date.now();
   while (!cond()) {
     if (Date.now() - t0 > ms) throw new Error(`timeout aguardando ${what}`);
@@ -181,7 +183,7 @@ async function withHarness(fn: (h: Harness) => Promise<void>): Promise<void> {
 /** Turno real em voo com o stub (proc vivo, stream ativo, sessão adotada). */
 async function spawnTurnEmVoo(h: Harness, texto = "trabalho longo"): Promise<void> {
   h.runner.pushUserMessage(texto);
-  await until(() => h.argvLines().length === 1, 5000, "spawn do turno");
+  await until(() => h.argvLines().length === 1, 20_000, "spawn do turno");
   await until(() => typeof asAny(h.runner).messageSession.sessionId === "string", 3000, "sessão adotada do stub");
 }
 

@@ -98,7 +98,9 @@ function harness(mode: string): H {
   return { runner, texts, warns, recv: () => count("recv.log"), spawns: () => count("spawn.log") };
 }
 
-async function until(cond: () => boolean, ms = 8000, what = "condição"): Promise<void> {
+async function until(cond: () => boolean, ms = 20_000, what = "condição"): Promise<void> {
+// T-1088: budget LARGO — sob a carga da suíte inteira o spawn do stub passa
+// dos 4-8s e o caso virava falso vermelho (família 'timeout aguardando spawn').
   const t0 = Date.now();
   while (!cond()) {
     if (Date.now() - t0 > ms) throw new Error(`timeout aguardando ${what}`);
@@ -116,7 +118,7 @@ test("T-760: resposta dentro do kill NÃO é duplicada pelo re-envio (falha na b
   const h = harness("eof_reply");
   try {
     await h.runner.start();
-    await until(() => h.spawns() === 1, 5000, "spawn");
+    await until(() => h.spawns() === 1, 20_000, "spawn");
     h.runner.pushUserMessage("R1");
     await until(() => h.recv() === 1, 5000, "stub recebeu (mudo até o kill)");
     assert.equal(h.texts.length, 0, "ainda sem resposta");
@@ -133,7 +135,7 @@ test("T-760: sem resposta no kill, a mensagem é re-enviada e NÃO se perde", as
   const h = harness("silent_noreply");
   try {
     await h.runner.start();
-    await until(() => h.spawns() === 1, 5000, "spawn");
+    await until(() => h.spawns() === 1, 20_000, "spawn");
     h.runner.pushUserMessage("S1");
     await until(() => h.recv() === 1, 5000, "stub recebeu");
     disparaRestart(h);

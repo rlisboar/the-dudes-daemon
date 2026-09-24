@@ -112,7 +112,9 @@ function makeHarness(initialMode: string, opts: { stubDrain?: boolean } = {}): H
 const asAny = (r: AgentRunner) => r as unknown as Record<string, any>;
 const tick = (r: AgentRunner) => (r as unknown as { tickHangWatch: () => void }).tickHangWatch();
 
-async function until(cond: () => boolean, ms = 5000, what = "condição"): Promise<void> {
+async function until(cond: () => boolean, ms = 20_000, what = "condição"): Promise<void> {
+// T-1088: budget LARGO — sob a carga da suíte inteira o spawn do stub passa
+// dos 4-8s e o caso virava falso vermelho (família 'timeout aguardando spawn').
   const t0 = Date.now();
   while (!cond()) {
     if (Date.now() - t0 > ms) throw new Error(`timeout aguardando ${what}`);
@@ -152,7 +154,7 @@ test("T-371 (b): hard recover no turno qwen re-enfileira e re-processa a mensage
   withHarness("hang", {}, async (h) => {
     const a = asAny(h.runner);
     h.runner.pushUserMessage("pergunta do dono");
-    await until(() => h.argvLines().length === 1, 5000, "spawn do stub");
+    await until(() => h.argvLines().length === 1, 20_000, "spawn do stub");
     assert.ok(a.messageSession.busy, "turno em voo");
     assert.equal(a.inflightPerMessage?.content, "pergunta do dono", "inflight registrado no spawn");
 
@@ -176,7 +178,7 @@ test("T-371 guarda: close TARDIO de turno recuperado não zera busy/proc do turn
   withHarness("hang", { stubDrain: true }, async (h) => {
     const a = asAny(h.runner);
     void a.runQwenMessage("vitima");
-    await until(() => h.argvLines().length === 1, 5000, "spawn do turno vitimado");
+    await until(() => h.argvLines().length === 1, 20_000, "spawn do turno vitimado");
     const proc1 = a.ocActiveProc as { kill: (s: string) => void; emit: (e: string, c: null) => void };
     assert.ok(proc1, "turno vitimado tem proc");
     await new Promise((r) => setTimeout(r, 150)); // eventos do stub assentam
@@ -201,7 +203,7 @@ test("T-371 (a): após hard recover, spawn seguinte abre --session-id novo e NÃ
     const a = asAny(h.runner);
     a.messageSession.sessionId = "sess-velha-degenerada";
     void a.runQwenMessage("primeira");
-    await until(() => h.argvLines().length === 1, 5000, "spawn 1");
+    await until(() => h.argvLines().length === 1, 20_000, "spawn 1");
     assert.match(h.argvLines()[0]!, /-r sess-velha-degenerada/, "turno 1 retoma a sessão existente (pré-condição)");
     a.messageSession.busy = true;
     await new Promise((r) => setTimeout(r, 150)); // deixar eventos do stub assentarem
@@ -215,7 +217,7 @@ test("T-371 (a): após hard recover, spawn seguinte abre --session-id novo e NÃ
     // turno seguinte (disparo direto — (a) não depende do re-enfileiramento de (b))
     h.setMode("done");
     void a.runQwenMessage("segunda");
-    await until(() => h.argvLines().length === 2, 5000, "spawn 2");
+    await until(() => h.argvLines().length === 2, 20_000, "spawn 2");
     const argv2 = h.argvLines()[1]!;
     assert.match(argv2, /--session-id [0-9a-f-]{36}/, `spawn 2 tem de abrir sessão nova: ${argv2}`);
     assert.ok(!argv2.includes("sess-velha-degenerada"), `spawn 2 não pode retomar a sessão velha: ${argv2}`);
@@ -252,7 +254,7 @@ test("T-371 (c-integration): turno qwen em loop é abortado pela janela anti-rep
   withHarness("loop", {}, async (h) => {
     const a = asAny(h.runner);
     h.runner.pushUserMessage("gera texto");
-    await until(() => h.argvLines().length === 1, 5000, "spawn do loop");
+    await until(() => h.argvLines().length === 1, 20_000, "spawn do loop");
 
     // Quem mata o loop aqui é o TextLoopGuard (T-371 (c)): o marcador é o warn
 // "token loop detectado" + SIGKILL, ANTES de qualquer teto de lifetime.
@@ -319,7 +321,7 @@ test("T-371 (e): round de API intermediário (evento de stream sem texto) repõe
   withHarness("usage", {}, async (h) => {
     const a = asAny(h.runner);
     h.runner.pushUserMessage("pensar fundo");
-    await until(() => h.argvLines().length === 1, 5000, "spawn do stub");
+    await until(() => h.argvLines().length === 1, 20_000, "spawn do stub");
 
     a.activityClock.lastActivityAt = Date.now() - 60_000; // thinking profundo: sem eventos, o soft viria
     await until(() => (a.activityClock.lastActivityAt as number) > Date.now() - 55_000, 3000, "round de API intermediário repor o clock");

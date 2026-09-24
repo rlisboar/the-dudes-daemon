@@ -121,7 +121,9 @@ function fakeTurnProc(): any {
   };
 }
 
-async function until(cond: () => boolean, what: string, ms = 5000): Promise<void> {
+async function until(cond: () => boolean, what: string, ms = 20_000): Promise<void> {
+// T-1088: budget LARGO — sob a carga da suíte inteira o spawn do stub passa
+// dos 4-8s e o caso virava falso vermelho (família 'timeout aguardando spawn').
   const t0 = Date.now();
   while (!cond()) {
     if (Date.now() - t0 > ms) throw new Error(`timeout aguardando ${what}`);

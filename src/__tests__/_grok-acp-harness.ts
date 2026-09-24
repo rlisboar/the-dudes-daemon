@@ -7,8 +7,7 @@
  * (b) O caminho chega ao CLI pelo allowlist de env do runner
  *     (`THE_DUDES_AGENT_ENV_PASSTHROUGH`), que é o mecanismo desenhado para isso.
  */
-import { readFileSync, writeFileSync } from "node:fs";
-import os from "node:os";
+import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -44,9 +43,13 @@ export function harnessAcp(m: ModoAcp = {}): HarnessAcp {
   const logFile = path.join(dir, "acp.jsonl");
   const escrever = (novo: ModoAcp): void => writeFileSync(modoFile, JSON.stringify({ ...novo, log: logFile }));
   escrever(m);
-  process.env.T1063_MODE_FILE = modoFile;
-  // Allowlist de env do runner: é assim que o CLI (o fake) enxerga o caminho.
-  process.env.THE_DUDES_AGENT_ENV_PASSTHROUGH = "T1063_MODE_FILE";
+  // T-1083 (c): isolamento POR RUNNER, não global. O wrapper abaixo é o "CLI" que
+  // o runner spawna: ele exporta o caminho do modo ANTES de virar a fixture, então
+  // dois harnesses (t1063 e t1072, ou dois testes no mesmo arquivo) não disputam
+  // `process.env.THE_DUDES_AGENT_ENV_PASSTHROUGH` — quem manda no env é o spawn.
+  const wrapper = path.join(dir, "grok-acp.sh");
+  writeFileSync(wrapper, `#!/bin/sh\nT1063_MODE_FILE=${JSON.stringify(modoFile)} exec ${JSON.stringify(FIXTURE)} "$@"\n`);
+  chmodSync(wrapper, 0o755);
 
   const textos: string[] = [];
   const erros: string[] = [];
@@ -61,7 +64,7 @@ export function harnessAcp(m: ModoAcp = {}): HarnessAcp {
   const runner = new AgentRunner(info, {
     bridgeCommand: "node", bridgeArgs: [], orchestratorUrl: "http://127.0.0.1:0",
     agentToken: "t", cliRunner: "grok", autoApprove: true, workspaceRoot: dir,
-    cliCommands: { ...resolveCliCommands(), grok: { command: FIXTURE, source: "override" as const, available: true } },
+    cliCommands: { ...resolveCliCommands(), grok: { command: wrapper, source: "override" as const, available: true } },
     verbose: false, verboseHuman: false, verboseHumanIo: false,
     log: () => {}, cliLog: () => {}, onState: () => {},
     onAssistantText: (t: string) => { textos.push(t); return true; },
@@ -91,15 +94,8 @@ export async function until(cond: () => boolean, ms = 8_000, o = "condição"): 
 /** Liga a flag do driver ACP e restaura o ambiente ao fim do teste. */
 export function comFlagAcp(t: { after: (f: () => void) => void }): void {
   const antes = process.env.THE_DUDES_GROK_ACP;
-  const antesModo = process.env.T1063_MODE_FILE;
-  const antesPass = process.env.THE_DUDES_AGENT_ENV_PASSTHROUGH;
   process.env.THE_DUDES_GROK_ACP = "1";
   t.after(() => {
     if (antes === undefined) delete process.env.THE_DUDES_GROK_ACP; else process.env.THE_DUDES_GROK_ACP = antes;
-    if (antesModo === undefined) delete process.env.T1063_MODE_FILE; else process.env.T1063_MODE_FILE = antesModo;
-    if (antesPass === undefined) delete process.env.THE_DUDES_AGENT_ENV_PASSTHROUGH; else process.env.THE_DUDES_AGENT_ENV_PASSTHROUGH = antesPass;
   });
 }
-
-/** Diretório-base do harness (útil para asserções de caminho). */
-export const ehTemporario = (dir: string): boolean => dir.startsWith(os.tmpdir()) || dir.startsWith("/var/folders") || dir.startsWith("/tmp");

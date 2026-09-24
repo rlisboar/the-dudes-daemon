@@ -101,7 +101,9 @@ function makeRunner(fakeCodex: string): AgentRunner {
 const asAny = (r: AgentRunner) => r as unknown as Record<string, any>;
 
 /** Espera o poll pós-turno aplicar o sinal do rollout (ou timeout). */
-async function waitFor(cond: () => boolean, timeoutMs = 5000): Promise<boolean> {
+async function waitFor(cond: () => boolean, timeoutMs = 20_000): Promise<boolean> {
+// T-1088: budget LARGO — sob a carga da suíte inteira o spawn do stub passa
+// dos 4-8s e o caso virava falso vermelho (família 'timeout aguardando spawn').
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (cond()) return true;

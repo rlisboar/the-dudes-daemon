@@ -74,7 +74,9 @@ function makeClaude(mode: string): { runner: AgentRunner; sessionEvents: string[
   };
 }
 
-async function until(cond: () => boolean, ms = 4000, what = "condição"): Promise<void> {
+async function until(cond: () => boolean, ms = 20_000, what = "condição"): Promise<void> {
+// T-1088: budget LARGO — sob a carga da suíte inteira o spawn do stub passa
+// dos 4-8s e o caso virava falso vermelho (família 'timeout aguardando spawn').
   const t0 = Date.now();
   while (!cond()) {
     if (Date.now() - t0 > ms) throw new Error(`timeout aguardando ${what}`);
@@ -127,7 +129,7 @@ test("T-414 claude: texto real de sessão perdida ANTES do init apaga sessionId"
   const h = makeClaude("before-init-real");
   try {
     await h.runner.start();
-    await until(() => h.runner.info.sessionId === undefined || h.sessionEvents.includes(""), 4000, "sessionInvalid");
+    await until(() => h.runner.info.sessionId === undefined || h.sessionEvents.includes(""), 20_000, "sessionInvalid");
     assert.equal(h.runner.info.sessionId, undefined);
     assert.ok(h.sessionEvents.includes(""), "onSessionId(\"\") no missing-session pré-init");
   } finally {

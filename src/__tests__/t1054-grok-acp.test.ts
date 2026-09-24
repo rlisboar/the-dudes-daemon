@@ -110,7 +110,7 @@ test("T-1054: o processo é REUSADO — 2º turno não refaz boot nem abre sess�
   assert.ok(pid1, "cliente ACP vivo após o 1º turno");
 
   h.runner.pushUserMessage("segunda");
-  await until(() => h.textos.length > 1, 8_000, "2º turno");
+  await until(() => h.textos.length > 1, 20_000, "2º turno");
 
   assert.equal(asAny(h.runner).grokAcp?.pid?.(), pid1, "MESMO processo no 2º turno (é o ganho do card)");
   const log = h.lerLog();
@@ -145,6 +145,6 @@ test("T-1054: com a flag OFF nenhum cliente ACP é criado (headless segue dono)"
   // Sem flag, o caminho headless spawna o fixture com os args do headless — o
   // fake ACP não responde a `-p`, então basta provar que o cliente não existiu.
   h.runner.pushUserMessage("oi");
-  await until(() => asAny(h.runner).ocActiveProc !== null, 6_000, "spawn do headless");
+  await until(() => asAny(h.runner).ocActiveProc !== null, 20_000, "spawn do headless");
   assert.equal(asAny(h.runner).grokAcp, undefined, "sem cliente ACP com a flag off");
 });

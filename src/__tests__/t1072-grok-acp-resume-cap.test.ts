@@ -48,6 +48,9 @@ test("T-1072: o modo/log do fake vivem em diretório único por execução", asy
   assert.equal(h.lerLog().length, 0, "log começa vazio (nada de arquivo compartilhado de outra execução)");
   asAny(h.runner).messageSession.sessionId = "sessao-antiga";
   h.runner.pushUserMessage("primeiro");
-  await until(() => h.lerLog().length > 0, 8_000, "fake registrou no log do PRÓPRIO dir");
+  // T-1094 (repro do QA-A): esperar a LINHA `initialize`, não "alguma linha" — a
+  // fixture grava `boot` no startup e o `length > 0` ficava satisfeito ANTES do
+  // handshake (flake 25/25 na asserção seguinte). Budget largo: é a 1ª ação.
+  await until(() => h.lerLog().some((l) => l.method === "initialize"), 20_000, "initialize no log do PRÓPRIO dir");
   assert.ok(h.lerLog().some((l) => l.method === "initialize"), "o log é o do dir deste harness");
 });

@@ -85,7 +85,9 @@ async function tresTurnos(kind: "codex" | "gemini") {
     const t0 = Date.now();
     // T-888: 8s era apertado (o QA mediu 4,8s sob carga). O que o teste prova é
     // a ORDEM e o busy liberado, não o tempo — 15s não enfraquece a asserção.
-    while (Date.now() - t0 < 15_000 && !(texts.length >= 3 && a.messageSession.busy === false)) {
+    // T-1088: 40s — o teste prova ORDEM e busy, não tempo; sob carga o 3º stub
+    // demorava mais que os 15s anteriores.
+    while (Date.now() - t0 < 40_000 && !(texts.length >= 3 && a.messageSession.busy === false)) {
       await new Promise((r) => setTimeout(r, 30));
     }
     assert.deepEqual(texts, ["resp-1", "resp-2", "resp-3"], `${kind}: uma resposta por mensagem`);

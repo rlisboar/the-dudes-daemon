@@ -26,7 +26,8 @@ const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catc
  * write, o processo morre sem escrever e o teste falha por corrida, não por
  * defeito. Teto = 2 × p100 concorrente ≈ 6.5s.
  */
-const BOOT_BUDGET_MS = 6_500;
+// T-1088: 6,5s não bastava sob a carga da suíte (o stub nem se registrava).
+const BOOT_BUDGET_MS = 10_000;
 
 test("T-445: timeout do summarizer mata o grupo inteiro (líder + neto)", async () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), "t445-"));
@@ -46,7 +47,7 @@ setInterval(() => {}, 1000);
     cliCommands: { crush: { available: true, command: script } } as never,
     // BOOT_BUDGET_MS (derivado acima): o pid file tem de existir ANTES do
     // timeout disparar — o kill mata o fake CLI e ele nunca mais escreve.
-    timeoutMs: BOOT_BUDGET_MS,
+    timeoutMs: BOOT_BUDGET_MS + 2_000,  // T-1088: o CLI tem de viver MAIS que a janela de boot
   });
   assert.equal(r.ok, false);
   assert.match(r.error ?? "", /timeout/);
@@ -70,7 +71,9 @@ setInterval(() => {}, 1000);
   }
   assert.ok(parsed, `pid file não ficou parseável em ${BOOT_BUDGET_MS}ms (último raw=${JSON.stringify(raw)})`);
   const { leader, child } = parsed;
-  const deadline = Date.now() + 5_000;
+// T-1088: janela LARGA — sob carga o pid do neto demora a aparecer/morrer e a
+// janela curta virava falso vermelho ('pid file não parseável'/'neto sobreviveu').
+  const deadline = Date.now() + 10_000;
   while ((alive(leader) || alive(child)) && Date.now() < deadline) await new Promise((r2) => setTimeout(r2, 50));
   assert.equal(alive(leader), false, "líder morto");
   assert.equal(alive(child), false, `neto (pid ${child}) sobreviveu ao timeout — kill só no líder`);

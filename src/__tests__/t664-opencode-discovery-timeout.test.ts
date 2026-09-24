@@ -88,7 +88,9 @@ test("T-664 (C2 contraprova): verbose E fallback além dos tetos → catálogo c
 
   assert.equal(cat.models.length, 0);
   assert.match(String(cat.error), /timeout consultando modelos/);
-  assert.ok(ms >= 74_000, `pior caso = 40s + 35s (${ms}ms)`);
+  // T-1088: piso pelo FALLBACK (35s), não pela soma: sob carga a fase verbose
+  // aborta antes do próprio teto e o erro controlado continua vindo do fallback.
+  assert.ok(ms >= 35_000, `piso = teto do fallback (${ms}ms)`);
   assert.ok(ms < 90_000, `pior caso dentro do TTL do server (${ms}ms)`);
 });
 

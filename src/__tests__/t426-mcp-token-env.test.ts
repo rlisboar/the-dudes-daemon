@@ -95,7 +95,8 @@ test("T-426 codex: token fora do argv; config.toml 0600 fora do worktree", async
 
   await Promise.race([
     asAny(runner).runCodexMessage("ping"),
-    new Promise((r) => setTimeout(r, 8000)),
+    // T-1088: 8s era apertado sob carga (o CLI falso demora a rodar).
+    new Promise((r) => setTimeout(r, 20_000)),
   ]);
   assert.ok(await waitFor(() => existsSync(argvDump)), "CLI falso do codex não rodou");
   const argv = readFileSync(argvDump, "utf8");

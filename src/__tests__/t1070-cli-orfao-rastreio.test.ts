@@ -40,8 +40,12 @@ const vivo = (pid: number): boolean => {
  *  613s: dois stubs de crush nasceram após o teardown e seguraram os pipes.
  *  Aqui o teardown mata (a) o que o runner rastreia, (b) o `ocActiveProc` e
  *  (c) os pids que o PRÓPRIO stub grava em `sh.pid`/`sleep.pid` — estes últimos
- *  independem do rastreio, então cobrem o tardio. Sem `ps`. */
-async function teardown(runner: AgentRunner, dir: string): Promise<void> {
+ *  independem do rastreio, então cobrem o tardio. Sem `ps`.
+ *
+ *  `pisoMs`: só os casos de HARD RECOVER precisam do piso longo (8s), porque só
+ *  eles disparam o `auto-continue` em 5s do runner. Nos demais um piso curto
+ *  basta — era isso que fazia o arquivo custar 78,5s (9 casos × 8s). */
+async function teardown(runner: AgentRunner, dir: string, pisoMs = 1_000): Promise<void> {
   try { runner.stop(); } catch { /* já parado */ }
   const matarPid = (pid: number): boolean => {
     if (!Number.isFinite(pid) || pid <= 1) return false;
@@ -53,7 +57,7 @@ async function teardown(runner: AgentRunner, dir: string): Promise<void> {
   // `auto-continue` em 5s e esse spawn nasce DEPOIS do stop — sem cobrir a
   // janela o stub nascia livre (foi o vazamento que pendurou o arquivo).
   for (let i = 0; i < 150; i++) { // até ~15s
-    if (i >= 80 && limpos >= 5) break;
+    if (i * 100 >= pisoMs && limpos >= 5) break;
     await new Promise((r) => setTimeout(r, 100));
     try { asAny(runner).killTrackedTurnPids("SIGKILL"); } catch { /* observação */ }
     try { asAny(runner).ocActiveProc?.kill?.("SIGKILL"); } catch { /* observação */ }
@@ -147,7 +151,9 @@ for (const cliRunner of RUNNERS) {
 
   test(`T-1070 ${cliRunner}: hard recover mata por pid RASTREADO (e o NETO)`, async (t) => {
     const { runner, dir, pid, pidNeto } = await turnoComPidRastreado(cliRunner);
-    t.after(() => teardown(runner, dir));
+    // piso longo: o recover agenda `auto-continue` em 5s e esse spawn nasce
+    // depois do stop (é o único caso com essa janela).
+    t.after(() => teardown(runner, dir, 8_000));
     // Caminho real do watchdog (é ele que chama killTrackedTurnPids quando
     // `ocActiveProc` já foi anulado por um close tardio).
     await asAny(runner).recoverHungTurn("teste t1070", 0);

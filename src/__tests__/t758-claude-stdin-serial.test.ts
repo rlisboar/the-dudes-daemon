@@ -115,7 +115,7 @@ test("T-758: 3 pushes seguidos são serializados (stub que descarta linha em chu
   const h = harness("echo");
   try {
     await h.runner.start();
-    await until(() => h.spawns() === 1, 5000, "spawn");
+    await until(() => h.spawns() === 1, 20_000, "spawn");
     h.runner.pushUserMessage("A1");
     h.runner.pushUserMessage("B2");
     h.runner.pushUserMessage("C3");
@@ -141,7 +141,7 @@ test("T-758: mensagem não aceita vira evento visível em 30s e restart+re-envio
   const h = harness("mute");
   try {
     await h.runner.start();
-    await until(() => h.spawns() === 1, 5000, "spawn");
+    await until(() => h.spawns() === 1, 20_000, "spawn");
     h.runner.pushUserMessage("M1");
     await until(() => h.recv().length === 1, 5000, "stub recebeu (mudo, sem init)");
     assert.equal(h.warns.some((w) => w.includes("não foi aceita")), false, "antes do X nada");
