@@ -85,9 +85,12 @@ export function harnessAcp(m: ModoAcp = {}): HarnessAcp {
 
 export async function until(cond: () => boolean, ms = 8_000, o = "condição"): Promise<void> {
   const t0 = Date.now();
+  // T-1094: `T1094_POLL=immediate` aperta o poll (era 25ms) e expõe corridas de
+  // "espera satisfeita por linha errada" — é a alavanca do repro do QA-A.
+  const passo = process.env.T1094_POLL === "immediate" ? () => new Promise((r) => setImmediate(r)) : () => new Promise((r) => setTimeout(r, 25));
   while (!cond()) {
     if (Date.now() - t0 > ms) throw new Error(`timeout aguardando ${o}`);
-    await new Promise((r) => setTimeout(r, 25));
+    await passo();
   }
 }
 
