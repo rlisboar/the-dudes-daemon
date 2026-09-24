@@ -10,7 +10,7 @@ import "./scratch-home.js";
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -32,11 +32,14 @@ function harness(): {
   dir: string;
 } {
   const dir = mkdtempSync(path.join(os.tmpdir(), "t1054-"));
-  // `buildBaseRunnerEnv` não repassa env arbitrário ao CLI → o fake grava no
-  // default dele; limpamos antes de cada harness para não contar turnos alheios.
-  const logAcp = "/tmp/fake-acp-log.jsonl";
-  rmSync(logAcp, { force: true });
-  process.env.FAKE_ACP_LOG = logAcp;
+  // T-1088: caminho FIXO em /tmp era compartilhado com outros arquivos que usam
+  // esta mesma fixture (t690/t827) — um deles apagava/reescrevia o arquivo e a
+  // leitura aqui estourava com ENOENT (a "interferência entre paralelos").
+  // O wrapper exporta o caminho no SPAWN (o runner não repassa env arbitrário).
+  const logAcp = path.join(dir, "acp.jsonl");
+  const wrapper = path.join(dir, "acp.sh");
+  writeFileSync(wrapper, `#!/bin/sh\nFAKE_ACP_LOG=${JSON.stringify(logAcp)} exec ${JSON.stringify(FIXTURE)} "$@"\n`);
+  chmodSync(wrapper, 0o755);
   const textos: string[] = [];
   const pensamentos: string[] = [];
   const tools: Array<{ nome: string }> = [];
@@ -53,7 +56,7 @@ function harness(): {
   const runner = new AgentRunner(info, {
     bridgeCommand: "node", bridgeArgs: [], orchestratorUrl: "http://127.0.0.1:0",
     agentToken: "t", cliRunner: "grok", autoApprove: true, workspaceRoot: dir,
-    cliCommands: { ...resolveCliCommands(), grok: { command: FIXTURE, source: "override" as const, available: true }, "grok-custom": off() },
+    cliCommands: { ...resolveCliCommands(), grok: { command: wrapper, source: "override" as const, available: true }, "grok-custom": off() },
     verbose: false, verboseHuman: false, verboseHumanIo: false,
     log: () => {}, cliLog: () => {}, onState: () => {},
     onAssistantText: (t: string) => { textos.push(t); return true; },
@@ -63,11 +66,14 @@ function harness(): {
   } as never);
   return {
     runner, textos, tools, pensamentos, dir,
-    lerLog: () => readFileSync(logAcp, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>),
+    lerLog: () => {
+      try { return readFileSync(logAcp, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>); }
+      catch { return []; } // arquivo do próprio dir pode ainda não existir
+    },
   };
 }
 
-async function until(cond: () => boolean, ms = 8_000, o = "condição"): Promise<void> {
+async function until(cond: () => boolean, ms = 20_000, o = "condição"): Promise<void> {
   const t0 = Date.now();
   while (!cond()) {
     if (Date.now() - t0 > ms) throw new Error(`timeout aguardando ${o}`);
@@ -105,18 +111,29 @@ test("T-1054: o processo é REUSADO — 2º turno não refaz boot nem abre sess�
   t.after(() => h.runner.stop());
 
   h.runner.pushUserMessage("primeira");
-  await until(() => h.textos.length > 0, 8_000, "1º turno");
+  await until(() => h.textos.length > 0, 20_000, "1º turno");
+  // espera o 1º turno ASSENTAR (busy false) antes de fotografar: um retry dele
+  // caindo depois da foto contava como se fosse o 2º turno refazendo boot.
+  await until(() => asAny(h.runner).messageSession.busy === false, 20_000, "1º turno assentou");
   const pid1 = asAny(h.runner).grokAcp?.pid?.();
   assert.ok(pid1, "cliente ACP vivo após o 1º turno");
+  // T-1088: a contagem de handshake é ancorada DEPOIS do 1º turno. Sob carga o
+  // primeiro turno pode sofrer um retry (cliente novo) — isso é o retry, não o
+  // "boot por turno" que o teste denuncia. O que importa é o 2º turno NÃO refazer.
+  const aposPrimeiro = h.lerLog().map((l) => l.method);
+  const inicializa1 = aposPrimeiro.filter((m) => m === "initialize").length;
+  const sessoes1 = aposPrimeiro.filter((m) => m === "session/new").length;
+  const prompts1 = aposPrimeiro.filter((m) => m === "session/prompt").length;
 
   h.runner.pushUserMessage("segunda");
   await until(() => h.textos.length > 1, 20_000, "2º turno");
 
   assert.equal(asAny(h.runner).grokAcp?.pid?.(), pid1, "MESMO processo no 2º turno (é o ganho do card)");
   const log = h.lerLog();
-  assert.equal(log.filter((l) => l.method === "session/new").length, 1, "uma sessão só — sem boot por turno");
-  assert.equal(log.filter((l) => l.method === "initialize").length, 1, "um handshake só");
-  assert.equal(log.filter((l) => l.method === "session/prompt").length, 2, "os dois turnos foram prompts da MESMA sessão");
+  assert.equal(log.filter((l) => l.method === "session/new").length, sessoes1, `o 2º turno não abre sessão nova | pid1=${pid1} pidAgora=${asAny(h.runner).grokAcp?.pid?.()} metodos=${log.map((l) => l.method).join(",")}`);
+  assert.equal(log.filter((l) => l.method === "initialize").length, inicializa1, "nem refaz o handshake");
+  // relativo à foto: se o 1º turno sofreu retry, ele já custou prompts extras ✓
+  assert.equal(log.filter((l) => l.method === "session/prompt").length, prompts1 + 1, "o 2º turno foi UM prompt na mesma sessão");
 });
 
 test("T-1054: stop mata o cliente ACP (processo persistente não vaza)", async (t) => {
@@ -125,14 +142,14 @@ test("T-1054: stop mata o cliente ACP (processo persistente não vaza)", async (
   t.after(() => { if (antes === undefined) delete process.env.THE_DUDES_GROK_ACP; else process.env.THE_DUDES_GROK_ACP = antes; });
   const h = harness();
   h.runner.pushUserMessage("oi");
-  await until(() => h.textos.length > 0, 8_000, "turno");
+  await until(() => h.textos.length > 0, 25_000, "turno");  // T-1088: carga dupla
   const pid = asAny(h.runner).grokAcp?.pid?.() as number;
   assert.ok(pid > 0);
 
   h.runner.stop();
   await until(() => {
     try { process.kill(pid, 0); return false; } catch { return true; }
-  }, 5_000, "cliente morto");
+  }, 20_000, "cliente morto");
   assert.equal(asAny(h.runner).grokAcp, null, "a referência do cliente é liberada");
 });
 

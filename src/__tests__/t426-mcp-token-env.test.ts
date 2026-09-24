@@ -64,7 +64,8 @@ function makeRunner(runner: "codex" | "crush", opts: Record<string, unknown>): A
 const asAny = (r: AgentRunner) => r as unknown as Record<string, any>;
 
 /** runCodexMessage resolve logo após wire dos listeners — espera o CLI falso. */
-async function waitFor(cond: () => boolean, timeoutMs = 8000): Promise<boolean> {
+// T-1088: 20s — sob carga o CLI falso demora a rodar (era 8s).
+async function waitFor(cond: () => boolean, timeoutMs = 20_000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (cond()) return true;

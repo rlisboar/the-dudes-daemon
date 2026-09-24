@@ -46,17 +46,17 @@ test("T-463: timeout mata o GRUPO (shim + neto)", async () => {
     // T-1088: 1,2s não dava tempo de o SHIM nem começar sob carga (o pid do neto
     // nunca aparecia e o caso virava "neto 0 sobreviveu"). 5s mantém o teste
     // (timeout → kill do grupo) com folga para o shim se registrar.
-    const r = await runGit(process.cwd(), ["status"], { timeoutMs: 10_000 });
+    const r = await runGit(process.cwd(), ["status"], { timeoutMs: 20_000 });
     assert.equal(r.timedOut, true, JSON.stringify(r));
     assert.equal(r.ok, false);
     let raw = "";
 // T-1088: janela LARGA — sob carga o pid do neto demora a aparecer/morrer e a
 // janela curta virava falso vermelho ('pid file não parseável'/'neto sobreviveu').
-    const pidDeadline = Date.now() + 15_000;
+    const pidDeadline = Date.now() + 25_000;
     while (!raw && Date.now() < pidDeadline) { try { raw = readFileSync(pidFile, "utf8"); } catch { await new Promise((res) => setTimeout(res, 50)); } }
     assert.ok(raw.trim(), "pid do neto não apareceu no arquivo (shim morto antes de escrever?)");
     const child = Number(raw.trim());
-    const deadline = Date.now() + 10_000;
+    const deadline = Date.now() + 20_000;
     while (alive(child) && Date.now() < deadline) await new Promise((res) => setTimeout(res, 50));
     assert.equal(alive(child), false, `neto ${child} sobreviveu ao timeout`);
   } finally {

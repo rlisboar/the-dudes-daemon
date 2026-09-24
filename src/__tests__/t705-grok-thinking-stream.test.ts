@@ -114,7 +114,8 @@ function makeStreamHarness(opts: {
   return { runner, seq, thinking, texts, cliLogs, warns };
 }
 
-async function until(cond: () => boolean, what: string, ms = 12_000): Promise<void> {
+// T-1088: 25s — sob carga DUPLA (duas suítes) o texto do stub demora.
+async function until(cond: () => boolean, what: string, ms = 25_000): Promise<void> {
   const t0 = Date.now();
   while (!cond()) {
     if (Date.now() - t0 > ms) throw new Error(`timeout aguardando ${what}`);

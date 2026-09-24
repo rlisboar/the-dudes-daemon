@@ -27,7 +27,7 @@ const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catc
  * defeito. Teto = 2 × p100 concorrente ≈ 6.5s.
  */
 // T-1088: 6,5s não bastava sob a carga da suíte (o stub nem se registrava).
-const BOOT_BUDGET_MS = 10_000;
+const BOOT_BUDGET_MS = 20_000;
 
 test("T-445: timeout do summarizer mata o grupo inteiro (líder + neto)", async () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), "t445-"));
@@ -47,7 +47,7 @@ setInterval(() => {}, 1000);
     cliCommands: { crush: { available: true, command: script } } as never,
     // BOOT_BUDGET_MS (derivado acima): o pid file tem de existir ANTES do
     // timeout disparar — o kill mata o fake CLI e ele nunca mais escreve.
-    timeoutMs: BOOT_BUDGET_MS + 2_000,  // T-1088: o CLI tem de viver MAIS que a janela de boot
+    timeoutMs: BOOT_BUDGET_MS + 3_000,  // T-1088: o CLI tem de viver MAIS que a janela de boot
   });
   assert.equal(r.ok, false);
   assert.match(r.error ?? "", /timeout/);

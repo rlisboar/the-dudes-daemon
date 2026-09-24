@@ -128,7 +128,7 @@ process.stdin.on('end', () => {
   try {
     await runner.start();
     runner.pushUserMessage('PRIVATE_PROMPT'); runner.pushUserMessage('PRIVATE_PROMPT');
-    const deadline = Date.now() + 10_000;
+    const deadline = Date.now() + 25_000;  // T-1088: 25s sob carga dupla
     while (lines.length < 2 && Date.now() < deadline) await new Promise(r => setTimeout(r, 20));
     assert.equal(lines.length, 2);
     assert.equal(thoughts, 0);

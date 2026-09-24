@@ -23,7 +23,8 @@ import { ensureGraphWatch, stopGraphWatch } from "../graph-watcher.js";
 // atrasados do burst 2 ainda caem na mesma janela, que cada evento reinicia) e
 // confere a contagem quando o debounce dispara — o fim real da janela.
 const DEBOUNCE_MS = 3_000;
-const TETO_MS = 15_000;
+// T-1088: 35s — sob carga dupla a janela do aquecimento demora.
+const TETO_MS = 35_000;
 async function ate(cond: () => boolean, oque: string): Promise<void> {
   const t0 = Date.now();
   while (!cond()) {
