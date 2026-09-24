@@ -26,7 +26,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
-    "@sentry/node": "^10.74.0",
+    "@sentry/node": "^10.75.0",
     "@the-dudes/net-guard": "file:packages/net-guard",
     "@the-dudes/protocol": "file:packages/protocol",
     "undici": "^8.10.2",
