@@ -5,7 +5,7 @@ import {AgentRunner, type AgentRunnerOptions} from "./agent-runner.js";
 import {breadcrumb, captureWarn} from "./sentry.js";
 import {assertWorkspaceScoped, autoWorkspaceCwd, cloneRepoIfMissing, expandBasePath, findGitRoot, getWorkspaceRoot, isInsideRoot, repoCwd} from "./workspace.js";
 import {aadV2, E2EE_TABLE, MIGRATE_SEED_DROPPED_REASON, MIGRATE_SEED_RESUME_SKIPS_REASON} from "@the-dudes/protocol/e2ee-fields";
-import {decryptForProject, encryptForProject, isE2eEncrypted, isE2eeRequired, setE2eeRequired, redactCredentials, redactCredentialsDeep} from "./daemon-crypto.js";
+import {decryptForProject, decryptImageAttachments, encryptForProject, isE2eEncrypted, isE2eeRequired, setE2eeRequired, redactCredentials, redactCredentialsDeep} from "./daemon-crypto.js";
 import {classifyRunnerFailure} from "./runners/error-classifier.js";
 import {migratedSeedFor, MIGRATED_SEED_LIMIT_BYTES} from "./migrated-seed.js";
 import {agentStateInfo, cliIoCounters, recordAgentEvent, recordAgentState} from "./debug/store.js";
@@ -686,6 +686,10 @@ export class AgentHost {
       bridgeSocketPath: this.bridgeSocketPath,
       extraMcpServers: msg.extraMcpServers,
       features: msg.features,
+      // T-1150 (contrato §1): fila que o agente soltou no stop/replace/
+      // context-clear/loop-stop vai para o SERVER (fonte da verdade); a cópia
+      // local só cobre o intervalo até o server persistir.
+      onQueueRetained: (msgs, source) => { this.reterDoRunner(msg.agent.id, msgs, source as "stop"); },
       cliCommands: this.cliCommands,
       verbose: this.verbose,
       verboseHuman: this.verboseHuman,
@@ -889,8 +893,9 @@ export class AgentHost {
       // do agente sumia entre a entrega e a subida).
       await subiu;
       entrada.parado = false;
-      entrada.queueAutoRedeliver = (msg.agent as { queueAutoRedeliver?: boolean }).queueAutoRedeliver !== false;
-      this.entregarFilaRetida(msg.agent.id);
+      // T-1150 (contrato §2): NINGUÉM entrega sozinho no start — o server manda
+      // `agent:queue_deliver` depois de a web decidir (modal carregar × excluir).
+      entrada.queueAutoRedeliver = false;
     }
     // T-037: agent:send que chegou no gap pré-spawn (self-update / auto-resume)
     this.flushInboundBuffer(msg.agent.id);
@@ -1087,13 +1092,13 @@ export class AgentHost {
   }
 
   /** T-899: retenção vinda do runner (fila do agente), com source explícito. */
-  private reterDoRunner(agentId: string, msgs: Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string }>, source: "stop" | "context-clear" | "loop-stop" | "replace"): number {
+  private reterDoRunner(agentId: string, msgs: Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string }>, source: "stop" | "context-clear" | "loop-stop" | "replace" | "migrate"): number {
     this.gcFilaRetida();
     const r = reterFila(agentId, msgs.map((m) => ({ content: m.content, images: m.images, deliveryId: m.deliveryId, enqueuedAt: Date.now(), source })));
     if (r.retidos > 0) this.log("info", `[fila] ${r.retidos} msg(s) de ${agentId} retida(s) (source=${source}) — entregues no próximo spawn`);
     if (r.duplicados > 0) this.log("info", `[fila] ${r.duplicados} msg(s) de ${agentId} já estavam retidas (idempotência por deliveryId)`);
     if (r.descartados > 0) this.log("warn", `[fila] cap de ${CAP_POR_AGENTE} estourado para ${agentId} — descarte declarado`);
-    this.enviarFilaRetida(agentId, this.entries.get(agentId)?.projectId);
+    this.enviarFilaRetida(agentId, this.entries.get(agentId)?.projectId, source);
     return r.retidos;
   }
 
@@ -1112,7 +1117,7 @@ export class AgentHost {
 
   /** T-899: melhor esforço para o server (o WEB lista por lá, #898/#900).
    *  O daemon NÃO depende de ack nesta fase: a cópia local é a fonte. */
-  private enviarFilaRetida(agentId: string, projectId?: string): void {
+  private enviarFilaRetida(agentId: string, projectId?: string, source: "stop" | "context-clear" | "loop-stop" | "replace" | "migrate" = "stop"): void {
     if (!projectId) return;
     const itens = listarFilaRetida(agentId);
     if (itens.length === 0) return;
@@ -1122,7 +1127,13 @@ export class AgentHost {
     }
     if (enviar.length === 0) return;
     try {
-      this.send({ type: "agent:queue_retain", agentId, projectId, reason: "stop", items: enviar } as never);
+      this.send({
+        type: "agent:queue_retain",
+        agentId,
+        projectId,
+        source,
+        items: enviar.map((i) => ({ id: i.deliveryId ?? i.ack, content: i.cipher, images: i.imagesCipher, ts: i.enqueuedAt, source: i.source })),
+      });
     } catch { /* best-effort: a cópia local segue valendo */ }
   }
 
@@ -1130,6 +1141,35 @@ export class AgentHost {
   esquecerFilaRetida(agentId: string): number {
     const n = esquecerFilaRetida(agentId);
     if (n > 0) this.log("info", `[fila] ${n} msg(s) retida(s) de ${agentId} esquecida(s) (agente removido)`);
+    return n;
+  }
+
+
+  /** T-1150 (§3): `agent:queue_deliver` — decifra como no `agent:send`, entrega
+   *  NA ORDEM ao runner ATUAL e devolve só os ids ACEITOS (o resto fica retido). */
+  queueDeliver(agentId: string, items: Array<{ id: string; content: string; images?: unknown[]; ts?: number }>, projectId?: string): string[] {
+    const e = this.entries.get(agentId);
+    if (!e?.runner) { this.log("info", `[fila] queue_deliver sem runner para ${agentId} — nada aceito`); return []; }
+    const aceitos: string[] = [];
+    for (const item of items) {
+      try {
+        const pid = projectId ?? e.projectId;
+        const plain = pid
+          ? decryptForProject(item.content, pid, aadV2({ projectId: pid, table: E2EE_TABLE.MESSAGES, field: "content" })) ?? item.content
+          : item.content;
+        const imgs = (item.images ?? []).length ? decryptImageAttachments(item.images as never, pid) ?? undefined : undefined;
+        e.runner.pushUserMessage(plain, imgs, undefined, item.id);
+        aceitos.push(item.id);
+      } catch { /* não aceito: o server mantém retido (nada se perde) */ }
+    }
+    this.log("info", `[fila] queue_deliver ${agentId}: ${aceitos.length}/${items.length} aceita(s)`);
+    return aceitos;
+  }
+
+  /** T-1150 (§4): "excluir" no modal — larga as cópias locais. */
+  queueForget(agentId: string): number {
+    const n = this.esquecerFilaRetida(agentId);
+    this.log("info", `[fila] queue_forget ${agentId}: ${n} cópia(s) local(is) descartada(s)`);
     return n;
   }
 

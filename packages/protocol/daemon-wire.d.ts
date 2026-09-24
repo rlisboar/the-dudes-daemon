@@ -689,11 +689,62 @@ export interface TypesafeShadow extends JevVerdict {
  * `content` vem como o daemon já tem (cifrado se o projeto cifra); o server não
  * decifra. `deliveryId` é a chave de idempotência do retry.
  */
+/** T-1150: parada em qualquer caminho — `source` diz de onde veio. */
+export type QueueRetainSource = "stop" | "inbound-ttl" | "inbound" | "manual" | "replace" | "context-clear" | "loop-stop" | "migrate";
+
 export interface AgentQueueRetainEv {
   type: "agent:queue_retain";
   agentId: string;
-  source: "stop" | "inbound-ttl" | "manual";
-  items: Array<{ content: string; images?: unknown[]; deliveryId?: string }>;
+  projectId?: string;
+  /** T-1149: OPCIONAL no schema — daemon em rollout ainda manda sem `source`, e
+   *  recusar o frame fazia a fila SUMIR. Ausente = "stop". */
+  source?: QueueRetainSource;
+  /** Ordem preservada; `content` é ciphertext em projeto E2EE. */
+  /** `id`/`ts` opcionais: daemon em rollout manda sem (o server gera/usа o created_at). */
+  items: Array<{ id?: string; content: string; images?: unknown[]; ts?: number; source?: QueueRetainSource }>;
+}
+
+/** T-1150: confirmação — só os ids ACEITOS na entrega. */
+export interface AgentQueueDeliveredEv {
+  type: "agent:queue_delivered";
+  agentId: string;
+  ids: string[];
+}
+
+/** T-1150: ordem de entrega vinda do server (modal "carregar"). */
+export interface AgentQueueDeliver {
+  type: "agent:queue_deliver";
+  agentId: string;
+  projectId?: string;
+  items: Array<{ id: string; content: string; images?: unknown[]; ts?: number }>;
+}
+
+/** T-1150: decisão "excluir" — larga as cópias locais. */
+export interface AgentQueueForget {
+  type: "agent:queue_forget";
+  agentId: string;
+}
+
+/** T-1149: o server manda ENTREGAR a fila retida — vai para o daemon que hospeda
+ *  o agente AGORA, qualquer que seja o runner (o humano decidiu "carregar"). */
+export interface AgentQueueDeliverEv {
+  type: "agent:queue_deliver";
+  agentId: string;
+  items: Array<{ id: string; content: string; images?: unknown[]; ts: number }>;
+}
+
+/** T-1149: o humano excluiu a fila — o daemon descarta cópia local. */
+export interface AgentQueueForgetEv {
+  type: "agent:queue_forget";
+  agentId: string;
+  ids?: string[];
+}
+
+/** T-1149: confirmação do daemon sobre o que ENTREGOU (o resto segue retido). */
+export interface AgentQueueDeliveredEv {
+  type: "agent:queue_delivered";
+  agentId: string;
+  ids: string[];
 }
 
 /** T-1006: tetos do snapshot da fila ao vivo (daemon corta, server recusa). */
@@ -1194,6 +1245,7 @@ export type FromDaemon =
   | ModelsCatalogResult
   | TypesafeShadow
   | AgentQueueRetainEv
+  | AgentQueueDeliveredEv
   | AgentQueueLiveEv;
 
 export type FromOrch =
@@ -1202,6 +1254,7 @@ export type FromOrch =
   | ReleaseAvailable
   | AgentSpawn | AgentStop | AgentSend | AgentClear | AgentCompact
   | AgentQueueLiveRemove
+  | AgentQueueDeliver | AgentQueueForget
   | AutoApproveSet | WorkspaceSet
   | WorkspaceTaskCreateRequest | WorkspaceTaskRemoveRequest
   | FileListRequest | FileReadRequest | FileWriteRequest | FileOperationRequest | FileSearchRequest

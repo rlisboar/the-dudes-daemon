@@ -1056,6 +1056,17 @@ export class DaemonClient {
         }
         return;
       }
+      case "agent:queue_deliver": {
+        // T-1150 (§3): ordem de entrega vinda do server — confirma só o aceito.
+        const aceitos = this.host.queueDeliver(msg.agentId, msg.items, msg.projectId);
+        this.send({ type: "agent:queue_delivered", agentId: msg.agentId, ids: aceitos });
+        return;
+      }
+      case "agent:queue_forget": {
+        // T-1150 (§4): a web escolheu "excluir" — larga a cópia local.
+        this.host.queueForget(msg.agentId);
+        return;
+      }
       case "agent:send": {
         log("info", `agent:send recebido agent=${msg.agentId} bytes=${String(msg.content ?? "").length} imgs=${(msg.images ?? []).length}`);
         // T-037: reentrega do server (pending + resume) usa o mesmo deliveryId.

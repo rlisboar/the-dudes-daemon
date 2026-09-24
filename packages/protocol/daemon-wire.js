@@ -276,14 +276,30 @@ export const daemonWireSchemas = {
   }),
   // T-898/security A: retenção vinda do daemon (stop/inbound-ttl) — server não
   // decifra, só persiste o que chegou.
+  // T-1150 (contrato §1): retenção em QUALQUER caminho de parada. `source` diz
+  // de onde veio; `id` preserva a identidade para o `markDelivered` do server e
+  // `content` é ciphertext quando o projeto é E2EE (o server não decifra).
   "agent:queue_retain": msg("agent:queue_retain", {
     agentId: t,
-    source: z.enum(["stop", "inbound-ttl", "manual"]),
+    // projectId/source OPCIONAIS: daemon em rollout (pré-#1150) manda sem, e
+    // recusar o frame fazia a fila SUMIR — era o bug do dono.
+    projectId: t.optional(),
+    source: z.enum(["stop", "inbound-ttl", "inbound", "manual", "replace", "context-clear", "loop-stop", "migrate"]).optional(),
     items: z.array(z.object({
+      // id/ts OPCIONAIS: daemon em rollout (pré-#1150) manda sem, e o server
+      // gera o id da linha e usa o created_at — recusar era o bug da fila.
+      id: t.optional(),
       content: t,
       images: z.array(z.unknown()).optional(),
-      deliveryId: t.optional(),
+      ts: n.optional(),
+      source: t.optional(),
     })).max(200),
+  }),
+  // T-1150 (contrato §3): o daemon confirma SÓ o que aceitou; o resto fica retido.
+  // T-1149: o daemon confirma o que ENTREGOU (o resto continua retido).
+  "agent:queue_delivered": msg("agent:queue_delivered", {
+    agentId: t,
+    ids: z.array(t).max(200),
   }),
   // T-1006: snapshot COMPLETO da fila pendente do runner (o que ainda não virou
   // turno). Estado vivo: o server guarda só o último, em memória. `content`
@@ -404,6 +420,19 @@ const agentSendPart = z.union([
 const imageAtt = z.object({ mimeType: t, base64: t, name: t.optional() });
 
 export const fromOrchSchemas = {
+  // T-1150 (contrato §3): ordem de ENTREGA vinda do server (modal "carregar").
+  "agent:queue_deliver": msg("agent:queue_deliver", {
+    agentId: t,
+    projectId: t.optional(),
+    items: z.array(z.object({
+      id: t,
+      content: t,
+      images: z.array(z.unknown()).optional(),
+      ts: n.optional(),
+    })).max(200),
+  }),
+  // T-1150 (contrato §4): decisão "excluir" — o daemon larga a cópia local.
+  "agent:queue_forget": msg("agent:queue_forget", { agentId: t }),
   "daemon:welcome": msg("daemon:welcome", { user: z.object({ id: t, email: t, name: t }) }),
   "daemon:pong": msg("daemon:pong", { ts: n }),
   "daemon:challenge": msg("daemon:challenge", { nonce: t }),

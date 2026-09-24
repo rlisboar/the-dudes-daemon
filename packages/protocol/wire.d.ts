@@ -1259,6 +1259,8 @@ export type ServerEvent =
   | { type: "prefs_updated"; prefs: Record<string, unknown> }
   /** T-898: a fila retida de um agente mudou (retain/clear/move/entrega/flag). */
   | { type: "agent:queue"; agentId: string; motivo: string; pending: number }
+  /** T-1149: o agente subiu com fila retida — a web abre o modal carregar × excluir. */
+  | { type: "queue:pending_on_start"; projectId: string; agentId: string; count: number }
   /** T-1006: novo snapshot da fila AO VIVO do agente (lista vazia = esvaziou/limpou). */
   | ({ type: "agent:queue_live"; agentId: string } & AgentQueueLiveState)
   | { type: "auth"; user: UserPublic | null }

@@ -13,7 +13,7 @@ import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
-import { constants, createPublicKey, publicEncrypt, randomBytes, createHash } from "node:crypto";
+import { constants, createPublicKey, publicEncrypt, randomBytes } from "node:crypto";
 
 process.env.THE_DUDES_DAEMON_KEY_PATH = path.join(os.tmpdir(), `t899-key-${process.pid}.pem`);
 process.env.THE_DUDES_PROJECT_KEYS_PATH = path.join(os.tmpdir(), `t899-pkeys-${process.pid}.json`);
@@ -337,10 +337,14 @@ test("T-899: o frame de retenção sai cifrado, com ack e sem claro", () => {
   assert.ok(frame, enviados.map((m) => m.type).join(","));
   assert.equal(frame!.agentId, AG);
   assert.equal(frame!.projectId, PID);
-  const itens = frame!.items as Array<{ cipher: string; deliveryId?: string; ack: string }>;
+  // T-1150: o frame passou ao formato do CONTRATO (id/content/ts/source) —
+  // `ack`/`cipher` eram o formato antigo que o server recusava.
+  const itens = frame!.items as unknown as Array<{ id: string; content: string; ts: number; source?: string }>;
   assert.equal(itens.length, 1);
-  assert.ok(itens[0]!.cipher.startsWith("e2e:"), "cipher no frame");
-  assert.equal(itens[0]!.ack, createHash("sha256").update(`${AG}\nd1\n${itens[0]!.cipher}`, "utf8").digest("hex").slice(0, 12));
+  assert.ok(itens[0]!.content.startsWith("e2e:"), "cipher no frame (nunca claro)");
+  assert.equal(itens[0]!.id, "d1", "id preservado (o server usa no markDelivered)");
+  assert.equal(frame!.source, "stop");
+  assert.ok(itens[0]!.ts > 0, "ordem/timestamp no item");
 });
 
 test("T-938: item retido entra no spool do re-exec (senão morre no re-exec de 13-17x/dia)", async () => {

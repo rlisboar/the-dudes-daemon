@@ -27,7 +27,7 @@ import { aadV2, E2EE_TABLE } from "@the-dudes/protocol/e2ee-fields";
  * Origem do item. `replace` = o runner do agente foi substituído (respawn/
  * reconfig) com fila em mãos: a fila é do AGENTE e passa para o runner novo.
  */
-export type FonteRetencao = "stop" | "context-clear" | "loop-stop" | "replace" | "inbound";
+export type FonteRetencao = "stop" | "inbound-ttl" | "manual" | "inbound" | "replace" | "context-clear" | "loop-stop" | "migrate";
 
 export interface ItemRetido {
   deliveryId?: string;

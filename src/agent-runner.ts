@@ -85,6 +85,8 @@ export {
 // auto-retry nunca dispara — pior, zera o contador. Roteamos como erro.
 // Ex: "API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited"
 export interface AgentRunnerOptions {
+  /** T-1150: o que estava na fila quando o agente parou (qualquer caminho). */
+  onQueueRetained?: (msgs: Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string }>, source: string) => void;
   bridgeCommand: string;
   bridgeArgs: string[];
   orchestratorUrl: string;
@@ -975,7 +977,7 @@ export class AgentRunner {
     const itens = this.takeQueuedForDrain();
     if (itens.length === 0) return;
     this.opts.log("info", `[cli:${this.info.id}:${this.opts.cliRunner}] ${itens.length} msg(s) não iniciada(s) retidas (source=${source})`);
-    (this.opts as { onQueueRetained?: (m: typeof itens, s: string) => void }).onQueueRetained?.(itens, source);
+    this.opts.onQueueRetained?.(itens, source);
   }
 
   /** T-842: mensagem do turno que o SIGTERM vai matar. Uma vez: a segunda
@@ -1176,7 +1178,7 @@ export class AgentRunner {
     const paradas = this.takeQueuedForDrain();
     if (paradas.length > 0) {
       this.opts.log("info", `[cli:${this.info.id}:${this.opts.cliRunner}] stop com ${paradas.length} msg(s) não iniciada(s) — retidas para reentrega`);
-      (this.opts as { onQueueRetained?: (m: typeof paradas, s: string) => void }).onQueueRetained?.(paradas, fonte);
+      this.opts.onQueueRetained?.(paradas, fonte);
     }
     // (o host também pode colher por `takeQueueForRetain` — vem vazio aqui,
     // porque o callback já levou; vale para runners sem callback.)
