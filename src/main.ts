@@ -43,6 +43,7 @@ import { ensureGraphWatch, stopAllGraphWatches } from "./graph-watcher.js";
 import { detectDropTarget, spawnDropped, type DropTarget } from "./privileges.js";
 import { BridgeRelay, type PeerPidMode } from "./bridge-relay.js";
 import { definirEmissorSombra, definirLogJev, registrarJevDoProjeto } from "./typesafe-delegate-shadow.js";
+import { scheduleAgentMessageShadow } from "./typesafe-agentmsg-shadow.js";
 import { definirElencoProjeto } from "./typesafe-task-shadow.js";
 import { defaultDaemonConfigPath, formatCliStatus, loadDaemonCliConfig, mergeCliConfig, resolveCliCommands, type DaemonCliConfig, type ResolvedCliCommands } from "./cli-config.js";
 import { applyRunnerPolicy, buildInstalledRunnerAvailability, helloRunnerLists, POLICY_GATED_RUNNERS, type InstalledRunnerAvailability } from "./runner-policy.js";
@@ -443,6 +444,7 @@ export class DaemonClient {
       // T-581: o prompt de delegação cifrado cita o nome do pai (o subagente
       // responde por send_message pra ele). Closures lazy — `host` nasce abaixo.
       agentNameLookup: (agentId) => this.host.getAgentName(agentId),
+      onAgentMessageAction: (agentId) => this.host.noteAgentMessageAction(agentId),
     });
     try {
       await this.relay.start();
@@ -1136,6 +1138,7 @@ export class DaemonClient {
           return;
         }
         let content: string;
+        let agentMessageText: string | null = null;
         // T-597 F1: pid com que o frame foi de fato selado. Começa no pid da
         // linha; se um fallback abrir, vira o pid que abriu — os anexos do
         // mesmo frame usam o mesmo pid.
@@ -1179,6 +1182,7 @@ export class DaemonClient {
             log("warn", `agent:send to ${msg.agentId} parts abertas por fallback pid=${opened.pid} (linha=${msg.projectId ?? "-"})`);
           }
           content = opened.value.content;
+          agentMessageText = content;
         } else {
           content = msg.content;
           if (isE2eEncrypted(content)) {
@@ -1201,6 +1205,7 @@ export class DaemonClient {
             }
             content = opened.value;
           }
+          agentMessageText = content;
           if (msg.systemPrefix) content = msg.systemPrefix + content;
           if (msg.systemSuffix) content = content + msg.systemSuffix;
         }
@@ -1235,6 +1240,16 @@ export class DaemonClient {
         // de texto. Campo opcional: daemons/servers antigos não enviam.
         if (typeof msg.taskId === "string" && msg.taskId.trim()) {
           this.host.setActiveTask(msg.agentId, msg.taskId);
+        }
+        if (msg.origin === "agent" && msg.projectId && typeof msg.deliveryId === "string" && agentMessageText !== null) {
+          try {
+            scheduleAgentMessageShadow({
+              projectId: msg.projectId,
+              agentId: msg.agentId,
+              deliveryId: msg.deliveryId,
+              text: agentMessageText,
+            });
+          } catch { /* Jev cannot delay or fail message delivery */ }
         }
         // T-1005: a fila ao vivo manda o conteúdo COMO VEIO do server (blob
         // e2e original; nunca o texto decifrado) — registro guardado junto.

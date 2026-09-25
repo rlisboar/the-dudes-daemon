@@ -358,6 +358,8 @@ export class BridgeRelay {
   /** T-581: nome do agente — entra no prompt de delegação cifrado pelo relay
    *  (o subagente responde por send_message para este nome). */
   private agentNameLookup?: (agentId: string) => string | null;
+  /** T-1146: successful teammate messages/task writes mark the active turn. */
+  private onAgentMessageAction?: (agentId: string) => void;
 
   private socketDir: string;
   private peerPidSelfTest?: () => Promise<boolean>;
@@ -383,12 +385,14 @@ export class BridgeRelay {
     opts?: {
       peerPidSelfTest?: () => Promise<boolean>;
       agentNameLookup?: (agentId: string) => string | null;
+      onAgentMessageAction?: (agentId: string) => void;
     },
   ) {
     this.orchUrl = orchUrl.replace(/\/$/, "");
     this.dropTo = dropTo;
     this.agentProjectLookup = agentProjectLookup;
     this.agentNameLookup = opts?.agentNameLookup;
+    this.onAgentMessageAction = opts?.onAgentMessageAction;
     this.peerPidSelfTest = opts?.peerPidSelfTest;
     // Symlink attack defense: socket vivia em /tmp/the-dudes-bridge-<pid>.sock
     // — path previsível (PID sequential). Atacante local poderia pré-criar
@@ -924,6 +928,12 @@ export class BridgeRelay {
       } finally {
         clearTimeout(fetchTimer);
         req.removeListener("aborted", onClientGone);
+      }
+      if (upstream.status >= 200 && upstream.status < 300) {
+        const action = parsed.pathname.match(/^\/api\/bridge\/([^/]+)\/(send|tasks_add|tasks_update|tasks_comment_add)$/);
+        if (action) {
+          try { this.onAgentMessageAction?.(action[1]!); } catch { /* outcome telemetry is best-effort */ }
+        }
       }
       let buf = Buffer.from(await upstream.arrayBuffer());
       timing.upstreamMs = performance.now() - upT0;

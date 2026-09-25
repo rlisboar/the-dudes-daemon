@@ -58,7 +58,7 @@ test("T-415 mcps:scan: envKeys/headerKeys presentes; valores de credencial ausen
       "http-secret": {
         type: "http",
         url: "https://mcp.example/u",
-        headers: { Authorization: BEARER, "X-Api-Key": "sk_live_NEVER" },
+        headers: { Authorization: BEARER, "X-Api-Key": STRIPE },
       },
     },
   }));

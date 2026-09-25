@@ -10,6 +10,7 @@ import {classifyRunnerFailure} from "./runners/error-classifier.js";
 import {migratedSeedFor, MIGRATED_SEED_LIMIT_BYTES} from "./migrated-seed.js";
 import {agentStateInfo, cliIoCounters, recordAgentEvent, recordAgentState} from "./debug/store.js";
 import {formatDrainHolders, type DrainHolder} from "./self-update.js";
+import { addAgentMessageTokens, markAgentMessageActed, settleAgentMessageShadow } from "./typesafe-agentmsg-shadow.js";
 import {expirar as expirarFilaRetida, devolver as devolverFilaRetida, esquecer as esquecerFilaRetida, TTL_ITEM_MS, listar as listarFilaRetida, paraFio, reter as reterFila, tamanho as tamanhoFilaRetida, tomar as tomarFilaRetida, totalRetido, CAP_POR_AGENTE} from "./queue-retained.js";
 
 /** 1 enum operacional (paridade hung.soft). Classifica no plaintext ANTES do seal. */
@@ -798,7 +799,11 @@ export class AgentHost {
         this.deliver({ type: "agent:thinking", agentId: msg.agent.id, text: enc ?? red, redacted: !!thinkOpts?.redacted });
       },
       onSessionId: (sid) => { this.deliver({ type: "agent:session", agentId: msg.agent.id, sessionId: sid }); },
-      onUsageDelta: (delta) => { this.deliver({ type: "agent:usage_delta", agentId: msg.agent.id, delta }); },
+      onUsageDelta: (delta) => {
+        this.deliver({ type: "agent:usage_delta", agentId: msg.agent.id, delta });
+        addAgentMessageTokens(msg.agent.id, this.entries.get(msg.agent.id)?.runner?.currentDeliveryId(), delta);
+      },
+      onTurnSettled: (deliveryId, durationMs) => settleAgentMessageShadow(msg.agent.id, deliveryId, durationMs),
       onSessionInvalid: () => {
         this.emitAgentError(
           msg.agent.id,
@@ -1316,6 +1321,11 @@ export class AgentHost {
     return runGitWorktreeRemove(gitRoot, wt, this.dropTo)
       .then((r) => this.log(r.ok ? "info" : "warn", `[worktree] ${r.ok ? "removido" : "remoção falhou"} ${wt}${r.detail ? ` (${r.detail})` : ""}`))
       .catch((err) => this.log("warn", `[worktree] remoção falhou ${wt}: ${(err as Error).message}`));
+  }
+
+  /** BridgeRelay calls this only after a successful send/task write upstream. */
+  noteAgentMessageAction(agentId: string): void {
+    markAgentMessageActed(agentId, this.entries.get(agentId)?.runner?.currentDeliveryId());
   }
 
   send_message(agentId: string, content: string, images?: ImageAttachment[], deliveryId?: string, wire?: WireRecord | null) {

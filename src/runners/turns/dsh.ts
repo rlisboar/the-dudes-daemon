@@ -766,6 +766,7 @@ function dshPump(self: any): void {
   timing?.start();
   self.dshPromptInFlight = true;
   self.currentTurn = { content: next.content, deliveryId: next.deliveryId };
+  self.currentTurnSettled = false;
   self.setState("thinking");
   void (async () => {
     try {

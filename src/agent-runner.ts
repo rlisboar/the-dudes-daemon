@@ -151,6 +151,8 @@ export interface AgentRunnerOptions {
   onThinkingText?: (text: string, opts?: { redacted?: boolean }) => void;
   onSessionId?: (sessionId: string) => void;
   onUsageDelta?: (delta: AgentUsage) => void;
+  /** T-1146: observed end of the current inbound delivery (metadata only). */
+  onTurnSettled?: (deliveryId: string, durationMs: number) => void;
   /** Ocupação absoluta da janela (não delta de billing). Emitido a cada update. */
   onContextUsage?: (used: number, limit: number) => void;
   onContextWarning?: (used: number, limit: number) => void;
@@ -323,6 +325,13 @@ export class AgentRunner {
   /** Returns the runner's current runtime state — used during WS resync. */
   currentRuntimeState(): AgentRuntimeState { return this.currentState; }
 
+  /** Local correlation only; callers must not serialize this id to TypeSafe. */
+  currentDeliveryId(): string | undefined {
+    return this.currentState === "thinking" || this.currentState === "sending" || this.currentState === "speaking"
+      ? this.currentTurn?.deliveryId
+      : undefined;
+  }
+
   // OpenCode / Gemini per-message model
   private readonly messageSession: PerMessageSessionState;
   /** IDs de parts já processadas (dedup entre turnos). O POST /message só
@@ -429,6 +438,7 @@ export class AgentRunner {
   /** T-842: mensagem do turno aberto (com deliveryId). O SIGTERM a põe no
    *  spool; o fim normal do turno não — busy/claudeInflight/dsh já cairam. */
   private currentTurn: { content: string; images?: ImageAttachment[]; deliveryId?: string } | null = null;
+  private currentTurnSettled = false;
   /**
    * Claude (e similares): tool_use abertos sem tool_result ainda.
    * Enquanto >0 e com stream recente o CLI pode ficar minutos sem texto —
@@ -878,6 +888,7 @@ export class AgentRunner {
     const next = this.messageSession.dequeue();
     if (!next) { this.messageSession.busy = false; return; }
     this.currentTurn = { content: next.content, images: next.images, deliveryId: next.deliveryId };
+    this.currentTurnSettled = false;
     this.turnLatency.activate(next, this.messageSession.sessionId ? "resume" : "cold");
     const { content, images } = next;
     if (this.opts.cliRunner === "gemini") {
@@ -1091,6 +1102,7 @@ export class AgentRunner {
   private sendClaudeMessage(item: { content: string; images?: ImageAttachment[]; deliveryId?: string; timingMessage: object }): void {
     const { content, images, timingMessage } = item;
     this.currentTurn = { content, images, deliveryId: item.deliveryId };
+    this.currentTurnSettled = false;
     // Não-imagem não cabe no payload inline do claude — vai por arquivo.
     const anexos = this.attachNonImageFiles(content, images);
     const messageContent = buildClaudeUserContent(anexos.content, images);
@@ -1405,6 +1417,12 @@ export class AgentRunner {
 
   private setState(state: AgentRuntimeState) {
     if (state === this.currentState) return;
+    const previousState = this.currentState;
+    if (state === "idle" && previousState !== "idle" && !this.currentTurnSettled && this.currentTurn?.deliveryId) {
+      this.currentTurnSettled = true;
+      const durationMs = this.turnActiveSince == null ? 0 : Math.max(0, Date.now() - this.turnActiveSince);
+      try { this.opts.onTurnSettled?.(this.currentTurn.deliveryId, durationMs); } catch { /* observability must not affect the runner */ }
+    }
     this.currentState = state;
     this.info.state = state;
     if (state === "thinking" || state === "sending" || state === "speaking") {
