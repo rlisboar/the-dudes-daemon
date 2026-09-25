@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { registerAgentPid } from "../privileges.js";
@@ -18,14 +18,78 @@ export function grokHomePath(home: string, runner?: string): string {
   return path.join(home, grokHomeDirName(runner));
 }
 
-/** T-426 (A15): CODEX_HOME por agente = <base>/agents/<slug>. Fica FORA do
- *  git worktree do projeto (config.toml 0600 com os MCPs) e é estável por
- *  agente (slug de hash) para o resume de sessão do codex sobreviver a
- *  restart do daemon. `sessions`/`auth.json` são symlinks pro base — o
- *  histórico compartilhado e o login do dono continuam valendo. */
+const CODEX_AGENT_HOMES_DIR = ".the-dudes-agent-homes";
+const CODEX_AGENT_SLUG = /^[a-f0-9]{10}$/;
+
+function codexAgentSlug(agentId: string): string {
+  return createHash("sha1").update(agentId).digest("hex").slice(0, 10);
+}
+
+/** T-1248: resolve para a base real quando CODEX_HOME foi herdado de uma home
+ *  legada ou atual do daemon. Desembrulha mais de um nível para também
+ *  recuperar as homes aninhadas criadas antes do isolamento dos testes. */
+function codexBaseFromAgentHome(codexHome: string): string | undefined {
+  let candidate = path.resolve(codexHome);
+  let recognized = false;
+  while (CODEX_AGENT_SLUG.test(path.basename(candidate))) {
+    const parent = path.basename(path.dirname(candidate));
+    if (parent !== "agents" && parent !== CODEX_AGENT_HOMES_DIR) break;
+    candidate = path.dirname(path.dirname(candidate));
+    recognized = true;
+  }
+  return recognized ? candidate : undefined;
+}
+
+/** Preserve a nested legacy home tree without leaving the exact `agents/`
+ *  name Codex CLI recursively scans. The dated quarantine is intentionally
+ *  retained for the post-rollout cleanup and can be listed before removal. */
+function quarantineNestedCodexAgentHomes(home: string): boolean {
+  const nested = path.join(home, "agents");
+  let info;
+  try { info = lstatSync(nested); } catch { return true; }
+  if (!info.isDirectory() && !info.isSymbolicLink()) return true;
+
+  const date = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  const prefix = `agents.orfaos-${date}`;
+  let quarantined = path.join(home, prefix);
+  for (let suffix = 2; existsSync(quarantined); suffix++) {
+    quarantined = path.join(home, `${prefix}-${suffix}`);
+  }
+  try {
+    renameSync(nested, quarantined);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Move a home T-426 existente na primeira inicialização deste agente. Rename
+ *  é atômico dentro do mesmo base; preserva config, modos, symlinks de auth e
+ *  sessions. O `agents/` aninhado é só renomeado para uma quarentena inerte;
+ *  seus arquivos ficam disponíveis para a limpeza pós-rollout. Não apaga nem
+ *  sobrescreve se a nova home já existir. */
+function migrarCodexAgentHome(codexBase: string, slug: string): void {
+  const antiga = path.join(codexBase, "agents", slug);
+  const nova = path.join(codexBase, CODEX_AGENT_HOMES_DIR, slug);
+  let infoAntiga;
+  try { infoAntiga = lstatSync(antiga); } catch { return; }
+  if (!infoAntiga.isDirectory() || infoAntiga.isSymbolicLink() || existsSync(nova)) return;
+  mkdirSync(path.dirname(nova), { recursive: true, mode: 0o700 });
+  try { chmodSync(path.dirname(nova), 0o700); } catch {}
+  if (!quarantineNestedCodexAgentHomes(antiga)) return;
+  try {
+    renameSync(antiga, nova);
+    try { chmodSync(nova, 0o700); } catch {}
+  } catch {
+    // Migração best-effort: nunca apagar a sessão antiga se rename falhar.
+  }
+}
+
+/** T-426/A15 + T-1248: home por agente fica em sibling de `agents/`, para o
+ *  Codex CLI não confundi-la com definições de papel. O slug permanece estável
+ *  para que `sessions` continue retomando a mesma conversa após restart. */
 export function codexAgentHomePath(codexBase: string, agentId: string): string {
-  const slug = createHash("sha1").update(agentId).digest("hex").slice(0, 10);
-  return path.join(codexBase, "agents", slug);
+  return path.join(codexBase, CODEX_AGENT_HOMES_DIR, codexAgentSlug(agentId));
 }
 
 /** Arquivos e diretórios pertencentes a uma única instância de runner.
@@ -144,13 +208,14 @@ export class RunnerRuntimeFiles {
   private codexBaseDir(): string {
     const forced = process.env.CODEX_HOME?.trim();
     if (forced) {
+      const forcedBase = codexBaseFromAgentHome(forced) ?? forced;
       const daemonHome = os.homedir();
       const dropHome = this.input.home;
       const dropping = !!dropHome && path.resolve(dropHome) !== path.resolve(daemonHome);
       const forcedInsideDaemonHome =
-        path.resolve(forced) === path.resolve(daemonHome) ||
-        path.resolve(forced).startsWith(path.resolve(daemonHome) + path.sep);
-      if (!(dropping && forcedInsideDaemonHome)) return forced;
+        path.resolve(forcedBase) === path.resolve(daemonHome) ||
+        path.resolve(forcedBase).startsWith(path.resolve(daemonHome) + path.sep);
+      if (!(dropping && forcedInsideDaemonHome)) return forcedBase;
     }
     return path.join(this.input.home ?? os.homedir(), ".codex");
   }
@@ -162,6 +227,8 @@ export class RunnerRuntimeFiles {
    */
   codexHomeDir(): string {
     const base = this.codexBaseDir();
+    const slug = codexAgentSlug(this.input.agentId);
+    migrarCodexAgentHome(base, slug);
     const dir = codexAgentHomePath(base, this.input.agentId);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     try { chmodSync(dir, 0o700); } catch {}

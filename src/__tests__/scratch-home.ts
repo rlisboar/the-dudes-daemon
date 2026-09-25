@@ -12,5 +12,10 @@
  * inserção.
  */
 import { tmpdir } from "./tmp.js";
+import path from "node:path";
 
-process.env.HOME = tmpdir("the-dudes-scratch-home-");
+const scratchHome = tmpdir("the-dudes-scratch-home-");
+process.env.HOME = scratchHome;
+// CODEX_HOME is a separate inherited override. HOME alone does not prevent
+// RunnerRuntimeFiles from following the developer's real Codex home.
+process.env.CODEX_HOME = path.join(scratchHome, ".codex");
