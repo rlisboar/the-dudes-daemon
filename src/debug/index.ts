@@ -606,7 +606,7 @@ function sanitizedReport(): Record<string, unknown> {
 /* ───────────────────────────── env (redatado) ───────────────────────────── */
 
 const SECRET_KEY_RE = /TOKEN|KEY|SECRET|PASS|DSN|AUTH|COOKIE|CREDENTIAL|PRIVATE/i;
-const ENV_PREFIX_RE = /^(THE_DUDES_|DUDES_|QWEN_|GROK_|TYPESAFE_|SENTRY_|OPENCODE_|CLAUDE_|CODEX_|GEMINI_|NODE_|UV_THREADPOOL)/;
+const ENV_PREFIX_RE = /^(THE_DUDES_|DUDES_|QWEN_|GROK_|TYPESAFE_|OPENROUTER_|SENTRY_|OPENCODE_|CLAUDE_|CODEX_|GEMINI_|NODE_|UV_THREADPOOL)/;
 
 export function redactedEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
   const out: Record<string, string> = {};

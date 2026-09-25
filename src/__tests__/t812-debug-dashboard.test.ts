@@ -289,9 +289,10 @@ test("T-812 diagnose: prioridade de background no macOS, órfãos quentes, loop 
 });
 
 test("T-812 env redatado e resumo do CPU profile", () => {
-  const env = redactedEnv({ THE_DUDES_DAEMON_TOKEN: "abcdef", TYPESAFE_API_KEY: "k", THE_DUDES_MAX_CLI_TURNS: "7", OTHER: "x", PATH: "/bin" });
+  const env = redactedEnv({ THE_DUDES_DAEMON_TOKEN: "abcdef", TYPESAFE_API_KEY: "k", OPENROUTER_API_KEY: "or-secret", THE_DUDES_MAX_CLI_TURNS: "7", OTHER: "x", PATH: "/bin" });
   assert.equal(env.THE_DUDES_DAEMON_TOKEN, "[REDACTED · 6 chars]");
   assert.equal(env.TYPESAFE_API_KEY, "[REDACTED · 1 chars]");
+  assert.equal(env.OPENROUTER_API_KEY, "[REDACTED · 9 chars]");
   assert.equal(env.THE_DUDES_MAX_CLI_TURNS, "7");
   assert.equal(env.OTHER, undefined);
   const top = summarizeCpuProfile({

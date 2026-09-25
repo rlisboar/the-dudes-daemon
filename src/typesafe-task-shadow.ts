@@ -7,7 +7,7 @@
  * parcial e não serve de estado.
  *
  * Liga só com `TYPESAFE_TASK_SHADOW` em "1"/"true" (trim, ignora maiúsculas) E
- * `TYPESAFE_API_KEY` não vazia E `jev_enabled` do projeto (mesma flag do
+ * a chave do provedor configurado não vazia E `jev_enabled` do projeto (mesma flag do
  * delegate). Sem isso: no-op, zero rede, motivo no log.
  *
  * Não muta o request, não é awaited e uma falha aqui nunca falha a task.
@@ -28,11 +28,13 @@ import {
   prepararTexto,
   TYPESAFE_MODEL,
   TYPESAFE_MAX_TEXTO_BYTES,
+  typesafeLigado,
   type TypesafeFetch,
 } from "./typesafe-client.js";
 
 export { TYPESAFE_SYSTEMONE_URL } from "./typesafe-client.js";
 const MODEL = TYPESAFE_MODEL;
+const FLAG = "TYPESAFE_TASK_SHADOW";
 const TETO_TEXTO_BYTES = TYPESAFE_MAX_TEXTO_BYTES;
 const DEBOUNCE_MS = 400;
 const MAX_EM_VOO = 3;
@@ -158,9 +160,7 @@ export function flushTaskShadowDebounceForTests(): void {
 const AGENDADO = new Map<string, Pedido>();
 
 function sombraLigada(): boolean {
-  const flag = (process.env.TYPESAFE_TASK_SHADOW ?? "").trim().toLowerCase();
-  if (flag !== "1" && flag !== "true") return false;
-  return (process.env.TYPESAFE_API_KEY ?? "").trim() !== "";
+  return typesafeLigado(FLAG);
 }
 
 function logar(extra: Record<string, unknown>): void {

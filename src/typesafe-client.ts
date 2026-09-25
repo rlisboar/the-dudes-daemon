@@ -4,7 +4,9 @@ import { redactCredentials, getProjectKey, isE2eEncrypted } from "./daemon-crypt
 import { safeFetch, type SafeFetchOpts } from "./ssrf-guard.js";
 
 export const TYPESAFE_SYSTEMONE_URL = "https://api.typesafe.ai/v1/systemone";
+export const OPENROUTER_DECISIONS_URL = "https://openrouter.ai/api/alpha/decisions";
 export const TYPESAFE_MODEL = "jev-1.13.0";
+export const OPENROUTER_DEFAULT_MODEL = "typesafe/jev-1.13";
 export const TYPESAFE_TIMEOUT_MS = 2_500;
 export const TYPESAFE_MAX_BODY_BYTES = 8 * 1024;
 export const TYPESAFE_MAX_TEXTO_BYTES = 2 * 1024;
@@ -14,6 +16,45 @@ const DOMAIN_TEXT_HASH = "jev-text-hmac-v1";
 const DOMAIN_REF_ID = "jev-ref-id-hmac-v1";
 const REDACTED = "[REDACTED]";
 const REDACTED_DB = "[REDACTED_DATABASE_URI]";
+
+export type TypesafeProvider = "typesafe" | "openrouter";
+
+let warnedUnknownProvider = false;
+
+function selectedProvider(): TypesafeProvider | null {
+  const configured = (process.env.TYPESAFE_PROVIDER ?? "typesafe").trim().toLowerCase();
+  if (configured === "typesafe" || configured === "openrouter") return configured;
+  if (!warnedUnknownProvider) {
+    warnedUnknownProvider = true;
+    try { console.warn("[typesafe-client] disabled: unknown TYPESAFE_PROVIDER"); } catch {}
+  }
+  return null;
+}
+
+interface ProviderConfig {
+  provider: TypesafeProvider;
+  url: string;
+  apiKey: string;
+}
+
+function providerConfig(): ProviderConfig | null {
+  const provider = selectedProvider();
+  if (!provider) return null;
+  return {
+    provider,
+    url: provider === "openrouter" ? OPENROUTER_DECISIONS_URL : TYPESAFE_SYSTEMONE_URL,
+    apiKey: (process.env[provider === "openrouter" ? "OPENROUTER_API_KEY" : "TYPESAFE_API_KEY"] ?? "").trim(),
+  };
+}
+
+function payloadForProvider(payload: unknown, provider: TypesafeProvider): unknown {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
+  const configuredModel = (process.env.TYPESAFE_MODEL ?? "").trim();
+  const current = payload as Record<string, unknown>;
+  const currentModel = typeof current.model === "string" && current.model.trim() ? current.model : TYPESAFE_MODEL;
+  const model = configuredModel || (provider === "openrouter" ? OPENROUTER_DEFAULT_MODEL : currentModel);
+  return { ...current, model };
+}
 
 export interface TypesafeRequestInit {
   method: "POST";
@@ -70,8 +111,7 @@ const CLOUD_JSON_CREDENTIAL = /"(?:private_key|client_secret|access_token|refres
 export function typesafeLigado(flag: string): boolean {
   const value = (process.env[flag] ?? "").trim().toLowerCase();
   if (value !== "1" && value !== "true") return false;
-  if (!(process.env.TYPESAFE_API_KEY ?? "").trim()) return false;
-  return true;
+  return !!providerConfig()?.apiKey;
 }
 
 function containsSecretAssignment(text: string): boolean {
@@ -240,17 +280,18 @@ export async function chamarSystemOne(
   payload: unknown,
   fetcher?: TypesafeFetch,
 ): Promise<TypesafeResponse | null> {
-  const apiKey = (process.env.TYPESAFE_API_KEY ?? "").trim();
-  const body = serializarRequestSombra(payload);
-  if (!apiKey || !body) return null;
+  const config = providerConfig();
+  if (!config?.apiKey) return null;
+  const body = serializarRequestSombra(payloadForProvider(payload, config.provider));
+  if (!body) return null;
   const init: TypesafeRequestInit = {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${config.apiKey}` },
     body,
     signal: AbortSignal.timeout(TYPESAFE_TIMEOUT_MS),
   };
   const opts = { timeoutMs: TYPESAFE_TIMEOUT_MS, maxRedirects: 0 };
-  if (fetcher) return fetcher(TYPESAFE_SYSTEMONE_URL, init, opts);
-  const response = await safeFetch(TYPESAFE_SYSTEMONE_URL, init, opts as SafeFetchOpts);
+  if (fetcher) return fetcher(config.url, init, opts);
+  const response = await safeFetch(config.url, init, opts as SafeFetchOpts);
   return { status: response.status, text: () => response.text() };
 }

@@ -91,10 +91,16 @@ const fixtures: Array<{ name: string; value: string; action: "redact" | "drop" |
   { name: "truncation-boundary token", value: canary.truncation, action: "redact" },
   { name: "benign prose containing sensitive vocabulary", value: "The token count is shown in the basic security example; no credential is present.", action: "benign" },
 ];
+const rememberedCredential = join("runtime", "-stored-", "credential", "-only-", "4f", "6a", "2c");
+crypto.rememberCredentialPlaintext(PROJ, rememberedCredential);
+fixtures.push({ name: "project-memory credential (not a token pattern)", value: rememberedCredential, action: "redact" });
 
 function responseDelegate(): string {
   return JSON.stringify({
+    id: "synthetic-openrouter-response-id",
     model: "attacker-controlled-model-name-is-ignored",
+    provider: "TypeSafe",
+    usage: { input_tokens: 17, output_tokens: 3, cost: 0.000001 },
     answers: {
       task_type: { type: "choice", choice: "coding", probabilities: { coding: 0.9, general: 0.1 }, confidence: 0.9 },
       complexity: { type: "choice", choice: "moderate", probabilities: { moderate: 0.9, simple: 0.1 }, confidence: 0.9 },
@@ -107,6 +113,10 @@ function responseDelegate(): string {
 
 function responseTask(): string {
   return JSON.stringify({
+    id: "synthetic-openrouter-response-id",
+    model: "typesafe/jev-1.13-20260917",
+    provider: "TypeSafe",
+    usage: { input_tokens: 17, output_tokens: 3, cost: 0.000001 },
     answers: {
       domain: { type: "choice", choice: "DAEMON", probabilities: { DAEMON: 0.9, NONE: 0.1 }, confidence: 0.9 },
       complexity: { type: "choice", choice: "moderate", probabilities: { moderate: 0.9, simple: 0.1 }, confidence: 0.9 },
@@ -119,12 +129,34 @@ function responseTask(): string {
 }
 
 function responseReflect(): string {
-  return JSON.stringify({ answers: { has_reusable_lesson: { type: "noul", noul: 0.8 } }, rawEcho: RAW_RESPONSE_CANARY });
+  return JSON.stringify({
+    id: "synthetic-openrouter-response-id",
+    model: "typesafe/jev-1.13-20260917",
+    provider: "TypeSafe",
+    usage: { input_tokens: 17, output_tokens: 3, cost: 0.000001 },
+    answers: { has_reusable_lesson: { type: "noul", noul: 0.8 } },
+    rawEcho: RAW_RESPONSE_CANARY,
+  });
 }
 
 type Shadow = "task" | "delegate" | "reflect";
+type ProviderFixture = "typesafe" | "openrouter" | "unknown";
+const PROVIDER_SHADOW_FLAGS = [
+  "TYPESAFE_TASK_SHADOW",
+  "TYPESAFE_DELEGATE_SHADOW",
+  "TYPESAFE_REFLECT_SHADOW",
+  "TYPESAFE_AGENTMSG_SHADOW",
+  "TYPESAFE_VOICE_SHADOW",
+] as const;
 
-async function runOne(shadow: Shadow, value: string, serial: number, taskTitle = "Retry handling and safe worker recovery") {
+async function runOne(
+  shadow: Shadow,
+  value: string,
+  serial: number,
+  taskTitle = "Retry handling and safe worker recovery",
+  provider: ProviderFixture = "typesafe",
+  credentials = true,
+) {
   const calls: Array<{ url: string; body: string; headers: Record<string, string>; opts: { timeoutMs: number; maxRedirects: number } }> = [];
   const events: Array<Record<string, unknown>> = [];
   const logs: string[] = [];
@@ -132,14 +164,42 @@ async function runOne(shadow: Shadow, value: string, serial: number, taskTitle =
   console.error = (...args: unknown[]) => logs.push(args.map(String).join(" "));
   console.warn = (...args: unknown[]) => logs.push(args.map(String).join(" "));
   console.log = (...args: unknown[]) => logs.push(args.map(String).join(" "));
+  const envBefore = {
+    provider: process.env.TYPESAFE_PROVIDER,
+    typeSafeKey: process.env.TYPESAFE_API_KEY,
+    openRouterKey: process.env.OPENROUTER_API_KEY,
+    model: process.env.TYPESAFE_MODEL,
+    flags: Object.fromEntries(PROVIDER_SHADOW_FLAGS.map(flag => [flag, process.env[flag]])),
+  };
+  const typeSafeKey = "synthetic-typesafe-api-key-never-log";
+  const openRouterKey = "synthetic-openrouter-api-key-never-log";
+  let selectedKey: string | null = null;
   const capture = async (url: string, init: { body: string; headers: Record<string, string> }, opts: { timeoutMs: number; maxRedirects: number }, body: string) => {
     calls.push({ url, body: init.body, headers: init.headers, opts });
     return { status: 200, text: async () => body };
   };
-  process.env.TYPESAFE_API_KEY = "synthetic-api-key-never-log";
-  process.env.TYPESAFE_TASK_SHADOW = "1";
-  process.env.TYPESAFE_DELEGATE_SHADOW = "1";
-  process.env.TYPESAFE_REFLECT_SHADOW = "1";
+  if (provider === "unknown") {
+    process.env.TYPESAFE_PROVIDER = "invalid-provider-fixture";
+    process.env.TYPESAFE_API_KEY = typeSafeKey;
+    process.env.OPENROUTER_API_KEY = openRouterKey;
+  } else if (provider === "openrouter") {
+    process.env.TYPESAFE_PROVIDER = "openrouter";
+    process.env.TYPESAFE_API_KEY = credentials ? "" : typeSafeKey;
+    if (credentials) process.env.OPENROUTER_API_KEY = openRouterKey;
+    else delete process.env.OPENROUTER_API_KEY;
+    selectedKey = credentials ? openRouterKey : null;
+  } else {
+    process.env.TYPESAFE_PROVIDER = "typesafe";
+    process.env.TYPESAFE_API_KEY = typeSafeKey;
+    delete process.env.OPENROUTER_API_KEY;
+    selectedKey = typeSafeKey;
+  }
+  delete process.env.TYPESAFE_MODEL;
+  for (const flag of PROVIDER_SHADOW_FLAGS) process.env[flag] = "1";
+  if (provider === "openrouter" && !credentials) {
+    const detail = `openrouter key required for ${shadow}`;
+    for (const flag of PROVIDER_SHADOW_FLAGS) assert.equal(client.typesafeLigado(flag), false, detail);
+  }
   taskShadow._resetTaskShadowForTest();
   delegateShadow._resetJevProjetosForTest();
   delegateShadow.registrarJevDoProjeto(PROJ, true);
@@ -189,7 +249,7 @@ async function runOne(shadow: Shadow, value: string, serial: number, taskTitle =
       finish("EPISODE_JSON: lesson exists, summary stays local");
       await new Promise((resolve) => setImmediate(resolve));
     }
-    return { calls, events, logs };
+    return { calls, events, logs, selectedKey };
   } finally {
     console.error = originals.error;
     console.warn = originals.warn;
@@ -198,35 +258,131 @@ async function runOne(shadow: Shadow, value: string, serial: number, taskTitle =
     delegateShadow.setDelegateShadowFetch(null);
     reflectShadow.setReflectShadowFetchForTests(null);
     delegateShadow.definirEmissorSombra(null);
+    if (envBefore.provider === undefined) delete process.env.TYPESAFE_PROVIDER; else process.env.TYPESAFE_PROVIDER = envBefore.provider;
+    if (envBefore.typeSafeKey === undefined) delete process.env.TYPESAFE_API_KEY; else process.env.TYPESAFE_API_KEY = envBefore.typeSafeKey;
+    if (envBefore.openRouterKey === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = envBefore.openRouterKey;
+    if (envBefore.model === undefined) delete process.env.TYPESAFE_MODEL; else process.env.TYPESAFE_MODEL = envBefore.model;
+    for (const flag of PROVIDER_SHADOW_FLAGS) {
+      const previous = envBefore.flags[flag];
+      if (previous === undefined) delete process.env[flag]; else process.env[flag] = previous;
+    }
   }
 }
 
-test("T-1174: every synthetic credential canary is absent from captured requests, frames, and logs in each shadow", async () => {
+test("T-1174/T-1285: every credential canary stays redacted or dropped for every shadow and provider", async () => {
   let serial = 0;
-  for (const shadow of ["task", "delegate", "reflect"] as const) {
-    for (const fixture of fixtures) {
-      serial++;
-      const result = await runOne(shadow, fixture.value, serial);
-      const shouldSend = fixture.action !== "drop";
-      assert.equal(result.calls.length, shouldSend ? 1 : 0, `${shadow}/${fixture.name}: request count`);
-      assert.equal(result.events.length, shouldSend ? (shadow === "reflect" ? 2 : 1) : 0, `${shadow}/${fixture.name}: frame count`);
-      const captured = JSON.stringify({ calls: result.calls.map(({ url, body, opts }) => ({ url, body, opts })), events: result.events, logs: result.logs });
-      assert.equal(captured.includes(fixture.value), fixture.action === "benign", `${shadow}/${fixture.name}: canary handling`);
-      assert.equal(captured.includes(RAW_RESPONSE_CANARY), false, `${shadow}/${fixture.name}: raw response is absent`);
-      assert.equal(captured.includes("synthetic-api-key-never-log"), false, `${shadow}/${fixture.name}: API key is absent outside Authorization`);
-      assert.equal(result.logs.some((line) => line.includes(fixture.value)), false, `${shadow}/${fixture.name}: logs are sanitized`);
-      if (shouldSend) {
-        assert.equal(result.calls[0]!.url, client.TYPESAFE_SYSTEMONE_URL);
-        assert.equal(result.calls[0]!.headers.Authorization, "Bearer synthetic-api-key-never-log");
-        assert.ok(Buffer.byteLength(result.calls[0]!.body, "utf8") <= client.TYPESAFE_MAX_BODY_BYTES);
-        assert.equal(result.calls[0]!.opts.timeoutMs, 2500);
-        assert.equal(result.calls[0]!.opts.maxRedirects, 0);
-        assert.ok(result.calls[0]!.body.includes("This task documents a normal retry behavior."));
-        assert.equal(result.calls[0]!.body.includes("PRIVATE_CONTEXT_CANARY"), false);
-        assert.equal(result.calls[0]!.body.includes("PRIVATE_TOOL_OUTPUT_CANARY"), false);
-        assert.equal(result.calls[0]!.body.includes("PRIVATE_AGENT_ID_CANARY"), false);
+  for (const provider of ["typesafe", "openrouter"] as const) {
+    for (const shadow of ["task", "delegate", "reflect"] as const) {
+      for (const fixture of fixtures) {
+        serial++;
+        const result = await runOne(shadow, fixture.value, serial, undefined, provider);
+        const shouldSend = fixture.action !== "drop";
+        assert.equal(result.calls.length, shouldSend ? 1 : 0, `${provider}/${shadow}/${fixture.name}: request count`);
+        assert.equal(result.events.length, shouldSend ? (shadow === "reflect" ? 2 : 1) : 0, `${provider}/${shadow}/${fixture.name}: frame count`);
+        const captured = JSON.stringify({ calls: result.calls.map(({ url, body, opts }) => ({ url, body, opts })), events: result.events, logs: result.logs });
+        assert.equal(captured.includes(fixture.value), fixture.action === "benign", `${provider}/${shadow}/${fixture.name}: canary handling`);
+        assert.equal(captured.includes(RAW_RESPONSE_CANARY), false, `${provider}/${shadow}/${fixture.name}: raw response is absent`);
+        assert.equal(captured.includes("synthetic-typesafe-api-key-never-log"), false, `${provider}/${shadow}/${fixture.name}: TypeSafe key is absent outside Authorization`);
+        assert.equal(captured.includes("synthetic-openrouter-api-key-never-log"), false, `${provider}/${shadow}/${fixture.name}: OpenRouter key is absent outside Authorization`);
+        assert.equal(result.logs.some((line) => line.includes(fixture.value)), false, `${provider}/${shadow}/${fixture.name}: logs are sanitized`);
+        assert.equal(result.logs.some((line) => line.includes("synthetic-typesafe-api-key-never-log") || line.includes("synthetic-openrouter-api-key-never-log")), false, `${provider}/${shadow}/${fixture.name}: keys are absent from logs`);
+        if (shouldSend) {
+          const verdict = shadow === "reflect"
+            ? result.events.find(event => event.event === "verdict")
+            : result.events[0];
+          assert.equal(verdict?.ok, true, `${provider}/${shadow}/${fixture.name}: parser accepts response metadata id/provider/usage`);
+          if (shadow === "reflect") assert.equal(verdict?.hasReusableLessonNoul, 0.8);
+          const request = result.calls[0]!;
+          const expectedUrl = provider === "openrouter" ? client.OPENROUTER_DECISIONS_URL : client.TYPESAFE_SYSTEMONE_URL;
+          assert.equal(request.url, expectedUrl);
+          assert.equal(request.headers.Authorization, `Bearer ${result.selectedKey}`);
+          assert.ok(Buffer.byteLength(request.body, "utf8") <= client.TYPESAFE_MAX_BODY_BYTES);
+          assert.equal(request.opts.timeoutMs, 2500);
+          assert.equal(request.opts.maxRedirects, 0);
+          assert.ok(request.body.includes("This task documents a normal retry behavior."));
+          assert.equal(request.body.includes("PRIVATE_CONTEXT_CANARY"), false);
+          assert.equal(request.body.includes("PRIVATE_TOOL_OUTPUT_CANARY"), false);
+          assert.equal(request.body.includes("PRIVATE_AGENT_ID_CANARY"), false);
+          const body = JSON.parse(request.body) as { model?: string; state?: unknown; questions?: unknown };
+          assert.equal(body.model, provider === "openrouter" ? client.OPENROUTER_DEFAULT_MODEL : client.TYPESAFE_MODEL);
+          assert.ok(body.state && body.questions, `${provider}/${shadow}: state and typed questions survive`);
+        }
       }
     }
+  }
+});
+
+test("T-1285: unknown provider fails closed with a generic log; OpenRouter without its key cannot fall back to TypeSafe", async () => {
+  const unknown = await runOne("task", "ordinary task text", 5001, undefined, "unknown");
+  assert.equal(unknown.calls.length, 0);
+  assert.ok(unknown.logs.some((line) => line.includes("unknown TYPESAFE_PROVIDER")));
+  assert.equal(unknown.logs.some((line) => line.includes("invalid-provider-fixture")), false);
+
+  let serial = 5002;
+  for (const shadow of ["task", "delegate", "reflect"] as const) {
+    const missingOpenRouterKey = await runOne(shadow, "ordinary task text", serial++, undefined, "openrouter", false);
+    assert.equal(missingOpenRouterKey.calls.length, 0, `${shadow}: missing OpenRouter key disables its gate and fetch`);
+  }
+});
+
+test("T-1285: remembered project credential is not caught by token-pattern redaction", () => {
+  assert.equal(client.prepararTexto(rememberedCredential, client.TYPESAFE_MAX_TEXTO_BYTES, "proj_without_a_remembered_credential"), rememberedCredential);
+  assert.equal(client.prepararTexto(rememberedCredential, client.TYPESAFE_MAX_TEXTO_BYTES, PROJ), "");
+});
+
+test("T-1285: TYPESAFE_MODEL overrides the OpenRouter default in the request body", async () => {
+  const prevProvider = process.env.TYPESAFE_PROVIDER;
+  const prevOpenRouterKey = process.env.OPENROUTER_API_KEY;
+  const prevDirectKey = process.env.TYPESAFE_API_KEY;
+  const prevModel = process.env.TYPESAFE_MODEL;
+  const calls: Array<{ url: string; body: string; authorization: string }> = [];
+  process.env.TYPESAFE_PROVIDER = "openrouter";
+  process.env.OPENROUTER_API_KEY = "synthetic-openrouter-model-key";
+  delete process.env.TYPESAFE_API_KEY;
+  process.env.TYPESAFE_MODEL = "typesafe/jev-fixture-model";
+  try {
+    const result = await client.chamarSystemOne({ model: client.TYPESAFE_MODEL, state: { text: "benign" }, questions: {} }, async (url, init) => {
+      calls.push({ url, body: init.body, authorization: init.headers.Authorization! });
+      return { status: 200, text: async () => JSON.stringify({ id: "fixture", provider: "TypeSafe", usage: { cost: 0 }, answers: {} }) };
+    });
+    assert.equal(result?.status, 200);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]!.url, client.OPENROUTER_DECISIONS_URL);
+    assert.equal(calls[0]!.authorization, "Bearer synthetic-openrouter-model-key");
+    assert.equal((JSON.parse(calls[0]!.body) as { model: string }).model, "typesafe/jev-fixture-model");
+  } finally {
+    if (prevProvider === undefined) delete process.env.TYPESAFE_PROVIDER; else process.env.TYPESAFE_PROVIDER = prevProvider;
+    if (prevOpenRouterKey === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = prevOpenRouterKey;
+    if (prevDirectKey === undefined) delete process.env.TYPESAFE_API_KEY; else process.env.TYPESAFE_API_KEY = prevDirectKey;
+    if (prevModel === undefined) delete process.env.TYPESAFE_MODEL; else process.env.TYPESAFE_MODEL = prevModel;
+  }
+});
+
+test("T-1285: omitting TYPESAFE_PROVIDER keeps the direct TypeSafe endpoint as the default", async () => {
+  const prevProvider = process.env.TYPESAFE_PROVIDER;
+  const prevOpenRouterKey = process.env.OPENROUTER_API_KEY;
+  const prevDirectKey = process.env.TYPESAFE_API_KEY;
+  const prevModel = process.env.TYPESAFE_MODEL;
+  const calls: Array<{ url: string; body: string; authorization: string }> = [];
+  delete process.env.TYPESAFE_PROVIDER;
+  process.env.TYPESAFE_API_KEY = "synthetic-typesafe-default-key";
+  delete process.env.OPENROUTER_API_KEY;
+  delete process.env.TYPESAFE_MODEL;
+  try {
+    const result = await client.chamarSystemOne({ model: client.TYPESAFE_MODEL, state: { text: "benign" }, questions: {} }, async (url, init) => {
+      calls.push({ url, body: init.body, authorization: init.headers.Authorization! });
+      return { status: 200, text: async () => "{}" };
+    });
+    assert.equal(result?.status, 200);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]!.url, client.TYPESAFE_SYSTEMONE_URL);
+    assert.equal(calls[0]!.authorization, "Bearer synthetic-typesafe-default-key");
+    assert.equal((JSON.parse(calls[0]!.body) as { model: string }).model, client.TYPESAFE_MODEL);
+  } finally {
+    if (prevProvider === undefined) delete process.env.TYPESAFE_PROVIDER; else process.env.TYPESAFE_PROVIDER = prevProvider;
+    if (prevOpenRouterKey === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = prevOpenRouterKey;
+    if (prevDirectKey === undefined) delete process.env.TYPESAFE_API_KEY; else process.env.TYPESAFE_API_KEY = prevDirectKey;
+    if (prevModel === undefined) delete process.env.TYPESAFE_MODEL; else process.env.TYPESAFE_MODEL = prevModel;
   }
 });
 

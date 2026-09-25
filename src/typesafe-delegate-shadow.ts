@@ -4,10 +4,10 @@
  * O plaintext do goal só existe no relay, dentro de `encryptOr409`, entre o
  * `JSON.parse` e `encryptBridgePayload`. É daqui que a sombra sai — não do
  * mcp-bridge: o env do bridge não herda o do daemon, e copiar
- * `TYPESAFE_API_KEY` para lá gravaria a chave nos configs dos runners.
+ * credenciais TypeSafe/OpenRouter para lá gravaria a chave nos configs dos runners.
  *
  * Liga só com `TYPESAFE_DELEGATE_SHADOW` em "1"/"true" (trim, ignora maiúsculas) E
- * `TYPESAFE_API_KEY` não vazia. Sem flag ou sem chave: no-op, zero rede.
+ * a chave do provedor configurado não vazia. Sem flag ou sem chave: no-op, zero rede.
  * Copia apenas goal/taskType/complexity na hora e devolve. Não muta o json,
  * não é awaited e não acrescenta campo nenhum ao corpo que sobe. Uma falha
  * aqui não falha o delegate. A rota do Brain não lê este veredito.
@@ -18,6 +18,7 @@ import {
   hmacTexto,
   prepararTexto,
   TYPESAFE_MODEL,
+  typesafeLigado,
   type TypesafeFetch,
   type TypesafeFetchOpts,
   type TypesafeRequestInit,
@@ -214,13 +215,8 @@ export function settleDelegateShadowForTests(): Promise<void> {
   return Promise.all([...emVoo]).then(() => {});
 }
 
-function chaveApi(): string {
-  return (process.env.TYPESAFE_API_KEY ?? "").trim();
-}
-
 function sombraLigada(): boolean {
-  const flag = (process.env.TYPESAFE_DELEGATE_SHADOW ?? "").trim().toLowerCase();
-  return (flag === "1" || flag === "true") && chaveApi() !== "";
+  return typesafeLigado("TYPESAFE_DELEGATE_SHADOW");
 }
 
 function jaCifrado(valor: string): boolean {
