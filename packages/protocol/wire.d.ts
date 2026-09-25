@@ -622,6 +622,10 @@ export interface Task {
   createdBy: string;
   createdAt?: string;
   updatedAt?: string;
+  /** Fechamento atual; null quando aberta ou reaberta. */
+  closedAt?: string | null;
+  /** True só para datas estimadas no backfill legado. */
+  closedAtEstimated?: boolean;
   /** sequential per-project number (1-indexed) for human reference */
   taskNumber?: number;
   externalProvider?: "gitlab" | "github";
@@ -642,6 +646,69 @@ export interface Task {
    * Só metadados operacionais — sem ciphertext.
    */
   derived?: TaskDerived;
+}
+
+export type TaskEventKind =
+  | "created"
+  | "status"
+  | "assignee"
+  | "locked"
+  | "unlocked"
+  | "blocked"
+  | "unblocked"
+  | "comment"
+  | "reopened"
+  | "deleted";
+
+export type TaskEventActor =
+  | { type: "user"; id: string }
+  | { type: "agent"; id: string }
+  | { type: "system"; id: string }
+  | { type: "integration"; id: string };
+
+/** Evento de task sem título, descrição ou conteúdo de comentário. */
+export interface TaskEvent {
+  id: string;
+  projectId: string;
+  taskId: string;
+  kind: TaskEventKind;
+  /** Apenas status ou IDs estáveis. */
+  fromValue?: string | null;
+  toValue?: string | null;
+  actor: TaskEventActor;
+  at: string;
+}
+
+export interface TaskCalendarItem {
+  id: string;
+  taskNumber: number | null;
+  status: TaskStatus;
+  createdAt: string;
+  closedAt: string | null;
+  closedAtEstimated: boolean;
+  assigneeAgentId: string | null;
+}
+
+export interface TaskTimelineItem extends TaskCalendarItem {
+  interval: { start: string; end: string };
+  events: TaskEvent[];
+}
+
+export interface TaskEventsPage {
+  events: TaskEvent[];
+  limit: number;
+  offset: number;
+}
+
+export interface TaskCalendarResponse {
+  tasks: TaskCalendarItem[];
+}
+
+export interface TaskTimelinePage {
+  tasks: TaskTimelineItem[];
+  total: number;
+  limit: number;
+  offset: number;
 }
 
 /** T-096 — shape consumido pelo T-097 (coluna Needs-you). */
@@ -1385,6 +1452,7 @@ export type ServerEvent =
   | { type: "task:updated"; task: Task }
   | { type: "task:removed"; id: string }
   | { type: "task:comment:added"; comment: TaskComment }
+  | { type: "task:event"; event: TaskEvent }
   | { type: "memory:added"; memory: MemoryEntry }
   | { type: "memory:updated"; memory: MemoryEntry }
   | { type: "memory:removed"; id: string }

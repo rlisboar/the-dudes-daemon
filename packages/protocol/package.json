@@ -17,6 +17,10 @@
       "types": "./commands.d.ts",
       "default": "./commands.js"
     },
+    "./task-events": {
+      "types": "./task-events.d.ts",
+      "default": "./task-events.js"
+    },
     "./daemon-wire": {
       "types": "./daemon-wire.d.ts",
       "default": "./daemon-wire.js"
