@@ -23,6 +23,7 @@ let sessionId = null;
 let modelValue = '["deepseek-official","deepseek-v4-flash"]';
 let effortValue = "high";
 let promptInFlight = null;
+let promptCount = 0;
 let cancelRequested = false;
 let serverReqId = 100;
 
@@ -93,6 +94,7 @@ function handle(msg) {
         error: { code: -32603, message: "Internal error: turn failed: llm-deepseek: no API key for provider route \"deepseek-official\"" },
       });
     }
+    promptCount++;
     promptInFlight = { id: msg.id, text };
     // Updates na ordem do contrato: thought → tool (call+update) → texto → usage.
     notify("session/update", { sessionId, update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "pensando…" } } });
@@ -124,8 +126,10 @@ function handle(msg) {
         promptInFlight = null;
         cancelRequested = false;
         if (wasCancelled) return result(id, { stopReason: "cancelled" });
-        notify("session/update", { sessionId, update: { sessionUpdate: "agent_message_chunk", messageId: randomUUID(), content: { type: "text", text: text.includes(PROMPT_TEXT) ? "OK" : text } } });
-        notify("session/update", { sessionId, update: { sessionUpdate: "usage_update", used: 7457, size: 1048576 } });
+        const replies = process.env.FAKE_ACP_REPLY_SEQUENCE?.split("|");
+        const responseText = replies?.[promptCount - 1] ?? (text.includes(PROMPT_TEXT) ? "OK" : text);
+        notify("session/update", { sessionId, update: { sessionUpdate: "agent_message_chunk", messageId: randomUUID(), content: { type: "text", text: responseText } } });
+        notify("session/update", { sessionId, update: { sessionUpdate: "usage_update", used: 7457 + (promptCount - 1) * 531, size: 1048576 } });
         result(id, { stopReason: "end_turn" });
       }, 300);
     }

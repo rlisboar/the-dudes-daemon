@@ -23,7 +23,7 @@ import { accessSync, constants as fsConstants } from "node:fs";
 import { spawnDropped } from "../../privileges.js";
 import { appendPathAttachmentPrompt } from "../attachments.js";
 import { compatibleSessionId } from "../index.js";
-import type { ImageAttachment } from "../../types.js";
+import type { AgentUsage, ImageAttachment } from "../../types.js";
 
 /** Args de spawn do binário dsh (contrato: `dsh --profile acp`). */
 export const DSH_ACP_ARGS = ["--profile", "acp"] as const;
@@ -526,6 +526,9 @@ export function startDsh(self: any): void {
   const client = new DshClient({
     onText: (t) => {
       if (self.dsh !== client) return;
+      if (self.dshPromptInFlight) {
+        self.dshTurnOutputChars = Number(self.dshTurnOutputChars ?? 0) + t.length;
+      }
       self.touchActivity();
       self.setState("speaking");
       if (t) self.turnLatency?.current?.semantic("text");
@@ -740,6 +743,17 @@ export function dshPushUserMessage(self: any, content: string, images?: ImageAtt
   dshPump(self);
 }
 
+/** ACP dsh v1 exposes context occupancy, not turn token counts. Match the
+ *  one-shot fallback (~4 UTF-16 chars/token) and tag it in local logs. */
+function estimateDshTurnUsage(promptChars: number, outputChars: number): AgentUsage {
+  return {
+    input: Math.ceil(promptChars / 4),
+    output: Math.ceil(outputChars / 4),
+    cacheCreate: 0,
+    cacheRead: 0,
+  };
+}
+
 function dshPump(self: any): void {
   const client = self.dsh as DshClient | null;
   if (!client || !self.dshReady || self.dshPromptInFlight) return;
@@ -764,8 +778,17 @@ function dshPump(self: any): void {
       } else if (self.messageSession.firstTurn) {
         self.messageSession.firstTurn = false; // resume: só avança a flag
       }
+      self.dshTurnOutputChars = 0;
       const stop = await client.prompt(text);
       if (self.dsh !== client) return;
+      const usage = estimateDshTurnUsage(text.length, Number(self.dshTurnOutputChars ?? 0));
+      if (usage.input > 0 || usage.output > 0) {
+        self.opts.onUsageDelta?.(usage);
+        self.opts.log(
+          "info",
+          `[cli:${self.info.id}:dsh] uso estimado (heurística ACP ~4 chars/token): input=${usage.input} output=${usage.output}`,
+        );
+      }
       timing?.finish(stop === "cancelled" ? "cancelled" : "completed");
       self.dshFreshSession = false;
       self.dshPromptInFlight = false;

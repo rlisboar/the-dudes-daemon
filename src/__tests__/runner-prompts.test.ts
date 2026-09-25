@@ -9,6 +9,17 @@ test("capability header defaults every feature on", () => {
   }
 });
 
+test("teammate hierarchy prompt requires direct links or the same non-empty team", () => {
+  const header = buildSystemPromptHeader();
+  assert.ok(header.includes("Your direct manager (the agent listed as your manager)"));
+  assert.ok(header.includes("Your direct reports (agents who list you as manager)"));
+  assert.ok(header.includes("same non-empty team (trimmed, exact match), regardless of hierarchy level"));
+  assert.ok(header.includes("For cross-team or no-team requests, use your configured manager"));
+  assert.ok(header.includes("if you have neither a team nor a configured manager, contact the human"));
+  assert.ok(!header.includes("same-level siblings"));
+  assert.ok(!header.includes("If no hierarchy is configured, all communication is allowed"));
+});
+
 test("disabled capabilities remove their prose and cross-references", () => {
   const header = buildSystemPromptHeader({
     teammates: false, tasks: false, filelock: false, memory: false,

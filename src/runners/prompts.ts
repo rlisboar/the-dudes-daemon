@@ -25,8 +25,8 @@ function teammateSection(tasks: boolean): string {
 - **Hierarchy rules**: \`send_message\` is enforced by the server. You can ONLY message:
   - Your direct manager (the agent listed as your manager)
   - Your direct reports (agents who list you as manager)
-  - Peers at your exact hierarchy level (same team, or siblings under the same manager)
-  - If no hierarchy is configured, all communication is allowed
+  - Other agents only when both have the same non-empty team (trimmed, exact match), regardless of hierarchy level
+  - For cross-team or no-team requests, use your configured manager; if you have neither a team nor a configured manager, contact the human
 - If \`send_message\` returns an error, the message was blocked — do NOT retry. Instead:
 ${blocked}`;
 }
