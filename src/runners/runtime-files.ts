@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readlinkSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { registerAgentPid } from "../privileges.js";
@@ -20,6 +20,7 @@ export function grokHomePath(home: string, runner?: string): string {
 
 const CODEX_AGENT_HOMES_DIR = ".the-dudes-agent-homes";
 const CODEX_AGENT_SLUG = /^[a-f0-9]{10}$/;
+const CODEX_RESUME_COMPAT_MARKER = ".the-dudes-resume-compat-v1";
 
 function codexAgentSlug(agentId: string): string {
   return createHash("sha1").update(agentId).digest("hex").slice(0, 10);
@@ -40,27 +41,54 @@ function codexBaseFromAgentHome(codexHome: string): string | undefined {
   return recognized ? candidate : undefined;
 }
 
-/** Preserve a nested legacy home tree without leaving the exact `agents/`
- *  name Codex CLI recursively scans. The dated quarantine is intentionally
- *  retained for the post-rollout cleanup and can be listed before removal. */
-function quarantineNestedCodexAgentHomes(home: string): boolean {
+/** Quarantines live beside (not inside) any agent home. The compatibility
+ *  link under CODEX_HOME/agents points at the home, and Codex recursively
+ *  scans that tree for role files; keeping old nested homes elsewhere avoids
+ *  making them visible to that scan again. */
+function quarantineRoot(codexBase: string): string {
+  return path.join(codexBase, `${CODEX_AGENT_HOMES_DIR}-orfaos`);
+}
+
+function quarantinePath(codexBase: string, slug: string, suffix: string): string {
+  const root = quarantineRoot(codexBase);
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  try { chmodSync(root, 0o700); } catch {}
+  let dest = path.join(root, `${slug}-${suffix}`);
+  for (let n = 2; existsSync(dest); n++) dest = path.join(root, `${slug}-${suffix}-${n}`);
+  return dest;
+}
+
+function moveNestedCodexAgentHomes(codexBase: string, slug: string, home: string): boolean {
   const nested = path.join(home, "agents");
   let info;
   try { info = lstatSync(nested); } catch { return true; }
   if (!info.isDirectory() && !info.isSymbolicLink()) return true;
 
   const date = new Date().toISOString().slice(0, 10).replace(/-/g, "");
-  const prefix = `agents.orfaos-${date}`;
-  let quarantined = path.join(home, prefix);
-  for (let suffix = 2; existsSync(quarantined); suffix++) {
-    quarantined = path.join(home, `${prefix}-${suffix}`);
-  }
+  const quarantined = quarantinePath(codexBase, slug, `agents.orfaos-${date}`);
   try {
     renameSync(nested, quarantined);
     return true;
   } catch {
     return false;
   }
+}
+
+/** Moves quarantines created by the earlier T-1248 code out of the home too.
+ *  Idempotent: already external paths are left untouched. */
+function moveExistingCodexQuarantines(codexBase: string, slug: string, home: string): boolean {
+  let names: string[];
+  try { names = readdirSync(home).filter((name) => name.startsWith("agents.orfaos-")); }
+  catch { return false; }
+  for (const name of names) {
+    const source = path.join(home, name);
+    let info;
+    try { info = lstatSync(source); } catch { continue; }
+    if (!info.isDirectory() && !info.isSymbolicLink()) continue;
+    const target = quarantinePath(codexBase, slug, name);
+    try { renameSync(source, target); } catch { return false; }
+  }
+  return true;
 }
 
 /** Move a home T-426 existente na primeira inicialização deste agente. Rename
@@ -76,13 +104,38 @@ function migrarCodexAgentHome(codexBase: string, slug: string): void {
   if (!infoAntiga.isDirectory() || infoAntiga.isSymbolicLink() || existsSync(nova)) return;
   mkdirSync(path.dirname(nova), { recursive: true, mode: 0o700 });
   try { chmodSync(path.dirname(nova), 0o700); } catch {}
-  if (!quarantineNestedCodexAgentHomes(antiga)) return;
+  if (!moveNestedCodexAgentHomes(codexBase, slug, antiga)) return;
+  if (!moveExistingCodexQuarantines(codexBase, slug, antiga)) return;
   try {
     renameSync(antiga, nova);
     try { chmodSync(nova, 0o700); } catch {}
   } catch {
     // Migração best-effort: nunca apagar a sessão antiga se rename falhar.
   }
+}
+
+/** The Codex state DB stores absolute rollout paths. Keep the old home path as
+ *  a compatibility symlink so those paths keep resolving after migration.
+ *  Never replace a real file/directory: only an absent name or our own symlink
+ *  is safe to adopt. */
+function ensureLegacyCodexHomeAlias(codexBase: string, slug: string, home: string): boolean {
+  const legacy = path.join(codexBase, "agents", slug);
+  let info;
+  try { info = lstatSync(legacy); } catch { info = undefined; }
+  if (info?.isSymbolicLink()) {
+    try {
+      const current = path.resolve(path.dirname(legacy), readlinkSync(legacy));
+      if (current === path.resolve(home)) return true;
+    } catch { return false; }
+    return false;
+  }
+  if (info) return false;
+  mkdirSync(path.dirname(legacy), { recursive: true, mode: 0o700 });
+  try { chmodSync(path.dirname(legacy), 0o700); } catch {}
+  try {
+    symlinkSync(path.relative(path.dirname(legacy), home), legacy, "dir");
+    return true;
+  } catch { return false; }
 }
 
 /** T-426/A15 + T-1248: home por agente fica em sibling de `agents/`, para o
@@ -228,10 +281,30 @@ export class RunnerRuntimeFiles {
   codexHomeDir(): string {
     const base = this.codexBaseDir();
     const slug = codexAgentSlug(this.input.agentId);
-    migrarCodexAgentHome(base, slug);
     const dir = codexAgentHomePath(base, this.input.agentId);
+    const existedBeforeThisCall = existsSync(dir);
+    const legacy = path.join(base, "agents", slug);
+    let legacyNameExisted = false;
+    try { lstatSync(legacy); legacyNameExisted = true; } catch {}
+    migrarCodexAgentHome(base, slug);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     try { chmodSync(dir, 0o700); } catch {}
+    // Also upgrades homes migrated by an older daemon, where the quarantine
+    // still lived inside the home. Relocate it before making the old path
+    // visible to Codex again.
+    const quarantineReady = moveNestedCodexAgentHomes(base, slug, dir)
+      && moveExistingCodexQuarantines(base, slug, dir);
+    const compatMarker = path.join(dir, CODEX_RESUME_COMPAT_MARKER);
+    if (quarantineReady && !existsSync(compatMarker)) {
+      // Homes created after this fix use the new canonical path in Codex's
+      // state DB and need no legacy alias (which would add a role-scan warning).
+      // Existing homes and homes moved from agents/ do need their old absolute
+      // path kept alive for persisted rollout paths.
+      const aliasReady = !(existedBeforeThisCall || legacyNameExisted) || ensureLegacyCodexHomeAlias(base, slug, dir);
+      if (aliasReady) {
+        try { writeFileSync(compatMarker, "1\n", { mode: 0o600 }); } catch {}
+      }
+    }
     const link = (name: string, ensureDir = false) => {
       const target = path.join(base, name);
       const at = path.join(dir, name);

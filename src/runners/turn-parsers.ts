@@ -14,6 +14,13 @@ export type NormalizedTurnEvent =
 const record = (value: unknown): Record<string, unknown> | null =>
   value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 
+/** Codex resume errors caused by an absolute rollout path left in its state
+ *  DB after a home move. Keep this narrow: other resume failures must remain
+ *  visible to the caller rather than silently creating a new conversation. */
+export function isCodexMissingRolloutError(message: string): boolean {
+  return /no rollout found for thread id|state db returned stale rollout path/i.test(message);
+}
+
 /** T-829: tool iniciada SEM id (formato antigo/incompleto) ainda conta em voo —
  *  id sintético que nenhum completed desconta; o turn.completed zera, como antes. */
 let codexAnonToolSeq = 0;

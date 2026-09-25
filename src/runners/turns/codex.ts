@@ -8,7 +8,7 @@ import {armHardTimeout} from "../process-lifecycle.js";
 import {buildCodexMcpToml} from "../mcp-config.js";
 import {chmodSync, chownSync, readFileSync, readdirSync, writeFileSync} from "node:fs";
 import {codexEffort} from "../model-policy.js";
-import {parseCodexRolloutSessionId, parseCodexRolloutSignals, parseCodexTurnEvent} from "../turn-parsers.js";
+import {isCodexMissingRolloutError, parseCodexRolloutSessionId, parseCodexRolloutSignals, parseCodexTurnEvent} from "../turn-parsers.js";
 import {spawnDropped} from "../../privileges.js";
 import os from "node:os";
 import path from "node:path";
@@ -103,8 +103,20 @@ export async function runCodexMessage(self: any, content: string, images?: Image
     // Epoch do spawn: eventos deste turno só valem enquanto a sessão não foi
     // resetada (clear/compact) — ver handleCodexEvent.
     const epoch = self.messageSession.epoch;
+    const resumedSessionId = self.messageSession.sessionId;
     const turnKey = beginTurn(self);
     let buf = "";
+    let stderrForResume = "";
+    let resumeRolloutMissing = false;
+    let semanticActivity = false;
+    const handleEvent = (event: unknown) => {
+      const normalized = parseCodexTurnEvent(event);
+      if (resumedSessionId && normalized.some((e) => e.type === "error" && isCodexMissingRolloutError(e.message))) {
+        resumeRolloutMissing = true;
+      }
+      if (normalized.some((e) => e.type !== "session" && e.type !== "error")) semanticActivity = true;
+      self.handleCodexEvent(event, epoch);
+    };
     proc.stdout!.setEncoding("utf8");
     proc.stderr!.setEncoding("utf8");
     proc.stdout!.on("data", (chunk: string) => {
@@ -115,10 +127,14 @@ export async function runCodexMessage(self: any, content: string, images?: Image
         const line = buf.slice(0, idx).trim();
         buf = buf.slice(idx + 1);
         if (!line.startsWith("{")) continue;
-        try { self.handleCodexEvent(JSON.parse(line), epoch); } catch {}
+        try { handleEvent(JSON.parse(line)); } catch {}
       }
     });
     proc.stderr!.on("data", (chunk: string) => {
+      if (resumedSessionId) {
+        stderrForResume = `${stderrForResume}${chunk}`.slice(-8_192);
+        if (isCodexMissingRolloutError(stderrForResume)) resumeRolloutMissing = true;
+      }
       const msg = chunk.trim();
       if (!msg) return;
       self.traceCli("codex", "stderr", msg);
@@ -136,11 +152,32 @@ export async function runCodexMessage(self: any, content: string, images?: Image
       if (fechado) return;
       fechado = true;
       if (buf.trim().startsWith("{")) {
-        try { self.handleCodexEvent(JSON.parse(buf.trim()), epoch); } catch {}
+        try { handleEvent(JSON.parse(buf.trim())); } catch {}
       }
       buf = "";
+      const resumeFallback = !!resumedSessionId
+        && resumeRolloutMissing
+        && !semanticActivity
+        && !self.stopped
+        && self.messageSession.owns(epoch);
+      if (resumeFallback) {
+        const hasSummary = !!self.messageSession.pendingSummary;
+        self.messageSession.resetForRetry(self.messageSession.pendingSummary);
+        self.info.sessionId = undefined;
+        self.opts.onSessionId?.("");
+        const currentTurn = self.currentTurn;
+        self.messageSession.prepend({
+          content,
+          images,
+          ...(currentTurn?.deliveryId ? { deliveryId: currentTurn.deliveryId } : {}),
+        });
+        self.opts.log(
+          "warn",
+          `[codex:${self.info.name}] resume falhou (no rollout found); mensagem re-enfileirada em sessão nova; resumo de contexto ${hasSummary ? "preservado" : "indisponível"}`,
+        );
+      }
       // R7: fim de turno único/idempotente (T-417 + T-251 preservados dentro).
-      timing?.finish(code === 0 ? "completed" : "process-exit");
+      timing?.finish(resumeFallback ? "retry" : code === 0 ? "completed" : "process-exit");
       endTurn(self, { epoch, turnKey, code, imgCleanup });
       if (!self.stopped && self.messageSession.owns(epoch)) {
         // T-245: ocupação REAL pós-turno (último token_count do rollout). O
