@@ -683,7 +683,22 @@ export const commandSchemas = {
     claudeConfigDir: text.optional(),
     agentId: id.optional(),
     probe: flag.optional(),
+    // T-1232: resumo de voz × sugestão de resposta. Opcional (cliente antigo não
+    // manda); valor inventado morre aqui, no gate do server, não no daemon.
+    kind: z.enum(["tts", "reply"]).optional(),
   }),
+
+  // T-1235: desfecho das sombras de voz/sugestão vindo do CLIENTE (o daemon só
+  // manda o veredito). ESTREITO de propósito: só o que o pareamento precisa —
+  // `refId` = correlationId do summarize, booleano do desfecho, sem texto. Um
+  // campo extra aqui é payload folgado que não deve entrar calado.
+  "jev:shadow-outcome": z.object({
+    type: z.string(),
+    projectId: id,
+    source: z.enum(["tts-summary", "reply-suggest"]),
+    refId: text,
+    outcome: z.object({ acted: flag }).strict(),
+  }).strict(),
 
   list_files: cmd({ path: text }),
   read_file: cmd({ path: text }),
@@ -774,6 +789,8 @@ export const DB_WRITE_COMMANDS = Object.freeze([
   "remove_plan_task", "reorder_plan_tasks", "apply_plan_tasks",
   "start_plan", "pause_plan", "cancel_plan", "reset_plan",
   "validate_plan_task", "report_plan_task_sentinel",
+  // T-1235: grava a linha de desfecho da sombra (jev_verdicts).
+  "jev:shadow-outcome",
   "gitlab_save_config", "gitlab_import_issues", "gitlab_export_task",
   "github_save_config", "github_import_issues", "github_export_task", "github_export_all_tasks", "github_create_webhook",
   "repo_save_config", "repo_import_issues", "repo_export_task", "repo_export_all_tasks", "repo_create_webhook",
@@ -795,12 +812,29 @@ export const DB_WRITE_COMMANDS = Object.freeze([
  * livre. O canal do daemon (FromDaemon) usa `{failClosed:false}` até a T-423
  * publicar os schemas daquele contrato (0/97 hoje).
  */
+/**
+ * T-1249: o `type` ecoado na mensagem de erro. O envelope só limita o TAMANHO
+ * (1..100), então controle/bidi passariam crus para o texto. Mesma classe que o
+ * `sanitizeInboundText` do server (C0/C1/DEL + zero-width/bidi + NFC) MAIS
+ * colapso de espaço — `type` é id, e uma quebra de linha no meio da mensagem
+ * confunde mais do que ajuda.
+ */
+export function sanitizeCommandType(t) {
+  return String(t)
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/g, "")
+    .replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF\u061C]/g, "")
+    .normalize("NFC")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 100);
+}
+
 export function validateCommand(command, { failClosed = true } = {}) {
   const has = Object.prototype.hasOwnProperty.call(commandSchemas, command.type);
   const schema = has ? commandSchemas[command.type] : undefined;
   if (!schema) {
     return failClosed
-      ? { ok: false, error: `comando sem schema: ${command.type}` }
+      ? { ok: false, error: `comando desconhecido: ${sanitizeCommandType(command.type)} — sem schema no protocolo` }
       : { ok: true };
   }
   const parsed = schema.safeParse(command);

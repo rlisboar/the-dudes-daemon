@@ -206,6 +206,31 @@ test("T-878: typesafe:shadow aceita o contrato novo e o daemon antigo", () => {
   assert.equal(validateDaemonMessage({ ...novo, textSha256: 7 }).ok, false);
 });
 
+/**
+ * T-1232: `kind` no `summarize:request` (server → daemon) — o server REPASSA o
+ * que o web marcou para o daemon medir a sombra certa do Jev. Opcional: web
+ * antigo manda sem, e o frame tem de continuar válido.
+ */
+test("T-1232: summarize:request aceita kind tts|reply e recusa valor inventado", () => {
+  const base = { type: "summarize:request", correlationId: "c1", runner: "claude", text: "oi" };
+  const parse = (f) => fromOrchSchemas["summarize:request"].safeParse(f);
+  const ok = (f) => parse(f).success;
+  assert.equal(ok(base), true, "sem kind (web antigo) continua válido");
+  for (const kind of ["tts", "reply"]) assert.equal(ok({ ...base, kind }), true, `${kind} é do contrato`);
+  for (const ruim of ["voz", "", "TTS", 1, null]) {
+    assert.equal(ok({ ...base, kind: ruim }), false, `${JSON.stringify(ruim)} fora do contrato`);
+  }
+
+  // Nit da QA-A (#1233/#1240): só `.success` não basta. O objeto NÃO é estrito,
+  // então um campo DECLARADO que suma do schema vira chave desconhecida e passa
+  // calada (a direção da recusa pega, mas por acidente). Assert no OUTPUT prova
+  // que `kind` sobrevive ao parse — é o que o daemon consome.
+  for (const kind of ["tts", "reply"]) {
+    assert.equal(parse({ ...base, kind }).data.kind, kind, "o campo tem de SAIR do parse, não só não dar erro");
+  }
+  assert.equal("kind" in parse(base).data, false, "ausente segue ausente (sem default inventado)");
+});
+
 test("T-878: project:features existe nos dois lados do contrato e exige a flag", () => {
   assert.match(dts, /export interface ProjectFeatures\b/, "interface ausente do .d.ts");
   assert.match(dts, /type: "project:features"/);

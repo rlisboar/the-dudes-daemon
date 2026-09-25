@@ -604,6 +604,10 @@ export const fromOrchSchemas = {
     systemPrompt: t.optional(),
     text: t,
     claudeConfigDir: t.optional(),
+    // T-1232: repassado do web sem interpretação — distingue o resumo de voz da
+    // sugestão de resposta (sombra #3 do Jev no daemon). Opcional: web antigo
+    // não manda e o frame segue válido.
+    kind: z.enum(["tts", "reply"]).optional(),
     projectId: t.optional(),
   }),
   "transcript:request": msg("transcript:request", { correlationId: t, projectId: t, blobs: z.array(t) }),

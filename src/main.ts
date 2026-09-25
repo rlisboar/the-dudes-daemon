@@ -44,6 +44,7 @@ import { detectDropTarget, spawnDropped, type DropTarget } from "./privileges.js
 import { BridgeRelay, type PeerPidMode } from "./bridge-relay.js";
 import { definirEmissorSombra, definirLogJev, registrarJevDoProjeto } from "./typesafe-delegate-shadow.js";
 import { scheduleAgentMessageShadow } from "./typesafe-agentmsg-shadow.js";
+import { scheduleSummarizerShadow, summarizeKindFromRequest } from "./typesafe-summarizer-shadow.js";
 import { definirElencoProjeto } from "./typesafe-task-shadow.js";
 import { defaultDaemonConfigPath, formatCliStatus, loadDaemonCliConfig, mergeCliConfig, resolveCliCommands, type DaemonCliConfig, type ResolvedCliCommands } from "./cli-config.js";
 import { applyRunnerPolicy, buildInstalledRunnerAvailability, helloRunnerLists, POLICY_GATED_RUNNERS, type InstalledRunnerAvailability } from "./runner-policy.js";
@@ -1925,6 +1926,11 @@ export class DaemonClient {
       }
       plainText = dec;
     }
+    // T-1154: summarize.kind is supplied by the published protocol contract.
+    const kind = summarizeKindFromRequest(msg.kind);
+    const finishVoiceShadow = kind && msg.projectId
+      ? scheduleSummarizerShadow({ kind, projectId: msg.projectId, correlationId: msg.correlationId, text: plainText })
+      : null;
     log("info", `summarize:request runner=${msg.runner} model=${msg.model ?? "(default)"} effort=${msg.effort ?? "(none)"} len=${plainText?.length ?? 0} corrId=${msg.correlationId}`);
     try {
       const result = await runSummarizer({
@@ -1937,6 +1943,9 @@ export class DaemonClient {
         cliCommands: this.cliCommands,
         dropTo: this.dropTo,
       });
+      // Only the TTS shadow knows whether its summary materially changed the
+      // source. Reply suggestion use is observed by WEB, never inferred here.
+      finishVoiceShadow?.(result.ok ? result.summary : undefined);
       let outSummary = result.summary;
       if (result.ok && msg.projectId && outSummary) {
         const enc = encryptForProject(

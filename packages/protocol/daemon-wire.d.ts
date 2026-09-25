@@ -1001,6 +1001,12 @@ export interface SummarizeRequest {
   systemPrompt?: string;
   text: string;
   claudeConfigDir?: string;
+  /**
+   * T-1232: qual one-shot é este pedido — resumo de voz (`tts`) ou sugestão de
+   * resposta (`reply`). O server só REPASSA o que o web mandou, sem interpretar.
+   * Serve para o daemon medir a sombra certa do Jev (#3). Ausente = web antigo.
+   */
+  kind?: "tts" | "reply";
   /** When E2EE is on, `text` arrives as "e2e:" + b64. Daemon decrypts
    *  with this project's key, runs the LLM, and re-encrypts the
    *  summary with the same key before sending result back. */

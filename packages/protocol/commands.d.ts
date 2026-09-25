@@ -16,3 +16,8 @@ export declare function validateCommand(
   command: { type: string },
   opts?: { failClosed?: boolean },
 ): CommandValidation;
+
+/** T-1249: `type` pronto para eco em mensagem de erro — sem C0/C1/DEL,
+ *  zero-width/bidi, NFC e com espaço colapsado. O envelope só limita o
+ *  TAMANHO (1..100); esta é a limpeza de CONTEÚDO. */
+export declare function sanitizeCommandType(t: unknown): string;

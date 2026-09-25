@@ -1880,7 +1880,22 @@ export type ClientCommand =
   | { type: "write_file"; path: string; content: string }
   | { type: "file_operation"; op: "create_file" | "create_directory" | "rename" | "delete"; path: string; newPath?: string }
   | { type: "search_files"; query: string }
-  | { type: "summarize"; correlationId: string; runner: "claude" | "codex" | "opencode" | "gemini" | "qwen" | "crush" | "grok" | "grok-custom"; model?: string; effort?: string; systemPrompt?: string; text: string; dedupKey?: string; claudeConfigDir?: string; agentId?: string; probe?: boolean }
+  | { type: "summarize"; correlationId: string; runner: "claude" | "codex" | "opencode" | "gemini" | "qwen" | "crush" | "grok" | "grok-custom"; model?: string; effort?: string; systemPrompt?: string; text: string; dedupKey?: string; claudeConfigDir?: string; agentId?: string; probe?: boolean;
+      /**
+       * T-1232: qual one-shot é este pedido — resumo de voz (`tts`) ou sugestão
+       * de resposta (`reply`). O server só REPASSA; quem usa é o daemon, para
+       * medir a sombra certa do Jev (#3). Ausente = cliente antigo, segue válido.
+       */
+      kind?: "tts" | "reply" }
+  /**
+   * T-1235: DESFECHO de uma sombra de voz/sugestão, mandado pelo CLIENTE (o
+   * daemon só emite o veredito; o desfecho depende do humano).
+   *
+   * `refId` = `correlationId` do `summarize` correspondente — id aleatório e
+   * efêmero que o web já conhece e que não liga a conteúdo gravado, logo é
+   * opaco o bastante. Sem texto: só o booleano que o pareamento precisa.
+   */
+  | { type: "jev:shadow-outcome"; projectId: string; source: "tts-summary" | "reply-suggest"; refId: string; outcome: { acted: boolean } }
   | { type: "crypto:get_setup" }
   | { type: "crypto:init"; publicKey: string; wrappedPrivateKey: string; wrappedPrivateKeyRecovery: string; kekSalt: string; recoveryCodeHash: string }
   | { type: "crypto:rotate_passphrase"; wrappedPrivateKey: string; kekSalt: string }
