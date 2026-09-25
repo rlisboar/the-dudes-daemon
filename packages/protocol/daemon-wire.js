@@ -357,8 +357,14 @@ export const daemonWireSchemas = {
     // T-878 (Jev nas tasks): opcionais e aditivos. O daemon antigo (só
     // delegate) segue válido; campo fora do tipo declarado derruba a mensagem
     // no fail-closed, como qualquer outro campo do schema.
-    source: z.enum(["task", "delegate"]).optional(),
+    // T-1209: o RUNTIME estava só em task|delegate enquanto o `.d.ts` já
+    // declarava as cinco — frame de sombra nova era dropado aqui (fail-closed),
+    // antes de chegar no handler. `reflect` entra junto.
+    source: z.enum(["task", "delegate", "agent-msg", "tts-summary", "reply-suggest", "reflect"]).optional(),
     taskId: t.optional(),
+    /** T-1128: link OPAQUE do que não é task (mensagem/reflexão). O par
+     *  veredito↔desfecho é por igualdade de `refId`, sem interpretar o valor. */
+    refId: t.optional(),
     event: t.optional(),
     declaredAssignee: t.optional(),
     probabilities: z.object({
@@ -372,6 +378,20 @@ export const daemonWireSchemas = {
     textSha256: t.optional(),
     goalSha256: t.optional(),
     hashKind: z.enum(["sha256", "hmac1"]).optional(),
+    /** T-1209: "a task trouxe lição reutilizável?" — Noul da sombra `reflect`. */
+    hasReusableLessonNoul: n.nullable().optional(),
+    /**
+     * T-1128/T-1209: desfecho OBSERVADO, sempre em linha própria com o MESMO
+     * `refId` e `event: "outcome"`. `acted` = o destinatário agiu (agent-msg,
+     * tts-summary); `produced` = a reflexão gerou memória (reflect). Só
+     * booleanos — o texto fica no daemon.
+     */
+    outcome: z.object({
+      acted: b.optional(),
+      produced: b.optional(),
+      tokens: n.nullable().optional(),
+      durationMs: n.nullable().optional(),
+    }).nullable().optional(),
   }),
 };
 

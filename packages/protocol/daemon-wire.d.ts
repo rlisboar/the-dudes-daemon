@@ -692,7 +692,7 @@ export interface GraphFetchRequest { type: "graph:fetch"; correlationId?: string
 export interface TypesafeShadow extends JevVerdict {
   type: "typesafe:shadow";
   /** Ausente = `task` quando há `taskId` (daemon antigo não manda o campo). */
-  source?: "task" | "delegate" | "agent-msg" | "tts-summary" | "reply-suggest";
+  source?: "task" | "delegate" | "agent-msg" | "tts-summary" | "reply-suggest" | "reflect";
   /**
    * T-1128 — id do que o veredito julga quando não é uma task (mensagem
    * agente→agente). `taskId` fica nulo de propósito: a coluna tem FK para
@@ -708,8 +708,20 @@ export interface TypesafeShadow extends JevVerdict {
   speakAsIsNoul?: number | null;
   /** T-1130: "pede decisão/resposta/aprovação do humano?" — source `reply-suggest`. */
   asksHumanNoul?: number | null;
-  /** T-1128: desfecho real do turno do destinatário (linha própria, mesmo refId). */
-  outcome?: { acted: boolean; tokens?: number | null; durationMs?: number | null } | null;
+  /**
+   * T-1209: "a task trouxe lição reutilizável?" — Noul da sombra `reflect`.
+   * A reflexão real pós-task foi medida: se a probabilidade é BAIXA, o Jev
+   * dispensaria a chamada. Sem texto: só a probabilidade e o desfecho abaixo.
+   */
+  hasReusableLessonNoul?: number | null;
+  /**
+   * Desfecho observado do turno/reflexão — SEMPRE em linha própria, com
+   * `event: "outcome"` e o MESMO `refId` do veredito (`event: "verdict"`), que é
+   * como o server pareia os dois. `acted` (agent-msg/tts) e `produced`
+   * (reflect: a reflexão gerou memória ou devolveu `[]`) são booleanos; nada de
+   * texto sobe no frame.
+   */
+  outcome?: { acted?: boolean; produced?: boolean; tokens?: number | null; durationMs?: number | null } | null;
   /** Task dona do veredito. O server só liga se a task for do projeto. */
   taskId?: string;
   /** `create` | `edit` | `shadow` (delegate). */

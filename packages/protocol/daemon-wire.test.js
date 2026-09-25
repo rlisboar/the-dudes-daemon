@@ -248,6 +248,51 @@ test("T-878: vocabulário do hashKind bate com o CHECK da v22 (sha256|hmac1)", (
   assert.equal(validateDaemonMessage(shadowBase()).ok, true, "hashKind ausente é o legado");
 });
 
+/**
+ * T-1209: o RUNTIME do enum ficou para trás do `.d.ts` — as cinco sources já
+ * estavam declaradas no tipo, mas o schema aceitava só task|delegate, então
+ * todo frame de sombra nova (agent-msg/tts-summary/reply-suggest e agora
+ * `reflect`) era DROPADO no fail-closed, antes do handler. Este teste trava a
+ * sincronia: a lista do schema é lida do próprio `.d.ts`.
+ */
+test("T-1209: toda source declarada no .d.ts é aceita pelo schema (fim do drop silencioso)", () => {
+  const bloco = dts.slice(dts.indexOf("export interface TypesafeShadow"));
+  assert.ok(dts.indexOf("export interface TypesafeShadow") > 0, "interface TypesafeShadow sumiu");
+  const linha = /source\?:\s*([^;]+);/.exec(bloco);
+  assert.ok(linha, "a linha `source?:` sumiu do contrato");
+  const declaradas = [...linha[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(declaradas.sort(), ["agent-msg", "delegate", "reflect", "reply-suggest", "task", "tts-summary"]);
+
+  const noSchema = daemonWireSchemas["typesafe:shadow"].shape.source.unwrap().options;
+  assert.deepEqual([...noSchema].sort(), declaradas, "schema e .d.ts divergiram — sombra nova morre no drop");
+
+  for (const source of declaradas) {
+    assert.equal(validateDaemonMessage({ ...shadowBase(), source }).ok, true, `source ${source} devia passar`);
+  }
+  // fail-closed preservado: valor fora da lista continua recusado
+  assert.equal(validateDaemonMessage({ ...shadowBase(), source: "inventada" }).ok, false);
+});
+
+test("T-1209: sombra `reflect` sobe a Noul e o desfecho SEM texto", () => {
+  const veredito = {
+    ...shadowBase(), source: "reflect", event: "verdict", refId: "refl_1",
+    hasReusableLessonNoul: 0.08,
+  };
+  assert.equal(validateDaemonMessage(veredito).ok, true, "veredito da reflexão precisa passar");
+
+  const desfecho = { ...shadowBase(), source: "reflect", event: "outcome", refId: "refl_1", outcome: { produced: true } };
+  assert.equal(validateDaemonMessage(desfecho).ok, true, "desfecho pareado pelo MESMO refId");
+
+  // `produced` é booleano; o payload folgado (texto junto) passa porque o
+  // schema não é estrito — o server é quem descarta o texto.
+  assert.equal(validateDaemonMessage({ ...desfecho, texto: "SEGREDO", outcome: { produced: false } }).ok, true);
+  assert.equal(validateDaemonMessage({ ...desfecho, outcome: { produced: "true" } }).ok, false, "produced string");
+  assert.equal(validateDaemonMessage({ ...veredito, hasReusableLessonNoul: "0.1" }).ok, false, "Noul string");
+  // desfecho sem campo nenhum segue válido (daemon em rollout)
+  assert.equal(validateDaemonMessage({ ...shadowBase(), source: "reflect", outcome: {} }).ok, true);
+  assert.equal(validateDaemonMessage({ ...shadowBase(), source: "reflect", outcome: null }).ok, true);
+});
+
 test("T-878: project:features é não-estrito e exige só (projectId, jev)", () => {
   const schema = fromOrchSchemas["project:features"];
   // T-974: comportamento em vez de `_def.unknownKeys` (zod 3)
