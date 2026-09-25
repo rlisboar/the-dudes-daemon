@@ -21,6 +21,7 @@ import "./scratch-home.js";
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import type { ChildProcess } from "node:child_process";
 import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -45,7 +46,7 @@ interface Harness {
   runner: AgentRunner;
   warns: string[];
   errors: string[];
-  children: Array<{ kill: (s?: string) => boolean }>;
+  children: ChildProcess[];
   argvLines(): string[];
   /** Todos os pids de turno já spawnados, na ordem. */
   spawnedPids: number[];
@@ -112,15 +113,13 @@ function pidAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
-async function until(cond: () => boolean, what: string, h?: Harness, ms = 15_000): Promise<void> {
+async function until(cond: () => boolean, what: string, h?: Harness, ms = 45_000): Promise<void> {
   const t0 = Date.now();
   while (!cond()) {
     if (Date.now() - t0 > ms) throw new Error(`timeout aguardando ${what} :: ${h ? h.diag() : ""}`);
     await new Promise((r) => setTimeout(r, 25));
   }
 }
-
-const settle = () => new Promise((r) => setTimeout(r, 250));
 
 /** Cleanup exaustivo: o recover põe turnos NOVOS em voo pelo drain e esses não
  *  passam por `h.children` — mata por PID (rastreado pelo próprio runner e por
@@ -136,9 +135,8 @@ async function cleanup(h: Harness): Promise<void> {
   for (const pid of alvos) killPidTree(pid, "SIGKILL");
   for (const p of h.children) killProcess(p as never, "SIGKILL");
   h.runner.stop();
-  await settle();
   for (const pid of alvos) {
-    await until(() => !pidAlive(pid), `cleanup do pid ${pid}`, h, 5_000);
+    await until(() => !pidAlive(pid), `cleanup do pid ${pid}`, h, 45_000);
   }
   _resetTurnGateForTest();
 }
@@ -204,6 +202,10 @@ test("T-593 critério 2: após hard recover com close tardio já entregue, o pid
   _resetTurnGateForTest();
   try {
     const pid1 = await spawnTurn(h, "m1");
+    const proc1 = h.children.find((p) => p.pid === pid1);
+    assert.ok(proc1, "o processo do turno inicial está registrado");
+    let closeChegou = false;
+    proc1.once("close", () => { closeChegou = true; });
     // Fila atrás: o drain do recover põe um turno NOVO em voo (é ele que o
     // close tardio do morto apagava antes da fix).
     h.runner.pushUserMessage("m2");
@@ -212,7 +214,7 @@ test("T-593 critério 2: após hard recover com close tardio já entregue, o pid
 
     // O close REAL do turno morto (SIGKILL do recover) aterra DEPOIS do turno
     // novo existir — é exatamente esta ordem que produzia o defeito.
-    await settle();
+    await until(() => closeChegou, "close do pid recolhido", h);
     assert.equal(
       a.ocActiveProc?.pid,
       pid2,
@@ -279,9 +281,7 @@ test("T-593: stop() mata o turno abandonado mesmo com ocActiveProc já anulado",
     // Estado do defeito: a referência do turno vivo já foi anulada por um close
     // tardio e só o rastreio de pids sabe que ele existe.
     a.ocActiveProc = null;
-    const antes = [...(a.liveTurnPids as Set<number>)];
     h.runner.stop();
-    console.error(`[debug] stop(): pid=${pid1} tracked=${JSON.stringify(antes)} depois=${JSON.stringify([...(a.liveTurnPids as Set<number>)])} alive=${pidAlive(pid1)} diag=${h.diag()}`);
     await until(() => !pidAlive(pid1), "morte do turno abandonado no stop()", h);
     assert.equal(pidAlive(pid1), false, "stop() deixou o CLI abandonado vivo");
   } finally {
@@ -297,7 +297,6 @@ test("T-593 critério 4: cold start NÃO é morto aos 120s; pós-evento só no t
   _resetTurnGateForTest();
   try {
     const pid1 = await spawnTurn(h, "m1");
-    await settle();
 
     // 125s de silêncio sem NENHUM evento semântico — o limiar seco de 120s
     // matava aqui (121 de 124 hard recovers de prod caíram neste ponto).

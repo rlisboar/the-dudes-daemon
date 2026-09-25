@@ -114,10 +114,10 @@ function harness(extraMcpServers: Record<string, unknown>, bridgeCommand = "node
   return { runner, erros, logs, textos, spawns };
 }
 
-async function until(cond: () => boolean, ms = 15_000): Promise<void> {
+async function until(cond: () => boolean, what: string, ms = 45_000): Promise<void> {
   const t0 = Date.now();
   while (!cond()) {
-    if (Date.now() - t0 > ms) throw new Error("timeout");
+    if (Date.now() - t0 > ms) throw new Error(`timeout aguardando ${what}`);
     await new Promise((r) => setTimeout(r, 25));
   }
 }
@@ -130,9 +130,9 @@ test("T-726 (b): MCP extra que não resolve — agente SOBE sem ele, com aviso n
   });
   try {
     await h.runner.start();
-    await until(() => ready(h));
+    await until(() => ready(h), "dsh ready");
     h.runner.pushUserMessage("oi");
-    await until(() => h.textos.length > 0);
+    await until(() => h.textos.length > 0, "texto após remover MCP que não resolve");
     const aviso = h.erros.find((e) => e.includes('MCP "quebrado"'));
     assert.ok(aviso, `aviso do MCP quebrado: ${JSON.stringify(h.erros)}`);
     assert.match(aviso!, /não encontrado no PATH/);
@@ -146,9 +146,9 @@ test("T-726 (b)/(c): MCP extra que não CONECTA (-32603 do dsh) — retry sem el
   const h = harness({ playwright: { type: "stdio", command: "npx", args: ["-y", "@playwright/mcp"] } }, "node", "playwright");
   try {
     await h.runner.start();
-    await until(() => ready(h));
+    await until(() => ready(h), "dsh ready após MCP -32603");
     h.runner.pushUserMessage("oi");
-    await until(() => h.textos.length > 0);
+    await until(() => h.textos.length > 0, "texto após remover MCP que não conectou");
     const aviso = h.erros.find((e) => e.includes('MCP "playwright" não conectou'));
     assert.ok(aviso, `aviso do -32603: ${JSON.stringify(h.erros)}`);
     assert.match(aviso!, /-32603/);
@@ -160,7 +160,7 @@ test("T-726 (b): bridge the-dudes que não resolve é FATAL (não sobe sem o bri
   const h = harness({}, "bridge-inexistente-t726");
   try {
     await h.runner.start();
-    await until(() => h.erros.some((e) => e.includes("handshake:")));
+    await until(() => h.erros.some((e) => e.includes("handshake:")), "erro do bridge MCP fatal");
     const err = h.erros.find((e) => e.includes("handshake:"))!;
     assert.match(err, /bridge the-dudes indisponível/);
     assert.equal(ready(h), false, "não fica pronto sem o bridge");
@@ -171,7 +171,7 @@ test("T-726 (d): handshake que falha em série faz backoff e PARA com motivo vis
   const h = harness({}, "bridge-inexistente-t726");
   try {
     await h.runner.start();
-    await until(() => h.erros.some((e) => e.includes("agente PARADO")), 60_000);
+    await until(() => h.erros.some((e) => e.includes("agente PARADO")), "parada após falhas de handshake", 90_000);
     const parada = h.erros.find((e) => e.includes("agente PARADO"))!;
     assert.match(parada, new RegExp(`falhou ${DSH_HANDSHAKE_MAX_TRIES}x seguidas`));
     // T-731: o motivo tem de estar JUNTO, mas qual erro é depende do

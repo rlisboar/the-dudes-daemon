@@ -121,9 +121,9 @@ function fakeTurnProc(): any {
   };
 }
 
-async function until(cond: () => boolean, what: string, ms = 20_000): Promise<void> {
-// T-1088: budget LARGO — sob a carga da suíte inteira o spawn do stub passa
-// dos 4-8s e o caso virava falso vermelho (família 'timeout aguardando spawn').
+async function until(cond: () => boolean, what: string, ms = 45_000): Promise<void> {
+// O predicado é o fato que o teste precisa; o teto folgado só absorve atraso
+// de spawn/event loop sob dois workers de carga.
   const t0 = Date.now();
   while (!cond()) {
     if (Date.now() - t0 > ms) throw new Error(`timeout aguardando ${what}`);
@@ -135,11 +135,7 @@ async function until(cond: () => boolean, what: string, ms = 20_000): Promise<vo
  *  é um `node` novo sob a carga do runner de CI: 5s já estourou ali (observado
  *  nos dois lados, base e tip, na mesma rodada). Como o `until` espera um FATO,
  *  subir o budget não afrouxa asserção — só o tempo que o teste tolera. */
-const SPAWN_BUDGET_MS = 15_000;
-
-/** O evento real de close do filho morto chega assincronamente: dá-lhe tempo
- *  de aterrar antes das asserções (é exatamente esse close que se testa). */
-const settle = () => new Promise((r) => setTimeout(r, 250));
+const SPAWN_BUDGET_MS = 45_000;
 
 /** Cleanup: mata os filhos reais (senão o teste PENDA — ver cabeçalho), pára o
  *  runner e zera o gate para o próximo teste começar do zero.
@@ -209,8 +205,10 @@ for (const { runner, method } of RUNNERS) {
       let novoLibertado = 0;
       a.activeTurnRelease = () => { novoLibertado++; };
 
+      let closeChegou = false;
+      proc1.once("close", () => { closeChegou = true; });
       proc1.kill("SIGKILL");
-      proc1.emit("close", null); // o close tardio chega DEPOIS do turno novo existir
+      await until(() => closeChegou, "close real do proc morto após o turno novo", SPAWN_BUDGET_MS);
 
       assert.equal(novoLibertado, 0, "close velho não pode consumir o handle do gate do turno novo");
       assert.equal(a.activeTurnRelease !== null, true, "handle do turno novo continua armado");
@@ -219,7 +217,6 @@ for (const { runner, method } of RUNNERS) {
       assert.equal(a.messageSession.busy, true, "close velho não pode zerar o busy do turno novo");
       assert.notEqual(a.currentState, "idle", "close velho não pode pôr o runner idle");
 
-      await settle(); // o evento real de close do filho morto segue o mesmo caminho
       assert.equal(novoLibertado, 0, "close real do proc morto também não liberta o handle alheio");
       assert.equal(a.ocActiveProc, proc2, "close real do proc morto também não apaga o proc novo");
       assert.equal(a.messageSession.busy, true, "close real do proc morto também não zera o busy");
@@ -276,6 +273,8 @@ for (const { runner } of RUNNERS) {
       );
       const proc1 = a.ocActiveProc;
       h.children.push(proc1);
+      let closeRealChegou = false;
+      proc1.once("close", () => { closeRealChegou = true; });
       const epoch1 = a.messageSession.epoch;
       assert.equal(a.messageSession.busy, true, "turno 1 em voo");
       assert.equal(gateAtivos(), 1, "turno 1 segura o slot");
@@ -306,7 +305,7 @@ for (const { runner } of RUNNERS) {
       assert.equal(gateAtivos(), 1, "o slot em voo agora é o do turno novo");
       const handle2 = a.activeTurnRelease;
 
-      await settle(); // o close_REAL do proc1 (SIGKILL do recover) já apanhou o turno 2 em voo
+      await until(() => closeRealChegou, "close real do turno 1 após o recover", SPAWN_BUDGET_MS);
       assert.equal(a.messageSession.busy, true, "close real do morto não zera o busy do turno novo");
       proc1.emit("close", null); // e chega explicitamente mais uma vez
 
