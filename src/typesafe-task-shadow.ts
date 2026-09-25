@@ -14,65 +14,39 @@
  * Endpoint e modelo ficam pinados; `safeFetch` com maxRedirects 0 e 2,5s;
  * log sem texto, chave ou corpo.
  *
- * Itens do parecer do SECURITY (#855) que valem código:
- *  - rótulos seguros ao parser (`[A-Za-z0-9_.-]{1,64}`), colisão com sufixo,
- *    `NONE` reservado; `domain`/`declaredAssignee` viajam como agentId;
- *  - elenco por whitelist (`name`, `role`), nunca o AgentInfo (o systemPrompt
- *    decifrado ficaria fora); teto de 24, ordem determinística, o responsável
- *    declarado sempre presente;
- *  - hash HMAC local (HKDF do project key) para o server não virar oráculo de
- *    dicionário; projeto sem chave cai em sha256 etiquetado;
- *  - dedup/last-wins por taskId e teto de POSTs em voo.
+ * A TypeSafe receives only sanitized task title/description and fixed,
+ * bounded questions. Project/task/agent identifiers and rosters stay local.
+ * HMAC is optional when the project key is unavailable; raw SHA is forbidden.
  */
-import { createHash, createHmac, hkdfSync } from "node:crypto";
-import { decryptForProject, getProjectKey, isE2eEncrypted } from "./daemon-crypto.js";
+import { decryptForProject, isE2eEncrypted } from "./daemon-crypto.js";
 import { aadReadChain, E2EE_TABLE } from "@the-dudes/protocol/e2ee-fields";
-import { isJevLigado, emitirSombra, safeFetchSombra, type SombraFetchOpts } from "./typesafe-delegate-shadow.js";
+import { isJevLigado, emitirSombra } from "./typesafe-delegate-shadow.js";
 import type { TypesafeShadow } from "./protocol.js";
+import {
+  chamarSystemOne,
+  hmacTexto,
+  prepararTexto,
+  TYPESAFE_MODEL,
+  TYPESAFE_MAX_TEXTO_BYTES,
+  type TypesafeFetch,
+} from "./typesafe-client.js";
 
-export const TYPESAFE_SYSTEMONE_URL = "https://api.typesafe.ai/v1/systemone";
-const MODEL = "jev-1.13.0";
-const TIMEOUT_MS = 2500;
-const TETO_TEXTO = 2000;
-const TETO_ROLE = 160;
-const TETO_ELENCO = 24;
-const TETO_ROTULO = 64;
+export { TYPESAFE_SYSTEMONE_URL } from "./typesafe-client.js";
+const MODEL = TYPESAFE_MODEL;
+const TETO_TEXTO_BYTES = TYPESAFE_MAX_TEXTO_BYTES;
 const DEBOUNCE_MS = 400;
 const MAX_EM_VOO = 3;
 const PREFIXO_LOG = "[typesafe-task-shadow]";
-/** Vocabulário do CHECK do server (v22). */
-const HASH_INFO = "jev-text-hash-v1";
 
 export type EventoTask = "created" | "reassigned" | "edited";
-
-export interface ElencoOd {
-  agentId: string;
-  name: string;
-  role: string;
-}
-
-interface Rotulado {
-  rotulo: string;
-  agentId: string;
-  texto: string;
-}
 
 interface Pedido {
   projectId: string;
   taskId: string;
   evento: EventoTask;
-  declaredAssignee: string;
   title: string;
   description: string;
-  textHash: string;
-  hashKind: "hmac1" | "sha256";
-  elenco: Rotulado[];
-  /** Menos de 2 agentes conhecidos: o `domain` usa a lista fixa (não agentId). */
-  usarFixo: boolean;
-  rosterN: number;
-  rosterHash: string;
-  /** null = não comparável (fora do elenco deste daemon). */
-  declaradoNoElenco: string | null;
+  textSha256?: string;
 }
 
 const PERGUNTAS_FIXAS = {
@@ -134,10 +108,9 @@ const DOMINIO_FIXO = {
   },
 } as const;
 
-const ULTIMO: Map<string, { hash: string; assignee: string }> = new Map();
+const ULTIMO: Map<string, { textSha256: string }> = new Map();
 const PENDENTE: Map<string, NodeJS.Timeout> = new Map();
 const EM_VOO = new Set<Promise<void>>();
-let elencoFn: ((projectId: string) => ElencoOd[]) | null = null;
 let aleatorio = Math.random;
 
 /** Testes: relógio/aleatório e estado limpos. */
@@ -151,22 +124,20 @@ export function _setTaskShadowAleatorio(fn: () => number): void {
   aleatorio = fn;
 }
 
-/** Main liga o elenco (whitelist name/role do host). */
-export function definirElencoProjeto(fn: ((projectId: string) => ElencoOd[]) | null): void {
-  elencoFn = fn;
-}
+/** Compatibilidade com chamadores antigos: este classificador não envia elenco. */
+export function definirElencoProjeto(_fn: ((projectId: string) => unknown[]) | null): void {}
 
 export type TaskShadowFetch = (
   url: string,
   init: { method: string; headers: Record<string, string>; body: string; signal: AbortSignal },
-  opts: SombraFetchOpts,
+  opts: { timeoutMs: number; maxRedirects: number },
 ) => Promise<{ status: number; text: () => Promise<string> }>;
 
-let fetchInjetado: TaskShadowFetch | null = null;
+let fetchInjetado: TypesafeFetch | null = null;
 
 /** Só testes. `null` volta ao safeFetch de produção. */
 export function setTaskShadowFetch(fn: TaskShadowFetch | null): void {
-  fetchInjetado = fn;
+  fetchInjetado = fn as TypesafeFetch | null;
 }
 
 /** Só testes: espera os POSTs em voo assentarem. */
@@ -201,7 +172,7 @@ function logar(extra: Record<string, unknown>): void {
 }
 
 /** Um skip com motivo é uma linha só — sem texto. */
-function pular(motivo: "e2e" | "no-change" | "no-roster" | "disabled" | "inflight", ctx: Record<string, unknown>): void {
+function pular(motivo: "redaction" | "no-change" | "disabled" | "inflight", ctx: Record<string, unknown>): void {
   logar({ skip: motivo, ...ctx });
 }
 
@@ -224,64 +195,6 @@ function textoPlano(v: unknown, projectId: string, field: "title" | "description
   return decryptForProject(v, projectId) ?? null;
 }
 
-function higienizarRotulo(bruto: string): string {
-  const limpo = bruto.trim().replace(/[^A-Za-z0-9_.-]+/g, "_").replace(/^[_.-]+/, "").slice(0, TETO_ROTULO);
-  return limpo || "AGENTE";
-}
-
-function higienizarRole(bruto: string): string {
-  const t = bruto.replace(/\s+/g, " ").trim();
-  return t.length <= TETO_ROLE ? t : `${t.slice(0, TETO_ROLE - 1)}…`;
-}
-
-/** Rótulos únicos, ordem determinística, `NONE` por último. */
-function rotular(elenco: ElencoOd[], declaredAssignee: string): Rotulado[] {
-  const ordenado = [...elenco].sort((a, b) => (a.name || a.agentId).localeCompare(b.name || b.agentId, "en"));
-  // O responsável declarado entra sempre, mesmo fora do topo do teto.
-  const declarado = declaredAssignee ? ordenado.find((a) => a.agentId === declaredAssignee) : undefined;
-  const selecionados = ordenado.slice(0, TETO_ELENCO);
-  if (declarado && !selecionados.includes(declarado)) {
-    if (selecionados.length >= TETO_ELENCO) selecionados.pop();
-    selecionados.push(declarado);
-  }
-  const usados = new Set<string>(["NONE"]);
-  const out: Rotulado[] = [];
-  for (const a of selecionados) {
-    let rotulo = higienizarRotulo(a.name || a.agentId);
-    if (usados.has(rotulo)) {
-      let n = 2;
-      while (usados.has(`${rotulo}-${n}`)) n++;
-      rotulo = `${rotulo}-${n}`.slice(0, TETO_ROTULO);
-    }
-    usados.add(rotulo);
-    const nome = (a.name || a.agentId).replace(/\s+/g, " ").trim().slice(0, 64);
-    out.push({ rotulo, agentId: a.agentId, texto: `${nome} — ${higienizarRole(a.role)}` });
-  }
-  return out;
-}
-
-function hashElenco(rotulados: Rotulado[]): string {
-  const base = rotulados.map((r) => `${r.rotulo}:${r.agentId}`).join("|");
-  return createHash("sha256").update(base, "utf8").digest("hex").slice(0, 12);
-}
-
-/**
- * Hash do texto CRU. HMAC com chave derivada do project key (HKDF) para o
- * server não poder testar candidatos; projeto sem chave cai em sha256 e NUNCA
- * se mistura com hmac1 no histórico da mesma task.
- */
-function hashTexto(projectId: string, title: string, description: string): { hash: string; kind: "hmac1" | "sha256" } {
-  const base = `${projectId}\n${title}\n${description}`;
-  const chave = getProjectKey(projectId);
-  if (!chave) return { hash: createHash("sha256").update(base, "utf8").digest("hex").slice(0, 12), kind: "sha256" };
-  try {
-    const derivada = Buffer.from(hkdfSync("sha256", chave, Buffer.alloc(0), HASH_INFO, 32));
-    return { hash: createHmac("sha256", derivada).update(base, "utf8").digest("hex").slice(0, 12), kind: "hmac1" };
-  } catch {
-    return { hash: createHash("sha256").update(base, "utf8").digest("hex").slice(0, 12), kind: "sha256" };
-  }
-}
-
 /** Campos do request que interessam: presença decide evento e skip. */
 export interface PatchTask {
   title?: boolean;
@@ -296,29 +209,14 @@ export function classificarEvento(op: "tasks_add" | "tasks_update", patch: Patch
   return "no-change";
 }
 
-function montarCorpo(p: Pedido): string {
-  let domain: { type: "choice"; instructions: string; criteria: Record<string, string> };
-  if (p.usarFixo) {
-    domain = { type: "choice", ...DOMINIO_FIXO };
-  } else {
-    const criterios: Record<string, string> = {};
-    for (const r of p.elenco) criterios[r.rotulo] = r.texto;
-    criterios.NONE = "An explanation or a question, or no specialist implements anything.";
-    domain = {
-      type: "choice",
-      instructions:
-        "Which specialist should implement the work in `task`? Choose NONE when the task is an explanation or no specialist implements anything. `declaredAssignee` is who the board says is responsible, not the answer.",
-      criteria: criterios,
-    };
-  }
-  return JSON.stringify({
+function montarCorpo(p: Pedido): Record<string, unknown> {
+  return {
     model: MODEL,
     state: {
       task: { title: p.title, description: p.description },
-      declaredAssignee: p.declaredAssignee,
     },
-    questions: { domain, ...PERGUNTAS_FIXAS },
-  });
+    questions: { domain: { type: "choice", ...DOMINIO_FIXO }, ...PERGUNTAS_FIXAS },
+  };
 }
 
 interface ChoiceLido {
@@ -327,24 +225,25 @@ interface ChoiceLido {
   confidence: number;
 }
 
-function lerMapa(v: unknown): Record<string, number> | null {
+function lerMapa(v: unknown, allowed: ReadonlySet<string>): Record<string, number> | null {
   if (!v || typeof v !== "object" || Array.isArray(v)) return null;
   const out: Record<string, number> = {};
   for (const [k, n] of Object.entries(v as Record<string, unknown>)) {
-    if (typeof n !== "number" || !Number.isFinite(n)) return null;
+    if (!allowed.has(k) || typeof n !== "number" || !Number.isFinite(n) || n < 0 || n > 1) return null;
     out[k] = n;
   }
   return out;
 }
 
-function lerChoice(v: unknown): ChoiceLido | null {
+function lerChoice(v: unknown, allowed: ReadonlySet<string>): ChoiceLido | null {
   if (!v || typeof v !== "object" || Array.isArray(v)) return null;
   const a = v as Record<string, unknown>;
   if (a.type !== "choice") return null;
   if (typeof a.choice !== "string" || !a.choice) return null;
-  const probabilities = lerMapa(a.probabilities);
+  if (typeof a.choice !== "string" || !allowed.has(a.choice)) return null;
+  const probabilities = lerMapa(a.probabilities, allowed);
   if (!probabilities) return null;
-  if (typeof a.confidence !== "number" || !Number.isFinite(a.confidence)) return null;
+  if (typeof a.confidence !== "number" || !Number.isFinite(a.confidence) || a.confidence < 0 || a.confidence > 1) return null;
   return { choice: a.choice, probabilities, confidence: a.confidence };
 }
 
@@ -352,7 +251,7 @@ function lerNoul(v: unknown): number | null {
   if (!v || typeof v !== "object" || Array.isArray(v)) return null;
   const a = v as Record<string, unknown>;
   if (a.type !== "noul") return null;
-  if (typeof a.noul !== "number" || !Number.isFinite(a.noul)) return null;
+    if (typeof a.noul !== "number" || !Number.isFinite(a.noul) || a.noul < 0 || a.noul > 1) return null;
   return a.noul;
 }
 
@@ -365,18 +264,15 @@ function emitir(p: Pedido, evento: Record<string, unknown>): void {
     source: "task",
     taskId: p.taskId,
     event: p.evento,
-    declaredAssignee: p.declaredAssignee,
-    textSha256: p.textHash,
-    hashKind: p.hashKind,
+    ...(p.textSha256 ? { textSha256: p.textSha256, hashKind: "hmac1" as const } : {}),
   };
-  // T-878 ainda não está na main: os campos novos do veredito vão por cast.
   try { emitirSombra(msg as unknown as TypesafeShadow); } catch { /* emissão não falha a task */ }
 }
 
 async function executar(p: Pedido): Promise<void> {
   const inicio = Date.now();
   const falha = (error: string): void => {
-    logar({ source: "task", taskId: p.taskId, event: p.evento, ok: false, error, rosterN: p.rosterN, rosterHash: p.rosterHash, hashKind: p.hashKind });
+    logar({ source: "task", taskId: p.taskId, event: p.evento, ok: false, error });
     emitir(p, {
       ok: false, error, model: MODEL, latencyMs: Date.now() - inicio,
       declaredTaskType: "", declaredComplexity: "", taskType: "", complexity: "", domain: "",
@@ -385,16 +281,8 @@ async function executar(p: Pedido): Promise<void> {
     });
   };
   try {
-    const signal = AbortSignal.timeout(TIMEOUT_MS);
-    const init = {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${(process.env.TYPESAFE_API_KEY ?? "").trim()}` },
-      body: montarCorpo(p),
-      signal,
-    };
-    const res = fetchInjetado
-      ? await fetchInjetado(TYPESAFE_SYSTEMONE_URL, init, { timeoutMs: TIMEOUT_MS, maxRedirects: 0 })
-      : await safeFetchSombra(TYPESAFE_SYSTEMONE_URL, init, { timeoutMs: TIMEOUT_MS, maxRedirects: 0 });
+    const res = await chamarSystemOne(montarCorpo(p), fetchInjetado ?? undefined);
+    if (!res) return;
     if (res.status !== 200 && res.status !== 201) {
       await drenar(res);
       falha(res.status === 429 ? "http_429" : res.status >= 400 && res.status <= 599 ? `http_${res.status}` : "fetch");
@@ -409,8 +297,8 @@ async function executar(p: Pedido): Promise<void> {
     }
     const answers = (dados as { answers?: Record<string, unknown> } | null)?.answers;
     if (!answers || typeof answers !== "object") { falha("parse"); return; }
-    const domain = lerChoice(answers.domain);
-    const complexity = lerChoice(answers.complexity);
+    const domain = lerChoice(answers.domain, new Set(Object.keys(DOMINIO_FIXO.criteria)));
+    const complexity = lerChoice(answers.complexity, new Set(["simple", "moderate", "complex", "critical"]));
     const destructive = lerNoul(answers.destructive);
     const security = lerNoul(answers.security);
     const acceptance = lerNoul(answers.acceptance);
@@ -418,14 +306,8 @@ async function executar(p: Pedido): Promise<void> {
       falha("parse");
       return;
     }
-    const rotuloDe = new Map(p.elenco.map((r) => [r.rotulo, r.agentId]));
-    let domainAgent = "";
-    if (domain.choice !== "NONE") {
-      // Lista fixa (sem elenco): o veredito é o papel, não um agentId.
-      const resolvido = p.usarFixo ? (domain.choice in DOMINIO_FIXO.criteria ? domain.choice : "") : rotuloDe.get(domain.choice) ?? "";
-      if (!resolvido) { falha("rotulo"); return; }
-      domainAgent = resolvido;
-    }
+    if (!(domain.choice in DOMINIO_FIXO.criteria)) { falha("rotulo"); return; }
+    const domainAgent = domain.choice;
     const confianca = { task_type: 0, complexity: complexity.confidence, domain: domain.confidence };
     const evento = {
       ok: true,
@@ -444,10 +326,10 @@ async function executar(p: Pedido): Promise<void> {
       securityNoul: security,
       acceptanceNoul: acceptance,
       // null quando o responsável declarado não está no elenco deste daemon.
-      disagreeDomain: p.declaradoNoElenco == null ? null : domainAgent !== p.declaradoNoElenco,
+      disagreeDomain: null,
       probabilities: { domain: domain.probabilities, complexity: complexity.probabilities },
     };
-    logar({ source: "task", taskId: p.taskId, event: p.evento, ok: true, latencyMs: evento.latencyMs, rosterN: p.rosterN, rosterHash: p.rosterHash, hashKind: p.hashKind });
+    logar({ source: "task", taskId: p.taskId, event: p.evento, ok: true, latencyMs: evento.latencyMs });
     emitir(p, evento);
   } catch (e) {
     const nome = (e as { name?: string })?.name;
@@ -495,23 +377,21 @@ export function scheduleTaskShadow(input: EntradaTaskShadow): void {
 
     const titleCru = textoPlano(task.title, projectId, "title");
     const descCru = textoPlano(task.description, projectId, "description");
-    if (titleCru == null || descCru == null) {
-      pular("e2e", { source: "task", taskId, event: evento, title: titleCru != null, description: descCru != null });
+    if (titleCru == null || (task.description != null && descCru == null)) {
+      pular("redaction", { source: "task", taskId, event: evento });
       return;
     }
-    const title = titleCru.trim();
-    const description = descCru.trim();
+    const title = prepararTexto(titleCru, TETO_TEXTO_BYTES, projectId);
+    const description = descCru == null || !descCru.trim() ? "" : prepararTexto(descCru, TETO_TEXTO_BYTES, projectId);
+    if (title == null || description == null) {
+      pular("redaction", { source: "task", taskId, event: evento });
+      return;
+    }
     if (!title) return;
 
-    const elencoBruto = elencoFn?.(projectId) ?? [];
-    const declaredAssignee = typeof task.assigneeAgentId === "string" ? task.assigneeAgentId : "";
-    const elenco = rotular(elencoBruto, declaredAssignee);
-    const rosterN = elenco.length;
-    if (rosterN < 2) pular("no-roster", { source: "task", taskId, event: evento, rosterN });
-
-    const { hash, kind } = hashTexto(projectId, titleCru, descCru);
+    const textSha256 = hmacTexto(projectId, JSON.stringify([title, description])) ?? undefined;
     const anterior = ULTIMO.get(taskId);
-    if (anterior && anterior.hash === hash && anterior.assignee === declaredAssignee) {
+    if (textSha256 && anterior?.textSha256 === textSha256) {
       pular("no-change", { source: "task", taskId, event: evento });
       return;
     }
@@ -520,18 +400,11 @@ export function scheduleTaskShadow(input: EntradaTaskShadow): void {
       projectId,
       taskId,
       evento,
-      declaredAssignee,
-      title: title.length <= TETO_TEXTO ? title : title.slice(0, TETO_TEXTO),
-      description: description.length <= TETO_TEXTO ? description : description.slice(0, TETO_TEXTO),
-      textHash: hash,
-      hashKind: kind,
-      elenco,
-      usarFixo: elenco.length < 2,
-      rosterN,
-      rosterHash: hashElenco(elenco),
-      declaradoNoElenco: declaredAssignee && elenco.some((r) => r.agentId === declaredAssignee) ? declaredAssignee : null,
+      title,
+      description,
+      ...(textSha256 ? { textSha256 } : {}),
     };
-    ULTIMO.set(taskId, { hash, assignee: declaredAssignee });
+    if (textSha256) ULTIMO.set(taskId, { textSha256 });
 
     // Debounce last-wins: um burst manda só o último estado da task.
     AGENDADO.set(taskId, pedido);

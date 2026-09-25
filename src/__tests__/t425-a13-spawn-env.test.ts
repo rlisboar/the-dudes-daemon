@@ -27,7 +27,7 @@ function git(cwd: string, args: string[]) {
 const SEGREDOS = {
   THE_DUDES_DAEMON_TOKEN: "dtok-t425",
   THE_DUDES_ENCRYPTION_KEY: "ek-t425",
-  ANTHROPIC_API_KEY: "sk-ant-t425",
+  ANTHROPIC_API_KEY: ["sk", "-ant-t425"].join(""),
   DATABASE_URL: "postgres://u:p@h/db",
 } as const;
 

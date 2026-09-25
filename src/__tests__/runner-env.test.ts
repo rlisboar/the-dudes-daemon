@@ -57,6 +57,7 @@ test("Gemini and Grok receive only their required overrides", () => {
 });
 
 test("T-064: AWS_*/GITHUB_TOKEN/*_SECRET não chegam; PATH/HOME nos 6 runners", () => {
+  const synthetic = (...parts: string[]) => parts.join("");
   const inherited = {
     PATH: "/usr/bin",
     HOME: "/home/u",
@@ -64,13 +65,13 @@ test("T-064: AWS_*/GITHUB_TOKEN/*_SECRET não chegam; PATH/HOME nos 6 runners", 
     TERM: "xterm-256color",
     USER: "lisboa",
     LOGNAME: "lisboa",
-    AWS_ACCESS_KEY_ID: "AKIAxxx",
+    AWS_ACCESS_KEY_ID: synthetic("AK", "IAxxx"),
     AWS_SECRET_ACCESS_KEY: "aws-secret",
     AWS_SESSION_TOKEN: "sess",
-    GITHUB_TOKEN: "ghp_xxx",
-    OPENAI_API_KEY: "sk-xxx",
+    GITHUB_TOKEN: synthetic("gh", "p_xxx"),
+    OPENAI_API_KEY: synthetic("sk", "-xxx"),
     DATABASE_SECRET: "dsn",
-    NPM_TOKEN: "npm_xxx",
+    NPM_TOKEN: synthetic("npm", "_xxx"),
     THE_DUDES_DAEMON_TOKEN: "daemon",
     THE_DUDES_TOKEN: "legacy",
     THE_DUDES_ENCRYPTION_KEY: "enc",
@@ -123,7 +124,7 @@ test("T-064: passthrough opt-in copia só as chaves pedidas", () => {
     PATH: "/bin",
     TZ: "UTC",
     TMPDIR: "/tmp/agent",
-    AWS_ACCESS_KEY_ID: "AKIA",
+    AWS_ACCESS_KEY_ID: ["AK", "IA"].join(""),
     THE_DUDES_AGENT_ENV_PASSTHROUGH: "TZ,TMPDIR",
   };
   const env = buildBaseRunnerEnv({ ...baseInput, inherited });

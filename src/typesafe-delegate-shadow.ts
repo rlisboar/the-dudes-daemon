@@ -8,45 +8,46 @@
  *
  * Liga só com `TYPESAFE_DELEGATE_SHADOW` em "1"/"true" (trim, ignora maiúsculas) E
  * `TYPESAFE_API_KEY` não vazia. Sem flag ou sem chave: no-op, zero rede.
- * Copia goal/context/taskType/complexity na hora e devolve. Não muta o json,
+ * Copia apenas goal/taskType/complexity na hora e devolve. Não muta o json,
  * não é awaited e não acrescenta campo nenhum ao corpo que sobe. Uma falha
  * aqui não falha o delegate. A rota do Brain não lê este veredito.
  */
-import { createHash } from "node:crypto";
-import { isE2eEncrypted } from "./daemon-crypto.js";
 import type { TypesafeShadow } from "./protocol.js";
-import { safeFetch, type SafeFetchOpts } from "./ssrf-guard.js";
+import {
+  chamarSystemOne,
+  hmacTexto,
+  prepararTexto,
+  TYPESAFE_MODEL,
+  type TypesafeFetch,
+  type TypesafeFetchOpts,
+  type TypesafeRequestInit,
+} from "./typesafe-client.js";
 
 /** Endpoint pinado. Sem override por env. */
-export const TYPESAFE_SYSTEMONE_URL = "https://api.typesafe.ai/v1/systemone";
+export { TYPESAFE_SYSTEMONE_URL } from "./typesafe-client.js";
 
 /** Versão pinada. O alias móvel não entra no corpo. */
-const MODEL = "jev-1.13.0";
+const MODEL = TYPESAFE_MODEL;
 
-const TIMEOUT_MS = 2500;
-const TETO_CHARS = 2000;
+const TETO_BYTES = 2 * 1024;
 const TETO_DECLARADO = 64;
 const PREFIXO_LOG = "[typesafe-delegate-shadow]";
 
-export interface DelegateShadowRequestInit {
-  method: string;
-  headers: Record<string, string>;
-  body: string;
-  signal: AbortSignal;
-}
+export type DelegateShadowRequestInit = TypesafeRequestInit;
 
 export type DelegateShadowFetch = (
   url: string,
   init: DelegateShadowRequestInit,
 ) => Promise<{ status: number; text: () => Promise<string> }>;
 
+export type DelegateShadowSafeFetch = TypesafeFetch;
+
 interface Pedido {
-  /** Goal já com trim e teto. O hash usa o cru, que não fica retido. */
+  /** Goal redigido e truncado; nunca guarda o texto cru. */
   goal: string;
-  context: string;
   declaredTaskType: string;
   declaredComplexity: string;
-  goalSha256: string;
+  textSha256?: string;
   projectId: string;
 }
 
@@ -70,7 +71,8 @@ interface LogSombra {
   destructiveNoul: number | null;
   disagreeTaskType: boolean;
   disagreeComplexity: boolean;
-  goalSha256: string;
+  textSha256?: string;
+  hashKind?: "hmac1";
   latencyMs: number;
   ok: boolean;
   error: string | null;
@@ -85,7 +87,7 @@ const PERGUNTAS = {
   task_type: {
     type: "choice",
     instructions:
-      "What is the dominant kind of work requested in `goal`? Use `context` only as background. Judge the work itself. `declaredTaskType` is the caller's claim, not the answer, and must not be copied.",
+      "What is the dominant kind of work requested in `goal`? Judge the work itself. `declaredTaskType` is the caller's claim, not the answer, and must not be copied.",
     criteria: {
       coding: "Writing, modifying, or debugging source code is the main work.",
       research: "Gathering facts, documentation, or prior art, without implementing a change.",
@@ -99,7 +101,7 @@ const PERGUNTAS = {
   complexity: {
     type: "choice",
     instructions:
-      "What is the lowest complexity tier that can reliably carry out `goal`? Use `context` only as background. Do not copy `declaredComplexity`. Prefer the smallest reliable tier. Reserve critical for a cross-system decision, a production effect, or an irreversible effect.",
+      "What is the lowest complexity tier that can reliably carry out `goal`? Do not copy `declaredComplexity`. Prefer the smallest reliable tier. Reserve critical for a cross-system decision, a production effect, or an irreversible effect.",
     criteria: {
       simple: "Mechanical work, search, formatting, or a localized change whose path is obvious.",
       moderate: "Ordinary implementation or a contained fix that needs normal engineering judgment.",
@@ -110,7 +112,7 @@ const PERGUNTAS = {
   destructive: {
     type: "noul",
     instructions:
-      "Does `goal` or `context` ask to deploy, restart production, change or reveal a credential, delete data, force-push, or mutate a cluster?",
+      "Does `goal` ask to deploy, restart production, change or reveal a credential, delete data, force-push, or mutate a cluster?",
     criteria: {
       true: "One of those effects is requested, including as a step of a larger task.",
       false: "None of those effects is requested.",
@@ -119,7 +121,7 @@ const PERGUNTAS = {
   domain: {
     type: "choice",
     instructions:
-      "Which specialist should implement the work in `goal`? Use `context` only as background. Choose NONE when the request is an explanation or no specialist implements anything.",
+      "Which specialist should implement the work in `goal`? Choose NONE when the request is an explanation or no specialist implements anything.",
     criteria: {
       DAEMON: "Local agent runners, watchdogs, the MCP bridge, daemon lifecycle, or self-update.",
       SERVER: "The orchestrator, its API, persistence, or migrations.",
@@ -194,47 +196,12 @@ export function emitirSombra(msg: TypesafeShadow): void {
   emissorSombra?.(msg);
 }
 
-export interface SombraFetchOpts {
-  timeoutMs: number;
-  maxRedirects: number;
-}
-
-/** safeFetch de produção da sombra (maxRedirects 0 obrigatório). */
-export function safeFetchSombra(
-  url: string,
-  init: DelegateShadowRequestInit,
-  opts: SombraFetchOpts,
-): Promise<{ status: number; text: () => Promise<string> }> {
-  return safeFetchEmUso(url, init, opts);
-}
-
-/** Opts da chamada de produção. `maxRedirects: 0` é obrigatório. */
-export interface DelegateShadowSafeFetchOpts {
-  timeoutMs: number;
-  maxRedirects: number;
-}
-
-export type DelegateShadowSafeFetch = (
-  url: string,
-  init: DelegateShadowRequestInit,
-  opts: DelegateShadowSafeFetchOpts,
-) => Promise<{ status: number; text: () => Promise<string> }>;
-
-async function safeFetchProducao(
-  url: string,
-  init: DelegateShadowRequestInit,
-  opts: DelegateShadowSafeFetchOpts,
-): Promise<{ status: number; text: () => Promise<string> }> {
-  // timeoutMs existe no safeFetch em runtime; o .d.ts ainda não o declara.
-  const res = await safeFetch(url, init, opts as SafeFetchOpts);
-  return { status: res.status, text: () => res.text() };
-}
-
-let safeFetchEmUso: DelegateShadowSafeFetch = safeFetchProducao;
+export type SombraFetchOpts = TypesafeFetchOpts;
+let safeFetchInjetado: DelegateShadowSafeFetch | null = null;
 
 /** Só testes. `null` volta ao safeFetch de produção. O atalho `setDelegateShadowFetch` não passa por aqui. */
 export function setDelegateShadowSafeFetch(fn: DelegateShadowSafeFetch | null): void {
-  safeFetchEmUso = fn ?? safeFetchProducao;
+  safeFetchInjetado = fn;
 }
 
 /** Só testes. `null` faz o post seguir pelo safeFetch (não pelo atalho). */
@@ -253,69 +220,54 @@ function chaveApi(): string {
 
 function sombraLigada(): boolean {
   const flag = (process.env.TYPESAFE_DELEGATE_SHADOW ?? "").trim().toLowerCase();
-  if (flag !== "1" && flag !== "true") return false;
-  return chaveApi() !== "";
+  return (flag === "1" || flag === "true") && chaveApi() !== "";
 }
 
 function jaCifrado(valor: string): boolean {
-  return isE2eEncrypted(valor) || valor.startsWith("e2e:v2:");
+  return valor.startsWith("e2e:");
 }
 
-function tokenCurto(v: unknown): string | null {
-  if (typeof v !== "string" || !/^[A-Za-z0-9_.-]{1,64}$/.test(v)) return null;
-  return v;
-}
-
-function declarado(v: unknown): string {
+function declarado(v: unknown, permitidos: ReadonlySet<string>): string {
   if (typeof v !== "string") return "";
   const t = v.trim();
-  return t.length <= TETO_DECLARADO ? t : t.slice(0, TETO_DECLARADO);
+  return t.length <= TETO_DECLARADO && permitidos.has(t) ? t : "";
 }
 
-/** Contexto cifrado não sai: o blob não ajuda o modelo e não pode ir pra fora. */
-function contextoSeguro(v: unknown): string {
-  if (typeof v !== "string") return "";
-  const t = v.trim();
-  if (!t || jaCifrado(t)) return "";
-  return t.length <= TETO_CHARS ? t : t.slice(0, TETO_CHARS);
-}
-
-function hashGoal(goalCru: string): string {
-  return createHash("sha256").update(goalCru, "utf8").digest("hex").slice(0, 12);
-}
+const TIPOS = new Set(["coding", "research", "analysis", "review", "testing", "documentation", "general"]);
+const COMPLEXIDADES = new Set(["simple", "moderate", "complex", "critical"]);
+const DOMINIOS = new Set(["DAEMON", "SERVER", "WEB", "DEVOPS", "QA_A", "QA_B", "SECURITY", "THREEJS", "PM", "NONE"]);
 
 /**
- * Lê o pedido sem escrever no objeto. O hash é do goal cru (antes do trim
- * e do teto); o state leva só a versão curta.
+ * Lê apenas o campo permitido. Redação e teto em bytes são aplicados antes de
+ * qualquer retenção; o HMAC cobre somente o texto já higienizado.
  */
-function copiarPedido(json: unknown): Pedido | null {
+function copiarPedido(json: unknown, projectId: string): Pedido | null {
   if (!json || typeof json !== "object" || Array.isArray(json)) return null;
   const rec = json as Record<string, unknown>;
   const cru = rec.goal;
   if (typeof cru !== "string") return null;
-  const aparado = cru.trim();
-  if (!aparado || jaCifrado(aparado)) return null;
+  if (!cru.trim() || jaCifrado(cru.trim())) return null;
+  const goal = prepararTexto(cru, TETO_BYTES, projectId);
+  if (!goal?.trim()) return null;
   return {
-    goal: aparado.length <= TETO_CHARS ? aparado : aparado.slice(0, TETO_CHARS),
-    context: contextoSeguro(rec.context),
-    declaredTaskType: declarado(rec.taskType),
-    declaredComplexity: declarado(rec.complexity),
-    goalSha256: hashGoal(cru),
-    projectId: "",
+    goal,
+    declaredTaskType: declarado(rec.taskType, TIPOS),
+    declaredComplexity: declarado(rec.complexity, COMPLEXIDADES),
+    textSha256: hmacTexto(projectId, goal) ?? undefined,
+    projectId,
   };
 }
 
-function montarCorpo(snap: Pedido): string {
-  return JSON.stringify({
+function montarCorpo(snap: Pedido): Record<string, unknown> {
+  return {
     model: MODEL,
     state: {
       goal: snap.goal,
-      context: snap.context,
       declaredTaskType: snap.declaredTaskType,
       declaredComplexity: snap.declaredComplexity,
     },
     questions: PERGUNTAS,
-  });
+  };
 }
 
 function emitirVeredito(evento: LogSombra, projectId: string): void {
@@ -339,8 +291,9 @@ function emitirVeredito(evento: LogSombra, projectId: string): void {
     destructiveNoul: evento.destructiveNoul,
     disagreeTaskType: evento.disagreeTaskType,
     disagreeComplexity: evento.disagreeComplexity,
+    ...(evento.textSha256 ? { textSha256: evento.textSha256, hashKind: "hmac1" as const } : {}),
   };
-  try { fn(msg); } catch { /* a emissão não falha o delegate */ }
+  try { fn(msg as TypesafeShadow); } catch { /* a emissão não falha o delegate */ }
 }
 
 function logar(evento: LogSombra, projectId: string): void {
@@ -367,25 +320,25 @@ function erroCurto(e: unknown): string {
   return "fetch";
 }
 
-function lerMapa(v: unknown): Record<string, number> | null {
+function lerMapa(v: unknown, allowed: ReadonlySet<string>): Record<string, number> | null {
   if (!v || typeof v !== "object" || Array.isArray(v)) return null;
   const out: Record<string, number> = {};
   for (const [k, n] of Object.entries(v as Record<string, unknown>)) {
-    if (!/^[A-Za-z0-9_.-]{1,64}$/.test(k)) return null;
-    if (typeof n !== "number" || !Number.isFinite(n)) return null;
+    if (!allowed.has(k)) return null;
+    if (typeof n !== "number" || !Number.isFinite(n) || n < 0 || n > 1) return null;
     out[k] = n;
   }
   return out;
 }
 
-function lerChoice(v: unknown): ChoiceLido | null {
+function lerChoice(v: unknown, allowed: ReadonlySet<string>): ChoiceLido | null {
   if (!v || typeof v !== "object" || Array.isArray(v)) return null;
   const a = v as Record<string, unknown>;
   if (a.type !== "choice") return null;
-  const choice = tokenCurto(a.choice);
-  const probabilities = lerMapa(a.probabilities);
+  const choice = typeof a.choice === "string" && allowed.has(a.choice) ? a.choice : null;
+  const probabilities = lerMapa(a.probabilities, allowed);
   if (!choice || !probabilities) return null;
-  if (typeof a.confidence !== "number" || !Number.isFinite(a.confidence)) return null;
+  if (typeof a.confidence !== "number" || !Number.isFinite(a.confidence) || a.confidence < 0 || a.confidence > 1) return null;
   return { choice, probabilities, confidence: a.confidence };
 }
 
@@ -408,14 +361,13 @@ function interpretar(dados: unknown): {
   const answers = (dados as Record<string, unknown>).answers;
   if (!answers || typeof answers !== "object" || Array.isArray(answers)) return null;
   const a = answers as Record<string, unknown>;
-  const task = lerChoice(a.task_type);
-  const complexity = lerChoice(a.complexity);
-  const domain = lerChoice(a.domain);
+  const task = lerChoice(a.task_type, TIPOS);
+  const complexity = lerChoice(a.complexity, COMPLEXIDADES);
+  const domain = lerChoice(a.domain, DOMINIOS);
   const destructiveNoul = lerNoul(a.destructive);
   if (!task || !complexity || !domain || destructiveNoul == null) return null;
-  const model = tokenCurto((dados as Record<string, unknown>).model) ?? MODEL;
   return {
-    model,
+    model: MODEL,
     choices: { task_type: task.choice, complexity: complexity.choice, domain: domain.choice },
     probabilities: {
       task_type: task.probabilities,
@@ -429,26 +381,6 @@ function interpretar(dados: unknown): {
     },
     destructiveNoul,
   };
-}
-
-async function postar(body: string, signal: AbortSignal): Promise<{ status: number; text: () => Promise<string> }> {
-  const init: DelegateShadowRequestInit = {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${chaveApi()}`,
-    },
-    body,
-    signal,
-  };
-  if (fetchInjetado) return fetchInjetado(TYPESAFE_SYSTEMONE_URL, init);
-  // maxRedirects 0: o safeFetch reenvia Authorization e o body em cada 3xx.
-  // Com 0 o loop estoura antes do hop seguinte e lança. O signal do init
-  // vale no lugar do timeoutMs quando os dois estão presentes.
-  return safeFetchEmUso(TYPESAFE_SYSTEMONE_URL, init, {
-    timeoutMs: TIMEOUT_MS,
-    maxRedirects: 0,
-  });
 }
 
 async function drenar(res: { text: () => Promise<string> }): Promise<void> {
@@ -468,15 +400,18 @@ async function executar(snap: Pedido): Promise<void> {
       destructiveNoul: null,
       disagreeTaskType: false,
       disagreeComplexity: false,
-      goalSha256: snap.goalSha256,
+      ...(snap.textSha256 ? { textSha256: snap.textSha256, hashKind: "hmac1" as const } : {}),
       latencyMs: Date.now() - inicio,
       ok: false,
       error,
     }, snap.projectId);
   };
   try {
-    const signal = AbortSignal.timeout(TIMEOUT_MS);
-    const res = await postar(montarCorpo(snap), signal);
+    const fetcher: TypesafeFetch | undefined = fetchInjetado
+      ? (url, init) => fetchInjetado!(url, init)
+      : safeFetchInjetado ?? undefined;
+    const res = await chamarSystemOne(montarCorpo(snap), fetcher);
+    if (!res) return;
     if (res.status === 429) {
       await drenar(res);
       falha("http_429");
@@ -516,7 +451,7 @@ async function executar(snap: Pedido): Promise<void> {
       destructiveNoul: interp.destructiveNoul,
       disagreeTaskType: interp.choices.task_type !== snap.declaredTaskType,
       disagreeComplexity: interp.choices.complexity !== snap.declaredComplexity,
-      goalSha256: snap.goalSha256,
+      ...(snap.textSha256 ? { textSha256: snap.textSha256, hashKind: "hmac1" as const } : {}),
       latencyMs: Date.now() - inicio,
       ok: true,
       error: null,
@@ -535,9 +470,8 @@ export function scheduleDelegateShadow(json: unknown, projectId?: string): void 
     if (!sombraLigada()) return;
     // Feature do projeto vem só do agent:spawn. Ausente ou false: zero rede.
     if (!projectId || !jevLigado(projectId)) return;
-    const snap = copiarPedido(json);
+    const snap = copiarPedido(json, projectId);
     if (!snap) return;
-    snap.projectId = projectId;
     const job = executar(snap).catch(() => {});
     emVoo.add(job);
     void job.finally(() => { emVoo.delete(job); });

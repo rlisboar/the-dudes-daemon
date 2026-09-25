@@ -48,6 +48,7 @@ import {compactContext, compactContextInner, waitOcIdle, parseAndStripMemory, sa
 import {runOneShot, runOneShotWithSession, killClaudeForRestart} from "./runners/one-shot.js";
 import {traceCli, traceSpawn, renderVerboseIoBlock, traceInternalCli, renderVerboseBlock, colorizeAgentName, supportsAnsi, hexToRgb, extractVerbosePayload, extractValueText, prettyPrintVerboseText, cleanupAgentTmpDir, grokSessionRecentWrite} from "./runners/support.js";
 import {startClaude, bootPerMessageRunner, featuresEnv, bridgeEnv, writeGeminiConfig, writeQwenConfig, writeOpenCodeConfig, buildEnv, buildClaudeArgs, writeMcpConfig, capAccum, handleStdout, handleStreamEvent, prepareGraphify, refreshGraphifyMcp, bridgePost, runnerCommand, workspaceInfo, promptContext, initialMessage, ensureRunnerAvailable} from "./runners/bootstrap.js";
+import { sombraDaReflexao } from "./typesafe-reflect-shadow.js";
 export {
   extractOneShotText,
   grokSignalsPath,
@@ -1355,9 +1356,20 @@ export class AgentRunner {
         "Write in the conversation's language. Output exactly one line: `EPISODE_JSON:` followed by a single-line JSON array with ONE element " +
         "{\"title\": \"<short, <=120 chars>\", \"body\": \"<situation -> what worked -> pitfall>\"} or `EPISODE_JSON: []` to skip. No markdown, no fences." +
         (this.opts.cliRunner ? "" : "");
+      // The SystemOne shadow is independent and never blocks the reflection.
+      const registrarDesfecho = sombraDaReflexao({
+        projectId: (this.opts as { projectId?: string }).projectId ?? "",
+        agentId: this.info.id,
+        taskId,
+        deliveryId: this.currentTurn?.deliveryId,
+        titulo: title,
+        descricao: (this as unknown as { __taskDesc?: string }).__taskDesc,
+        turnos: (this as unknown as { __turnSeq?: number }).__turnSeq ?? 0,
+      });
       const out = await this.runOneShot(prompt);
       if (this.stopped) return;
       const items = this.parseEpisodeJson(out);
+      registrarDesfecho(items.length > 0 ? JSON.stringify(items).slice(0, 500) : "");
       if (items.length === 0) {
         this.opts.onError("[episode] reflexão: nada a guardar");
         return;

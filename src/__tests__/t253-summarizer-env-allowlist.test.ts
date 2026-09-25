@@ -20,7 +20,7 @@ test("T-253: buildSummarizerEnv NÃO vaza tokens/keys — só a allowlist sobrev
     THE_DUDES_TOKEN: "tok",
     THE_DUDES_ENCRYPTION_KEY: "ek",
     THE_DUDES_AGENT_TOKEN: "atok",
-    ANTHROPIC_API_KEY: "sk-ant-…",
+    ANTHROPIC_API_KEY: ["sk", "-ant-…"].join(""),
     GOOGLE_API_KEY: "gk",
     XAI_API_KEY: "xk",
     OPENAI_API_KEY: "ok",

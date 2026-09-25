@@ -1,12 +1,8 @@
 /**
  * T-852 — sombra do Jev nas tasks (fase 1: só observa).
  *
- * Cobre o aceite do card e os 10 itens do parecer do SECURITY (#855): dispara
- * em created/reassigned/edited e não em status-only; skip com motivo; corpo com
- * as 5 perguntas e o elenco dinâmico; evento com o contrato (agentId, nunca
- * rótulo); dedup last-wins e teto de POSTs em voo; rótulos seguros; whitelist
- * do elenco; hash HMAC igual entre daemons e sha256 sem chave; kill-switch e
- * desligamento imediato pelo `project:features`.
+ * Cobre as sombras das tasks com estado allowlisted, redação compartilhada,
+ * limites em bytes, HMAC opcional e resposta validada por enums fixos.
  */
 import "./scratch-home.js";
 
@@ -70,9 +66,9 @@ function corpoOk(over: Record<string, unknown> = {}): string {
 }
 
 const ELENCO = [
-  { agentId: "agent_pm", name: "PM", role: "Product Manager e coordenador" },
-  { agentId: "agent_web", name: "WEB", role: "Responsável por web/**" },
-  { agentId: "agent_qa_b", name: "QA-B", role: "Revisor de web/**" },
+  { agentId: "agent_private_1", name: "PRIVATE_AGENT_NAME_ONE", role: "PRIVATE_AGENT_ROLE_ONE" },
+  { agentId: "agent_private_2", name: "PRIVATE_AGENT_NAME_TWO", role: "PRIVATE_AGENT_ROLE_TWO" },
+  { agentId: "agent_private_3", name: "PRIVATE_AGENT_NAME_THREE", role: "PRIVATE_AGENT_ROLE_THREE" },
 ];
 
 function preparar(opts: { jev?: boolean; flag?: boolean; chave?: boolean; projectId?: string } = {}) {
@@ -104,7 +100,7 @@ test("T-852: created/reassigned/edited disparam; status-only não", () => {
   assert.equal(classificarEvento("tasks_update", {}), "no-change");
 });
 
-test("T-852: skip com motivo (disabled por flag, por jev-off, e2e, no-change)", async () => {
+test("T-852: skip com motivo (disabled por flag, por jev-off, secret/e2e, no-change)", async () => {
   const logs: string[] = [];
   const orig = console.error;
   console.error = (l: string) => { logs.push(l); };
@@ -127,7 +123,7 @@ test("T-852: skip com motivo (disabled por flag, por jev-off, e2e, no-change)", 
     preparar();
     await rodar("tasks_add", {}, tarefa({ title: "e2e:blob-que-nao-abre" }));
     assert.equal(chamadas.length, 0);
-    assert.ok(logs.some((l) => l.includes('"skip":"e2e"')), logs.join("\n"));
+    assert.ok(logs.some((l) => l.includes('"skip":"redaction"')), logs.join("\n"));
 
     // status-only
     logs.length = 0;
@@ -149,13 +145,13 @@ test("T-852: skip com motivo (disabled por flag, por jev-off, e2e, no-change)", 
   }
 });
 
-test("T-852: o corpo tem as 5 perguntas e o elenco dinâmico com rótulos seguros", async () => {
+test("T-852: o corpo tem perguntas fixas e não envia roster, ids ou nomes", async () => {
   const proj = preparar();
   definirElencoProjeto(() => [
-    { agentId: "agent_pm", name: "PM", role: "Product Manager" },
-    { agentId: "agent_web", name: "WEB QA", role: "Revisor de web/** e CI" },
-    { agentId: "agent_x", name: "WEB QA", role: "outro" }, // colisão de rótulo
-    { agentId: "agent_y", name: "NONE", role: "reservado" },
+    { agentId: "agent_private_pm", name: "PRIVATE_AGENT_NAME_A", role: "PRIVATE_AGENT_ROLE_A" },
+    { agentId: "agent_private_web", name: "PRIVATE_AGENT_NAME_B", role: "PRIVATE_AGENT_ROLE_B" },
+    { agentId: "agent_private_x", name: "PRIVATE_AGENT_NAME_B", role: "PRIVATE_AGENT_ROLE_X" },
+    { agentId: "agent_private_y", name: "PRIVATE_AGENT_NAME_C", role: "PRIVATE_AGENT_ROLE_C" },
   ]);
   await rodar("tasks_add", {}, tarefa(), proj);
   assert.equal(chamadas.length, 1);
@@ -173,22 +169,20 @@ test("T-852: o corpo tem as 5 perguntas e o elenco dinâmico com rótulos seguro
   assert.match(corpo.questions.acceptance!.instructions, /acceptance criteria, tests, or an observable result/);
 
   const rotulos = Object.keys(corpo.questions.domain!.criteria);
-  for (const r of rotulos) assert.match(r, /^[A-Za-z0-9_.-]{1,64}$/, `rótulo seguro: ${r}`);
-  assert.equal(rotulos[rotulos.length - 1], "NONE", "NONE por último");
-  assert.ok(rotulos.includes("WEB_QA"), "nome higienizado");
-  assert.ok(rotulos.includes("WEB_QA-2"), "colisão ganha sufixo");
-  assert.ok(rotulos.includes("NONE-2"), "NONE é reservado: colisão vira NONE-2");
-  assert.match(corpo.questions.domain!.criteria.PM!, /PM — Product Manager/);
+  assert.ok(rotulos.includes("DAEMON") && rotulos.includes("SERVER") && rotulos.includes("NONE"));
 
-  const estado = corpo.state as { task: Record<string, unknown>; declaredAssignee: string };
+  const estado = corpo.state as { task: Record<string, unknown> };
   assert.equal(estado.task.title, "Arrumar o board");
   assert.equal(estado.task.description, "ver aceite");
-  assert.equal(estado.declaredAssignee, "agent_pm", "declarado vai como agentId");
+  for (const privateValue of ["agent_private_1", "agent_private_2", "PRIVATE_AGENT_NAME", "PRIVATE_AGENT_ROLE", "agent_x", "task_852", PROJ]) {
+    assert.equal(chamadas[0]!.init.body.includes(privateValue), false, `request excludes ${privateValue}`);
+  }
+  assert.ok(Buffer.byteLength(chamadas[0]!.init.body, "utf8") <= 8 * 1024);
   assert.equal(chamadas[0]!.opts.maxRedirects, 0);
   assert.ok(chamadas[0]!.opts.timeoutMs <= 2500);
 });
 
-test("T-852: o evento sai com o contrato e nunca com o rótulo", async () => {
+test("T-852: evento leva só sinais agregados e HMAC (sem ids de agente)", async () => {
   const proj = preparar();
   definirElencoProjeto(() => ELENCO);
   const { definirEmissorSombra } = await import("../typesafe-delegate-shadow.js");
@@ -201,21 +195,21 @@ test("T-852: o evento sai com o contrato e nunca com o rótulo", async () => {
   assert.equal(ev.source, "task");
   assert.equal(ev.taskId, "task_852");
   assert.equal(ev.event, "reassigned");
-  assert.equal(ev.declaredAssignee, "agent_web");
-  assert.equal(ev.domain, "agent_pm", "agentId, não o rótulo PM");
+  assert.equal("declaredAssignee" in ev, false);
+  assert.equal(ev.domain, "PM", "o domínio é um rótulo fixo");
   assert.equal(ev.complexity, "moderate");
   assert.equal(ev.ok, true);
-  assert.equal(ev.disagreeDomain, true, "agent_pm != agent_web");
+  assert.equal(ev.disagreeDomain, null, "não se compara com agente local");
   assert.equal(ev.securityNoul, 0.2);
   assert.equal(ev.acceptanceNoul, 0.8);
   assert.equal(typeof ev.textSha256, "string");
-  assert.equal((ev.textSha256 as string).length, 12);
+  assert.equal((ev.textSha256 as string).length, 64);
   assert.equal(ev.hashKind, "hmac1");
   assert.ok(ev.probabilities);
   void emissorAntigo;
 });
 
-test("T-852: disagreeDomain é null quando o responsável não está no elenco deste daemon", async () => {
+test("T-852: não há comparação com responsável nem quando vem no task", async () => {
   const proj = preparar();
   definirElencoProjeto(() => ELENCO);
   const { definirEmissorSombra } = await import("../typesafe-delegate-shadow.js");
@@ -278,23 +272,18 @@ test("T-852: falha, timeout e 429 não afetam a task e emitem ok:false", async (
   assert.equal(JSON.stringify(pedido), antes);
 });
 
-test("T-852: elenco — teto de 24, declarado sempre presente e role higienizado/truncado", async () => {
+test("T-852: nenhum campo livre do elenco entra no request", async () => {
   const proj = preparar();
   const grande = Array.from({ length: 30 }, (_, i) => ({ agentId: `agent_${String(i).padStart(2, "0")}`, name: `Agente ${i}`, role: `role ${i}` }));
   grande.push({ agentId: "agent_alvo", name: "Alvo", role: "  muito   espaçado  " + "x".repeat(200) });
   definirElencoProjeto(() => grande);
   await rodar("tasks_add", {}, tarefa({ assigneeAgentId: "agent_alvo" }), proj);
-  const corpo = JSON.parse(chamadas[0]!.init.body) as { questions: { domain: { criteria: Record<string, string> } } };
-  const rotulos = Object.keys(corpo.questions.domain.criteria).filter((r) => r !== "NONE");
-  assert.equal(rotulos.length, 24, "teto de 24");
-  assert.ok(rotulos.includes("Alvo"), "declarado entra mesmo fora do topo");
-  const texto = corpo.questions.domain.criteria.Alvo!;
-  assert.ok(!texto.includes("  "), "espaços colapsados");
-  assert.ok(texto.length <= 70 + 160, "role truncado");
-  assert.match(texto, /…$/);
+  const body = chamadas[0]!.init.body;
+  for (const privateValue of ["agent_alvo", "Agente 0", "Alvo", "muito", "role 0"]) assert.equal(body.includes(privateValue), false);
+  assert.ok(Buffer.byteLength(body, "utf8") <= 8 * 1024);
 });
 
-test("T-852: hash igual entre daemons com a mesma chave; sha256 estável sem chave", async () => {
+test("T-852: HMAC igual com a chave de projeto; sem chave omite hash e hashKind", async () => {
   const proj = preparar();
   const { definirEmissorSombra } = await import("../typesafe-delegate-shadow.js");
   definirEmissorSombra((m) => emitidos.push(m as unknown as Record<string, unknown>));
@@ -313,15 +302,15 @@ test("T-852: hash igual entre daemons com a mesma chave; sha256 estável sem cha
   await rodar("tasks_add", {}, tarefa({ id: "t-h3", title: "outro título" }), proj);
   assert.notEqual(emitidos.at(-1)!.textSha256, h1);
 
-  // Projeto sem chave: sha256, determinístico, nunca hmac1.
+  // Projeto sem chave: nenhum hash, sem fallback SHA desprotegido.
   forgetProjectKey(PROJ_SEM_CHAVE);
   registrarJevDoProjeto(PROJ_SEM_CHAVE, true);
   await rodar("tasks_add", {}, tarefa({ id: "t-s1" }), PROJ_SEM_CHAVE);
-  assert.equal(emitidos.at(-1)!.hashKind, "sha256");
-  const s1 = emitidos.at(-1)!.textSha256;
+  assert.equal("hashKind" in emitidos.at(-1)!, false);
+  assert.equal("textSha256" in emitidos.at(-1)!, false);
   _resetTaskShadowForTest();
   await rodar("tasks_add", {}, tarefa({ id: "t-s2" }), PROJ_SEM_CHAVE);
-  assert.equal(emitidos.at(-1)!.textSha256, s1, "sha256 consistente");
+  assert.equal("textSha256" in emitidos.at(-1)!, false);
 });
 
 test("T-852: desligar o Jev vale na hora, sem esperar o próximo spawn", async () => {
@@ -351,7 +340,7 @@ test("T-852: campo cifrado é decifrado localmente antes de desistir", async () 
   assert.equal(corpo.state.task.title, "Título cifrado");
 });
 
-test("T-852: menos de 2 agentes conhecidos cai na lista fixa (no-roster)", async () => {
+test("T-852: a pergunta de domínio sempre usa a lista fixa e sem roster", async () => {
   const proj = preparar();
   const logs: string[] = [];
   const orig = console.error;
@@ -368,7 +357,7 @@ test("T-852: menos de 2 agentes conhecidos cai na lista fixa (no-roster)", async
   assert.ok(corpo.questions.domain.criteria.NONE, "NONE presente");
   assert.equal(emitidos.length, 1, "segue disparando (fallback, não skip)");
   assert.equal(emitidos[0]!.domain, "WEB", "sem elenco, o veredito é o papel");
-  assert.ok(logs.some((l) => l.includes("no-roster")), logs.join("\n"));
+  assert.equal(logs.some((l) => l.includes("no-roster")), false);
 });
 
 test("T-852: camposDoPatch lê só a presença e tolera corpo não-JSON", async () => {

@@ -4,7 +4,6 @@
  */
 import { describe, test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,10 +18,12 @@ import {
   type DelegateShadowFetch,
   type DelegateShadowRequestInit,
 } from "../typesafe-delegate-shadow.js";
+import { TYPESAFE_MODEL, TYPESAFE_TIMEOUT_MS } from "../typesafe-client.js";
 
 const AQUI = dirname(fileURLToPath(import.meta.url));
 const RELAY = readFileSync(join(AQUI, "../bridge-relay.ts"), "utf8");
 const MODULO = readFileSync(join(AQUI, "../typesafe-delegate-shadow.ts"), "utf8");
+const CLIENTE = readFileSync(join(AQUI, "../typesafe-client.ts"), "utf8");
 const PREFIXO = "[typesafe-delegate-shadow] ";
 const FLAG_ORIGINAL = process.env.TYPESAFE_DELEGATE_SHADOW;
 const CHAVE_ORIGINAL = process.env.TYPESAFE_API_KEY;
@@ -53,10 +54,6 @@ function instalarLog(): { linhas: () => string[]; parar: () => void } {
     linhas: () => linhas.filter((l) => l.startsWith(PREFIXO)),
     parar: () => { console.error = orig; },
   };
-}
-
-function sha12(s: string): string {
-  return createHash("sha256").update(s, "utf8").digest("hex").slice(0, 12);
 }
 
 function choice(escolha: string, opcoes: string[]) {
@@ -172,7 +169,7 @@ describe("typesafe-delegate-shadow", { concurrency: 1 }, () => {
     }
   });
 
-  test("request pinada: model jev-1.13.0, estado só os campos previstos, trunca a 2000", async () => {
+  test("request pinada: estado allowlisted, goal até 2 KiB UTF-8 e sem context", async () => {
     const log = instalarLog();
     try {
       const goal = "a".repeat(2500);
@@ -214,25 +211,24 @@ describe("typesafe-delegate-shadow", { concurrency: 1 }, () => {
         };
       };
       assert.equal(corpo.model, "jev-1.13.0");
-      assert.deepEqual(Object.keys(corpo.state).sort(), ["context", "declaredComplexity", "declaredTaskType", "goal"]);
-      assert.equal(corpo.state.goal, "a".repeat(2000));
-      assert.equal(corpo.state.context, "b".repeat(2000));
+      assert.deepEqual(Object.keys(corpo.state).sort(), ["declaredComplexity", "declaredTaskType", "goal"]);
+      assert.ok(Buffer.byteLength(corpo.state.goal!, "utf8") <= 2048);
+      assert.ok(String(corpo.state.goal).endsWith("…"));
       assert.equal(corpo.state.declaredTaskType, "coding");
       assert.equal(corpo.state.declaredComplexity, "moderate");
       assert.equal(corpo.questions.task_type.type, "choice");
       assert.equal(corpo.questions.complexity.type, "choice");
       assert.equal(corpo.questions.destructive.type, "noul");
       assert.equal(corpo.questions.domain.type, "choice");
-      assert.equal(initVisto.body.includes("a".repeat(2001)), false);
+      assert.equal(initVisto.body.includes("a".repeat(2046)), false);
       assert.equal(initVisto.body.includes("REPO_SENTINELA"), false);
       assert.equal(initVisto.body.includes("DIFF_SENTINELA"), false);
       assert.equal(initVisto.body.includes("preferredRunner"), false);
+      assert.equal("context" in corpo.state, false);
       assert.equal(initVisto.body.includes("chave-teste-nao-logar"), false);
       const linha = log.linhas();
       assert.equal(linha.length, 1);
-      const evento = JSON.parse(linha[0]!.slice(PREFIXO.length)) as { goalSha256: string };
-      assert.equal(evento.goalSha256, sha12(goal));
-      assert.notEqual(evento.goalSha256, sha12(goal.slice(0, 2000)));
+      assert.equal(linha[0]!.includes(goal), false);
     } finally {
       log.parar();
     }
@@ -305,7 +301,7 @@ describe("typesafe-delegate-shadow", { concurrency: 1 }, () => {
       });
       await settleDelegateShadowForTests();
       assert.ok(body.includes(sentinelaGoal));
-      assert.ok(body.includes(sentinelaCtx));
+      assert.equal(body.includes(sentinelaCtx), false);
       const linhas = log.linhas();
       assert.equal(linhas.length, 1);
       const linha = linhas[0]!;
@@ -402,14 +398,14 @@ describe("typesafe-delegate-shadow", { concurrency: 1 }, () => {
       await settleDelegateShadowForTests();
       assert.equal(urlVista, "https://api.typesafe.ai/v1/systemone");
       assert.equal(log.linhas().some((l) => l.includes("mede a url")), false);
-      assert.match(MODULO, /https:\/\/api\.typesafe\.ai\/v1\/systemone/);
-      assert.match(MODULO, /jev-1\.13\.0/);
-      assert.match(MODULO, /const TIMEOUT_MS = 2500/);
-      assert.match(MODULO, /AbortSignal\.timeout\(TIMEOUT_MS\)/);
-      assert.match(MODULO, /timeoutMs: TIMEOUT_MS/);
-      assert.match(MODULO, /from "\.\/ssrf-guard\.js"/);
-      assert.match(MODULO, /safeFetch\(/);
-      assert.equal(MODULO.includes("jev-latest"), false);
+      assert.equal(TYPESAFE_MODEL, "jev-1.13.0");
+      assert.equal(TYPESAFE_TIMEOUT_MS, 2500);
+      assert.match(CLIENTE, /https:\/\/api\.typesafe\.ai\/v1\/systemone/);
+      assert.match(CLIENTE, /AbortSignal\.timeout\(TYPESAFE_TIMEOUT_MS\)/);
+      assert.match(CLIENTE, /maxRedirects: 0/);
+      assert.match(CLIENTE, /from "\.\/ssrf-guard\.js"/);
+      assert.match(CLIENTE, /safeFetch\(/);
+      assert.equal(CLIENTE.includes("jev-latest"), false);
       assert.equal(MODULO.includes("selectBrainRoute"), false);
       assert.equal(MODULO.includes("buildBridgeEnv"), false);
     } finally {
@@ -433,9 +429,9 @@ describe("typesafe-delegate-shadow", { concurrency: 1 }, () => {
       await settleDelegateShadowForTests();
       assert.equal(chamadasRede, 1);
       assert.equal(log.linhas().length, 1);
-      const state = JSON.parse(body).state as { goal: string; context: string };
+      const state = JSON.parse(body).state as { goal: string; context?: string };
       assert.equal(state.goal, "plaintext ok");
-      assert.equal(state.context, "");
+      assert.equal("context" in state, false);
       assert.equal(body.includes("e2e:v2:ctx"), false);
     } finally {
       log.parar();

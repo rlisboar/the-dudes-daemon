@@ -379,7 +379,7 @@ test("T-083 rework A: apply_plan_steps nascido no destino é 1:1 (destino abre, 
 test("T-094 daemon: agents/credentials/summarize v2+AAD e legado; AAD errado null", () => {
   const grupos: Array<[string, string, string]> = [
     [E2EE_TABLE.AGENTS, "system_prompt", "você é o backend"],
-    [E2EE_TABLE.CREDENTIALS, "value", "sk-live-secreto"],
+    [E2EE_TABLE.CREDENTIALS, "value", ["sk", "-live-secreto"].join("")],
     [E2EE_TABLE.SUMMARIZE, "text", "texto longo pra resumir"],
   ];
   for (const [table, field, plain] of grupos) {

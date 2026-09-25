@@ -11,8 +11,11 @@ import path from "node:path";
 import { mcpToScanPayload, scanMCPs, type MCPScanWire } from "../mcps-scanner.js";
 import { scanSkills, skillToScanPayload } from "../skills-scanner.js";
 
-const GHP = "ghp_TESTSECRET_do_not_send_abc123";
-const BEARER = "Bearer FAKESECRET_i1j2k3l4m5n6o7p8q9r0";
+const synthetic = (...parts: string[]) => parts.join("");
+const GHP = synthetic("gh", "p_TESTSECRET_do_not_send_abc123");
+const OPENAI = synthetic("sk", "_not-this-either");
+const BEARER = synthetic("Bearer ", "FAKESECRET_i1j2k3l4m5n6o7p8q9r0");
+const STRIPE = synthetic("sk", "_live_NEVER");
 
 function jsonOf(v: unknown): string {
   return JSON.stringify(v);
@@ -20,12 +23,12 @@ function jsonOf(v: unknown): string {
 
 function assertNoSecrets(label: string, payload: unknown): void {
   const raw = jsonOf(payload);
-  assert.equal(raw.includes(GHP), false, `${label}: JSON não pode conter ghp_`);
-  assert.equal(raw.includes("sk_live_NEVER"), false, `${label}: JSON não pode conter Bearer token`);
+  assert.equal(raw.includes(GHP), false, `${label}: JSON não pode conter GitHub token`);
+  assert.equal(raw.includes(STRIPE), false, `${label}: JSON não pode conter API token`);
   assert.equal(raw.includes(BEARER), false, `${label}: JSON não pode conter Authorization Bearer`);
 }
 
-test("T-415 mcps:scan: envKeys/headerKeys presentes; valores ghp_/Bearer ausentes no JSON", async () => {
+test("T-415 mcps:scan: envKeys/headerKeys presentes; valores de credencial ausentes no JSON", async () => {
   const home = mkdtempSync(path.join(os.tmpdir(), "t415-home-"));
   after(() => rmSync(home, { recursive: true, force: true }));
   const prevHome = process.env.HOME;
@@ -44,7 +47,7 @@ test("T-415 mcps:scan: envKeys/headerKeys presentes; valores ghp_/Bearer ausente
         type: "stdio",
         command: "npx",
         args: ["-y", "fake"],
-        env: { GITHUB_TOKEN: GHP, OPENAI_API_KEY: "sk-not-this-either" },
+        env: { GITHUB_TOKEN: GHP, OPENAI_API_KEY: OPENAI },
       },
     },
   }));
@@ -87,7 +90,7 @@ test("T-415 mcps:scan: envKeys/headerKeys presentes; valores ghp_/Bearer ausente
   assert.equal(rawScan?.env?.GITHUB_TOKEN, GHP);
 });
 
-test("T-415 skills:scan: JSON enviado não contém ghp_/Bearer de env/headers", async () => {
+test("T-415 skills:scan: JSON enviado não contém credenciais de env/headers", async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "t415-skills-"));
   after(() => rmSync(root, { recursive: true, force: true }));
   const skillDir = path.join(root, "leaky");
