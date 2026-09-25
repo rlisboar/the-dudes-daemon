@@ -359,6 +359,17 @@ export interface AgentSend {
    */
   origin?: "user" | "agent" | "system";
   /**
+   * T-1236: QUEM enviou, com id ESTÁVEL — o `origin` diz a natureza, isto diz a
+   * identidade. O server é quem sabe no roteamento: `agent` com o `fromId` na
+   * entrega entre agentes, `user` com o userId na mensagem do humano.
+   * `system` (loop-stop, task, park) fica SEM `from`: não há autor humano/agente.
+   *
+   * O daemon só repassa isto ao `sender` do `agent:queue_retain` (#1180/#1183) —
+   * o nome no envelope não serve porque não é id. Mesmo formato e limites da
+   * `QueueSender`. Opcional: daemon antigo ignora.
+   */
+  from?: QueueSender;
+  /**
    * T-1006 (acréscimo PM): quando true, nada no chat (ex.: marcação do
    * Quadro). O daemon propaga ao `agent:queue_live`. Opcional (retrocompat).
    */
@@ -753,6 +764,11 @@ export interface TypesafeShadow extends JevVerdict {
 /** T-1150: parada em qualquer caminho — `source` diz de onde veio. */
 export type QueueRetainSource = "stop" | "inbound-ttl" | "inbound" | "manual" | "replace" | "context-clear" | "loop-stop" | "migrate";
 
+/** Autor original da mensagem retida. Só o id estável atravessa o fio. */
+export type QueueSender =
+  | { type: "user"; id: string }
+  | { type: "agent"; id: string };
+
 export interface AgentQueueRetainEv {
   type: "agent:queue_retain";
   agentId: string;
@@ -762,7 +778,15 @@ export interface AgentQueueRetainEv {
   source?: QueueRetainSource;
   /** Ordem preservada; `content` é ciphertext em projeto E2EE. */
   /** `id`/`ts` opcionais: daemon em rollout manda sem (o server gera/usа o created_at). */
-  items: Array<{ id?: string; content: string; images?: unknown[]; ts?: number; source?: QueueRetainSource }>;
+  items: Array<{
+    id?: string;
+    content: string;
+    images?: unknown[];
+    ts?: number;
+    source?: QueueRetainSource;
+    /** Opcional para compatibilidade com daemons antigos. */
+    sender?: QueueSender;
+  }>;
 }
 
 /** T-1150: confirmação — só os ids ACEITOS na entrega. */

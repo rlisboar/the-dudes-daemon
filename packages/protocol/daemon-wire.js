@@ -18,6 +18,12 @@ const t = z.string();
 const n = z.number();
 const b = z.boolean();
 const id = z.string();
+const queueSenderId = z.string().min(1).max(128).regex(/^[^\u0000-\u001f\u007f]+$/);
+const queueSender = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("user"), id: queueSenderId }).strict(),
+  z.object({ type: z.literal("agent"), id: queueSenderId }).strict(),
+]);
+
 const cliRunner = z.enum(RUNNERS);
 const effortLevel = z.enum(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const opaqueConfigAlias = z.string().regex(/^[A-Za-z0-9_-]{8,64}$/);
@@ -320,6 +326,7 @@ export const daemonWireSchemas = {
       images: z.array(z.unknown()).optional(),
       ts: n.optional(),
       source: t.optional(),
+      sender: queueSender.optional(),
     })).max(200),
   }),
   // T-1150 (contrato §3): o daemon confirma SÓ o que aceitou; o resto fica retido.
@@ -542,6 +549,11 @@ export const fromOrchSchemas = {
      * Opcionais: daemon antigo ignora (compat).
      */
     origin: z.enum(["user", "agent", "system"]).optional(),
+    // T-1236: identidade de quem enviou (id ESTÁVEL, não o nome do envelope).
+    // Reusa o MESMO `queueSender` do retain (#1180) — formato e limites iguais,
+    // para o daemon só repassar ao `sender` sem conversão. Opcional: daemon
+    // antigo ignora; `system` fica sem `from`.
+    from: queueSender.optional(),
     silent: b.optional(),
   }),
   "agent:clear": msg("agent:clear", { agentId: t }),

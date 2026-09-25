@@ -347,6 +347,30 @@ test("T-899: o frame de retenção sai cifrado, com ack e sem claro", () => {
   assert.ok(itens[0]!.ts > 0, "ordem/timestamp no item");
 });
 
+test("T-1183: o retain repassa o from do agent:send como sender e omite sem origem", async () => {
+  const { registroDoFrame } = await import("../queue-live.js");
+  const { validateDaemonMessage } = await import("@the-dudes/protocol/daemon-wire");
+  const cases = [
+    { id: "human-1", from: { type: "user" as const, id: "user-stable-1" } },
+    { id: "agent-1", from: { type: "agent" as const, id: "agent-stable-1" } },
+    { id: "unknown-1", from: undefined },
+  ];
+
+  for (const { id, from } of cases) {
+    _resetFilaRetidaForTest();
+    const { host, enviados, entries } = hostFalso();
+    (entries.get(AG) as { parado?: boolean }).parado = true;
+    const wire = registroDoFrame({ content: `message ${id}`, projectId: PID, from }, `message ${id}`, undefined);
+    host.send_message(AG, `message ${id}`, undefined, id, wire);
+
+    const frame = enviados.find((m) => m.type === "agent:queue_retain")!;
+    const retained = (frame.items as Array<Record<string, unknown>>)[0]!;
+    assert.deepEqual(validateDaemonMessage(frame), { ok: true }, "frame aceita pelo schema do protocolo");
+    if (from) assert.strictEqual(retained.sender, from, "cópia direta, sem converter o sender");
+    else assert.equal(Object.hasOwn(retained, "sender"), false, "sem from, omite sender");
+  }
+});
+
 test("T-938: item retido entra no spool do re-exec (senão morre no re-exec de 13-17x/dia)", async () => {
   const { host } = hostFalso();
   reter(AG, [item("sobrevive ao re-exec", "d1")]);

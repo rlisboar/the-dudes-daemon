@@ -1204,7 +1204,12 @@ export class AgentHost {
         agentId,
         projectId,
         source,
-        items: enviar.map((i) => ({ id: i.deliveryId ?? i.ack, content: i.cipher, images: i.imagesCipher, ts: i.enqueuedAt, source: i.source })),
+        items: enviar.map((i) => {
+          const sender = i.deliveryId
+            ? this.filaVivaRegistros.get(agentId)?.get(i.deliveryId)?.sender
+            : undefined;
+          return { id: i.deliveryId ?? i.ack, content: i.cipher, images: i.imagesCipher, ts: i.enqueuedAt, source: i.source, ...(sender ? { sender } : {}) };
+        }),
       });
     } catch { /* best-effort: a cópia local segue valendo */ }
   }

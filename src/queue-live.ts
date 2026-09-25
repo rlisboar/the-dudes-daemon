@@ -18,7 +18,7 @@
 import type { ImageAttachment } from "./types.js";
 import { encryptForProject, encryptImageBase64, hasProjectKey, isE2eEncrypted } from "./daemon-crypto.js";
 import { aadV2, E2EE_TABLE } from "@the-dudes/protocol/e2ee-fields";
-import { QUEUE_LIVE_MAX_BYTES, QUEUE_LIVE_MAX_ITEMS, queueLiveItemBytes } from "@the-dudes/protocol/daemon-wire";
+import { QUEUE_LIVE_MAX_BYTES, QUEUE_LIVE_MAX_ITEMS, queueLiveItemBytes, type QueueSender } from "@the-dudes/protocol/daemon-wire";
 
 export const QUEUE_LIVE_DEBOUNCE_MS = 250;
 /** Reconciliação: pega mutações da fila fora dos caminhos instrumentados. */
@@ -44,6 +44,7 @@ export interface WireRecord {
   images?: unknown[];
   enqueuedAt: number;
   origin: QueueOrigin;
+  sender?: QueueSender;
   silent?: boolean;
 }
 
@@ -108,7 +109,7 @@ export function origemDoFrame(msg: { origin?: unknown; parts?: unknown[]; system
  * sem vazar texto claro.
  */
 export function registroDoFrame(
-  msg: { content?: string; parts?: unknown[]; images?: unknown[]; projectId?: string; origin?: unknown; silent?: unknown; systemPrefix?: string },
+  msg: { content?: string; parts?: unknown[]; images?: unknown[]; projectId?: string; origin?: unknown; from?: QueueSender; silent?: unknown; systemPrefix?: string },
   conteudoFinal: string,
   imagensFinal: ImageAttachment[] | undefined,
   agora = Date.now(),
@@ -119,17 +120,17 @@ export function registroDoFrame(
   const cifrado = !temParts && typeof msg.content === "string" && isE2eEncrypted(msg.content);
   if (cifrado) {
     // O blob ORIGINAL do server; os anexos também como vieram.
-    return { content: msg.content!, images: msg.images?.length ? msg.images : undefined, enqueuedAt: agora, origin, silent };
+    return { content: msg.content!, images: msg.images?.length ? msg.images : undefined, enqueuedAt: agora, origin, ...(msg.from ? { sender: msg.from } : {}), silent };
   }
   const pid = msg.projectId;
   if (pid && hasProjectKey(pid)) {
     // Projeto cifra mas o frame veio em partes (ou montado): re-sela.
     const s = selar(pid, conteudoFinal, imagensFinal);
     if (!s) return null;
-    return { content: s.content, images: s.images, enqueuedAt: agora, origin, silent };
+    return { content: s.content, images: s.images, enqueuedAt: agora, origin, ...(msg.from ? { sender: msg.from } : {}), silent };
   }
   // Projeto sem chave: o texto como chegou.
-  return { content: conteudoFinal, images: imagensFinal?.length ? imagensFinal : undefined, enqueuedAt: agora, origin, silent };
+  return { content: conteudoFinal, images: imagensFinal?.length ? imagensFinal : undefined, enqueuedAt: agora, origin, ...(msg.from ? { sender: msg.from } : {}), silent };
 }
 
 /**

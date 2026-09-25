@@ -85,6 +85,26 @@ test("T-423: payload válido conhecido passa; campo errado recusa", () => {
   assert.match(validateDaemonMessage({ type: "agent:text", agentId: 7, text: "x" }).error, /agentId/);
 });
 
+test("T-1180: sender tipado é opcional para daemon antigo", () => {
+  const legacy = validateDaemonMessage({
+    type: "agent:queue_retain", agentId: "ag-1", items: [{ content: "mensagem" }],
+  });
+  assert.equal(legacy.ok, true);
+  assert.equal(validateDaemonMessage({
+    type: "agent:queue_retain", agentId: "ag-1", items: [{ content: "e2e:blob", sender: { type: "user", id: "user-1" } }],
+  }).ok, true);
+  assert.equal(validateDaemonMessage({
+    type: "agent:queue_retain", agentId: "ag-1", items: [{ content: "e2e:blob", sender: { type: "agent", id: "ag-2" } }],
+  }).ok, true);
+  assert.equal(validateDaemonMessage({
+    type: "agent:queue_retain", agentId: "ag-1", items: [{ content: "mensagem", sender: { type: "system", id: "x" } }],
+  }).ok, false);
+  assert.equal(validateDaemonMessage({
+    type: "agent:queue_retain", agentId: "ag-1", items: [{ content: "mensagem", sender: { type: "user", id: "bad\nvalue" } }],
+  }).ok, false);
+});
+
+
 test("T-1135: hello reporta UUID e aliases opacos, sem caminhos", () => {
   const base = { type: "daemon:hello", name: "d", os: "mac", hostname: "h", version: "1" };
   assert.equal(validateDaemonMessage({
