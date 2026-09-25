@@ -5,7 +5,7 @@ import {ChildProcess} from "node:child_process";
 import {PER_MSG_TURN_TIMEOUT_MS} from "../../agent-runner.js";
 import {appendFilePrompt, codexImageArgs} from "../attachments.js";
 import {armHardTimeout} from "../process-lifecycle.js";
-import {buildCodexMcpToml} from "../mcp-config.js";
+import {buildCodexMcpToml, CODEX_MODEL_MIRROR_KEYS, extractTopLevelTomlValues} from "../mcp-config.js";
 import {chmodSync, chownSync, readFileSync, readdirSync, writeFileSync} from "node:fs";
 import {codexEffort} from "../model-policy.js";
 import {isCodexMissingRolloutError, parseCodexRolloutSessionId, parseCodexRolloutSignals, parseCodexTurnEvent} from "../turn-parsers.js";
@@ -20,8 +20,22 @@ export function writeCodexConfig(self: any, ): void {
       env: self.bridgeEnv(),
     });
     for (const warning of built.warnings) self.opts.log("warn", `[codex:${self.info.name}] ${warning}`);
+    // T-1018: espelho das chaves de modelo do config.toml do dono. O CODEX_HOME
+    // por agente (T-426) não herda a config da base — sem isso o codex
+    // gerenciado roda com a janela default do catálogo (272k → 258.400
+    // efetivo) mesmo com model_context_window maior no config do dono.
+    // Chaves precisam ficar ANTES da primeira seção [mcp_servers.*] (TOML).
+    let modeloToml = "";
+    try {
+      const owner = readFileSync(self.runtimeFiles.codexBaseConfigPath(), "utf8");
+      const espelho = extractTopLevelTomlValues(owner, CODEX_MODEL_MIRROR_KEYS);
+      const linhas = Object.entries(espelho).map(([k, v]) => `${k} = ${v}`);
+      if (linhas.length) {
+        modeloToml = `# T-1018: espelho do config.toml do dono (CODEX_HOME por agente não herda a base).\n${linhas.join("\n")}\n\n`;
+      }
+    } catch { /* base sem config.toml — gera só com MCPs */ }
     const file = path.join(home, "config.toml");
-    writeFileSync(file, built.toml, { mode: 0o600 });
+    writeFileSync(file, modeloToml + built.toml, { mode: 0o600 });
     try { chmodSync(file, 0o600); } catch {}
     // Daemon root → CLI dropado: arquivo/dir precisam pertencer ao user do
     // drop, senão o codex (uid drop) não lê o config nem escreve no home.

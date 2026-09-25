@@ -319,6 +319,12 @@ export class RunnerRuntimeFiles {
     return dir;
   }
 
+  /** T-1018: config.toml do dono (base) — fonte das chaves de modelo que o
+   *  writeCodexConfig espelha no config.toml por agente. */
+  codexBaseConfigPath(): string {
+    return path.join(this.codexBaseDir(), "config.toml");
+  }
+
   crushDataDir(): string {
     const root = path.join(this.input.workspaceRoot, ".crush");
     // encodeURIComponent não codifica pontos; fazê-lo evita os segmentos

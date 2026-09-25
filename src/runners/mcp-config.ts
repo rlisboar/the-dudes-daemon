@@ -369,3 +369,53 @@ export function wrapToolFilteredServers(
   }
   return changed ? out : extras;
 }
+
+/**
+ * T-1018: chaves de modelo do config.toml do dono espelhadas no config.toml
+ * POR AGENTE (T-426). O CODEX_HOME isolado não herda a config da base — sem o
+ * espelho, o codex gerenciado roda com a janela default do catálogo (272k →
+ * 258.400 efetivo com 5% de reserve) mesmo com model_context_window maior no
+ * config do dono; a UI (T-245) mostra a janela REAL do rollout, então o
+ * agente parecia "preso" em 258k.
+ */
+export const CODEX_MODEL_MIRROR_KEYS = [
+  "model_context_window",
+  "model_auto_compact_token_limit",
+  "model_reasoning_effort",
+] as const;
+
+/**
+ * Extrai chaves top-level (antes da primeira seção `[...]`) de um TOML e
+ * devolve o RHS pronto para re-emissão: inteiro decimal (underscores ok,
+ * comentário à direita descartado) ou string com aspas simples/duplas
+ * (escapes \\ e \" respeitados). Formas não re-emissíveis (arrays, datas,
+ * strings multilinha) são silenciosamente ignoradas — o espelho nunca pode
+ * corromper o TOML gerado.
+ */
+export function extractTopLevelTomlValues(source: string, keys: readonly string[]): Record<string, string> {
+  const wanted = new Set(keys);
+  const out: Record<string, string> = {};
+  const intRe = /^[+-]?[0-9][0-9_]*$/;
+  for (const rawLine of source.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    if (line.startsWith("[")) break;
+    const eq = line.indexOf("=");
+    if (eq <= 0) continue;
+    const key = line.slice(0, eq).trim();
+    if (!wanted.has(key) || Object.hasOwn(out, key)) continue;
+    const rhs = line.slice(eq + 1).trim();
+    const token = rhs.match(/^\S+/)?.[0] ?? "";
+    if (intRe.test(token)) { out[key] = token; continue; }
+    const quote = rhs[0];
+    if (quote !== '"' && quote !== "'") continue;
+    if (rhs.startsWith('"""') || rhs.startsWith("'''")) continue;
+    let close = -1;
+    for (let i = 1; i < rhs.length; i++) {
+      if (quote === '"' && rhs[i] === "\\") { i++; continue; }
+      if (rhs[i] === quote) { close = i; break; }
+    }
+    if (close > 0) out[key] = rhs.slice(0, close + 1);
+  }
+  return out;
+}
