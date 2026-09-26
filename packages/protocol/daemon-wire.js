@@ -452,6 +452,10 @@ const agentInfo = z
     color: t,
     state: t,
     running: b,
+    paused: b.optional(),
+    pausedAt: n.nullable().optional(),
+    pausedBy: t.nullable().optional(),
+    queuePending: z.number().int().nonnegative().optional(),
     usage: z.object({ input: n, output: n, cacheCreate: n, cacheRead: n }),
   })
   .passthrough();
@@ -487,6 +491,22 @@ const agentSendPart = z.union([
   z.object({ kind: z.literal("plain"), text: t }),
   z.object({ kind: z.literal("cipher"), text: t, table: t.optional(), field: t.optional() }),
 ]);
+// `from`/`isAgentOwner` são calculados pelo server NO deliver, nunca aceitos
+// dentro do payload persistido. O daemon recebe os dois no item externo.
+const queueDeliveryPayload = z.object({
+  deliveryId: t,
+  systemPrefix: t.optional(),
+  systemSuffix: t.optional(),
+  parts: z.array(z.union([
+    z.object({ kind: z.literal("plain"), text: t }).strict(),
+    z.object({ kind: z.literal("cipher"), text: t, table: t.optional(), field: t.optional() }).strict(),
+  ])).optional(),
+  mem: z.record(t).optional(),
+  telegram: z.object({ botToken: t, chatId: t }).strict().nullable().optional(),
+  taskId: t.optional(),
+  origin: z.enum(["user", "agent", "system"]).optional(),
+  silent: b.optional(),
+}).strict();
 const imageAtt = z.object({ mimeType: t, base64: t, name: t.optional() });
 
 export const fromOrchSchemas = {
@@ -499,9 +519,16 @@ export const fromOrchSchemas = {
       content: t,
       images: z.array(z.unknown()).optional(),
       ts: n.optional(),
+      deliveryId: t.optional(),
+      payload: queueDeliveryPayload.optional(),
       from: queueSender.nullable().optional(),
       isAgentOwner: b.optional(),
-    }).superRefine((item, ctx) => requireOwnerStatusForNamedSender(item.from, item.isAgentOwner, ctx))).max(200),
+    }).strict().superRefine((item, ctx) => {
+      requireOwnerStatusForNamedSender(item.from, item.isAgentOwner, ctx);
+      if (item.payload && item.deliveryId && item.payload.deliveryId !== item.deliveryId) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: "payload.deliveryId must match item.deliveryId", path: ["payload", "deliveryId"] });
+      }
+    })).max(200),
   }),
   // T-1150 (contrato §4): decisão "excluir" — o daemon larga a cópia local.
   "agent:queue_forget": msg("agent:queue_forget", { agentId: t }),
@@ -539,6 +566,8 @@ export const fromOrchSchemas = {
     features: contextFeatures.optional(),
   }),
   "agent:stop": msg("agent:stop", { agentId: t }),
+  "agent:pause": msg("agent:pause", { agentId: t }),
+  "agent:resume": msg("agent:resume", { agentId: t }),
   // T-1006: tira da fila do runner um item que AINDA não iniciou (idempotente).
   "agent:queue_live_remove": msg("agent:queue_live_remove", { agentId: t, deliveryId: t.min(1).max(120) }),
   "agent:send": msg("agent:send", {

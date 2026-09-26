@@ -750,7 +750,7 @@ export function relaySnapshot(limit = 300): Record<string, unknown> {
 export interface AgentEvent {
   ts: number;
   agentId: string;
-  kind: "state" | "hung-soft" | "hung-hard" | "park" | "exit" | "error" | "spawn" | "stop";
+  kind: "state" | "hung-soft" | "hung-hard" | "park" | "exit" | "error" | "spawn" | "stop" | "pause" | "resume";
   detail: string;
 }
 

@@ -1107,6 +1107,16 @@ export class DaemonClient {
         log("info", `stop ${msg.agentId}`);
         this.host.stop(msg.agentId);
         return;
+      case "agent:pause":
+        // T-1306: segura as entregas sem parar o runner (o turno em curso termina).
+        log("info", `pause ${msg.agentId}`);
+        this.host.pause(msg.agentId);
+        return;
+      case "agent:resume":
+        // T-1306: o server já mandou o queue_deliver; entrega a fila em ordem.
+        log("info", `resume ${msg.agentId}`);
+        this.host.resume(msg.agentId);
+        return;
       case "agent:queue_live_remove": {
         // T-1005: server → daemon, remover da fila ao vivo a entrega ainda não
         // iniciada. Idempotente: já iniciada ou inexistente só loga no host.

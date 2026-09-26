@@ -211,6 +211,30 @@ test("T-1295: agent:queue_deliver carrega remetente e owner-status por item", ()
   assert.equal(schema.safeParse({ ...base, items: [{ ...base.items[0], from: { type: "agent", id: "a2", name: "Ana" } }] }).success, false);
 });
 
+test("T-1305: controles de pause e resume exigem agentId", () => {
+  for (const type of ["agent:pause", "agent:resume"]) {
+    const schema = fromOrchSchemas[type];
+    assert.equal(schema.safeParse({ type, agentId: "a1" }).success, true);
+    assert.equal(schema.safeParse({ type }).success, false);
+    assert.equal(schema.safeParse({ type, agentId: 42 }).success, false);
+  }
+});
+
+test("T-1305: payload da fila pode levar partes remontadas, sem proveniência embutida", () => {
+  const schema = fromOrchSchemas["agent:queue_deliver"];
+  const item = { id: "q1", deliveryId: "d1", content: "e2e:v2:blob", payload: {
+    deliveryId: "d1", systemPrefix: "[notice] ",
+    parts: [{ kind: "plain", text: "[system] " }, { kind: "cipher", text: "e2e:v2:blob" }],
+    mem: { NOTE: "clear by design" }, telegram: { botToken: "secret", chatId: "42" },
+    origin: "system", taskId: "t1",
+  }, from: { type: "user", id: "u1", name: "Ana" }, isAgentOwner: false };
+  assert.equal(schema.safeParse({ type: "agent:queue_deliver", agentId: "a1", items: [item] }).success, true);
+  assert.equal(schema.safeParse({ type: "agent:queue_deliver", agentId: "a1", items: [{ ...item, deliveryId: "other" }] }).success, false);
+  assert.equal(schema.safeParse({ type: "agent:queue_deliver", agentId: "a1", items: [{ ...item, images: ["image"], payload: { ...item.payload, images: ["duplicate"] } }] }).success, false);
+  assert.equal(schema.safeParse({ type: "agent:queue_deliver", agentId: "a1", items: [{ ...item, payload: { ...item.payload, from: { type: "user", id: "forged" } } }] }).success, false);
+  assert.equal(schema.safeParse({ type: "agent:queue_deliver", agentId: "a1", items: [{ ...item, payload: { ...item.payload, isAgentOwner: true } }] }).success, false);
+});
+
 test("T-423: scanner aninhado tolera campo novo (passthrough) mas exige o núcleo", () => {
   assert.equal(
     validateDaemonMessage({

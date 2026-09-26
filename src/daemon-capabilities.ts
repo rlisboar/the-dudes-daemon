@@ -1,5 +1,5 @@
 /** Capabilities the running daemon can enforce before an agent turn starts. */
-export const DAEMON_CAPABILITIES = ["member-gate"] as const;
+export const DAEMON_CAPABILITIES = ["member-gate", "pause"] as const;
 
 export type DaemonCapability = (typeof DAEMON_CAPABILITIES)[number];
 

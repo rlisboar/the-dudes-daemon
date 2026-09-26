@@ -5,7 +5,7 @@ import { validateDaemonMessage } from "@the-dudes/protocol/daemon-wire";
 import { DAEMON_CAPABILITIES, withDaemonCapabilities } from "../daemon-capabilities.js";
 
 test("T-1300: main hello builder advertises capabilities and passes the full protocol schema", () => {
-  assert.deepEqual(DAEMON_CAPABILITIES, ["member-gate"]);
+  assert.deepEqual(DAEMON_CAPABILITIES, ["member-gate", "pause"]);
   const hello = withDaemonCapabilities({
     type: "daemon:hello",
     name: "member-gate-test",
@@ -27,7 +27,7 @@ test("T-1300: main hello builder advertises capabilities and passes the full pro
     installedRunners: ["claude"],
     graphify: { cli: true, mcp: false },
   });
-  assert.deepEqual(hello.capabilities, ["member-gate"]);
+  assert.deepEqual(hello.capabilities, ["member-gate", "pause"]);
   const result = validateDaemonMessage(hello as never);
   assert.equal(result.ok, true, JSON.stringify(result));
 });

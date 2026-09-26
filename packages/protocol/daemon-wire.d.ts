@@ -293,6 +293,9 @@ export interface MCPServerConfig {
 }
 
 export interface AgentStop { type: "agent:stop"; agentId: string }
+/** Runtime pause toggles delivery without stopping an in-progress turn. */
+export interface AgentPause { type: "agent:pause"; agentId: string }
+export interface AgentResume { type: "agent:resume"; agentId: string }
 /** T-117: cipher part pode anunciar table/field; ambos ausentes = legado messages.content. */
 export type AgentSendPart =
   | { kind: "plain"; text: string }
@@ -820,6 +823,21 @@ export interface AgentQueueDeliver {
     content: string;
     images?: unknown[];
     ts?: number;
+    /** Mesmo deliveryId da coluna; opcional para linhas legadas. */
+    deliveryId?: string;
+    /** Campos de entrega remontados pelo server. Proveniência vem de `from`
+     *  e `isAgentOwner` externos, recalculados com dono atual. */
+    payload?: {
+      deliveryId: string;
+      systemPrefix?: string;
+      systemSuffix?: string;
+      parts?: AgentSendPart[];
+      mem?: Record<string, string>;
+      telegram?: { botToken: string; chatId: string } | null;
+      taskId?: string;
+      origin?: "user" | "agent" | "system";
+      silent?: boolean;
+    };
     from?: QueueSender | null;
     /** Sempre enviado pelo server; false para sender ausente/legado. Obrigatório
      *  junto de `from.name`; o wire mantém opcionalidade para versões antigas. */
@@ -1368,7 +1386,7 @@ export type FromOrch =
   | DaemonLogsGetRequest
   | DaemonWelcome | DaemonPong | DaemonChallenge | RunnerPolicySet | RunnerDefaultsSet
   | ReleaseAvailable
-  | AgentSpawn | AgentStop | AgentSend | AgentClear | AgentCompact
+  | AgentSpawn | AgentStop | AgentPause | AgentResume | AgentSend | AgentClear | AgentCompact
   | AgentQueueLiveRemove
   | AgentQueueDeliver | AgentQueueForget
   | AutoApproveSet | WorkspaceSet

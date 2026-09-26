@@ -451,6 +451,11 @@ export interface AgentInfo {
   color: string;
   state: AgentRuntimeState;
   running: boolean;
+  /** Pause is independent of running/stopped and survives runner migration. */
+  paused?: boolean;
+  /** Unix time in milliseconds and user id of the last pause. */
+  pausedAt?: number | null;
+  pausedBy?: string | null;
   model?: string;
   effort?: EffortLevel;
   cliRunner?: CliRunner;
@@ -1371,7 +1376,7 @@ export interface AgentQueueItemPublic {
   e2ee: boolean;
   images?: unknown[] | null;
   deliveryId: string | null;
-  source: "stop" | "inbound-ttl" | "manual";
+  source: "stop" | "inbound-ttl" | "manual" | "pause";
   createdAt: number;
   deliveredAt: number | null;
 }
@@ -1695,6 +1700,8 @@ export type ClientCommand =
   | { type: "spawn"; spec: AgentSpec }
   | { type: "start_agent"; id: string }
   | { type: "stop_agent"; id: string }
+  | { type: "pause_agent"; id: string }
+  | { type: "resume_agent"; id: string }
   | { type: "remove_agent"; id: string }
   | { type: "transfer_agent_owner"; id: string; newOwnerUserId: string }
   | { type: "assign_agent_repo"; id: string; repo: AgentRepo | null }

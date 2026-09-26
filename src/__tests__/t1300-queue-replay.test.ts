@@ -13,6 +13,9 @@ function fakeHost() {
   const host = Object.create(AgentHost.prototype) as any;
   host.entries = new Map([["agent-a", { runner, projectId: undefined }]]);
   host.log = () => {};
+  host.pausados = new Set<string>();
+  host.pauseHeld = new Map();
+  host.filaVivaRegistros = new Map();
   return { host, delivered };
 }
 

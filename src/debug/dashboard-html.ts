@@ -951,7 +951,7 @@ const JS = String.raw`
   /* ─────────── Eventos ─────────── */
   function renderEvents(list) {
     var el = clear($("tab-events"));
-    var kinds = ["", "state", "hung-soft", "hung-hard", "park", "error", "exit", "spawn", "stop"];
+    var kinds = ["", "state", "hung-soft", "hung-hard", "park", "error", "exit", "spawn", "stop", "pause", "resume"];
     el.appendChild(h("div", { cls: "row" }, "tipo:", h("select", { on: { change: function (e) { S.eventsKind = e.target.value; tick(true); } } }, kinds.map(function (k) { return h("option", { value: k, selected: S.eventsKind === k }, k || "todos"); })),
       S.eventsAgent ? h("button", { text: "agente: " + agentName(S.eventsAgent) + " ✕", on: { click: function () { S.eventsAgent = ""; tick(true); } } }) : null));
     el.appendChild(table("events", [

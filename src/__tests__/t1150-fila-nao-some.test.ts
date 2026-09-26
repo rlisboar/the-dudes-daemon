@@ -96,7 +96,12 @@ test("T-1150 §3: queue_deliver decifra, entrega na ORDEM e confirma só o aceit
       },
     } }]]),
     log: () => {},
+    // T-1306: estado de pausa do host (agente não pausado neste caso).
+    pausados: new Set<string>(),
+    pauseHeld: new Map(),
+    filaVivaRegistros: new Map(),
   };
+  Object.setPrototypeOf(fake, AgentHost.prototype);
   const itens = [
     { id: "d1", content: encryptForProject("primeiro", PID, aad)!, ts: 1 },
     { id: "d2", content: encryptForProject("explode", PID, aad)!, ts: 2 },

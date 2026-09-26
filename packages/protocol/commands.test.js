@@ -45,6 +45,15 @@ test("T-1295: toggle de mensagens de membros tem schema Zod estrito", () => {
   assert.equal(validateCommand({ type: "set_agent_allow_member_messages", id: "a1", value: false, text: "surpresa" }).ok, false);
 });
 
+test("T-1305: pause/resume exigem apenas o id do agente", () => {
+  for (const type of ["pause_agent", "resume_agent"]) {
+    assert.equal(validateCommand({ type, id: "a1" }).ok, true);
+    assert.equal(validateCommand({ type }).ok, false);
+    assert.equal(validateCommand({ type, id: 42 }).ok, false);
+    assert.equal(validateCommand({ type, id: "a1", userId: "forged" }).ok, false);
+  }
+});
+
 test("T-1295: comandos do chat humano exigem ciphertext e shape estrito", () => {
   assert.equal(validateCommand({ type: "human_chat_send", contentCipher: "e2e:v2:blob" }).ok, true);
   assert.equal(validateCommand({ type: "human_chat_send", content: "plain text" }).ok, false);

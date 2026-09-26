@@ -5,7 +5,10 @@ import {AgentRunner, type AgentRunnerOptions} from "./agent-runner.js";
 import {breadcrumb, captureWarn} from "./sentry.js";
 import {assertWorkspaceScoped, autoWorkspaceCwd, cloneRepoIfMissing, expandBasePath, findGitRoot, getWorkspaceRoot, isInsideRoot, repoCwd} from "./workspace.js";
 import {aadV2, E2EE_TABLE, MIGRATE_SEED_DROPPED_REASON, MIGRATE_SEED_RESUME_SKIPS_REASON} from "@the-dudes/protocol/e2ee-fields";
+import { interpolateMissionMemory } from "@the-dudes/protocol/mission-memory";
 import {decryptForProject, decryptImageAttachments, encryptForProject, isE2eEncrypted, isE2eeRequired, setE2eeRequired, redactCredentials, redactCredentialsDeep} from "./daemon-crypto.js";
+import { assembleAgentSendParts } from "./protocol.js";
+import { mergeQueueDeliveryPayload, type MergedQueueDeliveryItem, type QueueDeliveryInput, type QueueDeliveryPayload } from "./runners/queue-delivery.js";
 import {classifyRunnerFailure} from "./runners/error-classifier.js";
 import {isNonOwnerTurn, principalFromQueueDeliver, type InboundTurnPrincipal} from "./runners/turn-security.js";
 import {migratedSeedFor, MIGRATED_SEED_LIMIT_BYTES} from "./migrated-seed.js";
@@ -70,7 +73,7 @@ import os from "node:os";
 
 import {compatibleSessionId} from "./runners/index.js";
 import {createAgentInboundBuffer} from "./inbound-dedup.js";
-import {montarSnapshot, QUEUE_LIVE_DEBOUNCE_MS, QUEUE_LIVE_RECONCILE_MS, type PendingItem, type WireRecord} from "./queue-live.js";
+import {montarSnapshot, QUEUE_LIVE_DEBOUNCE_MS, QUEUE_LIVE_RECONCILE_MS, registroDoFrame, type PendingItem, type WireRecord} from "./queue-live.js";
 
 // Works in both CJS bundle (where __dirname is native) and ESM dev (tsx)
 // where we fall back to the process entry script.
@@ -160,6 +163,8 @@ interface SpoolItem {
   deliveryId?: string;
   enqueuedAt: number;
   principal?: InboundTurnPrincipal;
+  /** T-1306: veio da fila da pausa — no spool vale o TTL da fila retida. */
+  pausa?: true;
 }
 /** T-720: registro do spool em disco — só metadados + blob e2e:v2 re-cifrado. */
 interface SpoolRecord {
@@ -168,6 +173,7 @@ interface SpoolRecord {
   deliveryId?: string;
   enqueuedAt: number;
   blob: string;
+  pausa?: true;
 }
 const SPOOL_FILE = "reexec-spool.json";
 /** Spool mais velho que isto não é entregue (o contexto já passou). */
@@ -206,6 +212,14 @@ export class AgentHost {
   private drainNotified = new Set<string>();
   /** T-720: spool carregado no boot do processo novo, entregue no spawn. */
   private spooled = new Map<string, SpoolRecord[]>();
+
+  /** T-1306: agentes pausados. Fora do Entry de propósito: o spawn troca o
+   *  Entry inteiro (migração de runner) e a pausa precisa atravessar. A fonte
+   *  de verdade é o server (`AgentInfo.paused` no spawn, `agent:pause/resume`). */
+  private pausados = new Set<string>();
+  /** T-1306: o que chegou durante a pausa, na ordem, com o principal de cada
+   *  item (o gate do #1300 decide na entrega). Vai no spool do re-exec. */
+  private pauseHeld = new Map<string, SpoolItem[]>();
 
   /** T-1005: fila ao vivo — registro de cada entrega como veio do fio
    *  (agentId → deliveryId → blob original), debounce e último snapshot. */
@@ -455,6 +469,10 @@ export class AgentHost {
 
   async spawn(msg: AgentSpawn): Promise<void> {
     if (msg.projectId && msg.e2eeRequired != null) setE2eeRequired(msg.projectId, !!msg.e2eeRequired);
+    // T-1306: o spawn (inclusive o re-anúncio do hello) traz o estado da pausa
+    // do server — cobre pause/resume perdidos com o daemon desconectado.
+    if (msg.agent.paused === true) this.pausados.add(msg.agent.id);
+    else this.pausados.delete(msg.agent.id);
     const existing = this.entries.get(msg.agent.id);
     if (existing?.runner) {
       // Distingue RECONNECT (WS reconectou; mesma config) de RECONFIG
@@ -492,6 +510,8 @@ export class AgentHost {
         const sid = existing.info?.sessionId ?? existing.runner.info?.sessionId;
         if (sid) this.send({ type: "agent:session", agentId: msg.agent.id, sessionId: sid });
         this.send({ type: "agent:state", agentId: msg.agent.id, state: existing.runner.currentRuntimeState() });
+        if (this.pausados.has(msg.agent.id)) this.tirarDoRunnerParaPausa(msg.agent.id, existing);
+        else this.liberarPausa(msg.agent.id);
         return;
       }
       // Reconfig OU runner stale (M17): derruba o antigo antes de criar o
@@ -1086,6 +1106,7 @@ export class AgentHost {
     const out: PendingItem[] = typeof doRunner === "function" ? doRunner.call(e!.runner) ?? [] : [];
     for (const m of this.inboundBuffer.peek(agentId)) out.push({ content: m.content, images: m.images as ImageAttachment[] | undefined, deliveryId: m.deliveryId });
     for (const m of this.drainHeld.get(agentId) ?? []) out.push({ content: m.content, images: m.images, deliveryId: m.deliveryId });
+    for (const m of this.pauseHeld.get(agentId) ?? []) out.push({ content: m.content, images: m.images, deliveryId: m.deliveryId });
     return out;
   }
 
@@ -1119,8 +1140,9 @@ export class AgentHost {
     const doRunner = (e?.runner as unknown as { removeQueued?: (id: string) => boolean } | null)?.removeQueued;
     let ok = typeof doRunner === "function" ? doRunner.call(e!.runner, deliveryId) === true : false;
     if (!ok) ok = this.inboundBuffer.remove(agentId, deliveryId);
-    if (!ok) {
-      const held = this.drainHeld.get(agentId);
+    for (const mapa of [this.drainHeld, this.pauseHeld]) {
+      if (ok) break;
+      const held = mapa.get(agentId);
       const i = held?.findIndex((m) => m.deliveryId === deliveryId) ?? -1;
       if (held && i >= 0) { held.splice(i, 1); ok = true; }
     }
@@ -1226,21 +1248,55 @@ export class AgentHost {
 
   /** T-1150 (§3): `agent:queue_deliver` — decifra como no `agent:send`, entrega
    *  NA ORDEM ao runner ATUAL e devolve só os ids ACEITOS (o resto fica retido). */
-  queueDeliver(agentId: string, items: Array<{
-    id: string;
-    content: string;
-    images?: unknown[];
-    ts?: number;
-    from?: InboundTurnPrincipal["from"] | null;
-    isAgentOwner?: boolean;
-  }>, projectId?: string): string[] {
+  queueDeliver(agentId: string, items: QueueDeliveryInput[], projectId?: string): string[] {
     const e = this.entries.get(agentId);
     if (!e?.runner) { this.log("info", `[fila] queue_deliver sem runner para ${agentId} — nada aceito`); return []; }
     const aceitos: string[] = [];
     let notificadoTurnoMembroBloqueado = false;
-    for (const item of items) {
+    for (const rawItem of items) {
       try {
-        const principal = principalFromQueueDeliver(item);
+        const item = mergeQueueDeliveryPayload(rawItem, { log: (level, message) => this.log(level, message) });
+        const deliveryId = item.deliveryId;
+        const opened = this.abrirItemDaFila(item, projectId ?? e.projectId);
+        const payload = opened.payload;
+        const principal = principalFromQueueDeliver({
+          from: item.from,
+          isAgentOwner: item.isAgentOwner,
+          origin: payload?.origin,
+        });
+        const applyPayloadMetadata = () => {
+          if (payload?.telegram !== undefined) this.setTelegramMirror(agentId, payload.telegram);
+          if (typeof payload?.taskId === "string" && payload.taskId.trim()) this.setActiveTask(agentId, payload.taskId);
+        };
+        const registerQueueWireRecord = () => {
+          if (!deliveryId) return;
+          const wire = registroDoFrame({
+            content: item.content,
+            images: item.images,
+            parts: payload?.parts,
+            projectId: projectId ?? e.projectId,
+            origin: payload?.origin,
+            from: item.from ?? undefined,
+            silent: payload?.silent,
+            systemPrefix: payload?.systemPrefix,
+          }, opened.content, opened.images);
+          if (!wire) return;
+          const regs = this.filaVivaRegistros.get(agentId) ?? new Map<string, WireRecord>();
+          regs.set(deliveryId, wire);
+          this.filaVivaRegistros.set(agentId, regs);
+        };
+        // T-1306: no resume o server manda o queue_deliver ANTES do
+        // agent:resume. Pausado, o item é aceito (custódia do daemon) e fica
+        // atrás da fila local; o gate do membro roda na liberação.
+        if (this.pausados.has(agentId)) {
+          if (!this.pauseHeld.get(agentId)?.some((m) => m.deliveryId === deliveryId)) {
+            this.segurarNaPausa(agentId, [{ content: opened.content, images: opened.images, deliveryId, enqueuedAt: Date.now(), principal }]);
+          }
+          applyPayloadMetadata();
+          registerQueueWireRecord();
+          aceitos.push(item.id);
+          continue;
+        }
         if (isNonOwnerTurn(principal) && !e.runner.canAcceptNonOwnerTurn()) {
           const reason = e.runner.nonOwnerTurnBlockReason() ?? "runner ainda não está pronto para um turno de membro";
           this.log("warn", `[security] queue_deliver ${agentId}: turno de membro recusado (${reason})`);
@@ -1250,17 +1306,125 @@ export class AgentHost {
           }
           continue;
         }
-        const pid = projectId ?? e.projectId;
-        const plain = pid
-          ? decryptForProject(item.content, pid, aadV2({ projectId: pid, table: E2EE_TABLE.MESSAGES, field: "content" })) ?? item.content
-          : item.content;
-        const imgs = (item.images ?? []).length ? decryptImageAttachments(item.images as never, pid) ?? undefined : undefined;
-        e.runner.pushUserMessage(plain, imgs, undefined, item.id, principal);
+        e.runner.pushUserMessage(opened.content, opened.images, undefined, deliveryId, principal);
+        applyPayloadMetadata();
+        registerQueueWireRecord();
         aceitos.push(item.id);
       } catch { /* não aceito: o server mantém retido (nada se perde) */ }
     }
-    this.log("info", `[fila] queue_deliver ${agentId}: ${aceitos.length}/${items.length} aceita(s)`);
+    this.log("info", `[fila] queue_deliver ${agentId}: ${aceitos.length}/${items.length} aceita(s)${this.pausados.has(agentId) ? " (retidas: agente pausado)" : ""}`);
+    if (this.pausados.has(agentId)) this.agendarFilaViva(agentId);
     return aceitos;
+  }
+
+  /** Decifra um item do queue_deliver como no agent:send. */
+  private abrirItemDaFila(item: MergedQueueDeliveryItem, pid: string | undefined): { content: string; images?: ImageAttachment[]; payload?: QueueDeliveryPayload } {
+    let payload = item.payload;
+    let content: string;
+    if (payload?.parts?.length) {
+      const assembled = assembleAgentSendParts(payload.parts, pid, decryptForProject, isE2eEncrypted);
+      if (assembled.ok) {
+        content = assembled.content;
+      } else {
+        this.log("warn", `[security] queue_deliver ${item.id}: payload.parts inválido/indecifrável; usando content externo`);
+        payload = undefined;
+        content = pid
+          ? decryptForProject(item.content, pid, aadV2({ projectId: pid, table: E2EE_TABLE.MESSAGES, field: "content" })) ?? item.content
+          : item.content;
+      }
+    } else {
+      content = pid
+      ? decryptForProject(item.content, pid, aadV2({ projectId: pid, table: E2EE_TABLE.MESSAGES, field: "content" })) ?? item.content
+      : item.content;
+      if (payload?.systemPrefix) content = payload.systemPrefix + content;
+      if (payload?.systemSuffix) content += payload.systemSuffix;
+    }
+    if (payload?.mem) content = interpolateMissionMemory(content, payload.mem);
+    const images = (item.images ?? []).length ? decryptImageAttachments(item.images as never, pid) ?? undefined : undefined;
+    return { content, images, ...(payload ? { payload } : {}) };
+  }
+
+  /* ------------------------- T-1306: estado "Pausado" ------------------------- */
+
+  isPaused(agentId: string): boolean { return this.pausados.has(agentId); }
+
+  /** server → daemon `agent:pause`: o turno em curso termina; o que ainda não
+   *  virou turno volta para a fila da pausa e nada novo chega ao runner. */
+  pause(agentId: string): void {
+    if (this.pausados.has(agentId)) return;
+    this.pausados.add(agentId);
+    const e = this.entries.get(agentId);
+    const n = e ? this.tirarDoRunnerParaPausa(agentId, e) : 0;
+    this.log("info", `[pausa] ${agentId} pausado — ${n} msg(s) não iniciada(s) voltaram para a fila`);
+    try { recordAgentEvent(agentId, "pause", `agent:pause do orchestrator (${n} na fila)`); } catch { /* observação */ }
+    this.agendarFilaViva(agentId);
+  }
+
+  /** server → daemon `agent:resume`: entrega a fila da pausa em ordem ao
+   *  runner atual. Sem runner, segue retida até o próximo spawn. */
+  resume(agentId: string): void {
+    if (!this.pausados.delete(agentId)) return;
+    const n = this.liberarPausa(agentId);
+    this.log("info", `[pausa] ${agentId} retomado — ${n} msg(s) entregue(s) da fila`);
+    try { recordAgentEvent(agentId, "resume", `agent:resume do orchestrator (${n} entregue(s))`); } catch { /* observação */ }
+  }
+
+  /** Itens ainda não iniciados do runner vão para a FRENTE da fila da pausa
+   *  (chegaram antes de tudo que já está nela). */
+  private tirarDoRunnerParaPausa(agentId: string, e: Entry): number {
+    const take = (e.runner as unknown as { takeQueuedForDrain?: () => Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string; principal?: InboundTurnPrincipal }> } | null)?.takeQueuedForDrain;
+    if (!e.runner || typeof take !== "function") return 0;
+    const itens = (take.call(e.runner) ?? []).map((m) => ({ content: m.content, images: m.images, deliveryId: m.deliveryId, principal: m.principal, enqueuedAt: Date.now() }));
+    this.segurarNaPausa(agentId, itens, { naFrente: true });
+    return itens.length;
+  }
+
+  private segurarNaPausa(agentId: string, itens: SpoolItem[], opts: { naFrente?: boolean } = {}): void {
+    if (itens.length === 0) return;
+    const atual = this.pauseHeld.get(agentId) ?? [];
+    const lista = opts.naFrente ? [...itens, ...atual] : [...atual, ...itens];
+    const excesso = lista.length - CAP_POR_AGENTE;
+    if (excesso > 0) {
+      lista.splice(0, excesso);
+      this.log("warn", `[pausa] fila de ${agentId} passou de ${CAP_POR_AGENTE} — ${excesso} msg(s) mais antiga(s) descartada(s)`);
+      this.emitAgentError(agentId, `[daemon] agente pausado com a fila cheia: ${excesso} mensagem(ns) mais antiga(s) descartada(s)`, this.entries.get(agentId)?.projectId);
+    }
+    this.pauseHeld.set(agentId, lista);
+  }
+
+  /** Entrega a fila da pausa se o agente não está pausado e há runner apto.
+   *  Item de não dono passa pelo mesmo gate do agent:send (#1300). */
+  private liberarPausa(agentId: string): number {
+    if (this.pausados.has(agentId)) return 0;
+    const lista = this.pauseHeld.get(agentId);
+    if (!lista || lista.length === 0) return 0;
+    const e = this.entries.get(agentId);
+    if (!e?.runner || e.parado || this.spooled.has(agentId)) {
+      this.log("info", `[pausa] ${agentId} retomado sem runner — ${lista.length} msg(s) seguem retidas até o próximo spawn`);
+      return 0;
+    }
+    this.pauseHeld.delete(agentId);
+    if (this.draining) {
+      for (const m of lista) this.holdForDrain(agentId, m);
+      return 0;
+    }
+    let entregues = 0;
+    let avisado = false;
+    for (const m of lista) {
+      if (isNonOwnerTurn(m.principal) && !e.runner.canAcceptNonOwnerTurn()) {
+        const reason = e.runner.nonOwnerTurnBlockReason() ?? "runner ainda não está pronto para um turno de membro";
+        this.log("warn", `[security] resume ${agentId}: turno de membro recusado (${reason})`);
+        if (!avisado) {
+          this.emitAgentError(agentId, `[security] mensagem de membro retida na pausa bloqueada: ${reason}; o dono deste agente precisa aprovar ou assumir o turno`, e.projectId);
+          avisado = true;
+        }
+        continue;
+      }
+      e.runner.pushUserMessage(m.content, m.images, undefined, m.deliveryId, m.principal);
+      entregues++;
+    }
+    this.agendarFilaViva(agentId);
+    return entregues;
   }
 
   /** T-1150 (§4): "excluir" no modal — larga as cópias locais. */
@@ -1296,6 +1460,11 @@ export class AgentHost {
     if (e.queueAutoRedeliver === false) {
       const n = tamanhoFilaRetida(agentId);
       if (n > 0) this.log("info", `[fila] ${n} msg(s) retida(s) de ${agentId} — reentrega DESLIGADA (ficam na fila)`);
+      return 0;
+    }
+    if (this.pausados.has(agentId)) {
+      const n = tamanhoFilaRetida(agentId);
+      if (n > 0) this.log("info", `[pausa] ${n} msg(s) retida(s) de ${agentId} — agente pausado (ficam na fila)`);
       return 0;
     }
     const itens = tomarFilaRetida(agentId);
@@ -1372,6 +1541,14 @@ export class AgentHost {
   }
 
   private sendMessageInner(agentId: string, content: string, images?: ImageAttachment[], deliveryId?: string, principal?: InboundTurnPrincipal) {
+    // T-1306: pausado, TODA entrega (humano, agente, task, agendamento,
+    // delegação) fica na fila da pausa, com o principal, em qualquer estado do
+    // runner (inclusive dreno e spool pendente). O gate do membro roda no resume.
+    if (this.pausados.has(agentId)) {
+      this.segurarNaPausa(agentId, [{ content, images, deliveryId, enqueuedAt: Date.now(), principal }]);
+      this.log("info", `[pausa] send_message para ${agentId} retido (${this.pauseHeld.get(agentId)?.length ?? 0} na fila)`);
+      return;
+    }
     if (isNonOwnerTurn(principal)) {
       const e = this.entries.get(agentId);
       const blockReason = this.draining ? "daemon reiniciando"
@@ -1447,7 +1624,16 @@ export class AgentHost {
   /** Chamado após spawn bem-sucedido — drena fila local T-037. */
   flushInboundBuffer(agentId: string): number {
     // T-720: spool do re-exec anterior (mais antigo) antes do buffer local.
-    this.deliverSpoolFor(agentId);
+    const doSpool = this.deliverSpoolFor(agentId);
+    if (this.pausados.has(agentId)) {
+      // T-1306: spool e buffer chegaram antes da pausa conhecida — frente da fila.
+      const doBuffer = this.inboundBuffer.drain(agentId).map((m) => ({ ...m, images: m.images as ImageAttachment[] | undefined }));
+      this.inboundAgentIds.delete(agentId);
+      // O seed de migração (já no runner) segue: é o contexto, não a fila.
+      this.segurarNaPausa(agentId, [...doSpool, ...doBuffer], { naFrente: true });
+      this.agendarFilaViva(agentId);
+      return 0;
+    }
     if (this.draining) {
       for (const m of this.inboundBuffer.drain(agentId)) this.holdForDrain(agentId, { ...m, images: m.images as ImageAttachment[] | undefined });
       this.inboundAgentIds.delete(agentId);
@@ -1456,6 +1642,8 @@ export class AgentHost {
     this.inboundAgentIds.delete(agentId);
     const pending = this.inboundBuffer.drain(agentId);
     const e = this.entries.get(agentId);
+    // T-1306: resume com o agente parado — a fila da pausa sai neste spawn.
+    this.liberarPausa(agentId);
     if (!e?.runner || pending.length === 0) return 0;
     for (const m of pending) {
       e.runner.pushUserMessage(m.content, m.images as ImageAttachment[] | undefined, undefined, m.deliveryId);
@@ -1570,6 +1758,10 @@ export class AgentHost {
       for (const m of this.inboundBuffer.drain(agentId)) this.holdForDrain(agentId, { ...m, images: m.images as ImageAttachment[] | undefined });
     }
     this.inboundAgentIds.clear();
+    // T-1306: a fila da pausa atravessa o re-exec; o spawn do processo novo
+    // traz `paused` e o flush a devolve para a fila da pausa, sem entregar.
+    for (const [agentId, itens] of this.pauseHeld) for (const m of itens) this.holdForDrain(agentId, { ...m, pausa: true });
+    this.pauseHeld.clear();
     const records: SpoolRecord[] = [];
     let lost = 0;
     // T-824 (prova): id da mensagem que NÃO entrou no spool não pode ir para os
@@ -1587,7 +1779,7 @@ export class AgentHost {
           this.log("warn", `[self-update] spool: msg para ${agentId} (project=${projectId ?? "?"}) sem chave do projeto — NÃO gravada em claro; perdida no re-exec`);
           continue;
         }
-        records.push({ agentId, projectId, deliveryId: item.deliveryId, enqueuedAt: item.enqueuedAt, blob });
+        records.push({ agentId, projectId, deliveryId: item.deliveryId, enqueuedAt: item.enqueuedAt, blob, ...(item.pausa ? { pausa: true as const } : {}) });
       }
     }
     // Revisão T-824: o spool do boot anterior que ainda não foi entregue
@@ -1630,8 +1822,10 @@ export class AgentHost {
         this.log("warn", `[self-update] spool: registro inválido descartado`);
         continue;
       }
-      if (now - Number(r.enqueuedAt || 0) > SPOOL_TTL_MS) {
-        this.log("warn", `[self-update] spool: msg para ${r.agentId} vencida (> ${SPOOL_TTL_MS / 60_000}min) — descartada`);
+      // T-1306: a pausa pode durar horas; o item dela segue o TTL da fila retida.
+      const ttl = r.pausa === true ? TTL_ITEM_MS : SPOOL_TTL_MS;
+      if (now - Number(r.enqueuedAt || 0) > ttl) {
+        this.log("warn", `[self-update] spool: msg para ${r.agentId} vencida (> ${ttl / 60_000}min) — descartada`);
         continue;
       }
       const list = this.spooled.get(r.agentId) ?? [];
@@ -1644,16 +1838,19 @@ export class AgentHost {
     return n;
   }
 
-  private deliverSpoolFor(agentId: string): void {
+  /** @returns itens retidos porque o agente está pausado (T-1306), na ordem. */
+  private deliverSpoolFor(agentId: string): SpoolItem[] {
+    const retidos: SpoolItem[] = [];
     const list = this.spooled.get(agentId);
-    if (!list || list.length === 0) return;
+    if (!list || list.length === 0) return retidos;
     const e = this.entries.get(agentId);
-    if (!e?.runner) return;
+    if (!e?.runner) return retidos;
     this.spooled.delete(agentId);
     let ok = 0;
-    const deliver = (content: string, images?: ImageAttachment[], principal?: InboundTurnPrincipal) => {
+    const deliver = (content: string, images?: ImageAttachment[], principal?: InboundTurnPrincipal, deliveryId?: string) => {
+      if (this.pausados.has(agentId)) retidos.push({ content, images, principal, deliveryId, enqueuedAt: Date.now() });
       // Dreno de um NOVO update já ligado: segue retido para o próximo spool.
-      if (this.draining) this.holdForDrain(agentId, { content, images, principal, enqueuedAt: Date.now() });
+      else if (this.draining) this.holdForDrain(agentId, { content, images, principal, enqueuedAt: Date.now() });
       else e.runner!.pushUserMessage(content, images, undefined, undefined, principal);
     };
     for (const r of list) {
@@ -1665,14 +1862,15 @@ export class AgentHost {
       try {
         const m = JSON.parse(plain) as { content?: unknown; images?: ImageAttachment[]; principal?: InboundTurnPrincipal };
         if (typeof m.content !== "string") continue;
-        deliver(m.content, m.images, m.principal);
+        deliver(m.content, m.images, m.principal, r.deliveryId);
         ok++;
       } catch {
         this.log("warn", `[self-update] spool: msg para ${agentId} com payload inválido — descartada`);
       }
     }
-    this.log("info", `[self-update] spool: entregue ${ok}/${list.length} msg(s) a ${agentId}`);
+    this.log("info", `[self-update] spool: ${retidos.length ? "retido na pausa" : "entregue"} ${ok}/${list.length} msg(s) a ${agentId}`);
     this.persistSpool();
+    return retidos;
   }
 
   /** Reescreve o spool com o que falta entregar; remove o arquivo quando vazio. */

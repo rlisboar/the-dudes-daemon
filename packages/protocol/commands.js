@@ -273,6 +273,8 @@ export const commandSchemas = {
   /* ---------- agentes / mensagens persistidas ---------- */
   start_agent: cmd({ id }),
   stop_agent: cmd({ id }),
+  pause_agent: strictCmd({ id }),
+  resume_agent: strictCmd({ id }),
   remove_agent: cmd({ id }),
   transfer_agent_owner: cmd({ id, newOwnerUserId: id }),
   assign_agent_repo: cmd({ id, repo: z.union([agentRepo, text, z.null()]) }),
@@ -787,7 +789,7 @@ export const DB_WRITE_COMMANDS = Object.freeze([
   "create_project", "create_project_with_key", "duplicate_project", "update_project",
   "delete_project", "set_workspace", "set_auto_approve", "set_loop_protection",
   "set_auto_retry", "set_context_feature", "set_project_planner", "set_project_plan_defaults",
-  "start_agent", "stop_agent", "remove_agent", "transfer_agent_owner", "assign_agent_repo",
+  "start_agent", "stop_agent", "pause_agent", "resume_agent", "remove_agent", "transfer_agent_owner", "assign_agent_repo",
   "save_agent", "spawn", "user_to_agent", "broadcast", "clear_messages",
   "save_template", "update_template", "delete_template",
   "add_schedule", "update_schedule", "remove_schedule", "fire_schedule",
