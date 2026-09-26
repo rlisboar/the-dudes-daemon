@@ -731,17 +731,21 @@ export function dshToolInput(raw: unknown): Record<string, unknown> | undefined 
 }
 
 /** Enfileira mensagem do usuário; o pump serializa (ACP: 1 prompt por vez). */
-export function dshPushUserMessage(self: any, content: string, images?: ImageAttachment[], deliveryId?: string, principal?: InboundTurnPrincipal): void {
+export function dshPushUserMessage(self: any, content: string, images?: ImageAttachment[], deliveryId?: string, principal?: InboundTurnPrincipal): boolean {
   const queue = (self.dshQueue as DshQueued[] | undefined) ?? [];
   if (queue.length >= MAX_DSH_QUEUE) {
-    self.opts.log("warn", `[cli:${self.info.id}:dsh] fila cheia (${queue.length}) — drop mensagem`);
-    // T-818: descarte declarado a quem vê o chat (uma vez por rajada) —
-    // antes era só log.
-    if (!self.dshDropNoticeSent) {
-      self.dshDropNoticeSent = true;
-      self.opts.onError?.(`[fila] mensagem descartada: a fila do dsh está cheia (${queue.length}) — reenvie quando ela baixar (próximos descartes só no log)`);
+    if (deliveryId) {
+      self.opts.log("warn", `[cli:${self.info.id}:dsh] fila cheia (${queue.length}) — queue_deliver não aceito; item permanece retido no server`);
+    } else {
+      self.opts.log("warn", `[cli:${self.info.id}:dsh] fila cheia (${queue.length}) — drop mensagem`);
+      // T-818: descarte declarado a quem vê o chat (uma vez por rajada) —
+      // antes era só log.
+      if (!self.dshDropNoticeSent) {
+        self.dshDropNoticeSent = true;
+        self.opts.onError?.(`[fila] mensagem descartada: a fila do dsh está cheia (${queue.length}) — reenvie quando ela baixar (próximos descartes só no log)`);
+      }
     }
-    return;
+    return false;
   }
   if (queue.length < MAX_DSH_QUEUE / 2) self.dshDropNoticeSent = false;
   let message = content;
@@ -756,6 +760,7 @@ export function dshPushUserMessage(self: any, content: string, images?: ImageAtt
   self.dshQueue = queue;
   self.queueChanged?.();
   dshPump(self);
+  return true;
 }
 
 /** ACP dsh v1 exposes context occupancy, not turn token counts. Match the

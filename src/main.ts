@@ -726,6 +726,10 @@ export class DaemonClient {
       // T-1005: a desconexão limpa a fila ao vivo no server — reemite o
       // snapshot de quem tem fila (debounce; o server trata igual como no-op).
       try { this.host.reemitirFilaVivaNoHello(); } catch { /* observação */ }
+      // T-1329: o `agent:queue_retain` do que venceu no boot não é frame
+      // crítico — com o WS ainda fechado no boot ele não entra na fila de
+      // reenvio. Aqui, conectado, a fila retida do boot chega ao server.
+      try { this.host.reenviarRetidoNoBoot(); } catch { /* observação */ }
       // T-822: o estado NÃO crítico (running/state/usage/context) é descartado
       // com o WS fora (não entra na fila de reenvio) — reemite o ATUAL, senão o
       // server fica com running=true de um agente morto e retém as mensagens.

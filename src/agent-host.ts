@@ -16,7 +16,7 @@ import {migratedSeedFor, MIGRATED_SEED_LIMIT_BYTES} from "./migrated-seed.js";
 import {agentStateInfo, cliIoCounters, recordAgentEvent, recordAgentState} from "./debug/store.js";
 import {formatDrainHolders, type DrainHolder} from "./self-update.js";
 import { addAgentMessageTokens, markAgentMessageActed, settleAgentMessageShadow } from "./typesafe-agentmsg-shadow.js";
-import {expirar as expirarFilaRetida, devolver as devolverFilaRetida, esquecer as esquecerFilaRetida, TTL_ITEM_MS, listar as listarFilaRetida, paraFio, reter as reterFila, tamanho as tamanhoFilaRetida, tomar as tomarFilaRetida, totalRetido, CAP_POR_AGENTE} from "./queue-retained.js";
+import {expirar as expirarFilaRetida, devolver as devolverFilaRetida, esquecer as esquecerFilaRetida, TTL_ITEM_MS, listar as listarFilaRetida, paraFio, reter as reterFila, tamanho as tamanhoFilaRetida, tomar as tomarFilaRetida, totalRetido, CAP_POR_AGENTE, type FonteRetencao} from "./queue-retained.js";
 
 /** 1 enum operacional (paridade hung.soft). Classifica no plaintext ANTES do seal. */
 export type AgentErrorKind = "rate_limit" | "other";
@@ -169,6 +169,8 @@ interface SpoolItem {
   principal?: InboundTurnPrincipal;
   /** T-1306: veio da fila da pausa — no spool vale o TTL da fila retida. */
   pausa?: true;
+  /** T-1329: veio da fila RETIDA (T-938) — idem: o TTL dela é de dias. */
+  retido?: true;
 }
 /** T-720: registro do spool em disco — só metadados + blob e2e:v2 re-cifrado. */
 interface SpoolRecord {
@@ -178,7 +180,14 @@ interface SpoolRecord {
   enqueuedAt: number;
   blob: string;
   pausa?: true;
+  /** T-1329: item que estava na fila retida — não pode cair no TTL de 1 h. */
+  retido?: true;
 }
+
+/** T-1329: resultado da leitura de um registro do spool (decifra + parse). */
+type LeituraSpool =
+  | { ok: true; content: string; images?: ImageAttachment[]; principal?: InboundTurnPrincipal }
+  | { ok: false; motivo: "chave" | "payload" };
 const SPOOL_FILE = "reexec-spool.json";
 /** Spool mais velho que isto não é entregue (o contexto já passou). */
 const SPOOL_TTL_MS = 60 * 60_000;
@@ -236,6 +245,13 @@ export class AgentHost {
   private ultimoContexto = new Map<string, { used: number; limit: number }>();
   private filaVivaReconcilia: ReturnType<typeof setInterval> | null = null;
   private spoolPath: string | null = null;
+  /** T-1329: itens vencidos no boot que voltaram para a fila retida — o
+   *  projeto por agente, para reenviar o `agent:queue_retain` no hello (o
+   *  frame não é crítico e o WS ainda não subiu no boot). */
+  private retidoNoBoot = new Map<string, string>();
+  /** T-1329: contadores de telemetria (nunca silencioso). */
+  private spoolVencidasRetidas = 0;
+  private spoolVencidasPerdidas = 0;
 
   /** Quantos agentes este daemon mantém vivos — indicador de saúde da UI. */
   agentCount(): number {
@@ -286,6 +302,11 @@ export class AgentHost {
       inboundAgents: [...this.inboundAgentIds].map((id) => ({ agentId: id, pending: this.inboundBuffer.size(id) })),
       drainHeld: [...this.drainHeld.entries()].map(([id, l]) => ({ agentId: id, held: l.length })),
       spoolPending: this.spoolPendingCount(),
+      // T-1329: vencidas no boot que voltaram para a fila retida (com motivo) e
+      // as que não deu para decifrar. Nunca mais um sumiço sem contador.
+      spoolVencidasRetidas: this.spoolVencidasRetidas,
+      spoolVencidasPerdidas: this.spoolVencidasPerdidas,
+      retidoNoBootPendente: [...this.retidoNoBoot.keys()],
     };
   }
 
@@ -769,7 +790,7 @@ export class AgentHost {
         // T-1005: turno começou/acabou = a fila andou.
         this.agendarFilaViva(msg.agent.id);
       },
-      onQueueChanged: () => this.agendarFilaViva(msg.agent.id),
+      onQueueChanged: () => this.onRunnerQueueChanged(msg.agent.id),
       onHung: (info) => {
         try { recordAgentEvent(msg.agent.id, info.parked ? "park" : info.soft ? "hung-soft" : "hung-hard", `${info.reason} (idle ${Math.round(info.idleMs / 1000)}s)`); } catch { /* observação */ }
         this.deliver({
@@ -1178,10 +1199,10 @@ export class AgentHost {
   }
 
   /** T-938: retenção por agente das entries conhecidas (para o spool). */
-  private entriesRetidos(): Array<[string, Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string; enqueuedAt: number }>]> {
-    const out: Array<[string, Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string; enqueuedAt: number }>]> = [];
+  private entriesRetidos(): Array<[string, Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string; enqueuedAt: number; principal?: InboundTurnPrincipal }>]> {
+    const out: Array<[string, Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string; enqueuedAt: number; principal?: InboundTurnPrincipal }>]> = [];
     for (const [agentId] of this.entries) {
-      const itens = listarFilaRetida(agentId) as Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string; enqueuedAt: number; source: string }>;
+      const itens = listarFilaRetida(agentId) as Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string; enqueuedAt: number; source: string; principal?: InboundTurnPrincipal }>;
       if (itens.length > 0) out.push([agentId, itens]);
     }
     return out;
@@ -1194,9 +1215,9 @@ export class AgentHost {
   }
 
   /** T-899: retenção vinda do runner (fila do agente), com source explícito. */
-  private reterDoRunner(agentId: string, msgs: Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string }>, source: "stop" | "context-clear" | "loop-stop" | "replace" | "migrate"): number {
+  private reterDoRunner(agentId: string, msgs: Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string; principal?: InboundTurnPrincipal }>, source: "stop" | "context-clear" | "loop-stop" | "replace" | "migrate"): number {
     this.gcFilaRetida();
-    const r = reterFila(agentId, msgs.map((m) => ({ content: m.content, images: m.images, deliveryId: m.deliveryId, enqueuedAt: Date.now(), source })));
+    const r = reterFila(agentId, msgs.map((m) => ({ content: m.content, images: m.images, deliveryId: m.deliveryId, principal: m.principal, enqueuedAt: Date.now(), source })));
     if (r.retidos > 0) this.log("info", `[fila] ${r.retidos} msg(s) de ${agentId} retida(s) (source=${source}) — entregues no próximo spawn`);
     if (r.duplicados > 0) this.log("info", `[fila] ${r.duplicados} msg(s) de ${agentId} já estavam retidas (idempotência por deliveryId)`);
     if (r.descartados > 0) this.log("warn", `[fila] cap de ${CAP_POR_AGENTE} estourado para ${agentId} — descarte declarado`);
@@ -1206,10 +1227,10 @@ export class AgentHost {
 
   /** T-899: colhe o que o runner parou de segurar e retém (idempotente). */
   private retainFromRunner(agentId: string, e: Entry, source: "stop" | "context-clear" | "replace"): number {
-    const take = (e.runner as unknown as { takeQueueForRetain?: () => Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string }> } | null)?.takeQueueForRetain;
+    const take = (e.runner as unknown as { takeQueueForRetain?: () => Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string; principal?: InboundTurnPrincipal }> } | null)?.takeQueueForRetain;
     const itens = typeof take === "function" ? take.call(e.runner) ?? [] : [];
     if (itens.length === 0) return 0;
-    const r = reterFila(agentId, itens.map((m) => ({ content: m.content, images: m.images, deliveryId: m.deliveryId, enqueuedAt: Date.now(), source })));
+    const r = reterFila(agentId, itens.map((m) => ({ content: m.content, images: m.images, deliveryId: m.deliveryId, principal: m.principal, enqueuedAt: Date.now(), source })));
     if (r.retidos > 0) this.log("info", `[fila] ${r.retidos} msg(s) de ${agentId} retida(s) no stop (source=${source}) — entregues no próximo spawn`);
     if (r.duplicados > 0) this.log("info", `[fila] ${r.duplicados} msg(s) de ${agentId} já estavam retidas (idempotência por deliveryId)`);
     if (r.descartados > 0) this.log("warn", `[fila] cap de ${CAP_POR_AGENTE} estourado para ${agentId} — ${r.descartados} item(ns) mais antigo(s) descartado(s)`);
@@ -1219,7 +1240,7 @@ export class AgentHost {
 
   /** T-899: melhor esforço para o server (o WEB lista por lá, #898/#900).
    *  O daemon NÃO depende de ack nesta fase: a cópia local é a fonte. */
-  private enviarFilaRetida(agentId: string, projectId?: string, source: "stop" | "context-clear" | "loop-stop" | "replace" | "migrate" = "stop"): void {
+  private enviarFilaRetida(agentId: string, projectId?: string, source: FonteRetencao = "stop"): void {
     if (!projectId) return;
     const itens = listarFilaRetida(agentId);
     if (itens.length === 0) return;
@@ -1235,9 +1256,7 @@ export class AgentHost {
         projectId,
         source,
         items: enviar.map((i) => {
-          const sender = i.deliveryId
-            ? this.filaVivaRegistros.get(agentId)?.get(i.deliveryId)?.sender
-            : undefined;
+          const sender = i.sender ?? (i.deliveryId ? this.filaVivaRegistros.get(agentId)?.get(i.deliveryId)?.sender : undefined);
           return { id: i.deliveryId ?? i.ack, content: i.cipher, images: i.imagesCipher, ts: i.enqueuedAt, source: i.source, ...(sender ? { sender } : {}) };
         }),
       });
@@ -1258,6 +1277,7 @@ export class AgentHost {
     const e = this.entries.get(agentId);
     if (!e?.runner) { this.log("info", `[fila] queue_deliver sem runner para ${agentId} — nada aceito`); return []; }
     const aceitos: string[] = [];
+    let recusadosPorCapacidade = 0;
     let notificadoTurnoMembroBloqueado = false;
     for (const rawItem of items) {
       try {
@@ -1312,13 +1332,20 @@ export class AgentHost {
           }
           continue;
         }
-        e.runner.pushUserMessage(opened.content, opened.images, undefined, deliveryId, principal);
+        const aceitoPeloRunner = e.runner.pushUserMessage(opened.content, opened.images, undefined, deliveryId, principal, true);
+        if (aceitoPeloRunner === false) {
+          // O servidor só solta a retenção após agent:queue_delivered. Deixar
+          // este id fora de `aceitos` mantém a mensagem no modal para retry.
+          recusadosPorCapacidade++;
+          this.log("warn", `[fila] queue_deliver ${agentId}: runner recusou item por capacidade — mantido retido no server`);
+          continue;
+        }
         applyPayloadMetadata();
         registerQueueWireRecord();
         aceitos.push(item.id);
       } catch { /* não aceito: o server mantém retido (nada se perde) */ }
     }
-    this.log("info", `[fila] queue_deliver ${agentId}: ${aceitos.length}/${items.length} aceita(s)${this.pausados.has(agentId) ? " (retidas: agente pausado)" : ""}`);
+    this.log("info", `[fila] queue_deliver ${agentId}: ${aceitos.length}/${items.length} aceita(s)${recusadosPorCapacidade ? `, ${recusadosPorCapacidade} recusada(s) por capacidade (mantidas retidas no server)` : ""}${this.pausados.has(agentId) ? " (retidas: agente pausado)" : ""}`);
     if (this.pausados.has(agentId)) this.agendarFilaViva(agentId);
     return aceitos;
   }
@@ -1570,7 +1597,7 @@ export class AgentHost {
     if (this.draining) {
       // T-720: dreno — não alimenta o runner (turno novo atrasaria o re-exec);
       // a mensagem vai no spool cifrado e é entregue pelo processo novo.
-      this.holdForDrain(agentId, { content, images, deliveryId, enqueuedAt: Date.now() });
+      this.holdForDrain(agentId, { content, images, deliveryId, principal, enqueuedAt: Date.now() });
       this.log("info", `${this.drainReason === "update" ? "[self-update] dreno" : "[shutdown] dreno"}: send_message para ${agentId} retido para o próximo processo (${this.drainHeld.get(agentId)?.length ?? 0} retidas)`);
       // T-824: no dreno do update o agente parece travado na UI (a mensagem
       // não vira turno até os turnos em curso terminarem) e o dono reiniciava
@@ -1656,6 +1683,14 @@ export class AgentHost {
     }
     this.log("info", `flushInboundBuffer agent=${agentId} entregou ${pending.length} msg(s) buffered`);
     return pending.length;
+  }
+
+  /** A fila do runner mudou: publica queue_live e retoma a parte do spool
+   *  que ficou sem ACK/capacidade no último flush. O runner chama este hook ao
+   *  aceitar ou retirar um turno; deliverSpoolFor consome antes do buffer novo. */
+  private onRunnerQueueChanged(agentId: string): void {
+    this.agendarFilaViva(agentId);
+    if (this.spooled.has(agentId)) this.deliverSpoolFor(agentId);
   }
 
   async clear(agentId: string) {
@@ -1757,7 +1792,7 @@ export class AgentHost {
     // spool gravar (nunca limpar antes).
     const doSpool: string[] = [];
     for (const [agentId, itens] of this.entriesRetidos()) {
-      for (const it of itens) this.holdForDrain(agentId, { content: it.content, images: it.images, deliveryId: it.deliveryId, enqueuedAt: it.enqueuedAt });
+      for (const it of itens) this.holdForDrain(agentId, { content: it.content, images: it.images, deliveryId: it.deliveryId, principal: it.principal, enqueuedAt: it.enqueuedAt, retido: true });
       doSpool.push(agentId);
     }
     for (const agentId of this.inboundAgentIds) {
@@ -1785,7 +1820,7 @@ export class AgentHost {
           this.log("warn", `[self-update] spool: msg para ${agentId} (project=${projectId ?? "?"}) sem chave do projeto — NÃO gravada em claro; perdida no re-exec`);
           continue;
         }
-        records.push({ agentId, projectId, deliveryId: item.deliveryId, enqueuedAt: item.enqueuedAt, blob, ...(item.pausa ? { pausa: true as const } : {}) });
+        records.push({ agentId, projectId, deliveryId: item.deliveryId, enqueuedAt: item.enqueuedAt, blob, ...(item.pausa ? { pausa: true as const } : {}), ...(item.retido ? { retido: true as const } : {}) });
       }
     }
     // Revisão T-824: o spool do boot anterior que ainda não foi entregue
@@ -1812,7 +1847,13 @@ export class AgentHost {
   }
 
   /** T-720: boot do processo novo — carrega o spool (entregue no spawn de
-   *  cada agente). Só aceita e2e:v2; registros vencidos saem com log. */
+   *  cada agente). Só aceita e2e:v2.
+   *
+   *  T-1329: registro vencido NÃO é mais descartado em silêncio — volta para a
+   *  fila RETIDA (source `inbound-ttl`) e o dono decide pelo modal. O TTL só
+   *  impede a entrega AUTOMÁTICA. Além disso, item que já estava na fila retida
+   *  (T-938) segue o TTL DA RETENÇÃO (dias), não o de 1 h do re-exec: era esse
+   *  descasamento que apagava 144 de 242 mensagens a cada self-update. */
   loadReexecSpool(dir: string = reexecSpoolDir(), now = Date.now()): number {
     const file = path.join(dir, SPOOL_FILE);
     let parsed: { v?: number; records?: SpoolRecord[] };
@@ -1823,15 +1864,34 @@ export class AgentHost {
     }
     this.spoolPath = file;
     let n = 0;
+    let retidasPorTtl = 0;
+    const perdasPorTtl: Array<{ agentId: string; motivo: string }> = [];
     for (const r of Array.isArray(parsed.records) ? parsed.records : []) {
       if (!r || typeof r.agentId !== "string" || typeof r.projectId !== "string" || typeof r.blob !== "string" || !r.blob.startsWith("e2e:v2:")) {
         this.log("warn", `[self-update] spool: registro inválido descartado`);
         continue;
       }
-      // T-1306: a pausa pode durar horas; o item dela segue o TTL da fila retida.
-      const ttl = r.pausa === true ? TTL_ITEM_MS : SPOOL_TTL_MS;
+      // T-1306/T-1329: a pausa e a fila retida podem durar horas/dias; os itens
+      // delas seguem o TTL da fila retida.
+      const ttl = r.pausa === true || r.retido === true ? TTL_ITEM_MS : SPOOL_TTL_MS;
       if (now - Number(r.enqueuedAt || 0) > ttl) {
-        this.log("warn", `[self-update] spool: msg para ${r.agentId} vencida (> ${ttl / 60_000}min) — descartada`);
+        const lido = this.lerRegistroSpool(r);
+        if (!lido.ok) {
+          perdasPorTtl.push({ agentId: r.agentId, motivo: lido.motivo });
+          continue;
+        }
+        const ret = reterFila(r.agentId, [{
+          content: lido.content,
+          images: lido.images,
+          deliveryId: r.deliveryId,
+          principal: lido.principal,
+          // Preserva a idade REAL: o TTL da retenção conta daqui.
+          enqueuedAt: Number(r.enqueuedAt) || now,
+          source: "inbound-ttl",
+        }]);
+        if (ret.descartados > 0) this.log("warn", `[self-update] spool: cap de ${CAP_POR_AGENTE} estourado para ${r.agentId} — descarte declarado`);
+        this.retidoNoBoot.set(r.agentId, r.projectId);
+        retidasPorTtl += ret.retidos;
         continue;
       }
       const list = this.spooled.get(r.agentId) ?? [];
@@ -1841,7 +1901,49 @@ export class AgentHost {
     }
     this.persistSpool();
     if (n > 0) this.log("info", `[self-update] spool do re-exec: ${n} msg(s) para ${this.spooled.size} agente(s), entregues no spawn`);
+    if (retidasPorTtl > 0) {
+      this.spoolVencidasRetidas += retidasPorTtl;
+      this.log("warn", `[self-update] spool: ${retidasPorTtl} msg(s) vencida(s) foram para a fila RETIDA (source=inbound-ttl, motivo=self-update/vencida) em ${this.retidoNoBoot.size} agente(s) — nada perdido; o dono decide pelo modal`);
+    }
+    for (const perda of perdasPorTtl) {
+      this.spoolVencidasPerdidas++;
+      this.log("warn", `[self-update] spool: msg para ${perda.agentId} vencida e ilegível (${perda.motivo}) — descartada`);
+    }
     return n;
+  }
+
+  /** T-1329: reenvia o `agent:queue_retain` do que virou fila retida no boot.
+   *  Chamado no hello — o frame não é crítico, então com o WS ainda fechado no
+   *  boot ele não entra na fila de reenvio. */
+  reenviarRetidoNoBoot(): number {
+    if (this.retidoNoBoot.size === 0) return 0;
+    let enviados = 0;
+    for (const [agentId, projectId] of this.retidoNoBoot) {
+      this.enviarFilaRetida(agentId, projectId, "inbound-ttl");
+      this.agendarFilaViva(agentId);
+      enviados++;
+    }
+    this.retidoNoBoot.clear();
+    this.log("info", `[self-update] spool: fila retida do boot reenviada ao server (${enviados} agente(s))`);
+    return enviados;
+  }
+
+  /** Decifra e valida um registro do spool (usado na entrega e no vencimento). */
+  private lerRegistroSpool(r: SpoolRecord): LeituraSpool {
+    let plain: string | null;
+    try {
+      plain = decryptForProject(r.blob, r.projectId, spoolAad(r.projectId));
+    } catch {
+      return { ok: false, motivo: "chave" };
+    }
+    if (plain == null) return { ok: false, motivo: "chave" };
+    try {
+      const parsed = JSON.parse(plain) as { content?: unknown; images?: unknown; principal?: unknown };
+      if (typeof parsed.content !== "string") return { ok: false, motivo: "payload" };
+      return { ok: true, content: parsed.content, images: parsed.images as ImageAttachment[] | undefined, principal: parsed.principal as InboundTurnPrincipal | undefined };
+    } catch {
+      return { ok: false, motivo: "payload" };
+    }
   }
 
   /** @returns itens retidos porque o agente está pausado (T-1306), na ordem. */
@@ -1852,29 +1954,35 @@ export class AgentHost {
     const e = this.entries.get(agentId);
     if (!e?.runner) return retidos;
     this.spooled.delete(agentId);
-    let ok = 0;
     const deliver = (content: string, images?: ImageAttachment[], principal?: InboundTurnPrincipal, deliveryId?: string) => {
       if (this.pausados.has(agentId)) retidos.push({ content, images, principal, deliveryId, enqueuedAt: Date.now() });
       // Dreno de um NOVO update já ligado: segue retido para o próximo spool.
       else if (this.draining) this.holdForDrain(agentId, { content, images, principal, enqueuedAt: Date.now() });
-      else e.runner!.pushUserMessage(content, images, undefined, undefined, principal);
+      else return e.runner!.pushUserMessage(content, images, undefined, deliveryId, principal, true) !== false;
+      return true;
     };
-    for (const r of list) {
-      const plain = decryptForProject(r.blob, r.projectId, spoolAad(r.projectId));
-      if (plain == null) {
-        this.log("warn", `[self-update] spool: msg para ${agentId} não autenticou com a chave do projeto — descartada`);
+    const recusados: SpoolRecord[] = [];
+    let entregues = 0;
+    for (let index = 0; index < list.length; index++) {
+      const r = list[index]!;
+      const lido = this.lerRegistroSpool(r);
+      if (!lido.ok) {
+        this.log("warn", `[self-update] spool: msg para ${agentId} ${lido.motivo === "chave" ? "não autenticou com a chave do projeto" : "com payload inválido"} — descartada`);
         continue;
       }
-      try {
-        const m = JSON.parse(plain) as { content?: unknown; images?: ImageAttachment[]; principal?: InboundTurnPrincipal };
-        if (typeof m.content !== "string") continue;
-        deliver(m.content, m.images, m.principal, r.deliveryId);
-        ok++;
-      } catch {
-        this.log("warn", `[self-update] spool: msg para ${agentId} com payload inválido — descartada`);
+      if (deliver(lido.content, lido.images, lido.principal, r.deliveryId)) entregues++;
+      else {
+        // O spool é FIFO: não tentar os itens seguintes depois que a fila
+        // recusa um item, para não entregar uma mensagem mais nova primeiro.
+        recusados.push(...list.slice(index));
+        break;
       }
     }
-    this.log("info", `[self-update] spool: ${retidos.length ? "retido na pausa" : "entregue"} ${ok}/${list.length} msg(s) a ${agentId}`);
+    if (recusados.length > 0) {
+      this.spooled.set(agentId, recusados);
+      this.log("warn", `[self-update] spool: ${recusados.length} msg(s) de ${agentId} excederam a capacidade do runner e continuam no spool`);
+    }
+    this.log("info", `[self-update] spool: ${retidos.length ? "retido na pausa" : "entregue"} ${entregues}/${list.length} msg(s) a ${agentId}`);
     this.persistSpool();
     return retidos;
   }

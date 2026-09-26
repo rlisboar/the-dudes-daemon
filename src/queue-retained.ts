@@ -20,6 +20,7 @@
  */
 import { createHash } from "node:crypto";
 import type { ImageAttachment } from "./types.js";
+import type { InboundTurnPrincipal } from "./runners/turn-security.js";
 import { encryptForProject, encryptImageBase64, isE2eEncrypted } from "./daemon-crypto.js";
 import { aadV2, E2EE_TABLE } from "@the-dudes/protocol/e2ee-fields";
 
@@ -35,6 +36,8 @@ export interface ItemRetido {
   images?: ImageAttachment[];
   enqueuedAt: number;
   source: FonteRetencao;
+  /** Proveniência autenticada local; no fio só enviamos `from` como sender. */
+  principal?: InboundTurnPrincipal;
 }
 
 /** Cap por agente. Acima disso o mais antigo sai (declarado no log). */
@@ -76,6 +79,7 @@ export interface ItemNoFio {
   enqueuedAt: number;
   source: FonteRetencao;
   ack: string;
+  sender?: NonNullable<InboundTurnPrincipal["from"]>;
 }
 
 interface Estado {
@@ -194,6 +198,7 @@ export function paraFio(agentId: string, projectId: string, itens: ItemRetido[])
       enqueuedAt: item.enqueuedAt,
       source: item.source,
       ack: createHash("sha256").update(`${agentId}\n${item.deliveryId ?? ""}\n${cipher}`, "utf8").digest("hex").slice(0, 12),
+      sender: item.principal?.from,
     });
   }
   return { enviar, semChave };

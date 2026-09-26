@@ -1074,11 +1074,11 @@ export class AgentRunner {
     return { content: t.content, images: t.images, deliveryId: t.deliveryId, principal: t.principal };
   }
 
-  pushUserMessage(content: string, images?: ImageAttachment[], latencyMessage?: { content: string; images?: ImageAttachment[]; deliveryId?: string }, deliveryId?: string, principal?: InboundTurnPrincipal) {
+  pushUserMessage(content: string, images?: ImageAttachment[], latencyMessage?: { content: string; images?: ImageAttachment[]; deliveryId?: string }, deliveryId?: string, principal?: InboundTurnPrincipal, preserveAsOwnDelivery = false): boolean {
     const nonOwnerBlockReason = isNonOwnerTurn(principal) ? this.nonOwnerTurnBlockReason() : null;
     if (nonOwnerBlockReason) {
       this.opts.onError(`[security] mensagem de membro bloqueada: ${nonOwnerBlockReason}; o turno não foi executado`);
-      return;
+      return false;
     }
     if (isLoopStopMessage(content)) {
       // T-899: loop-stop é mensagem do usuário — retém em vez de descartar.
@@ -1090,6 +1090,13 @@ export class AgentRunner {
     }
     if (isPerMessageRunner(this.opts.cliRunner)) {
       const queued = this.messageSession.queuedCount();
+      // Replay from the server/spool represents an individually retained
+      // delivery. Never ACK it by coalescing it into another turn when the
+      // runner's 20-message queue is full; live chat may still coalesce.
+      if (preserveAsOwnDelivery && queued >= AgentRunner.MAX_BUFFERED_MESSAGES) {
+        this.opts.log("warn", `[cli:${this.info.id}:${this.opts.cliRunner}] ocQueue cheia (${queued}) — entrega retida não coalescida; queue_deliver/spool permanece pendente`);
+        return false;
+      }
       const outcome = this.messageSession.enqueueOrCoalesce(
         { content, images, deliveryId, principal },
         AgentRunner.MAX_BUFFERED_MESSAGES,
@@ -1097,12 +1104,18 @@ export class AgentRunner {
       );
       const tag = `[cli:${this.info.id}:${this.opts.cliRunner}]`;
       if (outcome === "dropped") {
-        this.opts.log("warn", `${tag} ocQueue cheia (${queued}) — drop mensagem (agrupamento no teto de ${AgentRunner.MAX_COALESCED_BYTES} bytes)`);
-        if (!this.queueDropNoticeSent) {
-          this.queueDropNoticeSent = true;
-          this.opts.onError(`[fila] mensagem descartada: a fila deste agente está cheia (${queued}) e o agrupamento chegou ao teto de 64 KiB — reenvie quando a fila baixar (próximos descartes desta rajada só no log)`);
+        if (deliveryId) {
+          // `queue_deliver` só confirma se o runner aceitou: o server mantém
+          // este item retido e poderá reenviá-lo quando a fila baixar.
+          this.opts.log("warn", `${tag} ocQueue cheia (${queued}) — queue_deliver não aceito; item permanece retido no server`);
+        } else {
+          this.opts.log("warn", `${tag} ocQueue cheia (${queued}) — drop mensagem (agrupamento no teto de ${AgentRunner.MAX_COALESCED_BYTES} bytes)`);
+          if (!this.queueDropNoticeSent) {
+            this.queueDropNoticeSent = true;
+            this.opts.onError(`[fila] mensagem descartada: a fila deste agente está cheia (${queued}) e o agrupamento chegou ao teto de 64 KiB — reenvie quando a fila baixar (próximos descartes desta rajada só no log)`);
+          }
         }
-        return;
+        return false;
       }
       if (outcome === "coalesced") {
         this.opts.log("warn", `${tag} fila no teto (${queued}) — mensagem agrupada na última da fila`);
@@ -1121,26 +1134,29 @@ export class AgentRunner {
       // confirma, sem comparação redundante.)
       this.queueChanged();
       this.drainOcQueue();
-      return;
+      return true;
     }
     // Durante restart (clearContext/compact) ou se proc ainda não está
     // writable, buffera. Flush acontece no spawn callback do startClaude.
     if (this.opts.cliRunner === "dsh") {
       // T-690: fila própria do ACP (1 prompt por vez por sessão); o driver
       // buffera até o handshake concluir.
-      dshPushUserMessage(this as unknown as Record<string, unknown>, content, images, deliveryId, principal);
-      return;
+      return dshPushUserMessage(this as unknown as Record<string, unknown>, content, images, deliveryId, principal);
     }
     if (this.restarting || !this.proc || !this.proc.stdin.writable) {
       if (this.pendingMessages.length >= AgentRunner.MAX_BUFFERED_MESSAGES) {
-        this.opts.log("warn", `[cli:${this.info.id}:claude] pendingMessages cheia (${this.pendingMessages.length}) — drop mensagem durante restart`);
-        // T-818: descarte declarado a quem vê o chat (uma vez por rajada) —
-        // antes era só log.
-        if (!this.restartDropNoticeSent) {
-          this.restartDropNoticeSent = true;
-          this.opts.onError(`[fila] mensagem descartada: ${this.pendingMessages.length} mensagens já esperavam o restart do claude — reenvie quando ele voltar (próximos descartes só no log)`);
+        if (deliveryId) {
+          this.opts.log("warn", `[cli:${this.info.id}:claude] pendingMessages cheia (${this.pendingMessages.length}) — queue_deliver não aceito; item permanece retido no server`);
+        } else {
+          this.opts.log("warn", `[cli:${this.info.id}:claude] pendingMessages cheia (${this.pendingMessages.length}) — drop mensagem durante restart`);
+          // T-818: descarte declarado a quem vê o chat (uma vez por rajada) —
+          // antes era só log.
+          if (!this.restartDropNoticeSent) {
+            this.restartDropNoticeSent = true;
+            this.opts.onError(`[fila] mensagem descartada: ${this.pendingMessages.length} mensagens já esperavam o restart do claude — reenvie quando ele voltar (próximos descartes só no log)`);
+          }
         }
-        return;
+        return false;
       }
       if (this.pendingMessages.length < AgentRunner.MAX_BUFFERED_MESSAGES / 2) this.restartDropNoticeSent = false;
       const pending = { ...(latencyMessage ?? { content, images }), deliveryId, principal };
@@ -1148,7 +1164,7 @@ export class AgentRunner {
       this.pendingMessages.push(pending);
       this.opts.log("info", `[cli:${this.info.id}:claude] buffered message during restart (queued=${this.pendingMessages.length})`);
       this.queueChanged();
-      return;
+      return true;
     }
     const latencyInput = latencyMessage ?? { content, images, deliveryId };
     this.turnLatency.enqueue(latencyInput);
@@ -1159,9 +1175,10 @@ export class AgentRunner {
       this.claudeWriteQueue.push(item);
       this.opts.log("info", `[cli:${this.info.id}:claude] serializado (turno em voo; fila=${this.claudeWriteQueue.length})`);
       this.queueChanged();
-      return;
+      return true;
     }
     this.sendClaudeMessage(item);
+    return true;
   }
 
   /** T-758: escreve UMA mensagem no stdin do claude e arma a vigilância de
