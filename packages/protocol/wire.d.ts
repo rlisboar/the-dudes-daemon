@@ -524,6 +524,7 @@ export interface AgentQueueLiveState {
     images?: unknown[];
     enqueuedAt: number;
     origin: "user" | "agent" | "system";
+    priority?: "high";
     silent?: boolean;
   }>;
 }
