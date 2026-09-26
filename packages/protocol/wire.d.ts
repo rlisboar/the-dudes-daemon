@@ -584,6 +584,8 @@ export interface MessageEntry {
   kind: MessageKind;
   fromUserId?: string;
   imageCount?: number;
+  /** T-1326: high means the owner/admin requested scheduling before normal messages. */
+  priority?: "high";
 }
 
 /** Mensagem do chat somente entre membros; o server só transporta ciphertext. */
@@ -1705,7 +1707,7 @@ export type ClientCommand =
   | { type: "remove_agent"; id: string }
   | { type: "transfer_agent_owner"; id: string; newOwnerUserId: string }
   | { type: "assign_agent_repo"; id: string; repo: AgentRepo | null }
-  | { type: "user_to_agent"; id: string; content: string; images?: ImageAttachment[] }
+  | { type: "user_to_agent"; id: string; content: string; images?: ImageAttachment[]; priority?: "normal" | "high" }
   | { type: "set_agent_allow_member_messages"; id: string; value: boolean }
   | { type: "human_chat_send"; contentCipher: string }
   | { type: "human_chat_list"; limit?: number; beforeCreatedAt?: string; beforeId?: string }

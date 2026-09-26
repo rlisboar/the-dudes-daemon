@@ -186,6 +186,32 @@ test("T-1006 (acréscimo PM): agent:send aceita `origin`/`silent` opcionais e re
   assert.equal(schema.safeParse({ ...base, silent: "sim" }).success, false, "silent não-boolean");
 });
 
+test("T-1326: agent:send aceita só prioridade alta (normal fica ausente)", () => {
+  const schema = fromOrchSchemas["agent:send"];
+  const base = { type: "agent:send", agentId: "a1", content: "oi" };
+  assert.equal(schema.safeParse(base).success, true);
+  assert.equal(schema.safeParse({ ...base, priority: "high" }).success, true);
+  assert.equal(schema.safeParse({ ...base, priority: "normal" }).success, false);
+  assert.equal(schema.safeParse({ ...base, priority: "urgent" }).success, false);
+});
+
+test("T-1326: contratos das filas aceitam apenas prioridade alta opcional", () => {
+  const deliver = fromOrchSchemas["agent:queue_deliver"];
+  const deliverBase = { type: "agent:queue_deliver", agentId: "a1", items: [{ id: "q1", content: "oi" }] };
+  assert.equal(deliver.safeParse(deliverBase).success, true);
+  assert.equal(deliver.safeParse({ ...deliverBase, items: [{ ...deliverBase.items[0], priority: "high" }] }).success, true);
+  assert.equal(deliver.safeParse({ ...deliverBase, items: [{ ...deliverBase.items[0], priority: "normal" }] }).success, false);
+
+  const live = daemonWireSchemas["agent:queue_live"];
+  const liveBase = {
+    type: "agent:queue_live", agentId: "a1", projectId: "p1", at: 1,
+    items: [{ deliveryId: "d1", content: "oi", enqueuedAt: 1, origin: "user" }],
+  };
+  assert.equal(live.safeParse(liveBase).success, true);
+  assert.equal(live.safeParse({ ...liveBase, items: [{ ...liveBase.items[0], priority: "high" }] }).success, true);
+  assert.equal(live.safeParse({ ...liveBase, items: [{ ...liveBase.items[0], priority: "normal" }] }).success, false);
+});
+
 test("T-1295: agent:send aceita identidade autenticada do humano e owner-status tipado", () => {
   const schema = fromOrchSchemas["agent:send"];
   const base = { type: "agent:send", agentId: "a1", content: "e2e:v2:opaque", origin: "user" };

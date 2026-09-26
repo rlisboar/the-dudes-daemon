@@ -97,6 +97,7 @@ const queueLiveItem = z.object({
   images: z.array(z.unknown()).optional(),
   enqueuedAt: n,
   origin: z.enum(["user", "agent", "system"]),
+  priority: z.literal("high").optional(),
   silent: b.optional(),
 });
 const queueLiveItems = z.array(queueLiveItem).max(QUEUE_LIVE_MAX_ITEMS).superRefine((items, ctx) => {
@@ -520,6 +521,7 @@ export const fromOrchSchemas = {
       images: z.array(z.unknown()).optional(),
       ts: n.optional(),
       deliveryId: t.optional(),
+      priority: z.literal("high").optional(),
       payload: queueDeliveryPayload.optional(),
       from: queueSender.nullable().optional(),
       isAgentOwner: b.optional(),
@@ -590,6 +592,8 @@ export const fromOrchSchemas = {
     images: z.array(imageAtt).optional(),
     telegram: z.object({ botToken: t, chatId: t }).nullable().optional(),
     taskId: t.optional(),
+    /** T-1326: only server-authorized owner/admin priorities reach the daemon. */
+    priority: z.literal("high").optional(),
     /**
      * T-1006 (acréscimo PM): origem que o server conhece com certeza. O
      * daemon prefere este campo à dedução por systemPrefix/parts.

@@ -318,6 +318,8 @@ export declare function assembleAgentSendParts(
 export interface AgentSend {
   type: "agent:send";
   agentId: string;
+  /** High priority, derived by the server for an agent owner or project admin. */
+  priority?: "high";
   /**
    * T-037: id estável da entrega. Server reenvia o mesmo id no reconnect;
    * daemon deduplica pra não duplicar TASK_ASSIGN. Opcional (legado).
@@ -825,6 +827,8 @@ export interface AgentQueueDeliver {
     ts?: number;
     /** Mesmo deliveryId da coluna; opcional para linhas legadas. */
     deliveryId?: string;
+    /** Prioridade de despacho, quando preservada pelo consumidor da fila. */
+    priority?: "high";
     /** Campos de entrega remontados pelo server. Proveniência vem de `from`
      *  e `isAgentOwner` externos, recalculados com dono atual. */
     payload?: {
@@ -856,7 +860,7 @@ export interface AgentQueueForget {
 export interface AgentQueueDeliverEv {
   type: "agent:queue_deliver";
   agentId: string;
-  items: Array<{ id: string; content: string; images?: unknown[]; ts: number }>;
+  items: Array<{ id: string; content: string; images?: unknown[]; ts: number; priority?: "high" }>;
 }
 
 /** T-1149: o humano excluiu a fila — o daemon descarta cópia local. */
@@ -886,6 +890,7 @@ export interface AgentQueueLiveItem {
   images?: unknown[];
   enqueuedAt: number;
   origin: "user" | "agent" | "system";
+  priority?: "high";
   silent?: boolean;
 }
 

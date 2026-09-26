@@ -45,6 +45,14 @@ test("T-1295: toggle de mensagens de membros tem schema Zod estrito", () => {
   assert.equal(validateCommand({ type: "set_agent_allow_member_messages", id: "a1", value: false, text: "surpresa" }).ok, false);
 });
 
+test("T-1326: user_to_agent aceita prioridade normal/alta e recusa valores desconhecidos", () => {
+  assert.equal(validateCommand({ type: "user_to_agent", id: "a1", content: "oi" }).ok, true);
+  assert.equal(validateCommand({ type: "user_to_agent", id: "a1", content: "oi", priority: "normal" }).ok, true);
+  assert.equal(validateCommand({ type: "user_to_agent", id: "a1", content: "oi", priority: "high" }).ok, true);
+  assert.equal(validateCommand({ type: "user_to_agent", id: "a1", content: "oi", priority: "urgent" }).ok, false);
+  assert.equal(validateCommand({ type: "user_to_agent", id: "a1", content: "oi", extra: true }).ok, false);
+});
+
 test("T-1305: pause/resume exigem apenas o id do agente", () => {
   for (const type of ["pause_agent", "resume_agent"]) {
     assert.equal(validateCommand({ type, id: "a1" }).ok, true);

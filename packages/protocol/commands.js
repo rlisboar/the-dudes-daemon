@@ -280,7 +280,12 @@ export const commandSchemas = {
   assign_agent_repo: cmd({ id, repo: z.union([agentRepo, text, z.null()]) }),
   save_agent: cmd({ spec: agentSpec }),
   spawn: cmd({ spec: agentSpec }),
-  user_to_agent: cmd({ id, content: text, images: z.array(imageAtt).optional() }),
+  user_to_agent: strictCmd({
+    id,
+    content: text,
+    images: z.array(imageAtt).optional(),
+    priority: z.enum(["normal", "high"]).optional(),
+  }),
   set_agent_allow_member_messages: strictCmd({ id, value: flag }),
   human_chat_send: strictCmd({ contentCipher: text }),
   human_chat_list: strictCmd({
