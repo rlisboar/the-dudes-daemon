@@ -9,6 +9,21 @@ test("capability header defaults every feature on", () => {
   }
 });
 
+test("teammate routing does not narrate messages to the user", () => {
+  const header = buildSystemPromptHeader();
+  assert.ok(header.includes("Do NOT narrate to the user what you sent to a teammate"));
+  assert.ok(header.includes("the user already sees agent↔agent messages"));
+  assert.ok(header.includes("After `send_message`, end the turn with no text"));
+  assert.ok(!header.includes("It is fine to also include a short status line"));
+});
+
+test("conversation discipline only summarizes for escalation", () => {
+  const header = buildSystemPromptHeader();
+  assert.ok(header.includes("Summarize and tag the user only when escalating"));
+  assert.ok(header.includes("no progress, a conflict needs coordination, or the user's decision is required"));
+  assert.ok(!header.includes("Is the user aware this conversation is happening?"));
+});
+
 test("teammate hierarchy prompt requires direct links or the same non-empty team", () => {
   const header = buildSystemPromptHeader();
   assert.ok(header.includes("Your direct manager (the agent listed as your manager)"));

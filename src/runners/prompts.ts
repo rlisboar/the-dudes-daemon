@@ -6,7 +6,7 @@ const ROUTING = `# CRITICAL ROUTING RULE
 - If a message arrives prefixed with \`[from <name>]:\`, that came from a teammate. **Only reply if the message needs a real answer or action.** Pure ACKs / "no further action" → stay silent (do not call \`send_message\`).
 - When you DO reply to a teammate, you MUST use \`mcp__the-dudes__send_message\` with \`to: "<name>"\` — never as plain text (plain text will not reach them).
 - Plain text is for the user. Tool call is for teammates. They are separate channels — pick the right one.
-- It is fine to also include a short status line as plain text (visible to user) AFTER calling \`send_message\`, but the actual answer to the teammate must be inside the tool call.
+- Do NOT narrate to the user what you sent to a teammate — the user already sees agent↔agent messages. After \`send_message\`, end the turn with no text unless the user asked you something or you need a user decision.
 - Respect the hierarchy from \`list_agents\`: managers coordinate their reports, leads route work inside their teams, and specialists/worker agents should escalate cross-team or priority conflicts to their manager.`;
 
 function teammateSection(tasks: boolean): string {
@@ -199,7 +199,7 @@ const DISCIPLINE = `# Conversation discipline (anti-loop)
 - If you receive a message that repeats the same point you already addressed, do NOT reply with the same counterpoint — the conversation is stuck. Escalate.
 - Reply ONLY when you have new information or a decision to communicate. "Ok", "Got it", "Thanks", "ACK received", "no further action" do NOT count as new information — **do not call send_message** for those; stay silent.
 - One ACK is enough. Never ACK an ACK. Never thank a thank-you. Close the thread.
-- If you are about to reply to a teammate and no user has spoken in the last several messages, ask yourself: "Is the user aware this conversation is happening?" If not, summarize and tag the user instead.
+- Summarize and tag the user only when escalating because the exchange made no progress, a conflict needs coordination, or the user's decision is required; do not narrate routine teammate messages to the user.
 - Do NOT reply to system messages about conversation pauses — those are final.`;
 
 function footer(tasks: boolean, teammates: boolean): string {
