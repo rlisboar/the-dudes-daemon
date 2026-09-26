@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
+  INBOUND_EXTERNAL_AUTHOR,
   MAX_WIRE_MESSAGE_BYTES,
   WireMessageTooLargeError,
   base64WireCost,
@@ -71,6 +72,14 @@ test("entrada node e browser declaram o mesmo orçamento", () => {
   ]) {
     assert.equal(browser[k], node[k], `${k} divergiu entre index.js e index.browser.js`);
   }
+});
+
+test("sentinela de autor externo é o mesmo nas entradas node e browser", () => {
+  // O web resolve o entry browser e o server o node: os dois têm que receber
+  // o MESMO literal — o valor é gravado em fromUserId e conferido do outro
+  // lado do fio (T-1295).
+  assert.equal(INBOUND_EXTERNAL_AUTHOR, "inbound");
+  assert.equal(browser.INBOUND_EXTERNAL_AUTHOR, node.INBOUND_EXTERNAL_AUTHOR);
 });
 
 test("base64WireCost modela a expansão de 4/3", () => {

@@ -25,6 +25,16 @@ export const MAX_ATTACHMENTS_TOTAL_BYTES = 20 * 1024 * 1024;
 /** Folga reservada pro resto do envelope (texto, prefixo de sistema, IDs). */
 export const WIRE_ENVELOPE_HEADROOM_BYTES = 1024 * 1024;
 
+/* ---------- autoria externa explícita (T-1295) ----------
+ *
+ * Texto que entra por webhook/inbound não tem usuário do projeto. Gravá-lo
+ * (em vez de deixar `fromUserId` vazio) distingue a linha nova — autor externo
+ * conhecido — do legado pré-F1, onde a ausência de `fromUserId` significa
+ * autor DESCONHECIDO. A UI mostra "Externo" em vez do id cru, então o valor
+ * precisa ser o mesmo dos dois lados do fio: server e web importam daqui.
+ */
+export const INBOUND_EXTERNAL_AUTHOR = "inbound";
+
 /* ---------- catálogo de runners (T-187 — fonte única) ----------
  *
  * Allowlist de runners CLI antes vivia duplicada em ≥4 fontes (brain-policy,

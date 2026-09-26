@@ -7,6 +7,10 @@ export const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
 export const MAX_ATTACHMENTS_TOTAL_BYTES = 20 * 1024 * 1024;
 export const WIRE_ENVELOPE_HEADROOM_BYTES = 1024 * 1024;
 
+/* Mesmo valor de index.js (parity em index.test.js): sentinela de autor
+ * externo gravado em fromUserId pelo webhook/inbound. */
+export const INBOUND_EXTERNAL_AUTHOR = "inbound";
+
 export function base64WireCost(decodedBytes) {
   return Math.ceil(decodedBytes / 3) * 4;
 }

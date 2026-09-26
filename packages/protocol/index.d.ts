@@ -23,6 +23,9 @@ export declare const MAX_DAEMON_WIRE_MESSAGE_BYTES: number;
 export declare const MAX_ATTACHMENT_BYTES: number;
 export declare const MAX_ATTACHMENTS_TOTAL_BYTES: number;
 export declare const WIRE_ENVELOPE_HEADROOM_BYTES: number;
+/** Sentinela de autor externo (webhook/inbound) gravado em `fromUserId`.
+ *  A UI mostra "Externo"; não colide com ids de usuário. */
+export declare const INBOUND_EXTERNAL_AUTHOR: "inbound";
 export declare function base64WireCost(decodedBytes: number): number;
 export declare class WireMessageTooLargeError extends Error {
   readonly bytes: number;
