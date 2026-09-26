@@ -90,15 +90,22 @@ export async function runOpenCodeMessage(self: any, content: string, images?: Im
     // Sem isto o gate ficava vazio com turno opencode vivo e o self-update
     // (idle = gate vazio, T-088) matava o serve no meio.
     if (!(await self.gateTurn())) { self.messageSession.busy = false; return; }
+    // Captura o lease deste turno. Um cleanup tardio nunca deve soltar o slot
+    // de um turno mais novo instalado no mesmo AgentRunner (clear/restart).
+    const releaseSlot = self.activeTurnRelease as (() => void) | null;
     self.setState("thinking");
     timing?.bootStart();
     self.ensureOcServer().then(
       () => { timing?.bootReady(); return void self.runOpenCodeMessageAttached(content, images, retry)
         .catch((e: any) => { timing?.finish("error"); self.opts.log("warn", `[cli:${self.info.id}:opencode] attached threw: ${(e as Error).message}`); })
-        .finally(() => { timing?.finish("completed"); self.releaseActiveTurnSlot(); }); },
+        .finally(() => {
+          timing?.finish("completed");
+          self.releaseActiveTurnSlot(releaseSlot ?? undefined);
+          self.drainOcQueue();
+        }); },
       (err: any) => {
         timing?.finish("spawn-error");
-        self.releaseActiveTurnSlot();
+        self.releaseActiveTurnSlot(releaseSlot ?? undefined);
         ocReportError(self, `opencode serve falhou: ${err?.message ?? err}`);
         self.messageSession.busy = false;
         self.setState("idle");

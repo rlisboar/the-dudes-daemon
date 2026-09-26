@@ -941,7 +941,10 @@ export class AgentRunner {
     // paralelo com o one-shot/summarize na MESMA sessão (prime engoliria a
     // resposta dele; thread.started ressuscitaria a sessão pós-reset).
     // Re-drenada no finally do compactContext.
-    if (this.messageSession.busy || this.compacting || this.messageSession.queuedCount() === 0 || this.stopped) return;
+    // One runner owns at most one main-pool slot. In particular, OpenCode's
+    // attached POST may request a drain just before its wrapper releases the
+    // slot; the wrapper drains again after releasing it.
+    if (this.messageSession.busy || this.activeTurnRelease || this.compacting || this.messageSession.queuedCount() === 0 || this.stopped) return;
     this.messageSession.busy = true;
     this.touchActivity();
     const next = this.messageSession.dequeue();
@@ -1299,6 +1302,9 @@ export class AgentRunner {
     this.claudeUnacceptedSince = null;
     this.claudeUnacceptedWarned = false;
     this.stopped = true;
+    // The persistent OpenCode serve has no per-turn child in ocActiveProc.
+    // Releasing here makes stop immediate even when /message is still pending.
+    this.releaseActiveTurnSlot();
     this.stopHangWatch();
     if (this.hangNudgeTimer) {
       clearTimeout(this.hangNudgeTimer);
@@ -1517,6 +1523,7 @@ export class AgentRunner {
   private emitExit(code: number | null) {
     if (this.exited) return;
     this.turnLatency.finishAll("process-exit");
+    this.releaseActiveTurnSlot();
     for (const timing of this.claudeTimings) timing.finish("process-exit");
     this.claudeTimings = [];
     this.claudeInflight = null;
@@ -1563,10 +1570,17 @@ export class AgentRunner {
   }
 
   /** Idempotente — close e hard recover podem chamar os dois. */
-  private releaseActiveTurnSlot(): void {
-    const r = this.activeTurnRelease;
+  private releaseActiveTurnSlot(expected?: () => void): void {
+    const current = this.activeTurnRelease;
+    if (expected && current !== expected) {
+      // Um cleanup tardio pode pertencer ao turno antigo, depois de clear/
+      // restart ter instalado outro handle. Libera o handle capturado sem
+      // tocar no slot atual.
+      try { expected(); } catch { /* release do gate é best-effort */ }
+      return;
+    }
     this.activeTurnRelease = null;
-    try { r?.(); } catch { /* release do gate é best-effort */ }
+    try { (expected ?? current)?.(); } catch { /* release do gate é best-effort */ }
   }
 
   /** T-593: registra o pid do turno recém-spawnado (chamar logo após o spawn). */

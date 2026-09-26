@@ -406,7 +406,10 @@ export async function checkAndApplyUpdate(deps: SelfUpdateDeps): Promise<string>
     deps.log("info", `[self-update] binários trocados (release ${published.slice(0, 12)}) — assinatura e sha256 verificados`);
     appliedReleaseHash = published;
     updatePending = true;
-    updatePendingSince = (deps.nowFn ?? Date.now)();
+    // A newer release can arrive while the previous one is already waiting
+    // for idle (including during a drain). Keep the original pending clock so
+    // a repeated check or re-download cannot extend the hard drain ceiling.
+    updatePendingSince ??= (deps.nowFn ?? Date.now)();
 
     return planRestartWhenIdle(deps);
   } catch (e) {

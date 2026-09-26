@@ -162,7 +162,7 @@ async function observar(ms: number): Promise<string[]> {
   return transicoes;
 }
 
-test("T-417 flake: reset do gate ANTES do close do filho morto deixa dívida de -1", async () => {
+test("T-1334/T-417: stop libera o slot antes do close e evita dívida após reset", async () => {
   const h = makeHarness();
   _resetTurnGateForTest();
   try {
@@ -170,20 +170,17 @@ test("T-417 flake: reset do gate ANTES do close do filho morto deixa dívida de 
     const proc = await turnoEmVoo(h);
     assert.equal(gateAtivos(), 1, "pré-condição: turno em voo segura o slot");
 
-    // Cleanup na forma ANTIGA: mata, para o runner e zera o gate JÁ (sem esperar
-    // o close aterrar) — é o que a espera fixa de 250ms tentava garantir.
+    // Para o agente antes do close aterrar. O stop deve liberar o slot sem
+    // depender do evento do filho, e o close tardio não pode decrementar um
+    // contador global já resetado para os próximos testes.
     killProcess(proc, "SIGKILL");
     h.runner.stop();
+    assert.equal(gateAtivos(), 0, "stop libera o slot sem esperar pelo close");
     _resetTurnGateForTest();
 
-    const transicoes = await observar(2_000);
-    const depoisDoReset = transicoes.filter((t) => !t.startsWith("t+0ms"));
-    assert.ok(
-      transicoes.some((t) => t.endsWith("→ -1")),
-      `o close do filho morto tem de decrementar DEPOIS do reset (transições: ${transicoes.join(" | ") || "nenhuma"})`,
-    );
-    assert.equal(gateAtivos(), -1, "contador devendo 1: o próximo teste subiria para 0 e veria 0 no lugar de 1");
-    assert.ok(depoisDoReset.length > 0, "a transição tem de ser DEPOIS do reset, não antes");
+    const transicoes = await observar(500);
+    assert.deepEqual(transicoes, [], `close tardio não pode mexer no gate resetado (visto: ${transicoes.join(" | ") || "nenhuma"})`);
+    assert.equal(gateAtivos(), 0, "nenhuma dívida do runner parado pode atingir o próximo teste");
   } finally {
     await limpar(h);
   }

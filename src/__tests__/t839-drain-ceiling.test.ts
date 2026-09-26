@@ -56,6 +56,7 @@ function signedInstall(daemonBody: string, bridgeBody: string) {
   const b = signBundle(bridgeBody, pair.privateKey);
   return {
     pubs,
+    releaseHash: d.sha,
     fetchFn: fetchMap({
       "/install/daemon.cjs.sha256": Buffer.from(`${d.sha}  daemon.cjs\n`),
       "/install/daemon.cjs": d.bundle,
@@ -170,6 +171,93 @@ test("T-839: turno infinito segura só a si; no teto o re-exec sai e a mensagem 
   novo.entries.set(OCUPADO, { projectId: PID, runner: fakeRunner({ ativo: false }), info: { id: OCUPADO } });
   novo.host.flushInboundBuffer(OCIOSO);
   assert.deepEqual(entregue.pushed, ["oi-ocioso"], "no processo novo o ocioso recebe a mensagem");
+});
+
+test("T-1334 regression: uma segunda checagem da mesma release durante o dreno mantém o teto", async () => {
+  _resetIdleRestartForTest();
+  const clock = { t: 0 };
+  const ticks: Array<() => void> = [];
+  const logs: string[] = [];
+  let exit: number | null = null;
+  let startDrainCalls = 0;
+  const inst = signedInstall(`#!/usr/bin/env node\nconst DAEMON_BUILD_TS = Number("2000000000000");\n`, "bridge");
+  const selfPath = path.join(mkdtempSync(path.join(os.tmpdir(), "t1334-recheck-same-")), "daemon.cjs");
+  let requests = 0;
+  const fetchFn = (async (input: URL | RequestInfo, init?: RequestInit) => {
+    requests++;
+    return inst.fetchFn(input, init);
+  }) as typeof fetch;
+  const check = () => checkAndApplyUpdate({
+    orchBase: "http://x", selfPath,
+    runningHash: "b".repeat(64), runningBuildTs: 1_000_000_000_000,
+    log: (_level, message) => logs.push(message), underLauncher: true,
+    fetchFn, trustedPubs: inst.pubs, isIdle: () => false,
+    startDrain: () => { startDrainCalls++; }, drainAfterMs: DRAIN_AFTER_MS, drainForceMs: DRAIN_FORCE_MS,
+    idleRecheckMs: 15_000, nowFn: () => clock.t,
+    setTimeoutFn: (fn) => { ticks.push(fn); return 0; }, exitFn: (code) => { exit = code; },
+  });
+  assert.equal(await check(), "updated-awaiting-idle");
+  const firstRequestCount = requests;
+  const ceiling = DRAIN_AFTER_MS + DRAIN_FORCE_MS;
+  let rechecked = false;
+  for (let i = 0; i < ticks.length && exit == null && clock.t <= ceiling; i++) {
+    clock.t += 15_000;
+    ticks[i]!();
+    await new Promise((resolve) => setImmediate(resolve));
+    if (!rechecked && clock.t >= DRAIN_AFTER_MS + 30_000) {
+      assert.equal(await check(), "updated-awaiting-idle");
+      rechecked = true;
+      assert.equal(requests, firstRequestCount + 1, "a checagem consulta o SHA, mas não baixa os bundles de novo");
+    }
+  }
+  assert.equal(rechecked, true);
+  assert.equal(startDrainCalls, 1);
+  assert.equal(exit, 42);
+  assert.equal(clock.t, ceiling, "o dreno termina no teto original");
+});
+
+test("T-1334 regression: uma release nova durante o dreno é baixada sem renovar o relógio do teto", async () => {
+  _resetIdleRestartForTest();
+  const clock = { t: 0 };
+  const ticks: Array<() => void> = [];
+  const logs: string[] = [];
+  let exit: number | null = null;
+  let startDrainCalls = 0;
+  const instA = signedInstall(`#!/usr/bin/env node\nconst DAEMON_BUILD_TS = Number("2000000000000");\n`, "bridge-a");
+  const instB = signedInstall(`#!/usr/bin/env node\nconst DAEMON_BUILD_TS = Number("2000000000001");\n`, "bridge-b");
+  const requestsA = { count: 0 };
+  const requestsB = { count: 0 };
+  const selfPath = path.join(mkdtempSync(path.join(os.tmpdir(), "t1334-recheck-new-")), "daemon.cjs");
+  const countFetch = (inst: ReturnType<typeof signedInstall>, count: { count: number }): typeof fetch =>
+    (async (input: URL | RequestInfo, init?: RequestInit) => { count.count++; return inst.fetchFn(input, init); }) as typeof fetch;
+  const runCheck = (inst: ReturnType<typeof signedInstall>, count: { count: number }) => checkAndApplyUpdate({
+    orchBase: "http://x", selfPath,
+    runningHash: "b".repeat(64), runningBuildTs: 1_000_000_000_000,
+    log: (_level, message) => logs.push(message), underLauncher: true,
+    fetchFn: countFetch(inst, count), trustedPubs: inst.pubs, isIdle: () => false,
+    startDrain: () => { startDrainCalls++; }, drainAfterMs: DRAIN_AFTER_MS, drainForceMs: DRAIN_FORCE_MS,
+    idleRecheckMs: 15_000, nowFn: () => clock.t,
+    setTimeoutFn: (fn) => { ticks.push(fn); return 0; }, exitFn: (code) => { exit = code; },
+  });
+  assert.notEqual(instA.releaseHash, instB.releaseHash);
+  assert.equal(await runCheck(instA, requestsA), "updated-awaiting-idle");
+  const ceiling = DRAIN_AFTER_MS + DRAIN_FORCE_MS;
+  let rechecked = false;
+  for (let i = 0; i < ticks.length && exit == null && clock.t <= ceiling; i++) {
+    clock.t += 15_000;
+    ticks[i]!();
+    await new Promise((resolve) => setImmediate(resolve));
+    if (!rechecked && clock.t >= DRAIN_AFTER_MS + DRAIN_FORCE_MS / 2) {
+      assert.equal(await runCheck(instB, requestsB), "updated-awaiting-idle");
+      rechecked = true;
+    }
+  }
+  assert.equal(rechecked, true);
+  assert.equal(startDrainCalls, 1, "a release recheck não inicia um segundo dreno");
+  assert.ok(requestsB.count > 0, "a publicação nova foi realmente baixada e verificada");
+  assert.equal(exit, 42);
+  assert.equal(clock.t, ceiling, "release diferente não estende o teto original");
+  assert.ok(logs.filter((line) => line.includes("— baixando")).length >= 2, logs.join("\n"));
 });
 
 test("T-839: turnElapsedMs do claude é a idade do turno aberto, e o dashboard chama de turno longo", () => {

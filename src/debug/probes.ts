@@ -19,7 +19,8 @@
 import childProcess from "node:child_process";
 import fs from "node:fs";
 import { createRequire, syncBuiltinESMExports } from "node:module";
-import { monitorEventLoopDelay, performance, PerformanceObserver, type IntervalHistogram } from "node:perf_hooks";
+import { monitorEventLoopDelay, performance, PerformanceObserver } from "node:perf_hooks";
+type LoopHistogram = ReturnType<typeof monitorEventLoopDelay>;
 import { recordGc, recordStall, recordSyncOp } from "./store.js";
 
 /** fs *Sync abaixo disto só entra no agregado (não no ring). */
@@ -174,8 +175,8 @@ export interface LoopStats {
   eluPct: number;
 }
 
-let hWindow: IntervalHistogram | null = null;
-let hTotal: IntervalHistogram | null = null;
+let hWindow: LoopHistogram | null = null;
+let hTotal: LoopHistogram | null = null;
 let lastElu: ReturnType<typeof performance.eventLoopUtilization> | null = null;
 let stallTimer: NodeJS.Timeout | null = null;
 let gcObserver: PerformanceObserver | null = null;
@@ -232,7 +233,7 @@ export function readLoopStats(): LoopStats {
   const t = hTotal;
   const elu = performance.eventLoopUtilization(lastElu ?? undefined);
   lastElu = performance.eventLoopUtilization();
-  const safe = (h: IntervalHistogram | null, f: (h: IntervalHistogram) => number) => {
+  const safe = (h: LoopHistogram | null, f: (h: LoopHistogram) => number) => {
     try { return h && h.count > 0 ? ns(f(h)) : 0; } catch { return 0; }
   };
   const out: LoopStats = {
