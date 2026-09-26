@@ -8,6 +8,7 @@ import {armHardTimeout} from "../process-lifecycle.js";
 import {buildGeminiEnv} from "../env.js";
 import {parseGeminiTurnEvent} from "../turn-parsers.js";
 import {spawnDropped} from "../../privileges.js";
+import {markNonOwnerMessage} from "../turn-security.js";
 
 
 export function ingestGeminiLine(self: any, 
@@ -60,7 +61,7 @@ export async function runGeminiMessage(self: any, content: string, images?: Imag
     self.setState("thinking");
     const tmpDir = self.runtimeFiles.tempDir();
     self.writeGeminiConfig();
-    let message = content;
+    let message = markNonOwnerMessage(content, self.currentTurn?.principal);
     const firstTurnSnapshot = self.messageSession.consumeFirstTurnIfNeeded();
     const firstTurn = firstTurnSnapshot.firstTurn;
     // Preservados pra restaurar se o turno morrer sem completar: com o
@@ -71,7 +72,7 @@ export async function runGeminiMessage(self: any, content: string, images?: Imag
     const epoch = self.messageSession.epoch;
     const turnKey = beginTurn(self);
     if (firstTurn) {
-      message = self.initialMessage(content, pendingSummary);
+      message = self.initialMessage(message, pendingSummary);
     }
     // Anexos: gemini lê arquivos referenciados por @<path> no prompt.
     let imgCleanup = () => {};

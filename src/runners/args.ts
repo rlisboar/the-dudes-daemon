@@ -1,5 +1,6 @@
 import type { EffortLevel } from "../types.js";
 import { grokThinkingEffort } from "./model-policy.js";
+import { CODEX_MEMBER_PERMISSION_PROFILE, CODEX_MEMBER_PERMISSION_PROFILE_OVERRIDE } from "./codex-member-policy.js";
 
 export interface OneShotArgs {
   prompt: string;
@@ -42,6 +43,24 @@ export const codexOneShotArgs = ({ prompt, model, sessionId }: OneShotArgs): str
   return sessionId ? ["exec", "resume", ...flags, sessionId, prompt] : ["exec", ...flags, prompt];
 };
 
+/** Per-turn Codex control: member turns get a filesystem/network read-only sandbox. */
+export function codexTurnPermissionArgs(nonOwnerTurn: boolean): string[] {
+  return nonOwnerTurn
+    // `codex exec resume --help` exposes -c/--config but not exec's --sandbox
+    // or --ask-for-approval flags. The custom profile denies reads outside the
+    // workspace, unlike the broad built-in read-only profile.
+    ? [
+      // T-1300: o perfil viaja só neste argv (no config.toml quebra o dono).
+      "-c", CODEX_MEMBER_PERMISSION_PROFILE_OVERRIDE,
+      "-c", `default_permissions="${CODEX_MEMBER_PERMISSION_PROFILE}"`,
+      "-c", 'approval_policy="never"',
+      "-c", 'web_search="disabled"',
+      "-c", "features.apps=false",
+      "-c", "features.multi_agent=false",
+    ]
+    : ["--dangerously-bypass-approvals-and-sandbox"];
+}
+
 export function crushOneShotArgs(input: OneShotArgs & { dataDir: string }): string[] {
   const args = ["run", "--quiet", "--data-dir", input.dataDir];
   if (input.model) args.push("-m", input.model);
@@ -65,6 +84,8 @@ export interface GrokHeadlessArgs extends OneShotArgs {
   effort?: EffortLevel;
   collectThinking?: boolean;
   planMode?: boolean;
+  /** Turn-scoped policy. Used for member turns even in persistent sessions. */
+  nonOwnerTurn?: boolean;
   forCompact?: boolean;
   /** Socket do leader POR AGENTE (ver RunnerRuntimeFiles.grokLeaderSocket).
    *  Sem isto todos os agentes dividem `~/.grok/leader.sock` — inclusive com
@@ -92,7 +113,11 @@ export function grokHeadlessArgs(input: GrokHeadlessArgs): string[] {
   const effort = grokThinkingEffort(input.effort, !!input.collectThinking, !!input.forCompact, input.model, input.runner);
   if (effort) args.push("--effort", effort);
   if (input.sessionId) args.push("--resume", input.sessionId);
-  if (input.planMode && !input.forCompact) {
+  if (input.nonOwnerTurn) {
+    // The Grok headless path accepts the same tool allowlist per invocation.
+    // Do not expose web or write tools to a member turn.
+    args.push("--permission-mode", "plan", "--tools", "read_file,grep,list_dir");
+  } else if (input.planMode && !input.forCompact) {
     args.push("--permission-mode", "plan", "--tools", "read_file,grep,list_dir,web_search,web_fetch");
   } else {
     args.push("--always-approve");

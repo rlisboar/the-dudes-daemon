@@ -10,18 +10,35 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { buildOpenCodeMcpConfig, OPENCODE_INTERACTIVE_TOOLS, OPENCODE_TURN_TOOLS } from "../runners/mcp-config.js";
-import { runOpenCodeMessageAttached } from "../runners/turns/opencode.js";
+import { ocHandlePermissionAsked, runOpenCodeMessageAttached } from "../runners/turns/opencode.js";
 
 const bridge = { command: "node", args: ["bridge.cjs"], env: {} };
 
-test("T-826: config do opencode nega a `question` com e sem auto-approve", () => {
+test("T-826/T-1300: config nega `question` e não deixa auto-approve pular o callback", () => {
   assert.deepEqual([...OPENCODE_INTERACTIVE_TOOLS], ["question"]);
   const auto = buildOpenCodeMcpConfig({}, bridge, true);
-  // "allow" é normalizado pelo serve para {"*":"allow"}: a negação só soma.
-  assert.deepEqual(auto.config.permission, { "*": "allow", question: "deny" });
+  assert.deepEqual(auto.config.permission, { "*": "ask", read: "allow", grep: "allow", glob: "allow", list: "allow", external_directory: "ask", question: "deny" });
+  assert.equal((auto.config.permission as Record<string, unknown>)["*"], "ask");
   const manual = buildOpenCodeMcpConfig({}, bridge, false);
+  assert.deepEqual(manual.config.permission, auto.config.permission);
   assert.equal((manual.config.permission as Record<string, string>).question, "deny");
-  assert.equal((manual.config.permission as Record<string, string>).bash, "ask", "asks de sempre intactos");
+  assert.equal((manual.config.permission as Record<string, string>)["*"], "ask", "todas as operações não explicitamente seguras pedem autorização");
+});
+
+test("T-1300: OpenCode member permission is rejected locally even with project auto-approve", async () => {
+  const responses: unknown[] = [];
+  let bridgeCalls = 0;
+  const self: any = {
+    currentTurn: { principal: { isAgentOwner: false } },
+    info: { id: "agent_t1300", name: "agent" },
+    opts: { log: () => {} },
+    touchActivity: () => {},
+    bridgePost: async () => { bridgeCalls++; return { allow: true }; },
+    ocServeFetch: async (_path: string, _method: string, body: unknown) => { responses.push(body); return {}; },
+  };
+  await ocHandlePermissionAsked(self, { id: "permission-1", sessionID: "session-1", permission: "bash", metadata: { command: "write" } });
+  assert.equal(bridgeCalls, 0, "membro não consulta o auto-approve do projeto");
+  assert.deepEqual(responses, [{ response: "reject" }]);
 });
 
 test("T-826: POST do turno desliga a `question` (vale até num serve com config antiga)", async () => {

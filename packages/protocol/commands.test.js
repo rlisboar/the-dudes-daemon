@@ -39,6 +39,22 @@ test("aceita payload correto", () => {
   assert.equal(validateCommand({ type: "admin:set_disabled", userId: "u1", value: true }).ok, true);
 });
 
+test("T-1295: toggle de mensagens de membros tem schema Zod estrito", () => {
+  assert.equal(validateCommand({ type: "set_agent_allow_member_messages", id: "a1", value: false }).ok, true);
+  assert.equal(validateCommand({ type: "set_agent_allow_member_messages", id: "a1", value: "false" }).ok, false);
+  assert.equal(validateCommand({ type: "set_agent_allow_member_messages", id: "a1", value: false, text: "surpresa" }).ok, false);
+});
+
+test("T-1295: comandos do chat humano exigem ciphertext e shape estrito", () => {
+  assert.equal(validateCommand({ type: "human_chat_send", contentCipher: "e2e:v2:blob" }).ok, true);
+  assert.equal(validateCommand({ type: "human_chat_send", content: "plain text" }).ok, false);
+  assert.equal(validateCommand({ type: "human_chat_send", contentCipher: "e2e:v2:blob", userId: "spoof" }).ok, false);
+  assert.equal(validateCommand({ type: "human_chat_list", beforeId: "m1" }).ok, false);
+  assert.equal(validateCommand({ type: "human_chat_list", beforeCreatedAt: "2026-01-01T00:00:00Z", beforeId: "m1" }).ok, true);
+  assert.equal(validateCommand({ type: "human_chat_delete", id: "m1" }).ok, true);
+  assert.equal(validateCommand({ type: "human_chat_mark_read" }).ok, true);
+});
+
 test("rejeita exatamente o que passava batido antes", () => {
   // Este é o payload do exemplo: tipos errados chegavam inteiros no handler.
   const r = validateCommand({ type: "add_member", email: {}, role: [] });

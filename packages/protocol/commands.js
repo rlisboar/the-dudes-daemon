@@ -84,6 +84,9 @@ const planTaskIn = z.object({
 
 /** Objeto do comando — `type` já veio do envelope. */
 const cmd = (shape) => z.object({ type: z.string(), ...shape });
+// New human-chat/control commands have a fixed wire shape; reject typos and
+// accidental plaintext fields instead of silently accepting unknown keys.
+const strictCmd = (shape) => z.object({ type: z.string(), ...shape }).strict();
 
 export const commandSchemas = {
   /* ---------- membros ---------- */
@@ -276,6 +279,16 @@ export const commandSchemas = {
   save_agent: cmd({ spec: agentSpec }),
   spawn: cmd({ spec: agentSpec }),
   user_to_agent: cmd({ id, content: text, images: z.array(imageAtt).optional() }),
+  set_agent_allow_member_messages: strictCmd({ id, value: flag }),
+  human_chat_send: strictCmd({ contentCipher: text }),
+  human_chat_list: strictCmd({
+    limit: z.number().int().min(1).max(100).optional(),
+    beforeCreatedAt: text.optional(),
+    beforeId: id.optional(),
+  }).refine((value) => (value.beforeCreatedAt === undefined) === (value.beforeId === undefined), "cursor requires both createdAt and id"),
+  human_chat_edit: strictCmd({ id, contentCipher: text }),
+  human_chat_delete: strictCmd({ id }),
+  human_chat_mark_read: strictCmd({}),
   broadcast: cmd({ content: text, images: z.array(imageAtt).optional() }),
   clear_messages: cmd({}),
 

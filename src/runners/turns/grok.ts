@@ -17,6 +17,7 @@ import { GrokAcpClient, grokAcpHabilitado } from "./grok-acp.js";
 import { toAcpMcpServers, type DshMcpServer } from "./dsh.js";
 import {recordTurnEnd, recordTurnStart} from "../../health-monitor.js";
 import {spawnDropped} from "../../privileges.js";
+import {acpPermissionDecisionForTurn, markNonOwnerMessage} from "../turn-security.js";
 
 import path from "node:path";
 /**
@@ -50,6 +51,7 @@ export function buildGrokHeadlessArgs(self: any,
       forCompact: opts.forCompact,
       leaderSocket: self.runtimeFiles.grokLeaderSocket(),
       runner: self.opts.cliRunner,
+      nonOwnerTurn: self.currentTurn?.principal?.isAgentOwner === false,
     });
   }
   /** Project MCP config `.grok/config.toml` (docs: project-scoped MCP).
@@ -156,14 +158,14 @@ export async function runGrokMessage(self: any, content: string, images?: ImageA
     recordTurnStart(self.opts.cliRunner);
     const grokTurnT0 = Date.now();
     self.writeGrokConfig();
-    let message = content;
+    let message = markNonOwnerMessage(content, self.currentTurn?.principal);
     const firstTurn = self.messageSession.firstTurn;
     const pendingSummary = self.messageSession.pendingSummary;
     const epoch = self.messageSession.epoch;
     // Resume: NÃO re-injeta system+skills (já na sessão). Só first-turn cold.
     if (firstTurn && !self.messageSession.sessionId) {
       self.messageSession.consumeFirstTurn();
-      message = self.initialMessage(content, pendingSummary);
+      message = self.initialMessage(message, pendingSummary);
     } else if (firstTurn) {
       // Tinha resumeSessionId mas firstTurn ainda true (legado) — só avança flag.
       self.messageSession.firstTurn = false;
@@ -877,6 +879,7 @@ export async function runGrokTurnAcp(self: any, t: {
           if (self.messageSession.owns(epoch) || self.stopped) self.ocActiveProc = null;
           self.opts.log("info", `[grok-acp:${self.info.name}] processo saiu code=${code ?? "?"}`);
         },
+        onPermissionRequest: () => acpPermissionDecisionForTurn(self.currentTurn?.principal),
       });
       self.grokAcp = client;
       self.writeGrokConfig();

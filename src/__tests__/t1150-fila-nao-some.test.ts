@@ -86,9 +86,15 @@ test("T-1150: retenção preserva ORDEM e source, e em E2EE vai cifra (nunca cla
 });
 
 test("T-1150 §3: queue_deliver decifra, entrega na ORDEM e confirma só o aceito", () => {
-  const recebidas: Array<{ texto: string; id?: string }> = [];
+  const recebidas: Array<{ texto: string; id?: string; isAgentOwner?: boolean }> = [];
   const fake = {
-    entries: new Map([[AG, { projectId: PID, runner: { pushUserMessage: (t: string, _i?: unknown, _l?: unknown, id?: string) => { if (id === "d2") throw new Error("recusado"); recebidas.push({ texto: t, id }); } } }]]),
+    entries: new Map([[AG, { projectId: PID, runner: {
+      canAcceptNonOwnerTurn: () => true,
+      pushUserMessage: (t: string, _i?: unknown, _l?: unknown, id?: string, principal?: { isAgentOwner?: boolean }) => {
+        if (id === "d2") throw new Error("recusado");
+        recebidas.push({ texto: t, id, isAgentOwner: principal?.isAgentOwner });
+      },
+    } }]]),
     log: () => {},
   };
   const itens = [
@@ -100,6 +106,7 @@ test("T-1150 §3: queue_deliver decifra, entrega na ORDEM e confirma só o aceit
   assert.deepEqual(aceitos, ["d1", "d3"], "só o que foi ACEITO é confirmado (d2 volta pro server)");
   assert.deepEqual(recebidas.map((r) => r.texto), ["primeiro", "terceiro"], "texto decifrado, na ordem, sem o recusado");
   assert.deepEqual(recebidas.map((r) => r.id), ["d1", "d3"], "deliveryId propagado (idempotência)");
+  assert.deepEqual(recebidas.map((r) => r.isAgentOwner), [false, false], "itens legados sem proveniência são rebaixados como não dono");
 });
 
 test("T-1150 §4: queue_forget larga a cópia local; agente sem runner não aceita nada", () => {

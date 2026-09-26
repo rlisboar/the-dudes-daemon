@@ -25,6 +25,7 @@ import {
   scheduleGrokSessionCleanup,
 } from "./grok-session-cleanup.js";
 import { WIRE_PROTOCOL_VERSION } from "@the-dudes/protocol/wire-version";
+import { withDaemonCapabilities } from "./daemon-capabilities.js";
 import { initSentry, capture, captureWarn, breadcrumb, setTag, flush as flushSentry } from "./sentry.js";
 initSentry(); // gated em SENTRY_DSN_DAEMON / SENTRY_DSN; no-op sem env
 
@@ -50,6 +51,7 @@ import { defaultDaemonConfigPath, formatCliStatus, loadDaemonCliConfig, mergeCli
 import { applyRunnerPolicy, buildInstalledRunnerAvailability, helloRunnerLists, POLICY_GATED_RUNNERS, type InstalledRunnerAvailability } from "./runner-policy.js";
 import { buildRunnerStatusMap, probeRunnerVersion } from "./runner-status.js";
 import { assembleAgentSendParts, contentAadChain, openWithAnyHeldProject, type FromDaemon, type FromOrch, type TaskUpdatedEv } from "./protocol.js";
+import { principalFromAgentSend } from "./runners/turn-security.js";
 import { RUNNERS, type CliRunner } from "@the-dudes/protocol";
 import { runSummarizer } from "./summarizer-runner.js";
 import { aadV2, E2EE_TABLE } from "@the-dudes/protocol/e2ee-fields";
@@ -446,6 +448,7 @@ export class DaemonClient {
       // responde por send_message pra ele). Closures lazy — `host` nasce abaixo.
       agentNameLookup: (agentId) => this.host.getAgentName(agentId),
       onAgentMessageAction: (agentId) => this.host.noteAgentMessageAction(agentId),
+      agentOwnerTurnLookup: (agentId) => this.host?.getAgentOwnerTurn(agentId),
     });
     try {
       await this.relay.start();
@@ -692,7 +695,7 @@ export class DaemonClient {
         log("warn", `crypto keypair unavailable: ${(e as Error).message}`);
         capture(e, { phase: "getDaemonPublicKey" });
       }
-      this.send({
+      this.send(withDaemonCapabilities({
         type: "daemon:hello",
         name: this.args.name,
         os: process.platform,
@@ -717,7 +720,7 @@ export class DaemonClient {
           cli: !!this.cliCommands.graphify?.available,
           mcp: !!this.cliCommands.graphifyMcp?.available,
         },
-      } as FromDaemon);
+      } as FromDaemon));
       this.refreshRunnerStatus();
       this.sendHealth();
       // T-1005: a desconexão limpa a fila ao vivo no server — reemite o
@@ -1256,7 +1259,7 @@ export class DaemonClient {
         // e2e original; nunca o texto decifrado) — registro guardado junto.
         // `origin`/`silent` do server (T-1006, acréscimo PM) vencem a dedução.
         const wire = registroDoFrame(msg as Parameters<typeof registroDoFrame>[0], content, images ?? undefined);
-        this.host.send_message(msg.agentId, content, images, msg.deliveryId, wire);
+        this.host.send_message(msg.agentId, content, images, msg.deliveryId, wire, principalFromAgentSend(msg));
         // T-252: visto só agora — decrypt ok + processamento aceito
         // (entregue ao runner ou enfileirado pelo host). Falhas de decrypt
         // acima retornam sem marcar, deixando o retry do server ser processado.

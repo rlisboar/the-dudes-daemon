@@ -7,6 +7,7 @@ import {assertWorkspaceScoped, autoWorkspaceCwd, cloneRepoIfMissing, expandBaseP
 import {aadV2, E2EE_TABLE, MIGRATE_SEED_DROPPED_REASON, MIGRATE_SEED_RESUME_SKIPS_REASON} from "@the-dudes/protocol/e2ee-fields";
 import {decryptForProject, decryptImageAttachments, encryptForProject, isE2eEncrypted, isE2eeRequired, setE2eeRequired, redactCredentials, redactCredentialsDeep} from "./daemon-crypto.js";
 import {classifyRunnerFailure} from "./runners/error-classifier.js";
+import {isNonOwnerTurn, principalFromQueueDeliver, type InboundTurnPrincipal} from "./runners/turn-security.js";
 import {migratedSeedFor, MIGRATED_SEED_LIMIT_BYTES} from "./migrated-seed.js";
 import {agentStateInfo, cliIoCounters, recordAgentEvent, recordAgentState} from "./debug/store.js";
 import {formatDrainHolders, type DrainHolder} from "./self-update.js";
@@ -158,6 +159,7 @@ interface SpoolItem {
   images?: ImageAttachment[];
   deliveryId?: string;
   enqueuedAt: number;
+  principal?: InboundTurnPrincipal;
 }
 /** T-720: registro do spool em disco — só metadados + blob e2e:v2 re-cifrado. */
 interface SpoolRecord {
@@ -1224,18 +1226,36 @@ export class AgentHost {
 
   /** T-1150 (§3): `agent:queue_deliver` — decifra como no `agent:send`, entrega
    *  NA ORDEM ao runner ATUAL e devolve só os ids ACEITOS (o resto fica retido). */
-  queueDeliver(agentId: string, items: Array<{ id: string; content: string; images?: unknown[]; ts?: number }>, projectId?: string): string[] {
+  queueDeliver(agentId: string, items: Array<{
+    id: string;
+    content: string;
+    images?: unknown[];
+    ts?: number;
+    from?: InboundTurnPrincipal["from"] | null;
+    isAgentOwner?: boolean;
+  }>, projectId?: string): string[] {
     const e = this.entries.get(agentId);
     if (!e?.runner) { this.log("info", `[fila] queue_deliver sem runner para ${agentId} — nada aceito`); return []; }
     const aceitos: string[] = [];
+    let notificadoTurnoMembroBloqueado = false;
     for (const item of items) {
       try {
+        const principal = principalFromQueueDeliver(item);
+        if (isNonOwnerTurn(principal) && !e.runner.canAcceptNonOwnerTurn()) {
+          const reason = e.runner.nonOwnerTurnBlockReason() ?? "runner ainda não está pronto para um turno de membro";
+          this.log("warn", `[security] queue_deliver ${agentId}: turno de membro recusado (${reason})`);
+          if (!notificadoTurnoMembroBloqueado) {
+            this.emitAgentError(agentId, `[security] replay de mensagem de membro bloqueado: ${reason}; o dono deste agente precisa aprovar ou assumir o turno`, e.projectId);
+            notificadoTurnoMembroBloqueado = true;
+          }
+          continue;
+        }
         const pid = projectId ?? e.projectId;
         const plain = pid
           ? decryptForProject(item.content, pid, aadV2({ projectId: pid, table: E2EE_TABLE.MESSAGES, field: "content" })) ?? item.content
           : item.content;
         const imgs = (item.images ?? []).length ? decryptImageAttachments(item.images as never, pid) ?? undefined : undefined;
-        e.runner.pushUserMessage(plain, imgs, undefined, item.id);
+        e.runner.pushUserMessage(plain, imgs, undefined, item.id, principal);
         aceitos.push(item.id);
       } catch { /* não aceito: o server mantém retido (nada se perde) */ }
     }
@@ -1333,20 +1353,37 @@ export class AgentHost {
     markAgentMessageActed(agentId, this.entries.get(agentId)?.runner?.currentDeliveryId());
   }
 
-  send_message(agentId: string, content: string, images?: ImageAttachment[], deliveryId?: string, wire?: WireRecord | null) {
+  /** Turn-scoped trust queried by BridgeRelay before every MCP operation. */
+  getAgentOwnerTurn(agentId: string): boolean | undefined {
+    return this.entries.get(agentId)?.runner?.getCurrentTurnPrincipal()?.isAgentOwner;
+  }
+
+  send_message(agentId: string, content: string, images?: ImageAttachment[], deliveryId?: string, wire?: WireRecord | null, principal?: InboundTurnPrincipal) {
     if (deliveryId && wire) {
       const regs = this.filaVivaRegistros.get(agentId) ?? new Map<string, WireRecord>();
       regs.set(deliveryId, wire);
       this.filaVivaRegistros.set(agentId, regs);
     }
     try {
-      this.sendMessageInner(agentId, content, images, deliveryId);
+      this.sendMessageInner(agentId, content, images, deliveryId, principal);
     } finally {
       this.agendarFilaViva(agentId);
     }
   }
 
-  private sendMessageInner(agentId: string, content: string, images?: ImageAttachment[], deliveryId?: string) {
+  private sendMessageInner(agentId: string, content: string, images?: ImageAttachment[], deliveryId?: string, principal?: InboundTurnPrincipal) {
+    if (isNonOwnerTurn(principal)) {
+      const e = this.entries.get(agentId);
+      const blockReason = this.draining ? "daemon reiniciando"
+        : !e?.runner || this.spooled.has(agentId) ? "runner indisponível"
+        : e.parado ? "agente parado"
+        : e.runner.nonOwnerTurnBlockReason();
+      if (blockReason) {
+        this.log("warn", `[security] turno de membro recusado agent=${agentId} reason=${blockReason}`);
+        this.emitAgentError(agentId, `[security] mensagem de membro bloqueada: ${blockReason}; o dono deste agente precisa aprovar ou assumir o turno`, e?.projectId);
+        return;
+      }
+    }
     if (this.draining) {
       // T-720: dreno — não alimenta o runner (turno novo atrasaria o re-exec);
       // a mensagem vai no spool cifrado e é entregue pelo processo novo.
@@ -1404,7 +1441,7 @@ export class AgentHost {
       this.enviarFilaRetida(agentId, e.projectId);
       return;
     }
-    e.runner.pushUserMessage(content, images, undefined, deliveryId);
+    e.runner.pushUserMessage(content, images, undefined, deliveryId, principal);
   }
 
   /** Chamado após spawn bem-sucedido — drena fila local T-037. */
@@ -1465,10 +1502,10 @@ export class AgentHost {
     this.drainReason = reason;
     let moved = 0;
     for (const [agentId, e] of this.entries) {
-      const take = (e.runner as unknown as { takeQueuedForDrain?: () => Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string }> } | null)?.takeQueuedForDrain;
+      const take = (e.runner as unknown as { takeQueuedForDrain?: () => Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string; principal?: InboundTurnPrincipal }> } | null)?.takeQueuedForDrain;
       if (!e.runner || typeof take !== "function") continue;
       for (const m of take.call(e.runner)) {
-        this.holdForDrain(agentId, { content: m.content, images: m.images, deliveryId: m.deliveryId, enqueuedAt: Date.now() });
+        this.holdForDrain(agentId, { content: m.content, images: m.images, deliveryId: m.deliveryId, principal: m.principal, enqueuedAt: Date.now() });
         moved++;
       }
     }
@@ -1485,12 +1522,12 @@ export class AgentHost {
     let n = 0;
     for (const [agentId, e] of this.entries) {
       const take = (e.runner as unknown as {
-        takeInFlightForShutdown?: () => { content: string; images?: ImageAttachment[]; deliveryId?: string } | null;
+        takeInFlightForShutdown?: () => { content: string; images?: ImageAttachment[]; deliveryId?: string; principal?: InboundTurnPrincipal } | null;
       } | null)?.takeInFlightForShutdown;
       if (!e.runner || typeof take !== "function") continue;
       const m = take.call(e.runner);
       if (!m) continue;
-      this.holdForDrain(agentId, { content: m.content, images: m.images, deliveryId: m.deliveryId, enqueuedAt: Date.now() }, { primeiro: true });
+      this.holdForDrain(agentId, { content: m.content, images: m.images, deliveryId: m.deliveryId, principal: m.principal, enqueuedAt: Date.now() }, { primeiro: true });
       n++;
     }
     if (n > 0) this.log("info", `[shutdown] ${n} mensagem(ns) em turno retida(s) para o spool`);
@@ -1542,7 +1579,7 @@ export class AgentHost {
       const projectId = this.entries.get(agentId)?.projectId;
       for (const item of items) {
         const blob = projectId
-          ? encryptForProject(JSON.stringify({ content: item.content, images: item.images }), projectId, spoolAad(projectId))
+          ? encryptForProject(JSON.stringify({ content: item.content, images: item.images, principal: item.principal }), projectId, spoolAad(projectId))
           : null;
         if (!projectId || !blob || !blob.startsWith("e2e:v2:")) {
           lost++;
@@ -1614,10 +1651,10 @@ export class AgentHost {
     if (!e?.runner) return;
     this.spooled.delete(agentId);
     let ok = 0;
-    const deliver = (content: string, images?: ImageAttachment[]) => {
+    const deliver = (content: string, images?: ImageAttachment[], principal?: InboundTurnPrincipal) => {
       // Dreno de um NOVO update já ligado: segue retido para o próximo spool.
-      if (this.draining) this.holdForDrain(agentId, { content, images, enqueuedAt: Date.now() });
-      else e.runner!.pushUserMessage(content, images);
+      if (this.draining) this.holdForDrain(agentId, { content, images, principal, enqueuedAt: Date.now() });
+      else e.runner!.pushUserMessage(content, images, undefined, undefined, principal);
     };
     for (const r of list) {
       const plain = decryptForProject(r.blob, r.projectId, spoolAad(r.projectId));
@@ -1626,9 +1663,9 @@ export class AgentHost {
         continue;
       }
       try {
-        const m = JSON.parse(plain) as { content?: unknown; images?: ImageAttachment[] };
+        const m = JSON.parse(plain) as { content?: unknown; images?: ImageAttachment[]; principal?: InboundTurnPrincipal };
         if (typeof m.content !== "string") continue;
-        deliver(m.content, m.images);
+        deliver(m.content, m.images, m.principal);
         ok++;
       } catch {
         this.log("warn", `[self-update] spool: msg para ${agentId} com payload inválido — descartada`);

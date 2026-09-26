@@ -9,6 +9,7 @@ import {isMissingSessionFailure as isMissingSessionMessage} from "../error-class
 import {markTurnStart, QWEN_HARD_TIMEOUT_MS} from "../turn-watchdog.js";
 import {randomUUID} from "node:crypto";
 import {spawnDropped} from "../../privileges.js";
+import {markNonOwnerMessage} from "../turn-security.js";
 
 
 export async function runQwenMessage(self: any, content: string, images?: ImageAttachment[]) {
@@ -33,11 +34,11 @@ export async function runQwenMessage(self: any, content: string, images?: ImageA
     markTurnStart(self.activityClock);
     // T-371 (c): janela anti-repetição sobre os deltas de texto do turno.
     const loopGuard = new TextLoopGuard();
-    let message = content;
+    let message = markNonOwnerMessage(content, self.currentTurn?.principal);
     const firstTurnSnapshot = self.messageSession.consumeFirstTurnIfNeeded();
     const firstTurn = firstTurnSnapshot.firstTurn;
     const epoch = self.messageSession.epoch;
-    if (firstTurn) message = self.initialMessage(content, firstTurnSnapshot.pendingSummary);
+    if (firstTurn) message = self.initialMessage(message, firstTurnSnapshot.pendingSummary);
     // Anexos: qwen (herança Gemini CLI) lê arquivos referenciados por @<path>.
     let imgCleanup = () => {};
     if (images && images.length) {

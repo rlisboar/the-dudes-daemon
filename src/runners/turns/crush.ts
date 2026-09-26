@@ -9,6 +9,7 @@ import {buildCrushMcpConfig} from "../mcp-config.js";
 import {isMissingSessionFailure as isMissingSessionMessage} from "../error-classifier.js";
 import {parseCrushSessionMeta} from "../turn-parsers.js";
 import {spawnDropped} from "../../privileges.js";
+import {markNonOwnerMessage} from "../turn-security.js";
 import {writeFileSync} from "node:fs";
 
 import path from "node:path";
@@ -79,7 +80,7 @@ export async function runCrushMessage(self: any, content: string, images?: Image
     if (!(await self.gateTurn())) { self.messageSession.busy = false; return; }
     self.setState("thinking");
     self.writeCrushConfig();
-    let message = content;
+    let message = markNonOwnerMessage(content, self.currentTurn?.principal);
     const firstTurnSnapshot = self.messageSession.consumeFirstTurnIfNeeded();
     const firstTurn = firstTurnSnapshot.firstTurn;
     // Preservados pra restaurar se o turno morrer sem output (mesma lógica do
@@ -88,7 +89,7 @@ export async function runCrushMessage(self: any, content: string, images?: Image
     const pendingSummary = firstTurnSnapshot.pendingSummary;
     const epoch = self.messageSession.epoch;
     if (firstTurn) {
-      message = self.initialMessage(content, pendingSummary);
+      message = self.initialMessage(message, pendingSummary);
     }
     // Anexos: crush run não tem flag de attachment — grava temp e referencia
     // por path no prompt (a tool `view` do crush lê o arquivo do disco).

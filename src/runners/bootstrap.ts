@@ -250,10 +250,9 @@ export function buildClaudeArgs(self: any, ): string[] {
     const planAddon = self.info.planMode
       ? `\n\n# PLAN MODE ACTIVE\nDo NOT execute destructive tools (Write, Edit, Bash that mutates state, etc.). Only Read, Grep, Glob and analysis. Output a clear, numbered plan and ask the user to confirm before any execution. Wait for explicit user approval before proceeding.`
       : "";
-    // Allowed-tools base: tools internos do bridge "the-dudes" sempre liberados
-    // (não passa pelo permission-prompt). Cada MCP server extra ganha um
-    // wildcard `mcp__<name>__*` pra não cair em prompt — quando o user
-    // libera um MCP via allowlist, ele já está confiando.
+    // Bridge operations keep the owner's existing allowlist. During member
+    // turns BridgeRelay enforces a stricter turn-scoped allowlist before any
+    // operation reaches the server.
     const baseAllowed = [
       "mcp__the-dudes__send_message",
       "mcp__the-dudes__list_agents",
@@ -268,10 +267,15 @@ export function buildClaudeArgs(self: any, ): string[] {
       "mcp__the-dudes__get_credential",
       "mcp__the-dudes__send_webhook",
       "mcp__the-dudes__list_webhooks",
+      "mcp__the-dudes__get_task",
+      "mcp__the-dudes__get_plan",
+      "mcp__the-dudes__list_plans",
+      "mcp__the-dudes__memory_list",
+      "mcp__the-dudes__board_get",
+      "mcp__the-dudes__board_list",
     ];
-    // T-391 A3/A5 (T-397: + start/remove): as tools do controller só entram na
-    // lista de quem É controller — num projeto com teammates ligado, um BACKEND
-    // não as vê.
+    // T-391 role gate stays intact. The member-turn relay policy independently
+    // blocks these operations before they can reach the server.
     if (self.info.role === CONTROLLER_ROLE) {
       baseAllowed.push(
         "mcp__the-dudes__save_agent",
@@ -298,14 +302,12 @@ export function buildClaudeArgs(self: any, ): string[] {
       "--allowed-tools",
       [...baseAllowed, ...extraAllowed].join(","),
     ];
-    if (self.opts.autoApprove) {
-      args.push("--permission-mode", "bypassPermissions");
-    } else {
-      // O McpServer registra como "the-dudes" (com hífen); Claude Code
-      // expõe via mcp__the-dudes__approve_action. Underscore dispara
-      // "tool not found" e mata o agent.
-      args.push("--permission-prompt-tool", "mcp__the-dudes__approve_action");
-    }
+    // O turno do dono mantém a política da main; em auto-approve ela é
+    // bypassPermissions. Turnos de membro sempre mudam para default antes do
+    // envio, aguardando ACK; o permission-prompt-tool e o relay negam risco.
+    if (self.opts.autoApprove) args.push("--permission-mode", "bypassPermissions");
+    else args.push("--permission-mode", "default");
+    args.push("--permission-prompt-tool", "mcp__the-dudes__approve_action");
     if (self.info.model) args.push("--model", self.info.model);
     // Claude only emits `thinking` blocks when --effort gives the model
     // enough thinking budget AND the prompt is complex enough to warrant

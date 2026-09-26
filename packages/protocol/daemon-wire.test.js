@@ -85,6 +85,30 @@ test("T-423: payload válido conhecido passa; campo errado recusa", () => {
   assert.match(validateDaemonMessage({ type: "agent:text", agentId: 7, text: "x" }).error, /agentId/);
 });
 
+test("T-1300: capabilities do hello são opcionais, string[] e estritas", () => {
+  const base = { type: "daemon:hello", name: "d", os: "mac", hostname: "h", version: "1" };
+  assert.equal(validateDaemonMessage(base).ok, true, "daemon legado sem capabilities continua conectando");
+  assert.equal(validateDaemonMessage({ ...base, capabilities: ["member-gate", "pause"] }).ok, true);
+  assert.equal(validateDaemonMessage({ ...base, capabilities: ["member-gate", 1] }).ok, false);
+  assert.equal(validateDaemonMessage({ ...base, capabilities: ["member-gate", "member-gate"] }).ok, false);
+  assert.equal(validateDaemonMessage({ ...base, capabilities: ["member-gate"], isOwner: true }).ok, false);
+});
+
+test("T-1295: hello aceita passive/updatePendingSince/updateDraining do self-update", () => {
+  const base = { type: "daemon:hello", name: "d", os: "mac", hostname: "h", version: "1" };
+  assert.equal(validateDaemonMessage({ ...base, passive: false }).ok, true);
+  assert.equal(validateDaemonMessage({ ...base, updatePendingSince: null }).ok, true, "null é o valor de 'sem update pendente'");
+  assert.equal(
+    validateDaemonMessage({ ...base, updatePendingSince: 1_758_000_000_000, updateDraining: true }).ok,
+    true,
+  );
+  assert.equal(validateDaemonMessage({ ...base, passive: "sim" }).ok, false);
+  assert.equal(validateDaemonMessage({ ...base, updatePendingSince: "ontem" }).ok, false);
+  assert.equal(validateDaemonMessage({ ...base, updateDraining: 1 }).ok, false);
+  // strict preservado: chave fora do contrato continua recusada
+  assert.equal(validateDaemonMessage({ ...base, updatePendingAt: 1 }).ok, false);
+});
+
 test("T-1180: sender tipado é opcional para daemon antigo", () => {
   const legacy = validateDaemonMessage({
     type: "agent:queue_retain", agentId: "ag-1", items: [{ content: "mensagem" }],
@@ -160,6 +184,31 @@ test("T-1006 (acréscimo PM): agent:send aceita `origin`/`silent` opcionais e re
   assert.equal(schema.safeParse({ ...base, silent: false }).success, true);
   assert.equal(schema.safeParse({ ...base, origin: "humano" }).success, false, "origin fora do enum");
   assert.equal(schema.safeParse({ ...base, silent: "sim" }).success, false, "silent não-boolean");
+});
+
+test("T-1295: agent:send aceita identidade autenticada do humano e owner-status tipado", () => {
+  const schema = fromOrchSchemas["agent:send"];
+  const base = { type: "agent:send", agentId: "a1", content: "e2e:v2:opaque", origin: "user" };
+  assert.equal(schema.safeParse({ ...base, from: { type: "user", id: "u1", name: "Ana" }, isAgentOwner: false }).success, true);
+  assert.equal(schema.safeParse({ ...base, from: { type: "user", id: "u1" }, isAgentOwner: true }).success, true);
+  assert.equal(schema.safeParse({ ...base, from: { type: "user", id: "u1" } }).success, true, "from sem nome segue válido para server legado");
+  assert.equal(schema.safeParse({ ...base, from: { type: "user", id: "u1", name: "Ana" } }).success, false, "nome novo exige owner-status pareado");
+  assert.equal(schema.safeParse({ ...base, from: { type: "user", id: "u1", name: "" }, isAgentOwner: false }).success, false);
+  assert.equal(schema.safeParse({ ...base, from: { type: "user", id: "u1", name: "Ana", spoof: true }, isAgentOwner: false }).success, false);
+  assert.equal(schema.safeParse({ ...base, from: { type: "agent", id: "a2", name: "Ana" }, isAgentOwner: false }).success, false);
+  assert.equal(schema.safeParse({ ...base, from: { type: "user", id: "u1", name: "Ana" }, isAgentOwner: "false" }).success, false);
+  assert.equal(schema.safeParse({ ...base, from: null, isAgentOwner: true }).success, true, "system server-only declara null + confiança explícita");
+});
+
+test("T-1295: agent:queue_deliver carrega remetente e owner-status por item", () => {
+  const schema = fromOrchSchemas["agent:queue_deliver"];
+  const base = { type: "agent:queue_deliver", agentId: "a1", items: [{ id: "q1", content: "e2e:v2:opaque" }] };
+  assert.equal(schema.safeParse(base).success, true, "payload antigo continua compatível");
+  assert.equal(schema.safeParse({ ...base, items: [{ ...base.items[0], from: { type: "user", id: "u1", name: "Ana" }, isAgentOwner: false }] }).success, true);
+  assert.equal(schema.safeParse({ ...base, items: [{ ...base.items[0], from: { type: "user", id: "u1", name: "Ana" } }] }).success, false, "nome novo exige owner-status pareado");
+  assert.equal(schema.safeParse({ ...base, items: [{ ...base.items[0], isAgentOwner: false }] }).success, true, "sender legado explicita false sem from");
+  assert.equal(schema.safeParse({ ...base, items: [{ ...base.items[0], isAgentOwner: "false" }] }).success, false);
+  assert.equal(schema.safeParse({ ...base, items: [{ ...base.items[0], from: { type: "agent", id: "a2", name: "Ana" } }] }).success, false);
 });
 
 test("T-423: scanner aninhado tolera campo novo (passthrough) mas exige o núcleo", () => {

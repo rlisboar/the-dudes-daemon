@@ -10,6 +10,8 @@ import {chmodSync, chownSync, readFileSync, readdirSync, writeFileSync} from "no
 import {codexEffort} from "../model-policy.js";
 import {isCodexMissingRolloutError, parseCodexRolloutSessionId, parseCodexRolloutSignals, parseCodexTurnEvent} from "../turn-parsers.js";
 import {spawnDropped} from "../../privileges.js";
+import {markNonOwnerMessage} from "../turn-security.js";
+import {codexTurnPermissionArgs} from "../args.js";
 import os from "node:os";
 import path from "node:path";
 export function writeCodexConfig(self: any, ): void {
@@ -60,17 +62,18 @@ export async function runCodexMessage(self: any, content: string, images?: Image
     self.codexToolItems?.clear();
     self.clearGrokToolsInFlight();
     self.setState("thinking");
-    let message = content;
+    let message = markNonOwnerMessage(content, self.currentTurn?.principal);
     const firstTurnSnapshot = self.messageSession.consumeFirstTurnIfNeeded();
-    if (firstTurnSnapshot.firstTurn) message = self.initialMessage(content, firstTurnSnapshot.pendingSummary);
+    if (firstTurnSnapshot.firstTurn) message = self.initialMessage(message, firstTurnSnapshot.pendingSummary);
     self.writeCodexConfig();
     const configArgs: string[] = [];
     const commonFlags = [
       "--json",
       "--skip-git-repo-check",
-      // Codex has no way to show approval prompts when stdin is closed;
-      // our MCP tools are safe (no shell execution) so bypass is fine.
-      "--dangerously-bypass-approvals-and-sandbox",
+      // Non-owner turns have no stdin approval UI. Use the actual Codex
+      // read-only sandbox and close approval prompts instead of inheriting
+      // project auto-approve or the owner's bypass.
+      ...codexTurnPermissionArgs(self.currentTurn?.principal?.isAgentOwner === false),
       ...configArgs,
       ...(self.info.model ? ["-m", self.info.model] : []),
       ...(self.info.effort ? ["-c", `model_reasoning_effort="${codexEffort(self.info.effort)}"`] : []),
@@ -93,8 +96,13 @@ export async function runCodexMessage(self: any, content: string, images?: Image
       : ["exec", ...commonFlags, ...imageArgs, message];
     self.traceSpawn("codex", args);
     let proc: ChildProcess;
+    // T-1300: o sandbox do membro reexecuta o codex pelo caminho invocado, e o
+    // symlink do PATH dá execvp EPERM dentro do perfil; o realpath nativo passa.
+    const codexCommand = self.currentTurn?.principal?.isAgentOwner === false && self.codexMemberBinary
+      ? self.codexMemberBinary
+      : self.runnerCommand("codex");
     try {
-      proc = spawnDropped(self.runnerCommand("codex"), args, {
+      proc = spawnDropped(codexCommand, args, {
       cwd: self.opts.workspaceRoot,
       env: self.buildEnv(),
       stdio: ["ignore", "pipe", "pipe"],

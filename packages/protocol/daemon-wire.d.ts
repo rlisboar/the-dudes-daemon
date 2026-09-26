@@ -75,6 +75,11 @@ export interface DaemonHello {
   /** Versão do protocolo de fio (WIRE_PROTOCOL_VERSION). O server compara com
    *  a dele: igual = compatíveis; ausente = daemon antigo. */
   protocolVersion?: number;
+  /** Reconexão passiva de handoff; não substitui a conexão ativa. */
+  passive?: boolean;
+  /** Capacidades de segurança anunciadas por este processo daemon. Ausente =
+   *  daemon legado, sem gates de privilégio ou pause. */
+  capabilities?: string[];
   /** SPKI base64 of the daemon's RSA-OAEP-2048 public key. Web clients
    *  use this to wrap project keys for end-to-end transport without the
    *  server seeing the symmetric key. */
@@ -85,6 +90,10 @@ export interface DaemonHello {
   buildTs?: number;
   /** Arquivo novo no disco; processo ainda na imagem antiga (restart pendente). */
   updatePending?: boolean;
+  /** Instante em que a atualização pendente foi baixada; null quando ausente. */
+  updatePendingSince?: number | null;
+  /** Processo está drenando turnos antes do re-exec. */
+  updateDraining?: boolean;
   /** State recovery: maior seq de msg outbound vista antes do disconnect
    *  anterior. Server replay buffer das msgs com seq > resumeFromSeq.
    *  0/ausente = primeira conn ou buffer expirou. */
@@ -362,13 +371,18 @@ export interface AgentSend {
    * T-1236: QUEM enviou, com id ESTÁVEL — o `origin` diz a natureza, isto diz a
    * identidade. O server é quem sabe no roteamento: `agent` com o `fromId` na
    * entrega entre agentes, `user` com o userId na mensagem do humano.
-   * `system` (loop-stop, task, park) fica SEM `from`: não há autor humano/agente.
+   * Texto sem autor verificável envia `from: null`; a confiança continua no
+   * boolean server-derived `isAgentOwner`.
    *
-   * O daemon só repassa isto ao `sender` do `agent:queue_retain` (#1180/#1183) —
-   * o nome no envelope não serve porque não é id. Mesmo formato e limites da
-   * `QueueSender`. Opcional: daemon antigo ignora.
+   * O daemon só repassa isto ao `sender` do `agent:queue_retain` (#1180/#1183).
+   * `name` é opcional e serve para identificar o humano no prompt; autorização
+   * continua usando o id estável. Quando um user leva `name`, `isAgentOwner`
+   * acompanha o frame e foi derivado pelo server, fora do ciphertext. Os dois
+   * campos seguem opcionais no wire para aceitar servers/daemons legados.
    */
-  from?: QueueSender;
+  from?: QueueSender | null;
+  /** Server deriva do usuário autenticado e do dono persistido do agente. */
+  isAgentOwner?: boolean;
   /**
    * T-1006 (acréscimo PM): quando true, nada no chat (ex.: marcação do
    * Quadro). O daemon propaga ao `agent:queue_live`. Opcional (retrocompat).
@@ -764,9 +778,9 @@ export interface TypesafeShadow extends JevVerdict {
 /** T-1150: parada em qualquer caminho — `source` diz de onde veio. */
 export type QueueRetainSource = "stop" | "inbound-ttl" | "inbound" | "manual" | "replace" | "context-clear" | "loop-stop" | "migrate";
 
-/** Autor original da mensagem retida. Só o id estável atravessa o fio. */
+/** Autor original da mensagem. Nome é apenas exibição; autorização usa o id estável. */
 export type QueueSender =
-  | { type: "user"; id: string }
+  | { type: "user"; id: string; name?: string }
   | { type: "agent"; id: string };
 
 export interface AgentQueueRetainEv {
@@ -801,7 +815,16 @@ export interface AgentQueueDeliver {
   type: "agent:queue_deliver";
   agentId: string;
   projectId?: string;
-  items: Array<{ id: string; content: string; images?: unknown[]; ts?: number }>;
+  items: Array<{
+    id: string;
+    content: string;
+    images?: unknown[];
+    ts?: number;
+    from?: QueueSender | null;
+    /** Sempre enviado pelo server; false para sender ausente/legado. Obrigatório
+     *  junto de `from.name`; o wire mantém opcionalidade para versões antigas. */
+    isAgentOwner?: boolean;
+  }>;
 }
 
 /** T-1150: decisão "excluir" — larga as cópias locais. */

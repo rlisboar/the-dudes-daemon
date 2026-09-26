@@ -51,6 +51,8 @@ export interface GrokAcpHandlers {
   onConfig(options: Array<{ id: string; currentValue?: string }>): void;
   onStderr(line: string): void;
   onExit(code: number | null): void;
+  /** Pre-execution ACP permission decision for the active turn. */
+  onPermissionRequest?(params: unknown): "allow" | "deny";
 }
 
 interface Pedido {
@@ -119,10 +121,18 @@ export class GrokAcpClient {
     const method = typeof msg.method === "string" ? msg.method : "";
     if (id !== null && method) {
       if (method === "session/request_permission") {
-        const params = msg.params as { options?: Array<{ optionId?: string; kind?: string }> } | undefined;
+        const params = msg.params as { options?: Array<{ optionId?: string; kind?: string; name?: string }> } | undefined;
         const opts = params?.options ?? [];
-        const allow = opts.find((o) => o.kind === "allow_once") ?? opts.find((o) => o.kind === "allow_always") ?? opts[0];
-        this.responder(id, { outcome: { outcome: "selected", optionId: allow?.optionId ?? "allow_once" } });
+        const decision = this.handlers.onPermissionRequest?.(msg.params) ?? "deny";
+        if (decision === "deny") {
+          const reject = opts.find((o) => o.kind === "reject_once" || /reject|deny/i.test(`${o.optionId ?? ""} ${o.name ?? ""}`));
+          if (reject?.optionId) this.responder(id, { outcome: { outcome: "selected", optionId: reject.optionId } });
+          else this.responderError(id, "permission denied by daemon security policy");
+          return;
+        }
+        const allow = opts.find((o) => o.kind === "allow_once") ?? opts.find((o) => (o.optionId ?? "").includes("allow"));
+        if (allow?.optionId) this.responder(id, { outcome: { outcome: "selected", optionId: allow.optionId } });
+        else this.responderError(id, "permission request has no supported allow option");
         return;
       }
       this.responder(id, {});
@@ -164,6 +174,10 @@ export class GrokAcpClient {
 
   private responder(id: number, result: unknown): void {
     try { this.proc?.stdin?.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\n"); } catch { /* canal morto */ }
+  }
+
+  private responderError(id: number, message: string): void {
+    try { this.proc?.stdin?.write(JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32000, message } }) + "\n"); } catch { /* canal morto */ }
   }
 
   private rejeitarPendentes(motivo: string): void {

@@ -7,6 +7,7 @@ import {UsageSemantics} from "../context-tracker.js";
 import {buildOpenCodeParts} from "../attachments.js";
 import {parseOpenCodeTurnEvent} from "../turn-parsers.js";
 import {providerModelParts} from "../model-policy.js";
+import {markNonOwnerMessage} from "../turn-security.js";
 import {resolveOcCatalogContextLimit} from "../../model-discovery.js";
 
 
@@ -168,10 +169,10 @@ export async function runOpenCodeMessageAttached(self: any, content: string, ima
         if (Array.isArray(hist)) for (const m of hist) for (const p of (m?.parts ?? [])) { if (p?.id) self.ocSeenPartIds.add(p.id); }
       } catch { /* best-effort */ }
     }
-    let message = content;
+    let message = markNonOwnerMessage(content, self.currentTurn?.principal);
     const firstTurnSnapshot = self.messageSession.consumeFirstTurnIfNeeded();
     if (firstTurnSnapshot.firstTurn) {
-      message = self.initialMessage(content, firstTurnSnapshot.pendingSummary);
+      message = self.initialMessage(message, firstTurnSnapshot.pendingSummary);
     }
     self.traceCli("opencode", "stdin", message);
     // Transporte via API do serve (POST síncrono /session/:id/message) em vez
@@ -349,12 +350,16 @@ export async function ocHandlePermissionAsked(self: any, props: any): Promise<vo
       // input p/ exibir na UI: metadata (ex bash {command, description}) + patterns
       const input = { ...(props?.metadata ?? {}), patterns: props?.patterns };
       let allow = false;
-      try {
-        const r = await self.bridgePost("permission", { tool, input });
-        allow = !!r?.allow;
-      } catch (e) {
-        // fail-closed: nega se a política não respondeu (igual approve_action)
-        self.opts.log("warn", `[cli:${self.info.id}:opencode] permission '${tool}' negada (erro política): ${(e as Error).message}`);
+      if (self.currentTurn?.principal?.isAgentOwner === false) {
+        self.opts.log("info", `[cli:${self.info.id}:opencode] permission '${tool}' negada (turno de membro)`);
+      } else {
+        try {
+          const r = await self.bridgePost("permission", { tool, input });
+          allow = !!r?.allow;
+        } catch (e) {
+          // fail-closed: nega se a política não respondeu (igual approve_action)
+          self.opts.log("warn", `[cli:${self.info.id}:opencode] permission '${tool}' negada (erro política): ${(e as Error).message}`);
+        }
       }
       try {
         await self.ocServeFetch(`/session/${sessionID}/permissions/${permId}`, "POST", { response: allow ? "once" : "reject" });

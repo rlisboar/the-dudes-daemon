@@ -3,11 +3,51 @@
  * stdout/handlers de stream. Callers seguem via bootstrap (re-export).
  */
 import {type ChildProcessWithoutNullStreams} from "node:child_process";
+import {randomUUID} from "node:crypto";
 
 import {spawnDropped} from "../../privileges.js";
 
 import {isMissingSessionFailure as isMissingSessionMessage, classifyRunnerFailure, isApiErrorMessage} from "../error-classifier.js";
 import type {AgentUsage} from "../../types.js";
+
+type ClaudePermissionMode = "default" | "bypassPermissions";
+
+/** Change Claude's permission mode over the documented stream-json control channel. */
+export function requestClaudePermissionMode(self: any, mode: ClaudePermissionMode): Promise<void> {
+  if (!self.proc?.stdin?.writable) return Promise.reject(new Error("Claude stdin is not writable"));
+  const requestId = `daemon-${randomUUID()}`;
+  const pending = self.claudeControlRequests ??= new Map();
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pending.delete(requestId);
+      reject(new Error(`Claude set_permission_mode(${mode}) timed out`));
+    }, 5_000);
+    pending.set(requestId, {
+      resolve: () => { clearTimeout(timer); resolve(); },
+      reject: (error: Error) => { clearTimeout(timer); reject(error); },
+    });
+    try {
+      self.proc.stdin.write(`${JSON.stringify({
+        type: "control_request",
+        request_id: requestId,
+        request: { subtype: "set_permission_mode", mode },
+      })}\n`);
+    } catch (error) {
+      pending.delete(requestId);
+      clearTimeout(timer);
+      reject(error instanceof Error ? error : new Error(String(error)));
+    }
+  });
+}
+
+export function failPendingClaudeControlRequests(self: any, reason: string): void {
+  const pending: Map<string, { reject: (error: Error) => void }> | undefined = self.claudeControlRequests;
+  if (!pending) return;
+  for (const [requestId, request] of pending) {
+    pending.delete(requestId);
+    request.reject(new Error(reason));
+  }
+}
 
 export function startClaude(self: any) {
     self.claudeBootStartedAt = performance.now();
@@ -28,6 +68,7 @@ export function startClaude(self: any) {
     // (resolvedModel + idle) é perdido silenciosamente.
     self.buffer = "";
     self.claudeSawInit = false;
+    self.claudePermissionMode = self.opts.autoApprove ? "bypassPermissions" : "default";
     // Identidade capturada: chunks/exit tardios do processo antigo (entregues
     // entre exit e close, ou de um órfão) não podem re-emitir session_id/usage
     // da sessão descartada nem clobberar o processo novo.
@@ -55,6 +96,7 @@ export function startClaude(self: any) {
     // emitExit é idempotente; proc=null desarma qualquer exit tardio.
     proc.on("error", (err: any) => {
       if (self.proc !== proc) return;
+      failPendingClaudeControlRequests(self, `Claude process error: ${err.message}`);
       self.opts.onError(`[claude] spawn error: ${err.message}`);
       self.proc = null;
       self.emitExit(1);
@@ -81,6 +123,7 @@ export function startClaude(self: any) {
       // sem o guard, ele anularia self.proc do processo NOVO e chamaria
       // emitExit — agente marcado como morto com o processo vivo.
       if (self.proc !== proc) return;
+      failPendingClaudeControlRequests(self, "Claude process exited during permission mode change");
       if (self.sessionInvalid) {
         self.sessionInvalid = false;
         self.opts.resumeSessionId = undefined;
@@ -120,6 +163,18 @@ export function handleStdout(self: any, chunk: string) {
 export function handleStreamEvent(self: any, event: any) {
     // Qualquer evento de stream = atividade real (deltas, tools, etc.).
     self.touchActivity();
+    if (event.type === "control_response") {
+      const response = event.response;
+      const requestId = response?.request_id;
+      const pending = typeof requestId === "string" ? self.claudeControlRequests?.get(requestId) : undefined;
+      if (pending) {
+        self.claudeControlRequests.delete(requestId);
+        if (response.subtype === "error") pending.reject(new Error(String(response.error ?? "Claude rejected permission mode change")));
+        else if (response.subtype === "success") pending.resolve();
+        else pending.reject(new Error("Claude returned an invalid permission mode response"));
+      }
+      return;
+    }
     // claude emits session_id on every stream event. Only forward to
     // the orchestrator when it actually changes — otherwise we'd flood
     // listeners with redundant agent:session messages (one per chunk).

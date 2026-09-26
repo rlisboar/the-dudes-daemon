@@ -19,10 +19,20 @@ const n = z.number();
 const b = z.boolean();
 const id = z.string();
 const queueSenderId = z.string().min(1).max(128).regex(/^[^\u0000-\u001f\u007f]+$/);
+const queueSenderName = z.string().min(1).max(120).regex(/^[^\u0000-\u001f\u007f]+$/);
 const queueSender = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("user"), id: queueSenderId }).strict(),
+  z.object({ type: z.literal("user"), id: queueSenderId, name: queueSenderName.optional() }).strict(),
   z.object({ type: z.literal("agent"), id: queueSenderId }).strict(),
 ]);
+const requireOwnerStatusForNamedSender = (from, isAgentOwner, ctx) => {
+  if (from?.type === "user" && from.name !== undefined && typeof isAgentOwner !== "boolean") {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["isAgentOwner"],
+      message: "named user provenance requires server-derived owner status",
+    });
+  }
+};
 
 const cliRunner = z.enum(RUNNERS);
 const effortLevel = z.enum(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
@@ -110,15 +120,21 @@ export const daemonWireSchemas = {
       qwen: z.array(configAliasOption).max(32).optional(),
     }).strict().optional(),
     protocolVersion: n.optional(),
+    passive: b.optional(),
+    capabilities: z.array(z.string().min(1).max(80)).max(32)
+      .refine((items) => new Set(items).size === items.length, "duplicate capabilities are not allowed")
+      .optional(),
     cryptoPublicKey: t.optional(),
     binaryHash: t.optional(),
     buildTs: n.optional(),
     updatePending: b.optional(),
+    updatePendingSince: n.nullable().optional(),
+    updateDraining: b.optional(),
     resumeFromSeq: n.optional(),
     availableRunners: z.array(t).optional(),
     graphify: z.object({ cli: b, mcp: b }).optional(),
     installedRunners: z.array(t).optional(),
-  }),
+  }).strict(),
   "daemon:health": msg("daemon:health", {
     health: z.object({
       ts: n,
@@ -483,7 +499,9 @@ export const fromOrchSchemas = {
       content: t,
       images: z.array(z.unknown()).optional(),
       ts: n.optional(),
-    })).max(200),
+      from: queueSender.nullable().optional(),
+      isAgentOwner: b.optional(),
+    }).superRefine((item, ctx) => requireOwnerStatusForNamedSender(item.from, item.isAgentOwner, ctx))).max(200),
   }),
   // T-1150 (contrato §4): decisão "excluir" — o daemon larga a cópia local.
   "agent:queue_forget": msg("agent:queue_forget", { agentId: t }),
@@ -551,11 +569,13 @@ export const fromOrchSchemas = {
     origin: z.enum(["user", "agent", "system"]).optional(),
     // T-1236: identidade de quem enviou (id ESTÁVEL, não o nome do envelope).
     // Reusa o MESMO `queueSender` do retain (#1180) — formato e limites iguais,
-    // para o daemon só repassar ao `sender` sem conversão. Opcional: daemon
-    // antigo ignora; `system` fica sem `from`.
-    from: queueSender.optional(),
+    // para o daemon só repassar ao `sender` sem conversão. `from: null` marca
+    // autoria desconhecida ou texto confiado exclusivamente ao server.
+    from: queueSender.nullable().optional(),
+    // Derivado pelo server da identidade autenticada e do ownerUserId persistido.
+    isAgentOwner: b.optional(),
     silent: b.optional(),
-  }),
+  }).superRefine((frame, ctx) => requireOwnerStatusForNamedSender(frame.from, frame.isAgentOwner, ctx)),
   "agent:clear": msg("agent:clear", { agentId: t }),
   "agent:compact": msg("agent:compact", { agentId: t, saveMemory: b.optional() }),
   "auto_approve:set": msg("auto_approve:set", { value: b }),

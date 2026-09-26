@@ -100,7 +100,6 @@ function handle(msg) {
     notify("session/update", { sessionId, update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "pensando…" } } });
     // T-827: o dsh real manda os argumentos no rawInput do tool_call (dsh 0.1.5).
     notify("session/update", { sessionId, update: { sessionUpdate: "tool_call", toolCallId: "tc_1", title: "list_tasks", kind: "other", status: "pending", rawInput: { status: "open", limit: 5 } } });
-    notify("session/update", { sessionId, update: { sessionUpdate: "tool_call_update", toolCallId: "tc_1", status: "completed" } });
     // Permission request (server→client) — só depois da resposta seguimos.
     const pid = serverReqId++;
     out({ jsonrpc: "2.0", id: pid, method: "session/request_permission", params: { sessionId, toolCall: { toolCallId: "tc_1" }, options: [{ optionId: "allow_once", name: "Allow once", kind: "allow_once" }, { optionId: "reject_once", name: "Reject", kind: "reject_once" }] } });
@@ -120,12 +119,18 @@ function handle(msg) {
     // Resposta à request_permission.
     if (promptInFlight && msg.result?.outcome?.optionId) {
       const { id, text } = promptInFlight;
+      if (msg.result.outcome.optionId === "reject_once") {
+        promptInFlight = null;
+        notify("session/update", { sessionId, update: { sessionUpdate: "tool_call_update", toolCallId: "tc_1", status: "failed" } });
+        return result(id, { stopReason: "permission_denied" });
+      }
       // Janela de 300ms p/ um session/cancel chegar antes do settle.
       setTimeout(() => {
         const wasCancelled = cancelRequested;
         promptInFlight = null;
         cancelRequested = false;
         if (wasCancelled) return result(id, { stopReason: "cancelled" });
+        notify("session/update", { sessionId, update: { sessionUpdate: "tool_call_update", toolCallId: "tc_1", status: "completed" } });
         const replies = process.env.FAKE_ACP_REPLY_SEQUENCE?.split("|");
         const responseText = replies?.[promptCount - 1] ?? (text.includes(PROMPT_TEXT) ? "OK" : text);
         notify("session/update", { sessionId, update: { sessionUpdate: "agent_message_chunk", messageId: randomUUID(), content: { type: "text", text: responseText } } });

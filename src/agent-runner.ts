@@ -35,6 +35,8 @@ import {PerMessageSessionState, type FirstTurnSnapshot} from "./runners/message-
 import {resolveContextLimit, resolveContextLimitKnown} from "./runners/model-policy.js";
 
 import {isLoopStopMessage} from "./runners/error-classifier.js";
+import {isNonOwnerTurn, markNonOwnerMessage, memberTurnRunnerMode, claudePermissionModeForTurn, type InboundTurnPrincipal} from "./runners/turn-security.js";
+import {codexHasLegacySandboxConfig, resolveCodexNativeBinary} from "./runners/codex-member-policy.js";
 import {appendFilePrompt, attachmentExtension, buildClaudeUserContent, imageExtension, isInlineImage, safeAttachmentName} from "./runners/attachments.js";
 import {ensureOcServer, fetchOcCatalogLimit, ocUsageSemantics, runOpenCodeMessage, runOpenCodeMessageAttached, ocServeFetch, ocHandlePermissionAsked, ocProcessNewParts, ocDispatchPart, ocHandleStreamPart, applyOpenCodeEvents, handleOpenCodeEvent} from "./runners/turns/opencode.js";
 import {ingestGeminiLine, runGeminiMessage} from "./runners/turns/gemini.js";
@@ -48,6 +50,7 @@ import {compactContext, compactContextInner, waitOcIdle, parseAndStripMemory, sa
 import {runOneShot, runOneShotWithSession, killClaudeForRestart} from "./runners/one-shot.js";
 import {traceCli, traceSpawn, renderVerboseIoBlock, traceInternalCli, renderVerboseBlock, colorizeAgentName, supportsAnsi, hexToRgb, extractVerbosePayload, extractValueText, prettyPrintVerboseText, cleanupAgentTmpDir, grokSessionRecentWrite} from "./runners/support.js";
 import {startClaude, bootPerMessageRunner, featuresEnv, bridgeEnv, writeGeminiConfig, writeQwenConfig, writeOpenCodeConfig, buildEnv, buildClaudeArgs, writeMcpConfig, capAccum, handleStdout, handleStreamEvent, prepareGraphify, refreshGraphifyMcp, bridgePost, runnerCommand, workspaceInfo, promptContext, initialMessage, ensureRunnerAvailable} from "./runners/bootstrap.js";
+import {requestClaudePermissionMode} from "./runners/turns/claude.js";
 import { sombraDaReflexao } from "./typesafe-reflect-shadow.js";
 export {
   extractOneShotText,
@@ -305,10 +308,18 @@ export class AgentRunner {
    *  roda, então a pendente só é consumida quando OUTRA escrita chega (paradas
    *  de 25min em prod). Serializa: 1 write por vez; o próximo só sai no result.
    *  A espera fica no NOSSO queue (observável), não no pipe do CLI. */
-  private claudeWriteQueue: Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string; timingMessage: object }> = [];
+  private claudeWriteQueue: Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string; timingMessage: object; principal?: InboundTurnPrincipal }> = [];
   /** T-758: mensagem escrita e ainda não aceita pelo CLI (sem `system/init`).
    *  `claudeUnacceptedSince` arma o watchdog; zera no accept. */
   private claudeInflight: { content: string; images?: ImageAttachment[]; deliveryId?: string; timingMessage: object; timing: TurnTiming } | null = null;
+  /** Mode switches are ACKed before the next Claude user message is written. */
+  private claudePermissionMode: "default" | "bypassPermissions" = "bypassPermissions";
+  private claudeModeSwitching = false;
+  /** Turnos em voo na fila serializada (write queue) por principal: pin por
+   *  envio — a interrogação de modo usa o principal do item no momento de
+   *  liberar a escrita (não o principal global do turno/aprovador). */
+  private claudeModePin: "default" | "bypassPermissions" | null = null;
+  private claudeControlRequests = new Map<string, { resolve: () => void; reject: (error: Error) => void }>();
   private claudeUnacceptedSince: number | null = null;
   private claudeUnacceptedWarned = false;
   /** T-760: re-envio condicional — arma durante o kill do restart por não
@@ -397,7 +408,7 @@ export class AgentRunner {
   /** Mensagens recebidas durante restart (kill→startClaude). Flushed
    *  quando o novo proc estiver writable. Sem isso, mission engine
    *  perde dispatches feitos no meio do clearContext/compact. */
-  private pendingMessages: Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string }> = [];
+  private pendingMessages: Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string; principal?: InboundTurnPrincipal }> = [];
 
   /** Hang watchdog: última atividade SEMÂNTICA (eventos parseados / tools / state).
    *  NÃO bytes brutos de stdout/stderr — ver touchActivity + runGrokMessage. */
@@ -437,7 +448,9 @@ export class AgentRunner {
   } | null = null;
   /** T-842: mensagem do turno aberto (com deliveryId). O SIGTERM a põe no
    *  spool; o fim normal do turno não — busy/claudeInflight/dsh já cairam. */
-  private currentTurn: { content: string; images?: ImageAttachment[]; deliveryId?: string } | null = null;
+  private currentTurn: { content: string; images?: ImageAttachment[]; deliveryId?: string; principal?: InboundTurnPrincipal } | null = null;
+  /** T-1300: realpath do codex nativo usado no turno de membro (null = bloqueia). */
+  private codexMemberBinary: string | null = null;
   private currentTurnSettled = false;
   /**
    * Claude (e similares): tool_use abertos sem tool_result ainda.
@@ -618,6 +631,49 @@ export class AgentRunner {
     return this.contextTracker.limit();
   }
 
+  /** Turn-scoped server-authenticated identity for the local bridge gate. */
+  getCurrentTurnPrincipal(): InboundTurnPrincipal | undefined {
+    return this.currentTurn?.principal;
+  }
+
+  /**
+   * Members are accepted only when a turn can start immediately. This avoids
+   * mixing their authority with an owner turn already in flight; owner input
+   * may still queue behind a member and receives its own principal.
+   */
+  canAcceptNonOwnerTurn(): boolean {
+    return this.nonOwnerTurnBlockReason() === null;
+  }
+
+  nonOwnerTurnBlockReason(): string | null {
+    if (memberTurnRunnerMode(this.opts.cliRunner) !== "restricted") return `runner ${this.opts.cliRunner} não tem gate de ferramenta pré-execução`;
+    if (this.opts.cliRunner === "codex") {
+      // O perfil só foi provado no seatbelt do macOS; landlock/bwrap não.
+      if (process.platform !== "darwin") return "perfil Codex de leitura restrita só foi provado no macOS";
+      if (codexHasLegacySandboxConfig(this.opts.workspaceRoot)) return "config Codex legada impede aplicar o perfil de leitura restrita";
+      if (!this.codexMemberBinary) return "binário nativo do codex não resolvido (wrapper ou ausente)";
+    }
+    if (!this.opts.bridgeSocketPath) return "relay local de ferramentas indisponível";
+    if (Object.keys(this.opts.extraMcpServers ?? {}).some((name) => name !== "the-dudes")) return "MCP externo não pode ser isolado neste turno";
+    if (this.stopped || this.restarting || !this.isAlive() || this.waitingTurnGate) return "runner indisponível";
+    if (this.messageSession.busy || this.messageSession.queuedCount() > 0) return "runner ocupado ou com fila";
+    if (this.opts.cliRunner === "claude") {
+      return this.claudeSawInit && !this.claudeInflight && !this.claudeModeSwitching && this.claudeWriteQueue.length === 0 && this.pendingMessages.length === 0
+        ? null
+        : "Claude ainda não está ocioso";
+    }
+    if (this.opts.cliRunner === "dsh") {
+      const dshReady = (this as unknown as { dshReady?: boolean }).dshReady;
+      return dshReady && !dshIsInTurn(this) && dshPeekQueue(this).length === 0 ? null : "dsh ainda não está ocioso";
+    }
+    return null;
+  }
+
+  /** Called only at the point a specific message becomes the active turn. */
+  prepareInboundMessage(content: string): string {
+    return markNonOwnerMessage(content, this.currentTurn?.principal);
+  }
+
   resetWithSummary(summary?: string): void {
     // T-417: o reset abaixo bumpa o epoch e invalida o turno em voo — a partir
     // daqui o close dele é STALE e (pelo guarda dos runners per-message) não
@@ -665,7 +721,7 @@ export class AgentRunner {
     if (this.opts.cliRunner !== "claude") return false;
     if (this.pendingMessages.length > 0 && procAlive(this.proc)) return true;
     // T-758: fila serializada do stdin também é trabalho não terminado.
-    if ((this.claudeWriteQueue.length > 0 || this.claudeInflight) && procAlive(this.proc)) return true;
+    if ((this.claudeWriteQueue.length > 0 || this.claudeInflight || this.claudeModeSwitching) && procAlive(this.proc)) return true;
     return this.currentState === "thinking" || this.currentState === "sending" || this.currentState === "speaking";
   }
 
@@ -673,7 +729,7 @@ export class AgentRunner {
   turnHoldReason(): string | null {
     if (!this.isTurnActive()) return null;
     if (this.pendingMessages.length > 0) return "fila-pendente";
-    if (this.claudeWriteQueue.length > 0 || this.claudeInflight) return "stdin-em-voo";
+    if (this.claudeWriteQueue.length > 0 || this.claudeInflight || this.claudeModeSwitching) return "stdin-em-voo";
     // Tool (monitor inclusive) ainda sem tool_result: o CLI não manda `result`.
     if (this.toolsInFlight > 0) return "tool-em-voo-sem-result";
     return "stream-sem-result";
@@ -799,6 +855,9 @@ export class AgentRunner {
     }
     if (this.opts.cliRunner === "codex") {
       if (!this.ensureRunnerAvailable("codex")) { this.emitExit(1); return; }
+      // T-1300: sem realpath nativo o turno de membro fica bloqueado.
+      this.codexMemberBinary = resolveCodexNativeBinary(this.runnerCommand("codex"), this.buildEnv().PATH ?? process.env.PATH);
+      if (!this.codexMemberBinary) this.opts.log("warn", "[security] codex nativo não resolvido; turnos de membro neste agente ficam bloqueados");
       this.bootPerMessageRunner();
       return;
     }
@@ -887,7 +946,7 @@ export class AgentRunner {
     this.touchActivity();
     const next = this.messageSession.dequeue();
     if (!next) { this.messageSession.busy = false; return; }
-    this.currentTurn = { content: next.content, images: next.images, deliveryId: next.deliveryId };
+    this.currentTurn = { content: next.content, images: next.images, deliveryId: next.deliveryId, principal: next.principal };
     this.currentTurnSettled = false;
     this.turnLatency.activate(next, this.messageSession.sessionId ? "resume" : "cold");
     const { content, images } = next;
@@ -930,14 +989,14 @@ export class AgentRunner {
    * e fila do dsh — na ordem de chegada. O turno em curso não está em nenhuma
    * delas e segue intacto. O host re-cifra isto no spool do re-exec.
    */
-  takeQueuedForDrain(): Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string }> {
-    const out: Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string }> = [];
-    for (const m of this.messageSession.takeAllForDrain()) out.push({ content: m.content, images: m.images, deliveryId: m.deliveryId });
+  takeQueuedForDrain(): Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string; principal?: InboundTurnPrincipal }> {
+    const out: Array<{ content: string; images?: ImageAttachment[]; deliveryId?: string; principal?: InboundTurnPrincipal }> = [];
+    for (const m of this.messageSession.takeAllForDrain()) out.push({ content: m.content, images: m.images, deliveryId: m.deliveryId, principal: m.principal });
     for (const m of this.pendingMessages) this.turnLatency.discard(m, "drained");
-    out.push(...this.pendingMessages.splice(0).map((m) => ({ content: m.content, images: m.images, deliveryId: m.deliveryId })));
+    out.push(...this.pendingMessages.splice(0).map((m) => ({ content: m.content, images: m.images, deliveryId: m.deliveryId, principal: m.principal })));
     // T-758: escrita serializada ainda não enviada também é drainável.
     for (const m of this.claudeWriteQueue) this.turnLatency.discard(m.timingMessage, "drained");
-    out.push(...this.claudeWriteQueue.map((m) => ({ content: m.content, images: m.images, deliveryId: m.deliveryId })));
+    out.push(...this.claudeWriteQueue.map((m) => ({ content: m.content, images: m.images, deliveryId: m.deliveryId, principal: m.principal })));
     this.claudeWriteQueue = [];
     out.push(...dshTakeQueue(this as unknown as Record<string, unknown>));
     return out;
@@ -1003,16 +1062,21 @@ export class AgentRunner {
 
   /** T-842: mensagem do turno que o SIGTERM vai matar. Uma vez: a segunda
    *  chamada (prepareReexec depois do shutdown) devolve null. */
-  takeInFlightForShutdown(): { content: string; images?: ImageAttachment[]; deliveryId?: string } | null {
+  takeInFlightForShutdown(): { content: string; images?: ImageAttachment[]; deliveryId?: string; principal?: InboundTurnPrincipal } | null {
     const dshVivo = !!(this as unknown as { dshPromptInFlight?: boolean }).dshPromptInFlight;
-    const vivo = this.messageSession.busy || !!this.claudeInflight || dshVivo;
+    const vivo = this.messageSession.busy || !!this.claudeInflight || this.claudeModeSwitching || dshVivo;
     if (!vivo || !this.currentTurn) return null;
     const t = this.currentTurn;
     this.currentTurn = null;
-    return { content: t.content, images: t.images, deliveryId: t.deliveryId };
+    return { content: t.content, images: t.images, deliveryId: t.deliveryId, principal: t.principal };
   }
 
-  pushUserMessage(content: string, images?: ImageAttachment[], latencyMessage?: { content: string; images?: ImageAttachment[]; deliveryId?: string }, deliveryId?: string) {
+  pushUserMessage(content: string, images?: ImageAttachment[], latencyMessage?: { content: string; images?: ImageAttachment[]; deliveryId?: string }, deliveryId?: string, principal?: InboundTurnPrincipal) {
+    const nonOwnerBlockReason = isNonOwnerTurn(principal) ? this.nonOwnerTurnBlockReason() : null;
+    if (nonOwnerBlockReason) {
+      this.opts.onError(`[security] mensagem de membro bloqueada: ${nonOwnerBlockReason}; o turno não foi executado`);
+      return;
+    }
     if (isLoopStopMessage(content)) {
       // T-899: loop-stop é mensagem do usuário — retém em vez de descartar.
       const antes = this.messageSession.queuedCount();
@@ -1024,7 +1088,7 @@ export class AgentRunner {
     if (isPerMessageRunner(this.opts.cliRunner)) {
       const queued = this.messageSession.queuedCount();
       const outcome = this.messageSession.enqueueOrCoalesce(
-        { content, images, deliveryId },
+        { content, images, deliveryId, principal },
         AgentRunner.MAX_BUFFERED_MESSAGES,
         AgentRunner.MAX_COALESCED_BYTES,
       );
@@ -1061,7 +1125,7 @@ export class AgentRunner {
     if (this.opts.cliRunner === "dsh") {
       // T-690: fila própria do ACP (1 prompt por vez por sessão); o driver
       // buffera até o handshake concluir.
-      dshPushUserMessage(this as unknown as Record<string, unknown>, content, images, deliveryId);
+      dshPushUserMessage(this as unknown as Record<string, unknown>, content, images, deliveryId, principal);
       return;
     }
     if (this.restarting || !this.proc || !this.proc.stdin.writable) {
@@ -1076,7 +1140,7 @@ export class AgentRunner {
         return;
       }
       if (this.pendingMessages.length < AgentRunner.MAX_BUFFERED_MESSAGES / 2) this.restartDropNoticeSent = false;
-      const pending = { ...(latencyMessage ?? { content, images }), deliveryId };
+      const pending = { ...(latencyMessage ?? { content, images }), deliveryId, principal };
       this.turnLatency.enqueue(pending);
       this.pendingMessages.push(pending);
       this.opts.log("info", `[cli:${this.info.id}:claude] buffered message during restart (queued=${this.pendingMessages.length})`);
@@ -1085,10 +1149,10 @@ export class AgentRunner {
     }
     const latencyInput = latencyMessage ?? { content, images, deliveryId };
     this.turnLatency.enqueue(latencyInput);
-    const item = { content, images, deliveryId, timingMessage: latencyInput };
+    const item = { content, images, deliveryId, timingMessage: latencyInput, principal };
     // T-758: serializa — turno em voo segura a escrita (o CLI não lê stdin
     // durante o turno e linhas no mesmo chunk se perdem).
-    if (this.claudeInflight || this.claudeTimings.length > 0) {
+    if (this.claudeInflight || this.claudeModeSwitching || this.claudeTimings.length > 0) {
       this.claudeWriteQueue.push(item);
       this.opts.log("info", `[cli:${this.info.id}:claude] serializado (turno em voo; fila=${this.claudeWriteQueue.length})`);
       this.queueChanged();
@@ -1098,13 +1162,59 @@ export class AgentRunner {
   }
 
   /** T-758: escreve UMA mensagem no stdin do claude e arma a vigilância de
-   *  aceitação. Só chamar com CLI ocioso (sem claudeInflight). */
-  private sendClaudeMessage(item: { content: string; images?: ImageAttachment[]; deliveryId?: string; timingMessage: object }): void {
-    const { content, images, timingMessage } = item;
-    this.currentTurn = { content, images, deliveryId: item.deliveryId };
+   *  aceitação. Só chamar com CLI ocioso (sem claudeInflight).
+   *  T-1300 (P3 autoApprove): o alvo do modo é derivado de
+   *  `opts.autoApprove` no spawn (startClaude) — o estado inicial NÃO é fixo
+   *  em bypass. Cada envio fixa o pin do item (`claudeModePin`) e a troca só
+   *  sai pelo `sendClaudeMessage` real; ACK falho/timeout bloqueia o turno. */
+  private sendClaudeMessage(item: { content: string; images?: ImageAttachment[]; deliveryId?: string; timingMessage: object; principal?: InboundTurnPrincipal }): void {
+    const nextMode = claudePermissionModeForTurn(item.principal, this.opts.autoApprove);
+    this.currentTurn = { content: item.content, images: item.images, deliveryId: item.deliveryId, principal: item.principal };
     this.currentTurnSettled = false;
+    this.claudeModePin = nextMode;
+    if (nextMode !== this.claudePermissionMode) {
+      this.claudeModeSwitching = true;
+      this.setState("thinking");
+      void requestClaudePermissionMode(this, nextMode).then(() => {
+        if (this.stopped) return;
+        // Pin por envio: só confirma se o alvo fixado ainda é o do item.
+        if (this.claudeModePin !== nextMode) {
+          this.claudeModeSwitching = false;
+          this.currentTurn = null;
+          this.turnLatency.discard(item.timingMessage, "queue-cleared");
+          this.opts.onError(`[security] Claude trocou de alvo durante a confirmação (esperado ${nextMode}, fixado ${String(this.claudeModePin)}); turno bloqueado`);
+          this.setState("idle");
+          this.drainClaudeWriteQueue();
+          return;
+        }
+        this.claudePermissionMode = nextMode;
+        this.claudeModeSwitching = false;
+        this.writeClaudeMessage(item);
+      }).catch((error: unknown) => {
+        this.claudeModeSwitching = false;
+        this.currentTurn = null;
+        this.turnLatency.discard(item.timingMessage, "queue-cleared");
+        const detail = error instanceof Error ? error.message : String(error);
+        this.opts.onError(`[security] Claude não confirmou a troca para ${nextMode}; turno bloqueado: ${detail}`);
+        this.setState("idle");
+        this.drainClaudeWriteQueue();
+      });
+      return;
+    }
+    this.writeClaudeMessage(item);
+  }
+
+  private writeClaudeMessage(item: { content: string; images?: ImageAttachment[]; deliveryId?: string; timingMessage: object; principal?: InboundTurnPrincipal }): void {
+    // Pin do envio: a escrita usa o modo fixado pelo sendClaudeMessage do item.
+    // Desviar direto para writeClaudeMessage (fora do sendClaudeMessage) não
+    // pode herdar um pin de outro principal — o alvo é rederivado do item.
+    if (this.claudeModePin == null) {
+      this.claudeModePin = claudePermissionModeForTurn(item.principal, this.opts.autoApprove);
+    }
+    const { content, images, timingMessage } = item;
+    const inboundContent = markNonOwnerMessage(content, item.principal);
     // Não-imagem não cabe no payload inline do claude — vai por arquivo.
-    const anexos = this.attachNonImageFiles(content, images);
+    const anexos = this.attachNonImageFiles(inboundContent, images);
     const messageContent = buildClaudeUserContent(anexos.content, images);
     this.scheduleAttachmentCleanup(anexos.cleanup);
     const line = JSON.stringify({
@@ -1116,18 +1226,22 @@ export class AgentRunner {
     timing.start();
     this.claudeTimings.push(timing);
     this.claudeInflight = { ...item, timing };
+    this.claudeModePin = null;
     this.claudeUnacceptedSince = Date.now();
     this.claudeUnacceptedWarned = false;
     this.proc?.stdin.write(line + "\n");
     this.setState("thinking");
   }
 
-  /** T-758: próximo da fila serializada, assim que o turno anterior fecha. */
+  /** T-758: próximo da fila serializada, assim que o turno anterior fecha.
+   *  T-1300 (P3): cada envio volta pelo sendClaudeMessage (fixa o pin do item);
+   *  trocar sempre de modo é pedir um control_request por envio, e ACK falho
+   *  bloqueia o item em vez de escrever no modo errado. */
   private drainClaudeWriteQueue(): void {
-    if (this.stopped || this.claudeInflight || this.claudeTimings.length > 0) return;
+    if (this.stopped || this.claudeInflight || this.claudeModeSwitching || this.claudeTimings.length > 0) return;
     if (!this.proc || !this.proc.stdin.writable) return;
     const next = this.claudeWriteQueue.shift();
-    if (next) { this.queueChanged(); this.sendClaudeMessage(next); }
+    if (next) { this.queueChanged(); this.claudeModePin = null; this.sendClaudeMessage(next); }
   }
 
   /** T-758: mensagem escrita e NÃO aceita pelo CLI (stdin parado) — evento

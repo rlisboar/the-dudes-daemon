@@ -24,6 +24,7 @@ import { spawnDropped } from "../../privileges.js";
 import { appendPathAttachmentPrompt } from "../attachments.js";
 import { compatibleSessionId } from "../index.js";
 import type { AgentUsage, ImageAttachment } from "../../types.js";
+import { acpPermissionDecisionForTurn, markNonOwnerMessage, type InboundTurnPrincipal } from "../turn-security.js";
 
 /** Args de spawn do binário dsh (contrato: `dsh --profile acp`). */
 export const DSH_ACP_ARGS = ["--profile", "acp"] as const;
@@ -177,6 +178,7 @@ export interface DshHandlers {
   onConfig(options: DshConfigOption[]): void;
   onStderr(line: string): void;
   onExit(code: number | null): void;
+  onPermissionRequest?(params: unknown): "allow" | "deny";
 }
 
 interface Pending {
@@ -387,12 +389,20 @@ export class DshClient {
       return;
     }
     if (typeof msg.id === "number" && method) {
-      // Request do server (ex.: session/request_permission) — auto-allow once.
+      // ACP permission is a pre-execution hook. A member turn must never
+      // inherit the owner's auto-allow decision.
       if (method === "session/request_permission") {
-        const params = msg.params as { options?: Array<{ optionId?: string; kind?: string }> } | undefined;
+        const params = msg.params as { options?: Array<{ optionId?: string; kind?: string; name?: string }> } | undefined;
         const opts = params?.options ?? [];
+        if ((this.handlers.onPermissionRequest?.(msg.params) ?? "deny") === "deny") {
+          const reject = opts.find((o) => o.kind === "reject_once" || /reject|deny/i.test(`${o.optionId ?? ""} ${o.name ?? ""}`));
+          if (reject?.optionId) this.respond(msg.id, { outcome: { outcome: "selected", optionId: reject.optionId } });
+          else this.respondError(msg.id, "permission denied by daemon security policy");
+          return;
+        }
         const allow = opts.find((o) => o.kind === "allow_once") ?? opts.find((o) => (o.optionId ?? "").includes("allow")) ?? opts[0];
-        this.respond(msg.id, { outcome: { outcome: "selected", optionId: allow?.optionId ?? "allow_once" } });
+        if (allow?.optionId) this.respond(msg.id, { outcome: { outcome: "selected", optionId: allow.optionId } });
+        else this.respondError(msg.id, "permission request has no supported allow option");
         return;
       }
       // Métodos desconhecidos: resposta vazia evita o server pendurar.
@@ -420,6 +430,10 @@ export class DshClient {
 
   private respond(id: number, result: unknown): void {
     this.write({ jsonrpc: "2.0", id, result });
+  }
+
+  private respondError(id: number, message: string): void {
+    this.write({ jsonrpc: "2.0", id, error: { code: -32000, message } });
   }
 
   private write(obj: unknown): void {
@@ -460,7 +474,7 @@ const DSH_BACKOFF_CAP_MS = 30_000;
 /** Nome do bridge do the-dudes: sem ele o agente não fala com o time (fatal). */
 const BRIDGE_MCP_NAME = "the-dudes";
 
-interface DshQueued { content: string; deliveryId?: string }
+interface DshQueued { content: string; deliveryId?: string; principal?: InboundTurnPrincipal }
 
 /** mcpServers do session/new: bridge the-dudes + extras (stdio ou http). */
 function dshMcpServers(self: any): DshMcpServer[] {
@@ -557,6 +571,7 @@ export function startDsh(self: any): void {
         self.noteToolFechada(ev.id);
       }
     },
+    onPermissionRequest: () => acpPermissionDecisionForTurn(self.currentTurn?.principal),
     onUsage: (used, size) => {
       if (self.dsh !== client) return;
       self.touchActivity();
@@ -686,11 +701,11 @@ export function startDsh(self: any): void {
 
 /** T-720: dreno do self-update — devolve e esvazia a fila de prompts ainda
  *  NÃO enviados (o prompt em voo não está nela). Só leitura/limpeza. */
-export function dshTakeQueue(self: any): Array<{ content: string }> {
+export function dshTakeQueue(self: any): Array<{ content: string; deliveryId?: string; principal?: InboundTurnPrincipal }> {
   const queue = (self.dshQueue as DshQueued[] | undefined) ?? [];
   for (const q of queue) self.turnLatency?.discard(q, "drained");
   self.dshQueue = [];
-  return queue.map((q) => ({ content: q.content, deliveryId: q.deliveryId }));
+  return queue.map((q) => ({ content: q.content, deliveryId: q.deliveryId, principal: q.principal }));
 }
 
 /** T-1005: fila ao vivo — prompts ainda NÃO enviados, sem consumir. */
@@ -716,7 +731,7 @@ export function dshToolInput(raw: unknown): Record<string, unknown> | undefined 
 }
 
 /** Enfileira mensagem do usuário; o pump serializa (ACP: 1 prompt por vez). */
-export function dshPushUserMessage(self: any, content: string, images?: ImageAttachment[], deliveryId?: string): void {
+export function dshPushUserMessage(self: any, content: string, images?: ImageAttachment[], deliveryId?: string, principal?: InboundTurnPrincipal): void {
   const queue = (self.dshQueue as DshQueued[] | undefined) ?? [];
   if (queue.length >= MAX_DSH_QUEUE) {
     self.opts.log("warn", `[cli:${self.info.id}:dsh] fila cheia (${queue.length}) — drop mensagem`);
@@ -735,7 +750,7 @@ export function dshPushUserMessage(self: any, content: string, images?: ImageAtt
     self.scheduleAttachmentCleanup(cleanup);
     message = appendPathAttachmentPrompt(message, files, "dsh");
   }
-  const queued = { content: message, deliveryId };
+  const queued = { content: message, deliveryId, principal };
   self.turnLatency?.enqueue(queued);
   queue.push(queued);
   self.dshQueue = queue;
@@ -765,17 +780,17 @@ function dshPump(self: any): void {
   const timing = self.turnLatency?.activate(next, self.dshFreshSession ? "cold" : "resume");
   timing?.start();
   self.dshPromptInFlight = true;
-  self.currentTurn = { content: next.content, deliveryId: next.deliveryId };
+  self.currentTurn = { content: next.content, deliveryId: next.deliveryId, principal: next.principal };
   self.currentTurnSettled = false;
   self.setState("thinking");
   void (async () => {
     try {
       // First-turn de sessão NOVA leva system+contexto; resume NÃO re-injeta
       // (contrato: o log é durável).
-      let text = next.content;
+      let text = markNonOwnerMessage(next.content, next.principal);
       if (self.messageSession.firstTurn && self.dshFreshSession) {
         self.messageSession.consumeFirstTurn();
-        text = self.initialMessage(next.content, self.messageSession.pendingSummary);
+        text = self.initialMessage(text, self.messageSession.pendingSummary);
       } else if (self.messageSession.firstTurn) {
         self.messageSession.firstTurn = false; // resume: só avança a flag
       }

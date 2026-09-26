@@ -440,6 +440,8 @@ export interface AgentUsage {
 export interface AgentInfo {
   id: string;
   ownerUserId: string;
+  /** TRUE por padrão; se false, só dono/admin podem enviar mensagens. */
+  allowMemberMessages?: boolean;
   name: string;
   role: string;
   systemPrompt: string;
@@ -577,6 +579,35 @@ export interface MessageEntry {
   kind: MessageKind;
   fromUserId?: string;
   imageCount?: number;
+}
+
+/** Mensagem do chat somente entre membros; o server só transporta ciphertext. */
+export interface HumanChatMessage {
+  id: string;
+  projectId: string;
+  userId: string;
+  contentCipher: string;
+  createdAt: string;
+  editedAt?: string;
+  deletedAt?: string;
+}
+
+export interface HumanChatCursor {
+  createdAt: string;
+  id: string;
+}
+
+export interface HumanChatPage {
+  messages: HumanChatMessage[];
+  nextCursor?: HumanChatCursor;
+  unreadCount: number;
+  lastReadAt: string;
+}
+
+export interface HumanChatRead {
+  projectId: string;
+  userId: string;
+  lastReadAt: string;
 }
 
 export type TaskStatus = "todo" | "doing" | "done" | "blocked";
@@ -1056,6 +1087,8 @@ export interface ScheduledPrompt {
   lastEvaluatedMinute?: number;
   /** R9 (T-464): próximo disparo teórico (observabilidade). */
   nextDueAt?: number;
+  /** Autor original do texto agendado; ausente em linhas anteriores à v31. */
+  createdBy?: string;
   createdAt?: string;
   /** Últimas execuções (preenchido no snapshot / events). */
   recentRuns?: ScheduleRun[];
@@ -1448,6 +1481,10 @@ export type ServerEvent =
       to: { runner: string; model?: string };
     }
   | { type: "message"; msg: MessageEntry }
+  | { type: "human_chat:page"; page: HumanChatPage }
+  | { type: "human_chat:message"; message: HumanChatMessage }
+  | { type: "human_chat:updated"; message: HumanChatMessage }
+  | { type: "human_chat:updated"; read: HumanChatRead }
   | { type: "task:added"; task: Task }
   | { type: "task:updated"; task: Task }
   | { type: "task:removed"; id: string }
@@ -1662,6 +1699,12 @@ export type ClientCommand =
   | { type: "transfer_agent_owner"; id: string; newOwnerUserId: string }
   | { type: "assign_agent_repo"; id: string; repo: AgentRepo | null }
   | { type: "user_to_agent"; id: string; content: string; images?: ImageAttachment[] }
+  | { type: "set_agent_allow_member_messages"; id: string; value: boolean }
+  | { type: "human_chat_send"; contentCipher: string }
+  | { type: "human_chat_list"; limit?: number; beforeCreatedAt?: string; beforeId?: string }
+  | { type: "human_chat_edit"; id: string; contentCipher: string }
+  | { type: "human_chat_delete"; id: string }
+  | { type: "human_chat_mark_read" }
   | { type: "broadcast"; content: string; images?: ImageAttachment[] }
   | { type: "set_auto_approve"; value: boolean }
   | { type: "set_loop_protection"; value: "reactive" | "preventive"; limitEnabled?: boolean; limit?: number; pairLimit?: number; pairWindowMs?: number }

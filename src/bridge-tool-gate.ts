@@ -54,6 +54,30 @@ export const TOOL_GROUP: Record<string, string> = {
 };
 
 /**
+ * Operations the daemon may forward for a non-owner turn. Every other bridge
+ * operation is denied in the local relay before it reaches the server. Keep
+ * this list allow-only: the bridge grows over time and new operations must not
+ * become available to member turns by accident.
+ */
+export const NON_OWNER_READ_ONLY_BRIDGE_OPS: ReadonlySet<string> = new Set([
+  "list",
+  "tasks_list", "tasks_get", "tasks_comment_list", "tasks_files_locks",
+  "goals_list",
+  "plans_list", "plans_get",
+  "list_webhooks",
+  "memory_list",
+  "board_get", "board_list",
+]);
+
+/** Returns true only for a known read-only project bridge operation. */
+export function nonOwnerBridgeRequestAllowed(method: string, pathname: string): boolean {
+  if (method !== "POST" && method !== "GET") return false;
+  const match = pathname.match(/^\/api\/bridge\/[^/]+\/([A-Za-z0-9_]+)$/);
+  if (!match) return false;
+  return NON_OWNER_READ_ONLY_BRIDGE_OPS.has(match[1]!);
+}
+
+/**
  * `enabledGroups === null` = daemon antigo sem THE_DUDES_FEATURES → registra
  * tudo o que não for gated por papel. Um tool com papel exigido NUNCA depende
  * do null: sem papel, não registra, com features ou sem elas.

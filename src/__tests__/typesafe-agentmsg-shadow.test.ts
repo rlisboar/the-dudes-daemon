@@ -97,7 +97,7 @@ test("agent-msg fires without waiting, redacts text, and pairs verdict/outcome o
 
 test("agent-msg wiring captures only agent-origin plaintext and records observed turn actions", () => {
   const schedule = MAIN.indexOf("scheduleAgentMessageShadow({");
-  const delivery = MAIN.indexOf("this.host.send_message(msg.agentId, content, images, msg.deliveryId, wire)");
+  const delivery = MAIN.indexOf("this.host.send_message(msg.agentId, content, images, msg.deliveryId, wire, principalFromAgentSend(msg))");
   assert.ok(MAIN.includes('msg.origin === "agent"'));
   assert.ok(schedule >= 0 && delivery > schedule, "shadow starts in the decrypted agent:send path before delivery");
   assert.match(MAIN.slice(schedule, delivery), /text: agentMessageText/);

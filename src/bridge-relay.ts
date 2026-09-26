@@ -21,6 +21,7 @@ import { scheduleDelegateShadow } from "./typesafe-delegate-shadow.js";
 import { scheduleTaskShadow, type PatchTask } from "./typesafe-task-shadow.js";
 import { performance } from "node:perf_hooks";
 import { recordRelayConnection, recordRelayRequest } from "./debug/store.js";
+import { nonOwnerBridgeRequestAllowed } from "./bridge-tool-gate.js";
 
 /** T-812: tempos de uma request do relay (preenchidos pelo handleInner). */
 interface RelayTiming {
@@ -360,6 +361,8 @@ export class BridgeRelay {
   private agentNameLookup?: (agentId: string) => string | null;
   /** T-1146: successful teammate messages/task writes mark the active turn. */
   private onAgentMessageAction?: (agentId: string) => void;
+  /** Turn-scoped trust from the active runner; undefined = no member turn. */
+  private agentOwnerTurnLookup?: (agentId: string) => boolean | undefined;
 
   private socketDir: string;
   private peerPidSelfTest?: () => Promise<boolean>;
@@ -386,6 +389,7 @@ export class BridgeRelay {
       peerPidSelfTest?: () => Promise<boolean>;
       agentNameLookup?: (agentId: string) => string | null;
       onAgentMessageAction?: (agentId: string) => void;
+      agentOwnerTurnLookup?: (agentId: string) => boolean | undefined;
     },
   ) {
     this.orchUrl = orchUrl.replace(/\/$/, "");
@@ -393,6 +397,7 @@ export class BridgeRelay {
     this.agentProjectLookup = agentProjectLookup;
     this.agentNameLookup = opts?.agentNameLookup;
     this.onAgentMessageAction = opts?.onAgentMessageAction;
+    this.agentOwnerTurnLookup = opts?.agentOwnerTurnLookup;
     this.peerPidSelfTest = opts?.peerPidSelfTest;
     // Symlink attack defense: socket vivia em /tmp/the-dudes-bridge-<pid>.sock
     // — path previsível (PID sequential). Atacante local poderia pré-criar
@@ -819,6 +824,14 @@ export class BridgeRelay {
       console.warn(
         "[bridge-relay] WARN: peer-pid INSECURE — accepting unverifiable bridge connection (THE_DUDES_PEER_PID_INSECURE=1)",
       );
+    }
+    const agentId = parsed.pathname.match(/^\/api\/bridge\/([^/]+)/)?.[1];
+    const ownerTurn = agentId ? this.agentOwnerTurnLookup?.(agentId) : undefined;
+    if (ownerTurn === false && !nonOwnerBridgeRequestAllowed(req.method ?? "", parsed.pathname)) {
+      timing.error = "non-owner bridge operation blocked";
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "this bridge operation is blocked for a non-owner turn" }));
+      return;
     }
     // Reconstrói o upstream a partir do pathname normalizado + search,
     // não da string crua, pra não reintroduzir o que acabamos de validar.

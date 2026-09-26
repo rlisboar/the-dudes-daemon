@@ -66,7 +66,12 @@ function provisionKey(projectId: string, aes: Uint8Array): void {
 }
 
 function agentSend(deliveryId: string | undefined, content: string): Record<string, unknown> {
-  return { type: "agent:send", agentId: AGENT, projectId: PROJ, content, deliveryId };
+  // This test models an owner-authored dispatch; legacy frames without the
+  // server-derived owner flag are intentionally reclassified as non-owner.
+  return {
+    type: "agent:send", agentId: AGENT, projectId: PROJ, content, deliveryId,
+    from: { type: "user", id: "owner-t252" }, isAgentOwner: true,
+  };
 }
 
 test("T-252: decrypt falho não marca deliveryId; retry com chave boa é processado; duplicata pós-aceite é descartada", async () => {

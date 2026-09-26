@@ -1,4 +1,5 @@
 import type { ImageAttachment } from "../types.js";
+import { sameTurnPrincipal, type InboundTurnPrincipal } from "./turn-security.js";
 
 export interface QueuedMessage {
   content: string;
@@ -7,6 +8,8 @@ export interface QueuedMessage {
   synthetic?: string;
   /** T-842: id de entrega, para o spool do SIGTERM não perder o dedup. */
   deliveryId?: string;
+  /** T-1300: server-authenticated actor for this individual delivery. */
+  principal?: InboundTurnPrincipal;
   /** T-1005: ids das mensagens agrupadas NESTE item (T-818) — a fila ao vivo
    *  mostra cada uma; remover qualquer delas tira o item inteiro. */
   coalescedIds?: string[];
@@ -92,6 +95,7 @@ export class PerMessageSessionState {
     for (let i = this.queue.length - 1; i >= 0; i--) {
       const alvo = this.queue[i]!;
       if (alvo.synthetic) continue;
+      if (!sameTurnPrincipal(alvo.principal, message.principal)) continue;
       const content = alvo.content + COALESCE_SEPARATOR + message.content;
       if (Buffer.byteLength(content, "utf8") > maxBytes) return "dropped";
       alvo.content = content;

@@ -17,7 +17,7 @@ const FIXTURE = fileURLToPath(new URL("./fixtures/fake-acp-server.mjs", import.m
 
 type Ev = [string, unknown];
 
-function makeClient(): { client: DshClient; dir: string; logPath: string; events: Ev[] } {
+function makeClient(onPermissionRequest?: (params: unknown) => "allow" | "deny"): { client: DshClient; dir: string; logPath: string; events: Ev[] } {
   const dir = mkdtempSync(path.join(tmpdir(), "t690acp-"));
   const logPath = path.join(dir, "log.jsonl");
   const events: Ev[] = [];
@@ -29,6 +29,7 @@ function makeClient(): { client: DshClient; dir: string; logPath: string; events
     onConfig: (o) => events.push(["config", o]),
     onStderr: (l) => events.push(["stderr", l]),
     onExit: (c) => events.push(["exit", c]),
+    onPermissionRequest,
   });
   client.start(process.execPath, [FIXTURE], { cwd: dir, env: { ...process.env, FAKE_ACP_LOG: logPath } });
   return { client, dir, logPath, events };
@@ -40,7 +41,7 @@ const readLog = (p: string): Array<Record<string, unknown>> =>
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 test("T-690 ACP: handshake + turno mapeia updates, auto-responde permissão e devolve stopReason", async () => {
-  const { client, dir, logPath, events } = makeClient();
+  const { client, dir, logPath, events } = makeClient(() => "allow");
   try {
     const init = await client.initialize();
     assert.equal(init.protocolVersion, 1);
@@ -76,6 +77,17 @@ test("T-690 ACP: handshake + turno mapeia updates, auto-responde permissão e de
   }
 });
 
+test("T-1300 E: ACP permission request without a handler is denied", async () => {
+  const { client, dir } = makeClient();
+  try {
+    await client.initialize();
+    await client.newSession(dir, []);
+    assert.equal(await client.prompt("responda OK"), "permission_denied");
+  } finally {
+    client.kill();
+  }
+});
+
 test("T-690 ACP: resume reusa o sessionId sem replay de updates", async () => {
   const { client, dir, events } = makeClient();
   try {
@@ -89,7 +101,7 @@ test("T-690 ACP: resume reusa o sessionId sem replay de updates", async () => {
 });
 
 test("T-690 ACP: cancel do prompt em voo settle com stopReason cancelled", async () => {
-  const { client, dir } = makeClient();
+  const { client, dir } = makeClient(() => "allow");
   try {
     await client.initialize();
     await client.newSession(dir, []);

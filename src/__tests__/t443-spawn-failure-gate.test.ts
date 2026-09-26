@@ -77,7 +77,12 @@ test("T-443 wiring: gemini/qwen/codex/crush têm catch em volta do spawnDropped"
       new RegExp(`catch \\(e\\) \\{\\s*(?:this|self)\\.failTurnSpawn\\("${runner}"`),
       `${runner}: catch em volta do spawn chama failTurnSpawn`,
     );
-    const i = Math.max(src.lastIndexOf(`spawnDropped(this.runnerCommand("${runner}")`), src.lastIndexOf(`spawnDropped(self.runnerCommand("${runner}")`));
+    // T-1300: o codex spawna `codexCommand` (realpath nativo no turno de membro).
+    const i = Math.max(
+      src.lastIndexOf(`spawnDropped(this.runnerCommand("${runner}")`),
+      src.lastIndexOf(`spawnDropped(self.runnerCommand("${runner}")`),
+      src.lastIndexOf(`spawnDropped(${runner}Command,`),
+    );
     assert.ok(i > 0, `spawn per-message do ${runner} existe`);
     const tryIdx = src.lastIndexOf("try {", i);
     assert.ok(tryIdx > 0 && i - tryIdx < 300, `${runner}: spawn dentro de try`);

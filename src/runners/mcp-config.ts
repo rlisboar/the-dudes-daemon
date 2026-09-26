@@ -167,6 +167,10 @@ const OPENCODE_INTERACTIVE_DENY: Record<string, "deny"> = Object.fromEntries(
 );
 
 export function buildOpenCodeMcpConfig(extras: Record<string, McpServerConfig> | undefined, bridge: BridgeConfig, autoApprove: boolean, managedAgent?: Record<string, unknown>) {
+  // Keep permission.asked enabled even when project auto-approve is on. The
+  // daemon/server resolves owner turns as before; member turns are denied by
+  // the turn-scoped callback before the operation executes.
+  void autoApprove;
   const mcp: Record<string, unknown> = {};
   const warnings: string[] = [];
   for (const [name, config] of Object.entries(extras ?? {})) {
@@ -197,11 +201,15 @@ export function buildOpenCodeMcpConfig(extras: Record<string, McpServerConfig> |
     config: {
       $schema: "https://opencode.ai/config.json",
       mcp,
-      // T-826: `{"*":"allow"}` é a forma que o serve dá ao "allow" — só
-      // acrescenta a negação das interativas (bash/edit seguem sem ask).
-      permission: autoApprove
-        ? { "*": "allow", ...OPENCODE_INTERACTIVE_DENY }
-        : { edit: "ask", bash: "ask", webfetch: "ask", external_directory: "ask", ...OPENCODE_INTERACTIVE_DENY },
+      // T-1300: don't let project auto-approve skip the daemon's permission
+      // callback. The server auto-approves owner turns; member turns are denied
+      // locally before tool execution.
+      permission: {
+        "*": "ask",
+        read: "allow", grep: "allow", glob: "allow", list: "allow",
+        external_directory: "ask",
+        ...OPENCODE_INTERACTIVE_DENY,
+      },
       ...(managedAgent ? { agent: { "the-dudes-managed": managedAgent } } : {}),
     },
     warnings,

@@ -73,8 +73,14 @@ test("OpenCode serializes stdio as local and http/sse as remote (T-308); only mi
   assert.deepEqual(mcp.sse, { type: "remote", enabled: true, url: "https://sse" });
   assert.equal(result.warnings.length, 1);
   assert.match(result.warnings[0], /"broken".*requires url/);
-  assert.deepEqual(result.config.permission, { edit: "ask", bash: "ask", webfetch: "ask", external_directory: "ask", question: "deny" });
+  assert.deepEqual(result.config.permission, { "*": "ask", read: "allow", grep: "allow", glob: "allow", list: "allow", external_directory: "ask", question: "deny" });
   assert.deepEqual((result.config.agent as Record<string, unknown>)["the-dudes-managed"], { model: "openai/gpt-5", reasoningEffort: "high" });
+});
+
+test("T-1300: OpenCode keeps request-time permission checks when auto-approve is enabled", () => {
+  const result = buildOpenCodeMcpConfig(undefined, bridge, true);
+  assert.deepEqual(result.config.permission, { "*": "ask", read: "allow", grep: "allow", glob: "allow", list: "allow", external_directory: "ask", question: "deny" });
+  assert.equal((result.config.permission as Record<string, unknown>)["*"], "ask");
 });
 
 test("Codex config.toml (T-426): escapa nomes/valores e mantém token no arquivo, não em -c", () => {
