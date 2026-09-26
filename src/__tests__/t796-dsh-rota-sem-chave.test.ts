@@ -20,6 +20,7 @@ import { fileURLToPath } from "node:url";
 
 import { AgentRunner } from "../agent-runner.js";
 import { DSH_DEFAULT_MODEL, dshModelForTurn, dshModelRoute } from "../runners/turns/dsh.js";
+import { resolveRunnerSettings } from "../runner-defaults-local.js";
 
 const FIXTURE = fileURLToPath(new URL("./fixtures/fake-acp-server.mjs", import.meta.url));
 const OFICIAL = '["deepseek-official","deepseek-v4-flash"]';
@@ -67,7 +68,7 @@ function makeRunner(dir: string, model?: string) {
 
 const readLog = (p: string) => readFileSync(p, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>);
 
-async function turnCom(model: string | undefined) {
+async function turnCom(model: string | undefined, requireDsflash = true) {
   const dir = mkdtempSync(path.join(tmpdir(), "t796dsh-"));
   const logPath = path.join(dir, "acp.jsonl");
   const prev = process.env.FAKE_ACP_LOG;
@@ -75,7 +76,8 @@ async function turnCom(model: string | undefined) {
   const prevKey = process.env.FAKE_ACP_REQUIRE_DSFLASH;
   process.env.FAKE_ACP_LOG = logPath;
   process.env.THE_DUDES_AGENT_ENV_PASSTHROUGH = "FAKE_ACP_LOG,FAKE_ACP_REQUIRE_DSFLASH";
-  process.env.FAKE_ACP_REQUIRE_DSFLASH = "1";
+  if (requireDsflash) process.env.FAKE_ACP_REQUIRE_DSFLASH = "1";
+  else delete process.env.FAKE_ACP_REQUIRE_DSFLASH;
   const { runner, texts, errors } = makeRunner(dir, model);
   try {
     await runner.start();
@@ -105,4 +107,19 @@ test("T-796: agente dsh com o default official do catálogo → set_config_optio
   assert.equal(r.textos, "OK", "prompt completou: a sessão foi movida para dsflash");
   assert.deepEqual(r.sets, [DSH_DEFAULT_MODEL], "o par official do catálogo vira dsflash antes do prompt");
   assert.equal(r.errors.some((e) => /no API key/.test(e)), false);
+});
+
+test("T-1336: resolveRunnerSettings keeps the dsh OpenRouter pair through the real ACP turn", async () => {
+  const pair = '["openrouter","meta/muse-spark-1.3-contributor"]';
+  const settings = resolveRunnerSettings({
+    runner: "dsh",
+    agent: { model: pair },
+    configAliases: { claude: [] },
+    home: tmpdir(),
+    warn: (message) => { throw new Error(message); },
+  });
+  assert.equal(settings.model, pair);
+  const result = await turnCom(settings.model, false);
+  assert.equal(result.textos, "OK", "ACP turno completou usando o modelo resolvido");
+  assert.deepEqual(result.sets, [pair], "o par selecionado chegou intacto ao set_config_option model do dsh");
 });

@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { RUNNERS } from "@the-dudes/protocol";
+import { AgentHost } from "../agent-host.js";
+import { DSH_DEFAULT_MODEL, dshModelForTurn } from "../runners/turns/dsh.js";
 import { validateDaemonMessage } from "../protocol.js";
 import { loadOrCreateDaemonId } from "../daemon-id.js";
 import { loadDaemonCliConfig } from "../cli-config.js";
@@ -13,8 +15,10 @@ import type { ResolvedCliCommands } from "../cli-config.js";
 import type { InstalledRunnerAvailability } from "../runner-policy.js";
 import {
   discoverClaudeConfigAliases,
+  isValidDshModel,
   isCompatibleRunnerEffort,
   isValidRunnerModel,
+  isValidRunnerModelFor,
   publicConfigDirAliases,
   revalidateClaudeConfigAlias,
   resolveRunnerSettings,
@@ -109,6 +113,62 @@ test("T-1136: model precedence is env > saved agent > daemon default > native", 
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
+});
+
+test("T-1336: dsh accepts only a bounded canonical provider/model pair; other runners keep scalar grammar", () => {
+  const home = tempDir("t1336-dsh-model-");
+  const pair = '["openrouter","meta/muse-spark-1.3-contributor"]';
+  const warnings: string[] = [];
+  try {
+    const common = { runner: "dsh" as const, configAliases: { claude: [] }, home, ownerUid: uid, warn: (message: string) => warnings.push(message) };
+    const resolved = resolveRunnerSettings({ ...common, agent: { model: pair } });
+    assert.equal(resolved.model, pair, "model configurado chega intacto à resolução");
+    assert.equal(isValidDshModel(pair), true);
+    assert.equal(isValidRunnerModelFor("dsh", pair), true);
+    assert.equal(isValidRunnerModel(pair), false, "a gramática escalar continua rejeitando o par");
+
+    for (const invalid of [
+      '["openrouter"]',
+      '["openrouter","model","extra"]',
+      '["open router","model"]',
+      JSON.stringify(["openrouter", "x".repeat(129)]),
+      '[ "openrouter", "model" ]',
+      '["openrouter",9]',
+      '["openrouter","model"] trailing',
+    ]) assert.equal(isValidDshModel(invalid), false, invalid);
+    assert.equal(isValidRunnerModelFor("claude", pair), false, "structured models stay invalid for non-dsh runners");
+
+    const rejected = resolveRunnerSettings({ ...common, agent: { model: '["bad route","model"]' } });
+    assert.equal(rejected.model, undefined);
+    assert.ok(warnings.some((message) => /from agent is invalid: expected a compact JSON pair/.test(message)), warnings.join("\n"));
+
+    const sanitized = sanitizeRunnerDefaults({ defaults: { dsh: { model: pair }, claude: { model: pair } }, configAliases: { claude: [] } });
+    assert.equal(sanitized.dsh?.model, pair);
+    assert.equal(sanitized.claude, undefined);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("T-1336: debug status reports the dsh effective model after rejecting an invalid configured value", () => {
+  const resolved = resolveRunnerSettings({
+    runner: "dsh",
+    agent: { model: '["bad route","model"]' },
+    configAliases: { claude: [] },
+    home: os.homedir(),
+  });
+  assert.equal(resolved.model, undefined, "invalid agent config is rejected");
+  const effectiveModel = dshModelForTurn(resolved.model);
+  assert.equal(effectiveModel, DSH_DEFAULT_MODEL);
+  const host = new AgentHost(() => true, null, null, {} as never);
+  const entries = (host as unknown as { entries: Map<string, unknown> }).entries;
+  entries.set("dsh-agent", {
+    info: { id: "dsh-agent", name: "dsh", role: "test", cliRunner: "dsh", model: '["bad route","model"]' },
+    effectiveModel,
+    runner: null,
+    autoApprove: false,
+  });
+  assert.equal(host.debugSnapshot()[0]?.model, DSH_DEFAULT_MODEL, "dashboard status uses the model the dsh runner will actually set");
 });
 
 test("T-1136: agent effort beats default and runner/model compatibility is rechecked", () => {

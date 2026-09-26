@@ -9,6 +9,7 @@ import { interpolateMissionMemory } from "@the-dudes/protocol/mission-memory";
 import {decryptForProject, decryptImageAttachments, encryptForProject, isE2eEncrypted, isE2eeRequired, setE2eeRequired, redactCredentials, redactCredentialsDeep} from "./daemon-crypto.js";
 import { assembleAgentSendParts } from "./protocol.js";
 import { mergeQueueDeliveryPayload, type MergedQueueDeliveryItem, type QueueDeliveryInput, type QueueDeliveryPayload } from "./runners/queue-delivery.js";
+import { dshModelForTurn } from "./runners/turns/dsh.js";
 import {classifyRunnerFailure} from "./runners/error-classifier.js";
 import {isNonOwnerTurn, principalFromQueueDeliver, type InboundTurnPrincipal} from "./runners/turn-security.js";
 import {migratedSeedFor, MIGRATED_SEED_LIMIT_BYTES} from "./migrated-seed.js";
@@ -109,6 +110,9 @@ function resolveBridge(): { command: string; args: string[] } {
 
 interface Entry {
   info: AgentInfo;
+  /** Effective local model selected for the active runner (may be null when
+   *  invalid config was rejected and the runner uses its native default). */
+  effectiveModel?: string | null;
   runner: AgentRunner | null;
   /** T-899: parado pelo dono — mensagem que chega vai para a retenção até o
    *  próximo spawn (antes caía num runner morto e morria com ele). */
@@ -249,7 +253,7 @@ export class AgentHost {
         name: e.info.name,
         role: e.info.role ?? null,
         cliRunner: e.info.cliRunner ?? "claude",
-        model: e.info.model ?? null,
+        model: Object.hasOwn(e, "effectiveModel") ? e.effectiveModel ?? null : e.info.model ?? null,
         effort: e.info.effort ?? null,
         ephemeral: !!e.info.ephemeral,
         projectId: e.projectId ?? null,
@@ -906,6 +910,7 @@ export class AgentHost {
       env: process.env,
       warn: (message) => this.log("warn", `[runner-defaults:${cliRunner}] ${message}`),
     });
+    const effectiveModel = cliRunner === "dsh" ? dshModelForTurn(settings.model) : settings.model;
     this.effectiveRunnerConfig.set(cliRunner, {
       configSource: settings.configSource,
       configAlias: settings.configAlias,
@@ -920,15 +925,16 @@ export class AgentHost {
     };
     const runnerInfo: AgentInfo = {
       ...msg.agent,
-      model: settings.model,
+      model: effectiveModel,
       effort: settings.effort,
     };
     const runner = new AgentRunner(runnerInfo, opts);
     thisRunner = runner;
-    try { recordAgentEvent(msg.agent.id, "spawn", `runner=${cliRunner} model=${msg.agent.model ?? "-"} effort=${msg.agent.effort ?? "-"} resume=${resumeSessionId ? "sim" : "não"} cwd=${cwd}`); } catch { /* observação */ }
+    try { recordAgentEvent(msg.agent.id, "spawn", `runner=${cliRunner} model=${effectiveModel ?? "-"} effort=${settings.effort ?? "-"} resume=${resumeSessionId ? "sim" : "não"} cwd=${cwd}`); } catch { /* observação */ }
     const subiu = runner.start().catch((e) => this.log("error", `agent ${msg.agent.id} start failed: ${(e as Error).message}`));
     this.entries.set(msg.agent.id, {
       info: msg.agent,
+      effectiveModel: effectiveModel ?? null,
       runner,
       autoApprove: msg.autoApprove,
       projectId: msg.projectId,

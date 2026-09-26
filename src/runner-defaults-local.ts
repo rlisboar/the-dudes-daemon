@@ -7,6 +7,7 @@ import type { CliRunner, EffortLevel } from "./types.js";
 import { grokWireEfforts } from "./runners/model-policy.js";
 
 export const RUNNER_DEFAULT_MODEL_MAX_LENGTH = 128;
+export const DSH_MODEL_PAIR_MAX_LENGTH = RUNNER_DEFAULT_MODEL_MAX_LENGTH * 2 + 7;
 const MODEL_GRAMMAR = /^[A-Za-z0-9][A-Za-z0-9._:+/-]{0,127}$/;
 const EFFORTS = new Set<EffortLevel>(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
@@ -149,6 +150,26 @@ export function isValidRunnerModel(value: unknown): value is string {
   return typeof value === "string" && value.length <= RUNNER_DEFAULT_MODEL_MAX_LENGTH && MODEL_GRAMMAR.test(value);
 }
 
+/** dsh ACP models are serialized [provider, model] pairs. Keep the existing
+ *  scalar grammar for every other runner, and validate each dsh component by
+ *  that same grammar before accepting the bounded JSON representation. */
+export function isValidDshModel(value: unknown): value is string {
+  if (typeof value !== "string" || value.length > DSH_MODEL_PAIR_MAX_LENGTH) return false;
+  try {
+    const pair: unknown = JSON.parse(value);
+    return Array.isArray(pair)
+      && pair.length === 2
+      && pair.every((part) => typeof part === "string" && isValidRunnerModel(part))
+      && JSON.stringify(pair) === value;
+  } catch {
+    return false;
+  }
+}
+
+export function isValidRunnerModelFor(runner: CliRunner, value: unknown): value is string {
+  return runner === "dsh" ? isValidDshModel(value) : isValidRunnerModel(value);
+}
+
 /** Matches server/src/brain-effort.ts. Defaults must be valid for both the
  *  protocol enum and the selected runner/model before they can affect spawn. */
 export function isCompatibleRunnerEffort(runner: CliRunner, model: string | undefined, value: unknown): value is EffortLevel {
@@ -172,11 +193,11 @@ export function isCompatibleRunnerEffort(runner: CliRunner, model: string | unde
   return effort === "none";
 }
 
-function choose<T>(values: Array<{ source: string; value: unknown }>, valid: (value: unknown) => value is T, warn: (message: string) => void, field: string): T | undefined {
+function choose<T>(values: Array<{ source: string; value: unknown }>, valid: (value: unknown) => value is T, warn: (message: string) => void, field: string, invalidReason?: string): T | undefined {
   for (const item of values) {
     if (item.value == null || item.value === "") continue;
     if (valid(item.value)) return item.value;
-    warn(`runner default ${field} from ${item.source} is invalid; ignoring it`);
+    warn(`runner default ${field} from ${item.source} is invalid${invalidReason ? `: ${invalidReason}` : ""}; ignoring it`);
   }
   return undefined;
 }
@@ -221,7 +242,11 @@ export function resolveRunnerSettings(input: {
     { source: "env", value: input.env?.[`THE_DUDES_${key}_MODEL`] },
     { source: "agent", value: input.agent.model },
     { source: "default", value: input.defaults?.model },
-  ], isValidRunnerModel, warn, "model");
+  ],
+  (value): value is string => isValidRunnerModelFor(input.runner, value),
+  warn,
+  "model",
+  input.runner === "dsh" ? `expected a compact JSON pair ["provider","model"] with two non-empty strings matching the safe model grammar (each <= ${RUNNER_DEFAULT_MODEL_MAX_LENGTH} chars; pair <= ${DSH_MODEL_PAIR_MAX_LENGTH} chars)` : undefined);
   const effort = choose([
     { source: "env", value: input.env?.[`THE_DUDES_${key}_EFFORT`] },
     { source: "agent", value: input.agent.effort },
@@ -262,8 +287,8 @@ export function sanitizeRunnerDefaults(input: {
     const runner = name as CliRunner;
     const sanitized: RunnerDefaultSetValue = {};
     if (value.model !== undefined) {
-      if (isValidRunnerModel(value.model)) sanitized.model = value.model;
-      else warn(`invalid ${runner} model default ignored`);
+      if (isValidRunnerModelFor(runner, value.model)) sanitized.model = value.model;
+      else warn(`invalid ${runner} model default ignored${runner === "dsh" ? `: expected compact JSON ["provider","model"] with safe components (pair <= ${DSH_MODEL_PAIR_MAX_LENGTH} chars)` : ""}`);
     }
     if (value.effort !== undefined) {
       if (isCompatibleRunnerEffort(runner, sanitized.model, value.effort)) sanitized.effort = value.effort;
